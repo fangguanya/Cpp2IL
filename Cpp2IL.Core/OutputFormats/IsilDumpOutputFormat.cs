@@ -20,15 +20,35 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
     {
         outputRoot = Path.Combine(outputRoot, "IsilDump");
 
-        var numAssemblies = context.Assemblies.Count;
+        var runtimeOptions = Cpp2IlApi.RuntimeOptions;
+        var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
+        var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
+        var assemblies = IsilDumpSelectionHelper.SelectExact(
+            context.Assemblies,
+            assemblyFilters,
+            assembly => assembly.Name,
+            "ISIL 程序集");
+        var types = IsilDumpSelectionHelper.SelectExact(
+            assemblies.SelectMany(assembly => assembly.Types),
+            typeFilters,
+            type => type.Definition?.FullName ?? string.Empty,
+            "ISIL 类型");
+        if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
+            throw new InvalidOperationException("ISIL 类型筛选命中了注入类型或没有方法的类型。");
+
+        var selectedTypes = new HashSet<TypeAnalysisContext>(types);
+        var numAssemblies = assemblies.Count;
         var i = 1;
-        foreach (var assembly in context.Assemblies)
+        Logger.InfoNewline(
+            $"ISIL 输出已精确选择 {numAssemblies} 个程序集与 {types.Count} 个类型。",
+            "IsilOutputFormat");
+        foreach (var assembly in assemblies)
         {
             Logger.InfoNewline($"Processing assembly {i++} of {numAssemblies}: {assembly.Name}", "IsilOutputFormat");
 
             var assemblyNameClean = assembly.CleanAssemblyName;
 
-            MiscUtils.ExecuteParallel(assembly.Types, type =>
+            MiscUtils.ExecuteParallel(assembly.Types.Where(selectedTypes.Contains), type =>
             {
                 if (type is InjectedTypeAnalysisContext)
                     return;

@@ -27,4 +27,8 @@ public class Cpp2IlRuntimeArgs
 
     // 该上限只控制分析资源预算；ARM64 方法体实际长度由相邻虚拟地址动态确定。
     public int MaximumMethodSizeBytes = MethodAnalysisSizePolicy.DefaultMaximumBytes;
+
+    // ISIL 精确输出范围使用完整名称匹配；空集合保持原有全量输出语义。
+    public IReadOnlyList<string> IsilDumpAssemblyFilters = [];
+    public IReadOnlyList<string> IsilDumpTypeFilters = [];
 }

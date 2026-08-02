@@ -561,6 +561,12 @@ internal static class Program
 
         result.LowMemoryMode = options.LowMemoryMode;
         result.MaximumMethodSizeBytes = ValidateMaximumMethodSizeBytes(options.MaximumMethodSizeBytes);
+        result.IsilDumpAssemblyFilters = IsilDumpSelectionHelper.NormalizeFilters(
+            options.IsilAssemblyFilters,
+            "ISIL 程序集");
+        result.IsilDumpTypeFilters = IsilDumpSelectionHelper.NormalizeFilters(
+            options.IsilTypeFilters,
+            "ISIL 类型");
 
         // if(string.IsNullOrEmpty(options.OutputFormatId))      // throw new SoftException("No output format specified, so nothing to do!");
 
