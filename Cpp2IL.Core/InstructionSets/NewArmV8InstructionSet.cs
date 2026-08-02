@@ -23,16 +23,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     {
         var binary = context.AppContext.Binary;
 
-        if (context is not ConcreteGenericMethodAnalysisContext)
-        {
-            //Managed method or attr gen => grab raw byte range between a and b
-            var startOfNextFunction = (int)MiscUtils.GetAddressOfNextFunctionStart(context.UnderlyingPointer, binary);
-            var ptrAsInt = (int)context.UnderlyingPointer;
-            var count = startOfNextFunction - ptrAsInt;
-
-            if (startOfNextFunction > 0)
-                return new BinarySlice(binary, ptrAsInt, count);
-        }
+        // 普通托管方法使用相邻虚拟地址确定动态边界，再由二进制格式映射器得到文件区间。
+        if (context is not ConcreteGenericMethodAnalysisContext &&
+            Arm64MethodBodyReader.TryReadManagedMethodBody(binary, context.UnderlyingPointer, out var body))
+            return body;
 
         var result = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(binary, context.UnderlyingPointer);
         var lastInsn = result.LastValid();

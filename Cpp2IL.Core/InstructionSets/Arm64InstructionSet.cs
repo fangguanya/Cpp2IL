@@ -15,17 +15,10 @@ public class Arm64InstructionSet : Cpp2IlInstructionSet
     {
         var binary = context.AppContext.Binary;
 
-        //Avoid use of capstone where possible
-        if (true || context is not ConcreteGenericMethodAnalysisContext)
-        {
-            //Managed method or attr gen => grab raw byte range between a and b
-            var startOfNextFunction = (int)MiscUtils.GetAddressOfNextFunctionStart(context.UnderlyingPointer, binary) - 1;
-            var ptrAsInt = (int)context.UnderlyingPointer;
-            var count = startOfNextFunction - ptrAsInt;
-
-            if (startOfNextFunction > 0)
-                return new BinarySlice(binary, ptrAsInt, count);
-        }
+        // 旧反汇编器仅保留为显式兼容入口，但文件切片同样必须遵守虚拟地址到文件偏移的映射契约。
+        if (context is not ConcreteGenericMethodAnalysisContext &&
+            Arm64MethodBodyReader.TryReadManagedMethodBody(binary, context.UnderlyingPointer, out var body))
+            return body;
 
         var instructions = Arm64Utils.GetArm64MethodBodyAtVirtualAddress(binary, context.UnderlyingPointer);
 

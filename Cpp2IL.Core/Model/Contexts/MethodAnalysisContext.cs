@@ -70,8 +70,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public List<string> AnalysisWarnings = [];
 
-    public static int MaxMethodSizeBytes = 18000; // 18KB
-
     public List<ParameterAnalysisContext> Parameters = [];
 
     public List<LocalVariable> ParameterLocals = [];
@@ -345,7 +343,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     [MemberNotNull(nameof(ConvertedIsil))]
     public void Analyze()
     {
-        if (MaxMethodSizeBytes != -1 && RawBytes.Length > MaxMethodSizeBytes)
+        var maximumMethodSizeBytes = Cpp2IlApi.RuntimeOptions?.MaximumMethodSizeBytes ?? MethodAnalysisSizePolicy.DefaultMaximumBytes;
+        if (MethodAnalysisSizePolicy.ExceedsMaximum(RawBytes.Length, maximumMethodSizeBytes))
         {
             Logger.WarnNewline($"Method {FullName} is too big ({RawBytes.Length} bytes), skipping analysis.");
             ConvertedIsil = [];
