@@ -6,6 +6,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
 using AssetRipper.Primitives;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Exceptions;
 using Cpp2IL.Core.Il2CppApiFunctions;
@@ -73,10 +74,10 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     public readonly Dictionary<ulong, List<MethodAnalysisContext>> MethodsByAddress = new();
 
     /// <summary>
-    /// Exception type name thrown by the runtime helper at each address, or null where the address turned
-    /// out not to be a throw helper. Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
+    /// 按地址保存运行时辅助函数抛出的异常类型名称；空值表示该地址不是异常抛出辅助函数。
+    /// 由 <see cref="Analysis.ThrowHelperRecovery"/> 按需填充，并在应用上下文内同步递归解析。
     /// </summary>
-    public readonly ConcurrentDictionary<ulong, string?> ThrowHelperNamesByAddress = new();
+    internal readonly ThrowHelperNameCache ThrowHelperNamesByAddress = new();
 
     /// <summary>
     /// A dictionary of all the generic method variants to their corresponding analysis contexts.

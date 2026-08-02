@@ -36,9 +36,11 @@ public static class ThrowHelperRecovery
         if (address == 0 || depth >= MaxDepth)
             return null;
 
-        // Insert before recursing so a cycle terminates
-        appContext.ThrowHelperNamesByAddress[address] = null;
+        return appContext.ThrowHelperNamesByAddress.Resolve(address, () => ResolveNameUncached(appContext, address, depth));
+    }
 
+    private static string? ResolveNameUncached(ApplicationAnalysisContext appContext, ulong address, int depth)
+    {
         InstructionList body;
 
         try
@@ -66,7 +68,6 @@ public static class ThrowHelperRecovery
             }
         }
 
-        appContext.ThrowHelperNamesByAddress[address] = name;
         return name;
     }
 
