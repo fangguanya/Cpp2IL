@@ -117,6 +117,27 @@ public sealed class LibCpp2IlContext
         return metadataUsage;
     }
 
+    /// <summary>
+    /// 解析元数据版本 27 及以上使用的间接元数据表项。
+    /// 某些 Unity 版本会让全局槽经 ELF 重定位指向一组编码表项，生成代码先加载该表基址，
+    /// 再以字节偏移读取真正的编码元数据值；此方法完整执行这两次读取。
+    /// </summary>
+    public MetadataUsage? CheckForPost27GlobalTableEntryAt(ulong tableGlobalAddress, long entryByteOffset)
+    {
+        if (Metadata.MetadataVersion < 27f || entryByteOffset < 0 || entryByteOffset % Binary.PointerSizeBytes != 0)
+            return null;
+
+        if (!Binary.TryMapVirtualAddressToRaw(tableGlobalAddress, out var tableGlobalRaw) || tableGlobalRaw >= Binary.RawLength)
+            return null;
+
+        var tableAddress = Binary.ReadPointerAtVirtualAddress(tableGlobalAddress);
+        var unsignedOffset = (ulong)entryByteOffset;
+        if (tableAddress > ulong.MaxValue - unsignedOffset)
+            return null;
+
+        return CheckForPost27GlobalAt(tableAddress + unsignedOffset);
+    }
+
     public MetadataUsage? GetAnyGlobalByAddress(ulong address)
     {
         if (Metadata.MetadataVersion >= 27f)

@@ -28,20 +28,44 @@ public static class MetadataResolver
     private static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable destination)
+                definitions[destination] = instruction;
+
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode != OpCode.Move)
                 continue;
 
-            // Only an absolute-address load [addr] (no base/index/scale) can be a metadata-usage global.
             if (instruction.Operands[0] is not LocalVariable
-                || instruction.Operands[1] is not MemoryOperand { Base: null, Index: null, Scale: 0 } memory)
+                || instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0 } memory)
+                continue;
+
+            MetadataUsage? tableUsage = null;
+            if (memory.Base is LocalVariable tableBase
+                && definitions.TryGetValue(tableBase, out var tableDefinition)
+                && tableDefinition.Operands[1] is MemoryOperand { Base: null, Index: null, Scale: 0 } tableGlobal
+                && tableGlobal.Addend >= 0)
+            {
+                tableUsage = libContext.CheckForPost27GlobalTableEntryAt((ulong)tableGlobal.Addend, memory.Addend);
+            }
+
+            if (tableUsage != null)
+            {
+                if (ResolveMetadataUsageOperand(method, tableUsage) is { } resolvedTableOperand)
+                    instruction.SetOperand(1, resolvedTableOperand);
+
+                continue;
+            }
+
+            // 旧布局和部分新布局仍会直接从绝对地址读取元数据使用值。
+            if (memory.Base != null || memory.Addend < 0)
                 continue;
 
             var address = (ulong)memory.Addend;
 
-            // String literal.
             var stringLiteral = libContext.GetLiteralByAddress(address);
             if (stringLiteral != null)
             {
@@ -49,7 +73,6 @@ public static class MetadataResolver
                 continue;
             }
 
-            // Type metadata usage (Il2CppType* / Il2CppClass*).
             if (method.DeclaringType is { } declaringType)
             {
                 var typeGlobal = libContext.GetTypeGlobalByAddress(address);
@@ -60,13 +83,34 @@ public static class MetadataResolver
                 }
             }
 
-            // Method metadata usage (MethodInfo*). On metadata v27+ GetMethodGlobalByAddress can return
-            // any global, so confirm it is actually a method before resolving - the resolver's switch
-            // throws on other usage kinds.
             var methodUsage = libContext.GetMethodGlobalByAddress(address);
             if (methodUsage?.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef
                 && method.AppContext.ResolveContextForMethod(methodUsage) is { DeclaringType: { } methodDeclaringType } methodContext)
                 instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly));
+        }
+    }
+
+    /// <summary>
+    /// 将已验证的元数据使用项转换为 ISIL 强类型操作数。
+    /// 字段元数据需要独立的字段句柄模型，当前保持原始内存读取，避免错误改写。
+    /// </summary>
+    private static IOperand? ResolveMetadataUsageOperand(MethodAnalysisContext method, MetadataUsage usage)
+    {
+        switch (usage.Type)
+        {
+            case MetadataUsageType.StringLiteral:
+                return new StringLiteral(usage.AsLiteral());
+            case MetadataUsageType.Type:
+            case MetadataUsageType.TypeInfo:
+                return method.DeclaringType?.AppContext.ResolveIl2CppType(usage.AsType());
+            case MetadataUsageType.MethodDef:
+            case MetadataUsageType.MethodRef:
+                if (method.AppContext.ResolveContextForMethod(usage) is { DeclaringType: { } declaringType } methodContext)
+                    return new RuntimeMethodInfoAnalysisContext(methodContext, declaringType.DeclaringAssembly);
+
+                return null;
+            default:
+                return null;
         }
     }
 
@@ -176,7 +220,7 @@ public static class MetadataResolver
                 continue;
 
             callInstruction.SetOperand(0, singleTargetMethod);
-            X64CallingConventionResolver.RemapRawArguments(callInstruction, singleTargetMethod);
+            CallingConventionResolver.RemapRawArguments(callInstruction, singleTargetMethod);
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
@@ -214,7 +258,7 @@ public static class MetadataResolver
             {
                 var preferred = PreferredOf(candidates);
                 instruction.SetOperand(0, preferred);
-                X64CallingConventionResolver.RemapRawArguments(instruction, preferred);
+                CallingConventionResolver.RemapRawArguments(instruction, preferred);
                 changed = true;
                 continue;
             }
@@ -245,7 +289,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, match);
-            X64CallingConventionResolver.RemapRawArguments(instruction, match);
+            CallingConventionResolver.RemapRawArguments(instruction, match);
             changed = true;
         }
 
@@ -314,7 +358,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, constructor);
-            X64CallingConventionResolver.RemapRawArguments(instruction, constructor);
+            CallingConventionResolver.RemapRawArguments(instruction, constructor);
             changed = true;
         }
 
@@ -370,7 +414,7 @@ public static class MetadataResolver
                 // Il2cpp still passes the concrete MethodInfo as the hidden final parameter, so we can use a methodof there if we have one.
                 var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
                 var hiddenParamIndex = firstArg
-                    + (X64CallingConventionResolver.ReturnsViaHiddenBuffer(representedMethod) ? 1 : 0)
+                    + (CallingConventionResolver.ReturnsViaHiddenBuffer(representedMethod) ? 1 : 0)
                     + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
                 if (hiddenParamIndex >= instruction.Operands.Count
@@ -378,7 +422,7 @@ public static class MetadataResolver
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
-                X64CallingConventionResolver.RemapRawArguments(instruction, representedMethod);
+                CallingConventionResolver.RemapRawArguments(instruction, representedMethod);
                 changed = true;
                 continue;
             }
@@ -392,7 +436,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, representedMethod);
-            X64CallingConventionResolver.RemapRawArguments(instruction, representedMethod);
+            CallingConventionResolver.RemapRawArguments(instruction, representedMethod);
             changed = true;
         }
 
@@ -443,7 +487,7 @@ public static class MetadataResolver
 
             instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
             instruction.SetOperand(0, resolved);
-            X64CallingConventionResolver.RemapRawArguments(instruction, resolved);
+            CallingConventionResolver.RemapRawArguments(instruction, resolved);
 
             // the MethodInfo field is also the same method, name it, for cleanliness and so it can
             // serve as a hidden final parameter if needed

@@ -66,6 +66,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             or Arm64ConditionCode.NV;
     }
 
+    internal static OpCode? GetIndirectBranchOpCode(Arm64Mnemonic mnemonic)
+    {
+        return mnemonic switch
+        {
+            Arm64Mnemonic.BLR => OpCode.IndirectCall,
+            Arm64Mnemonic.BR => OpCode.IndirectJump,
+            _ => null
+        };
+    }
+
     internal static OpCode? GetRelationalBranchOpCode(Arm64ConditionCode conditionCode)
     {
         return conditionCode switch
@@ -186,13 +196,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return newInstruction;
         }
         
-        void AddCall(MethodAnalysisContext context, IOperand? returnRegister2, ulong address, ulong target)
+        void AddCall(MethodAnalysisContext context, ulong address, ulong target)
         {
-            var call = returnRegister2 == null ? 
-                Add(address, OpCode.CallVoid, Imm(target)) : 
-                Add(address, OpCode.Call, Imm(target), returnRegister2);
+            if (!context.AppContext.MethodsByAddress.TryGetValue(target, out var methodsAtAddress))
+            {
+                // 原生目标的签名尚未解析时保留 X0 返回值与全部 AAPCS64 参数，供后续 key function、
+                // 接口分派和委托恢复器统一裁决；未使用的返回值会由死代码消除器删除。
+                var unknownCall = Add(
+                    address,
+                    OpCode.Call,
+                    Imm(target),
+                    new Register(null, nameof(Arm64Register.X0)));
+                unknownCall.AddOperands(Arm64CallingConventionResolver.ResolveForUnmanaged());
+                return;
+            }
 
-            call.AddOperands(GetArgumentOperandsForCall(context, target));
+            var calledMethod = methodsAtAddress.Count == 1 ? methodsAtAddress[0] : context;
+            var returnRegister = GetReturnRegisterForContext(calledMethod);
+            var call = returnRegister == null
+                ? Add(address, OpCode.CallVoid, Imm(target))
+                : Add(address, OpCode.Call, Imm(target), returnRegister);
+
+            call.AddOperands(GetArgumentOperandsForCall(methodsAtAddress.First()));
+        }
+
+        void AddIndirectTransfer(Arm64Mnemonic mnemonic, ulong address, IOperand target)
+        {
+            var opCode = GetIndirectBranchOpCode(mnemonic)
+                         ?? throw new ArgumentOutOfRangeException(nameof(mnemonic));
+            var transfer = Add(
+                address,
+                opCode,
+                target,
+                new Register(null, nameof(Arm64Register.X0)));
+            transfer.AddOperands(Arm64CallingConventionResolver.ResolveForUnmanaged());
         }
 
         switch (instruction.Mnemonic)
@@ -242,7 +279,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 if (instruction.Op0Kind == Arm64OperandKind.Register)
                     adrpOffsets.Remove(instruction.Op0Reg);
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertMoveSourceOperand(instruction));
                 Add(address, OpCode.CheckEqual, new Register(null, "Z"), ConvertOperand(instruction, 0), Imm(0));
                 break;
             case Arm64Mnemonic.MOVN:
@@ -275,7 +312,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.STUR: // unscaled
             case Arm64Mnemonic.STRB:
                 //Store is (src, dest)
-                Add(address, OpCode.Move, ConvertOperand(instruction, 1), ConvertOperand(instruction, 0));
+                Add(address, OpCode.Move, ConvertOperand(instruction, 1), ConvertStoreSourceOperand(instruction));
                 break;
             case Arm64Mnemonic.STP:
                 // store pair of registers (reg1, reg2, dest)
@@ -289,7 +326,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     else if (dest3 is MemoryOperand memory)
                     {
                         var firstRegister = ConvertOperand(instruction, 0);
-                        long size = ((Register)firstRegister).Name[0] == 'W' ? 4 : 8;
+                        var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
                         Add(address, OpCode.Move, dest3, firstRegister); // [REG + offset] = REG1
                         memory = new MemoryOperand((Register)memory.Base!, addend: memory.Addend + size);
                         dest3 = memory;
@@ -298,7 +335,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     else // reg pointer
                     {
                         var firstRegister = ConvertOperand(instruction, 0);
-                        long size = ((Register)firstRegister).Name[0] == 'W' ? 4 : 8;
+                        var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
                         Add(address, OpCode.Move, dest3, firstRegister);
                         Add(address, OpCode.Add, dest3, dest3, Imm(size));
                         Add(address, OpCode.Move, dest3, ConvertOperand(instruction, 1));
@@ -342,19 +379,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Move, dest2, mem2);
                 break;
             case Arm64Mnemonic.BL:
-                if (context.AppContext.MethodsByAddress.TryGetValue(instruction.BranchTarget, out var possibleMethods))
-                {
-                    if (possibleMethods.Count == 1)
-                        AddCall(context, GetReturnRegisterForContext(possibleMethods[0]), address, instruction.BranchTarget);
-                    else
-                        // TODO: Properly fix this case where branch address is potentially more than 1 method
-                        AddCall(context, GetReturnRegisterForContext(context), address, instruction.BranchTarget);
-                }
-                else
-                {
-                    // TODO: properly handle unmanaged/API function
-                    AddCall(context, GetReturnRegisterForContext(context), address, instruction.BranchTarget);
-                }
+                AddCall(context, address, instruction.BranchTarget);
                 break;
             case Arm64Mnemonic.RET:
                 var returnRegister = GetReturnRegisterForContext(context);
@@ -414,7 +439,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     // 方法区间采用左闭右开语义；跳到相邻方法首地址属于尾调用，随后返回当前方法。
                     var returnRegister2 = GetReturnRegisterForContext(context);
-                    AddCall(context, returnRegister2, address, target);
+                    AddCall(context, address, target);
 
                     if (returnRegister2 == null)
                         Add(address, OpCode.Return);
@@ -427,9 +452,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
                 break;
+            case Arm64Mnemonic.BLR:
             case Arm64Mnemonic.BR:
-                // branches unconditionally to an address in a register, with a hint that this is not a subroutine return.
-                Add(address, OpCode.IndirectCall, ConvertOperand(instruction, 0));
+                // BLR 是带返回地址的间接调用；BR 是不返回当前点的间接尾跳转。
+                AddIndirectTransfer(instruction.Mnemonic, address, ConvertOperand(instruction, 0));
                 break;
             case Arm64Mnemonic.CBNZ:
             case Arm64Mnemonic.CBZ:
@@ -539,8 +565,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
 
             case Arm64Mnemonic.ADD:
+                // ADD 的扩展寄存器和移位寄存器格式必须先恢复第三操作数语义。
+                if (!Arm64AddOperandHelper.TryEmit(
+                        instruction,
+                        ConvertOperand(instruction, 2),
+                        (opCode, operands) => Add(address, opCode, operands),
+                        out var addRight))
+                {
+                    Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction ADD modifier {instruction.FinalOpExtendType}/{instruction.FinalOpShiftType} is not exactly modeled."));
+                    break;
+                }
+
+                Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), addRight);
+                break;
             case Arm64Mnemonic.FADD:
-                //Add is (dest, src1, src2)
+                // 浮点加法没有整数扩展寄存器格式。
                 Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
@@ -660,7 +699,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
             };
 
-            return new Register(null, reg.ToString().ToUpperInvariant());
+            return new Register(null, Arm64RegisterHelper.CanonicalName(reg));
         }
 
         if (kind == Arm64OperandKind.Memory)
@@ -674,7 +713,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return new MemoryOperand(addend: offset);
 
             //TODO Handle more stuff here
-            return new MemoryOperand(new Register(null, reg.ToString().ToUpperInvariant()), addend: offset);
+            return new MemoryOperand(new Register(null, Arm64RegisterHelper.CanonicalName(reg)), addend: offset);
         }
 
         if (kind == Arm64OperandKind.VectorRegisterElement)
@@ -711,6 +750,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         return new StringLiteral($"<UNIMPLEMENTED OPERAND TYPE {kind}>");
+    }
+
+    private IOperand ConvertMoveSourceOperand(Arm64Instruction instruction)
+    {
+        if (instruction.Op1Kind == Arm64OperandKind.Register
+            && Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg))
+            return Imm(0);
+
+        return ConvertOperand(instruction, 1);
+    }
+
+    private IOperand ConvertStoreSourceOperand(Arm64Instruction instruction)
+    {
+        if (instruction.Op0Kind == Arm64OperandKind.Register
+            && Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+            return Imm(0);
+
+        return ConvertOperand(instruction, 0);
     }
 
     public override BaseKeyFunctionAddresses CreateKeyFunctionAddressesInstance() => new NewArm64KeyFunctionAddresses();

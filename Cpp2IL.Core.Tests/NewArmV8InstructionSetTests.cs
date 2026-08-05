@@ -214,4 +214,31 @@ public class NewArmV8InstructionSetTests
             NewArmV8InstructionSet.GetRelationalBranchOpCode(Arm64ConditionCode.VS),
             Is.Null);
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void BlrMapsToIndirectCall()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetIndirectBranchOpCode(Arm64Mnemonic.BLR),
+            Is.EqualTo(OpCode.IndirectCall));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void BrMapsToIndirectTailJump()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetIndirectBranchOpCode(Arm64Mnemonic.BR),
+            Is.EqualTo(OpCode.IndirectJump));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void RetIsRejectedByIndirectBranchMapping()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetIndirectBranchOpCode(Arm64Mnemonic.RET),
+            Is.Null);
+    }
 }
