@@ -28,6 +28,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return target < methodStart || target >= methodEndExclusive;
     }
 
+    internal static bool? ShouldInvertZeroFlag(Arm64ConditionCode conditionCode)
+    {
+        return conditionCode switch
+        {
+            Arm64ConditionCode.EQ => false,
+            Arm64ConditionCode.NE => true,
+            _ => null
+        };
+    }
+
+    internal static bool IsScalarLoadMnemonic(Arm64Mnemonic mnemonic)
+    {
+        return mnemonic is Arm64Mnemonic.LDR
+            or Arm64Mnemonic.LDRB
+            or Arm64Mnemonic.LDRH
+            or Arm64Mnemonic.LDRSW
+            or Arm64Mnemonic.LDUR;
+    }
+
+    internal static bool IsExactlyRepresentableMovi(Arm64OperandKind immediateKind, long immediate)
+    {
+        return immediateKind == Arm64OperandKind.Immediate && immediate == 0;
+    }
+
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
     {
         var binary = context.AppContext.Binary;
@@ -127,8 +151,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.MOVZ:
             case Arm64Mnemonic.FMOV:
             case Arm64Mnemonic.SXTW: // move and sign extend Wn to Xd
-            case Arm64Mnemonic.LDR:
-            case Arm64Mnemonic.LDRB:
+            case var scalarLoad when IsScalarLoadMnemonic(scalarLoad):
                 //Load and move are (dest, src)
 
                 if (instruction.MemIsPreIndexed) //  such as  X8, [X19,#0x30]! 
@@ -184,6 +207,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, OpCode.Move, temp2, ConvertOperand(instruction, 1));
                     Add(address, OpCode.Not, temp2, temp2);
                     Add(address, OpCode.Move, ConvertOperand(instruction, 0), temp2);
+                    break;
+                }
+            case Arm64Mnemonic.MOVI:
+                {
+                    // 当前ISIL以托管值表达向量清零；其他向量立即数需保留元素复制语义后再接入。
+                    if (!IsExactlyRepresentableMovi(instruction.Op1Kind, instruction.Op1Imm))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction MOVI immediate {instruction.Op1Imm} not yet implemented."));
+                        break;
+                    }
+
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(0));
                     break;
                 }
             case Arm64Mnemonic.STR:
@@ -332,6 +367,51 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Subtract, temp, op1, op2);
                 Add(address, OpCode.CheckEqual, new Register(null, "Z"), temp, Imm(0));
                 break;
+
+            case Arm64Mnemonic.CSET:
+                {
+                    var invertZeroFlag = ShouldInvertZeroFlag(instruction.FinalOpConditionCode);
+                    if (invertZeroFlag is null)
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSET condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var zeroFlag = new Register(null, "Z");
+                    if (invertZeroFlag.Value)
+                        Add(address, OpCode.Not, destination, zeroFlag);
+                    else
+                        Add(address, OpCode.Move, destination, zeroFlag);
+                    break;
+                }
+
+            case Arm64Mnemonic.CSEL:
+                {
+                    var invertZeroFlag = ShouldInvertZeroFlag(instruction.FinalOpConditionCode);
+                    if (invertZeroFlag is null)
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSEL condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var trueValue = ConvertOperand(instruction, 1);
+                    var falseValue = ConvertOperand(instruction, 2);
+                    IOperand condition = new Register(null, "Z");
+                    if (invertZeroFlag.Value)
+                    {
+                        var invertedCondition = new Register(null, "TEMP_CONDITION");
+                        Add(address, OpCode.Not, invertedCondition, condition);
+                        condition = invertedCondition;
+                    }
+
+                    // 条件成立时保留第一个源值并跳过假值写入；目标是下一条 ARM64 指令的首个 ISIL。
+                    Add(address, OpCode.Move, destination, trueValue);
+                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
+                    Add(address, OpCode.Move, destination, falseValue);
+                    break;
+                }
 
             case Arm64Mnemonic.TBNZ:
             // TBNZ R<t>, #imm, label
