@@ -436,6 +436,10 @@ public static class IlGenerator
             case OpCode.CheckNotEqual:
             case OpCode.CheckGreaterOrEqual:
             case OpCode.CheckLessOrEqual:
+            case OpCode.CheckGreaterUnsigned:
+            case OpCode.CheckLessUnsigned:
+            case OpCode.CheckGreaterOrEqualUnsigned:
+            case OpCode.CheckLessOrEqualUnsigned:
 
             case OpCode.Add:
             case OpCode.Subtract:
@@ -456,6 +460,8 @@ public static class IlGenerator
                     case OpCode.CheckEqual: instructions.Add(CilOpCodes.Ceq); break;
                     case OpCode.CheckGreater: instructions.Add(CilOpCodes.Cgt); break;
                     case OpCode.CheckLess: instructions.Add(CilOpCodes.Clt); break;
+                    case OpCode.CheckGreaterUnsigned: instructions.Add(CilOpCodes.Cgt_Un); break;
+                    case OpCode.CheckLessUnsigned: instructions.Add(CilOpCodes.Clt_Un); break;
 
                     // a != b  ==  (a == b) == 0
                     case OpCode.CheckNotEqual:
@@ -472,6 +478,20 @@ public static class IlGenerator
                     // a <= b  ==  !(a > b)
                     case OpCode.CheckLessOrEqual:
                         instructions.Add(CilOpCodes.Cgt);
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                        instructions.Add(CilOpCodes.Ceq);
+                        break;
+
+                    // 无符号 a >= b 等价于 !(a < b)。
+                    case OpCode.CheckGreaterOrEqualUnsigned:
+                        instructions.Add(CilOpCodes.Clt_Un);
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                        instructions.Add(CilOpCodes.Ceq);
+                        break;
+
+                    // 无符号 a <= b 等价于 !(a > b)。
+                    case OpCode.CheckLessOrEqualUnsigned:
+                        instructions.Add(CilOpCodes.Cgt_Un);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;

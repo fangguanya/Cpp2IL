@@ -107,6 +107,10 @@ public class Instruction : IOperand
             case OpCode.CheckNotEqual:
             case OpCode.CheckGreaterOrEqual:
             case OpCode.CheckLessOrEqual:
+            case OpCode.CheckGreaterUnsigned:
+            case OpCode.CheckLessUnsigned:
+            case OpCode.CheckGreaterOrEqualUnsigned:
+            case OpCode.CheckLessOrEqualUnsigned:
             case OpCode.Newobj:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
@@ -164,6 +168,8 @@ public class Instruction : IOperand
             OpCode.CallVoid or OpCode.Phi => _operands.Skip(1).ToList(),
             OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
                 or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+                or OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned
+                or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned
                 => [_operands[1], _operands[2]],
 
             _ => []

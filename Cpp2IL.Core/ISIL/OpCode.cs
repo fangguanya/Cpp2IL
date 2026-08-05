@@ -104,6 +104,18 @@ public enum OpCode
     /// <summary>Moves 1 into op 1, if op 2 is less than or equal to op 3</summary>
     CheckLessOrEqual,
 
+    /// <summary>将 op 2 与 op 3 按无符号值比较；op 2 大于 op 3 时，把 1 写入 op 1</summary>
+    CheckGreaterUnsigned,
+
+    /// <summary>将 op 2 与 op 3 按无符号值比较；op 2 小于 op 3 时，把 1 写入 op 1</summary>
+    CheckLessUnsigned,
+
+    /// <summary>将 op 2 与 op 3 按无符号值比较；op 2 大于等于 op 3 时，把 1 写入 op 1</summary>
+    CheckGreaterOrEqualUnsigned,
+
+    /// <summary>将 op 2 与 op 3 按无符号值比较；op 2 小于等于 op 3 时，把 1 写入 op 1</summary>
+    CheckLessOrEqualUnsigned,
+
     /// <summary>
     /// Allocates a new, uninitialized instance of the type described by op 2 and moves it into op 1.
     /// </summary>

@@ -1,5 +1,6 @@
 using System;
 using Cpp2IL.Core.InstructionSets;
+using Cpp2IL.Core.ISIL;
 using Disarm;
 
 namespace Cpp2IL.Core.Tests;
@@ -141,5 +142,76 @@ public class NewArmV8InstructionSetTests
                 Arm64OperandKind.Register,
                 0),
             Is.False);
+    }
+
+    [TestCase(Arm64ConditionCode.GT, OpCode.CheckGreater, TestName = "有符号大于映射到有符号比较")]
+    [TestCase(Arm64ConditionCode.LT, OpCode.CheckLess, TestName = "有符号小于映射到有符号比较")]
+    [TestCase(Arm64ConditionCode.GE, OpCode.CheckGreaterOrEqual, TestName = "有符号大于等于映射到有符号比较")]
+    [TestCase(Arm64ConditionCode.LE, OpCode.CheckLessOrEqual, TestName = "有符号小于等于映射到有符号比较")]
+    [TestCase(Arm64ConditionCode.HI, OpCode.CheckGreaterUnsigned, TestName = "无符号大于映射到无符号比较")]
+    [TestCase(Arm64ConditionCode.CC, OpCode.CheckLessUnsigned, TestName = "无符号低于映射到无符号比较")]
+    [TestCase(Arm64ConditionCode.CS, OpCode.CheckGreaterOrEqualUnsigned, TestName = "无符号大于等于映射到无符号比较")]
+    [TestCase(Arm64ConditionCode.LS, OpCode.CheckLessOrEqualUnsigned, TestName = "无符号小于等于映射到无符号比较")]
+    [Category("基本功能")]
+    public void RelationalConditionsMapToExactComparison(
+        Arm64ConditionCode conditionCode,
+        OpCode expectedOpCode)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetRelationalBranchOpCode(conditionCode),
+            Is.EqualTo(expectedOpCode));
+    }
+
+    [TestCase(Arm64ConditionCode.NONE)]
+    [TestCase(Arm64ConditionCode.AL)]
+    [TestCase(Arm64ConditionCode.NV)]
+    [Category("边界值")]
+    public void AlwaysBranchCodesRemainUnconditional(Arm64ConditionCode conditionCode)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.IsUnconditionalBranchCode(conditionCode),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void EqualityBranchAcceptsZeroOnlyFlagProducer()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.EQ,
+                Arm64FlagState.ZeroOnly),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void RelationalBranchRequiresComparisonOperands()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.LT,
+                Arm64FlagState.ZeroOnly),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ConditionalBranchWithoutFlagProducerIsRejected()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.NE,
+                Arm64FlagState.None),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void UnsupportedOverflowConditionIsNotMappedToSignedComparison()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetRelationalBranchOpCode(Arm64ConditionCode.VS),
+            Is.Null);
     }
 }

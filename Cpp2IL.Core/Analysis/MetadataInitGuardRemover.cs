@@ -180,7 +180,7 @@ public static class MetadataInitGuardRemover
             OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.Not or OpCode.Negate
-                or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
+                or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned)
                 => instruction.Operands is [LocalVariable, ..],
             _ => false,
         };

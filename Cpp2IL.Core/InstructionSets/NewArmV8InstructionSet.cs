@@ -11,6 +11,13 @@ using Disarm.InternalDisassembly;
 
 namespace Cpp2IL.Core.InstructionSets;
 
+internal enum Arm64FlagState
+{
+    None,
+    ZeroOnly,
+    Comparison
+}
+
 public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 {
     [ThreadStatic]
@@ -50,6 +57,43 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     internal static bool IsExactlyRepresentableMovi(Arm64OperandKind immediateKind, long immediate)
     {
         return immediateKind == Arm64OperandKind.Immediate && immediate == 0;
+    }
+
+    internal static bool IsUnconditionalBranchCode(Arm64ConditionCode conditionCode)
+    {
+        return conditionCode is Arm64ConditionCode.NONE
+            or Arm64ConditionCode.AL
+            or Arm64ConditionCode.NV;
+    }
+
+    internal static OpCode? GetRelationalBranchOpCode(Arm64ConditionCode conditionCode)
+    {
+        return conditionCode switch
+        {
+            Arm64ConditionCode.GT => OpCode.CheckGreater,
+            Arm64ConditionCode.LT => OpCode.CheckLess,
+            Arm64ConditionCode.GE => OpCode.CheckGreaterOrEqual,
+            Arm64ConditionCode.LE => OpCode.CheckLessOrEqual,
+            Arm64ConditionCode.HI => OpCode.CheckGreaterUnsigned,
+            Arm64ConditionCode.CC => OpCode.CheckLessUnsigned,
+            Arm64ConditionCode.CS => OpCode.CheckGreaterOrEqualUnsigned,
+            Arm64ConditionCode.LS => OpCode.CheckLessOrEqualUnsigned,
+            _ => null
+        };
+    }
+
+    internal static bool CanEmitConditionalBranch(
+        Arm64ConditionCode conditionCode,
+        Arm64FlagState flagState)
+    {
+        if (flagState == Arm64FlagState.None)
+            return false;
+
+        if (ShouldInvertZeroFlag(conditionCode) is not null)
+            return true;
+
+        return flagState == Arm64FlagState.Comparison &&
+               GetRelationalBranchOpCode(conditionCode) is not null;
     }
 
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
@@ -93,9 +137,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
+        var flagState = Arm64FlagState.None;
 
         foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+            ConvertInstructionStatement(instruction, instructions, addresses, context, ref flagState);
 
         // fix branches
         for (var i = 0; i < instructions.Count; i++)
@@ -124,7 +169,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return instructions;
     }
 
-    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context)
+    private void ConvertInstructionStatement(
+        Arm64Instruction instruction,
+        List<Instruction> instructions,
+        List<ulong> addresses,
+        MethodAnalysisContext context,
+        ref Arm64FlagState flagState)
     {
         var address = instruction.Address;
 
@@ -315,6 +365,50 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
             case Arm64Mnemonic.B:
                 var target = instruction.BranchTarget;
+                var branchConditionCode = instruction.MnemonicConditionCode;
+
+                if (!IsUnconditionalBranchCode(branchConditionCode))
+                {
+                    if (IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Conditional branch {branchConditionCode} leaves the current method."));
+                        break;
+                    }
+
+                    if (!CanEmitConditionalBranch(branchConditionCode, flagState))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Conditional branch {branchConditionCode} has no exactly modeled flag producer."));
+                        break;
+                    }
+
+                    IOperand branchCondition;
+                    var invertZeroFlag = ShouldInvertZeroFlag(branchConditionCode);
+                    if (invertZeroFlag is not null)
+                    {
+                        branchCondition = new Register(null, "Z");
+                        if (invertZeroFlag.Value)
+                        {
+                            var invertedCondition = new Register(null, "BRANCH_CONDITION");
+                            Add(address, OpCode.Not, invertedCondition, branchCondition);
+                            branchCondition = invertedCondition;
+                        }
+                    }
+                    else
+                    {
+                        var comparisonOpCode = GetRelationalBranchOpCode(branchConditionCode)!.Value;
+                        var comparisonResult = new Register(null, "BRANCH_CONDITION");
+                        Add(
+                            address,
+                            comparisonOpCode,
+                            comparisonResult,
+                            new Register(null, "FLAG_COMPARE_LEFT"),
+                            new Register(null, "FLAG_COMPARE_RIGHT"));
+                        branchCondition = comparisonResult;
+                    }
+
+                    Add(address, OpCode.ConditionalJump, Imm(target), branchCondition);
+                    break;
+                }
 
                 if (IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
                 {
@@ -340,32 +434,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.CBNZ:
             case Arm64Mnemonic.CBZ:
                 {
-                    //Compare and branch if (non-)zero
+                    // CBZ/CBNZ 不写 NZCV，因此使用独立条件寄存器，保留此前 CMP/SUBS 的标志状态。
                     var targetAddr = (ulong)((long)instruction.Address + instruction.Op1Imm);
-
-                    //Compare to zero...
-                    Add(address, OpCode.CheckEqual, new Register(null, "Z"), ConvertOperand(instruction, 0), Imm(0));
-
-                    //And jump if (not) equal
-                    if (instruction.Mnemonic == Arm64Mnemonic.CBZ)
-                    {
-                        Add(address, OpCode.ConditionalJump, Imm(targetAddr), new Register(null, "Z"));
-                    }
-                    else
-                    {
-                        Add(address, OpCode.Not, new Register(null, "TEMP"), new Register(null, "Z"));
-                        Add(address, OpCode.ConditionalJump, Imm(targetAddr), new Register(null, "TEMP"));
-                    }
+                    var conditionRegister = new Register(null, "COMPARE_AND_BRANCH_CONDITION");
+                    var comparisonOpCode = instruction.Mnemonic == Arm64Mnemonic.CBZ
+                        ? OpCode.CheckEqual
+                        : OpCode.CheckNotEqual;
+                    Add(address, comparisonOpCode, conditionRegister, ConvertOperand(instruction, 0), Imm(0));
+                    Add(address, OpCode.ConditionalJump, Imm(targetAddr), conditionRegister);
                 }
                 break;
 
             case Arm64Mnemonic.CMP:
-                var op1 = ConvertOperand(instruction, 0);
-                var op2 = ConvertOperand(instruction, 1);
-                var temp = new Register(null, "TEMP");
-
-                Add(address, OpCode.Subtract, temp, op1, op2);
-                Add(address, OpCode.CheckEqual, new Register(null, "Z"), temp, Imm(0));
+            case Arm64Mnemonic.FCMP:
+                var compareLeft = new Register(null, "FLAG_COMPARE_LEFT");
+                var compareRight = new Register(null, "FLAG_COMPARE_RIGHT");
+                Add(address, OpCode.Move, compareLeft, ConvertOperand(instruction, 0));
+                Add(address, OpCode.Move, compareRight, ConvertOperand(instruction, 1));
+                Add(address, OpCode.CheckEqual, new Register(null, "Z"), compareLeft, compareRight);
+                flagState = Arm64FlagState.Comparison;
                 break;
 
             case Arm64Mnemonic.CSET:
@@ -421,21 +508,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 // test bit and branch if Zero
                 {
                     var targetAddr = (ulong)((long)instruction.Address + instruction.Op2Imm);
-                    var bit = 1 << (int)instruction.Op1Imm;
-                    var temp2 = new Register(null, "TEMP");
+                    var bit = 1L << (int)instruction.Op1Imm;
+                    var maskedBit = new Register(null, "TEST_BIT_VALUE");
+                    var conditionRegister = new Register(null, "TEST_BIT_CONDITION");
                     var src = ConvertOperand(instruction, 0);
-                    Add(address, OpCode.Move, temp2, src); // temp = src
-                    Add(address, OpCode.Move, temp2, Imm(bit)); // temp = temp & bit
-                    Add(address, OpCode.Move, temp2, Imm(bit)); // result = temp == bit
-                    if (instruction.Mnemonic == Arm64Mnemonic.TBNZ)
-                    {
-                        Add(address, OpCode.ConditionalJump, Imm(targetAddr), new Register(null, "Z")); // if (result) goto targetAddr
-                    }
-                    else
-                    {
-                        Add(address, OpCode.Not, new Register(null, "TEMP"), new Register(null, "Z"));
-                        Add(address, OpCode.ConditionalJump, Imm(targetAddr), new Register(null, "TEMP")); // if (result) goto targetAddr
-                    }
+                    Add(address, OpCode.And, maskedBit, src, Imm(bit));
+                    var comparisonOpCode = instruction.Mnemonic == Arm64Mnemonic.TBZ
+                        ? OpCode.CheckEqual
+                        : OpCode.CheckNotEqual;
+                    Add(address, comparisonOpCode, conditionRegister, maskedBit, Imm(0));
+                    Add(address, OpCode.ConditionalJump, Imm(targetAddr), conditionRegister);
                 }
                 break;
             case Arm64Mnemonic.UBFM:
@@ -476,21 +558,38 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.ADDS:
             case Arm64Mnemonic.SUBS:
             case Arm64Mnemonic.ANDS:
-                var dest = ConvertOperand(instruction, 0);
-                var src1 = ConvertOperand(instruction, 1);
-                var src2 = ConvertOperand(instruction, 2);
-
-                var opCode = instruction.Mnemonic switch
                 {
-                    Arm64Mnemonic.ADDS => OpCode.Add,
-                    Arm64Mnemonic.SUBS => OpCode.Subtract,
-                    Arm64Mnemonic.ANDS => OpCode.And,
-                    _ => OpCode.Invalid
-                };
+                    var dest = ConvertOperand(instruction, 0);
+                    var src1 = ConvertOperand(instruction, 1);
+                    var src2 = ConvertOperand(instruction, 2);
 
-                Add(address, opCode, dest, src1, src2);
-                Add(address, OpCode.CheckEqual, new Register(null, "Z"), dest, Imm(0));
-                break;
+                    var opCode = instruction.Mnemonic switch
+                    {
+                        Arm64Mnemonic.ADDS => OpCode.Add,
+                        Arm64Mnemonic.SUBS => OpCode.Subtract,
+                        Arm64Mnemonic.ANDS => OpCode.And,
+                        _ => OpCode.Invalid
+                    };
+
+                    if (instruction.Mnemonic == Arm64Mnemonic.SUBS)
+                    {
+                        // SUBS 的目标寄存器可能覆盖源寄存器，必须在运算前保存比较操作数。
+                        var subsCompareLeft = new Register(null, "FLAG_COMPARE_LEFT");
+                        var subsCompareRight = new Register(null, "FLAG_COMPARE_RIGHT");
+                        Add(address, OpCode.Move, subsCompareLeft, src1);
+                        Add(address, OpCode.Move, subsCompareRight, src2);
+                        Add(address, opCode, dest, subsCompareLeft, subsCompareRight);
+                        flagState = Arm64FlagState.Comparison;
+                    }
+                    else
+                    {
+                        Add(address, opCode, dest, src1, src2);
+                        flagState = Arm64FlagState.ZeroOnly;
+                    }
+
+                    Add(address, OpCode.CheckEqual, new Register(null, "Z"), dest, Imm(0));
+                    break;
+                }
 
             case Arm64Mnemonic.ORR:
                 //Orr is (dest, src1, src2)
