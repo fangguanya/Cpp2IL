@@ -51,7 +51,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             or Arm64Mnemonic.LDRB
             or Arm64Mnemonic.LDRH
             or Arm64Mnemonic.LDRSW
-            or Arm64Mnemonic.LDUR;
+            or Arm64Mnemonic.LDUR
+            or Arm64Mnemonic.LDURH;
+    }
+
+    internal static bool IsScalarStoreMnemonic(Arm64Mnemonic mnemonic)
+    {
+        return mnemonic is Arm64Mnemonic.STR
+            or Arm64Mnemonic.STRB
+            or Arm64Mnemonic.STRH
+            or Arm64Mnemonic.STUR
+            or Arm64Mnemonic.STURH;
     }
 
     internal static bool IsExactlyRepresentableMovi(Arm64OperandKind immediateKind, long immediate)
@@ -90,6 +100,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Arm64ConditionCode.LS => OpCode.CheckLessOrEqualUnsigned,
             _ => null
         };
+    }
+
+    internal static OpCode? GetConditionalSetRelationalOpCode(
+        Arm64ConditionCode conditionCode,
+        Arm64FlagState flagState)
+    {
+        return flagState == Arm64FlagState.Comparison
+            ? GetRelationalBranchOpCode(conditionCode)
+            : null;
     }
 
     internal static bool CanEmitConditionalBranch(
@@ -308,9 +327,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(0));
                     break;
                 }
-            case Arm64Mnemonic.STR:
-            case Arm64Mnemonic.STUR: // unscaled
-            case Arm64Mnemonic.STRB:
+            case var scalarStore when IsScalarStoreMnemonic(scalarStore):
                 //Store is (src, dest)
                 Add(address, OpCode.Move, ConvertOperand(instruction, 1), ConvertStoreSourceOperand(instruction));
                 break;
@@ -483,6 +500,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.CSET:
                 {
+                    var destination = ConvertOperand(instruction, 0);
+                    var relationalOpCode = GetConditionalSetRelationalOpCode(
+                        instruction.FinalOpConditionCode,
+                        flagState);
+                    if (relationalOpCode is not null)
+                    {
+                        Add(
+                            address,
+                            relationalOpCode.Value,
+                            destination,
+                            new Register(null, "FLAG_COMPARE_LEFT"),
+                            new Register(null, "FLAG_COMPARE_RIGHT"));
+                        break;
+                    }
+
                     var invertZeroFlag = ShouldInvertZeroFlag(instruction.FinalOpConditionCode);
                     if (invertZeroFlag is null)
                     {
@@ -490,7 +522,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
-                    var destination = ConvertOperand(instruction, 0);
                     var zeroFlag = new Register(null, "Z");
                     if (invertZeroFlag.Value)
                         Add(address, OpCode.Not, destination, zeroFlag);

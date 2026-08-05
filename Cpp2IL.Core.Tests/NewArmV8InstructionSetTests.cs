@@ -87,6 +87,7 @@ public class NewArmV8InstructionSetTests
     [TestCase(Arm64Mnemonic.LDRH, TestName = "半字无符号加载进入统一标量加载路径")]
     [TestCase(Arm64Mnemonic.LDRSW, TestName = "有符号字加载进入统一标量加载路径")]
     [TestCase(Arm64Mnemonic.LDUR, TestName = "非缩放加载进入统一标量加载路径")]
+    [TestCase(Arm64Mnemonic.LDURH, TestName = "非缩放半字加载进入统一标量加载路径")]
     [Category("基本功能")]
     public void MissingScalarLoadVariantsUseManagedValueMove(Arm64Mnemonic mnemonic)
     {
@@ -108,6 +109,32 @@ public class NewArmV8InstructionSetTests
     {
         Assert.That(
             NewArmV8InstructionSet.IsScalarLoadMnemonic(Arm64Mnemonic.STR),
+            Is.False);
+    }
+
+    [TestCase(Arm64Mnemonic.STRH, TestName = "半字存储进入统一标量存储路径")]
+    [TestCase(Arm64Mnemonic.STURH, TestName = "非缩放半字存储进入统一标量存储路径")]
+    [Category("基本功能")]
+    public void HalfWordStoreVariantsUseManagedValueMove(Arm64Mnemonic mnemonic)
+    {
+        Assert.That(NewArmV8InstructionSet.IsScalarStoreMnemonic(mnemonic), Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ExistingByteStoreRemainsInScalarStoreFamily()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.IsScalarStoreMnemonic(Arm64Mnemonic.STRB),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void LoadMnemonicIsRejectedByScalarStoreFamily()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.IsScalarStoreMnemonic(Arm64Mnemonic.LDRH),
             Is.False);
     }
 
@@ -160,6 +187,39 @@ public class NewArmV8InstructionSetTests
         Assert.That(
             NewArmV8InstructionSet.GetRelationalBranchOpCode(conditionCode),
             Is.EqualTo(expectedOpCode));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void ConditionalSetUsesUnsignedGreaterAfterComparison()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalSetRelationalOpCode(
+                Arm64ConditionCode.HI,
+                Arm64FlagState.Comparison),
+            Is.EqualTo(OpCode.CheckGreaterUnsigned));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ConditionalSetRejectsRelationalConditionAfterZeroOnlyProducer()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalSetRelationalOpCode(
+                Arm64ConditionCode.HI,
+                Arm64FlagState.ZeroOnly),
+            Is.Null);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ConditionalSetRejectsUnsupportedOverflowCondition()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalSetRelationalOpCode(
+                Arm64ConditionCode.VS,
+                Arm64FlagState.Comparison),
+            Is.Null);
     }
 
     [TestCase(Arm64ConditionCode.NONE)]
