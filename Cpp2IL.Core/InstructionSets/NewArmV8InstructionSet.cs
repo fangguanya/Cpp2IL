@@ -19,6 +19,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private static Immediate Imm(long value) => new(value);
     private static Immediate Imm(ulong value) => new(unchecked((long)value));
 
+    internal static bool IsBranchOutsideMethod(ulong target, ulong methodStart, int methodLength)
+    {
+        if (methodLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(methodLength));
+
+        var methodEndExclusive = checked(methodStart + (ulong)methodLength);
+        return target < methodStart || target >= methodEndExclusive;
+    }
+
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
     {
         var binary = context.AppContext.Binary;
@@ -272,9 +281,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.B:
                 var target = instruction.BranchTarget;
 
-                if (target < context.UnderlyingPointer || target > context.UnderlyingPointer + (ulong)context.RawBytes.Length)
+                if (IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
                 {
-                    //Unconditional branch to outside the method, treat as call (tail-call, specifically) followed by return
+                    // 方法区间采用左闭右开语义；跳到相邻方法首地址属于尾调用，随后返回当前方法。
                     var returnRegister2 = GetReturnRegisterForContext(context);
                     AddCall(context, returnRegister2, address, target);
 
