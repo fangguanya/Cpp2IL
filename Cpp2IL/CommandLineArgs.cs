@@ -49,10 +49,10 @@ public class CommandLineArgs
     [Option("output-to", HelpText = "Root directory to output to. Defaults to cpp2il_out in the current working directory.")]
     public string OutputRootDir { get; set; } = Path.GetFullPath("cpp2il_out");
 
-    [Option("isil-assembly-filter", Separator = '|', HelpText = "仅输出以 | 分隔的精确程序集名；空值表示全部程序集。")]
+    [Option("isil-assembly-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确程序集名；空值表示全部程序集。")]
     public IEnumerable<string> IsilAssemblyFilters { get; set; } = new List<string>();
 
-    [Option("isil-type-filter", Separator = '|', HelpText = "仅输出以 | 分隔的精确类型全名；空值表示全部类型。")]
+    [Option("isil-type-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确类型全名；空值表示全部类型。")]
     public IEnumerable<string> IsilTypeFilters { get; set; } = new List<string>();
 
     //Flags

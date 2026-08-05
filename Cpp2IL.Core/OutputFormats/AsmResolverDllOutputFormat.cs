@@ -9,7 +9,9 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
 using AsmResolver.PE.Builder;
 using AsmResolver.PE.DotNet.Metadata.Tables;
+using AssetRipper.CIL;
 using Cpp2IL.Core.Api;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -125,6 +127,13 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
     protected abstract void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext);
 
+    protected virtual bool ShouldFillMethodBody(
+        AssemblyAnalysisContext assemblyContext,
+        TypeAnalysisContext typeContext)
+    {
+        return true;
+    }
+
     protected virtual void FillMethodBodies(AssemblyAnalysisContext context)
     {
         foreach (var typeContext in context.Types)
@@ -136,11 +145,20 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             try
 #endif
             {
+                var shouldFillMethodBodies = ShouldFillMethodBody(context, typeContext);
                 foreach (var methodCtx in typeContext.Methods)
                 {
                     var managedMethod = methodCtx.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {typeContext.FullName}.{methodCtx.Name}");
 
-                    FillMethodBody(managedMethod, methodCtx);
+                    if (shouldFillMethodBodies)
+                    {
+                        FillMethodBody(managedMethod, methodCtx);
+                    }
+                    else if (managedMethod.IsManagedMethodWithBody())
+                    {
+                        // 未选类型仍保留完整声明，并用最小合法方法体维持程序集引用闭包。
+                        managedMethod.ReplaceMethodBodyWithMinimalImplementation();
+                    }
                 }
             }
 #if !DEBUG

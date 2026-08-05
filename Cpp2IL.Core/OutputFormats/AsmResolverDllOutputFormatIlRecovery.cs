@@ -17,9 +17,53 @@ namespace Cpp2IL.Core.OutputFormats;
 
 public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 {
+    private HashSet<TypeAnalysisContext>? selectedRecoveryTypes;
+
     public override string OutputFormatId => "dll_il_recovery";
 
     public override string OutputFormatName => "DLL files with IL Recovery";
+
+    public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
+    {
+        var runtimeOptions = Cpp2IlApi.RuntimeOptions;
+        var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
+        var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
+        if (assemblyFilters.Count == 0 && typeFilters.Count == 0)
+            return base.BuildAssemblies(context);
+
+        var assemblies = IsilDumpSelectionHelper.SelectExact(
+            context.Assemblies,
+            assemblyFilters,
+            assembly => assembly.Name,
+            "IL恢复程序集");
+        var types = IsilDumpSelectionHelper.SelectExact(
+            assemblies.SelectMany(assembly => assembly.Types),
+            typeFilters,
+            type => type.Definition?.FullName ?? string.Empty,
+            "IL恢复类型");
+        if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
+            throw new InvalidOperationException("IL恢复类型筛选命中了注入类型或没有方法的类型。");
+
+        selectedRecoveryTypes = new HashSet<TypeAnalysisContext>(types);
+        Logger.InfoNewline(
+            $"IL恢复已精确选择 {assemblies.Count} 个程序集与 {types.Count} 个类型；其他类型只保留声明。",
+            "DllOutput");
+        try
+        {
+            return base.BuildAssemblies(context);
+        }
+        finally
+        {
+            selectedRecoveryTypes = null;
+        }
+    }
+
+    protected override bool ShouldFillMethodBody(
+        AssemblyAnalysisContext assemblyContext,
+        TypeAnalysisContext typeContext)
+    {
+        return selectedRecoveryTypes == null || selectedRecoveryTypes.Contains(typeContext);
+    }
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
