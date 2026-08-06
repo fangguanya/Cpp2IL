@@ -459,6 +459,12 @@ public static class IlGenerator
             case OpCode.And:
             case OpCode.Or:
             case OpCode.Xor:
+                if (TryEmitNullablePresenceTest(instruction, method, locals))
+                {
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
+
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
                 LoadOperand(instruction.Operands[2], method, locals, writeLine, stringCtor);
 
@@ -782,6 +788,51 @@ public static class IlGenerator
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
         operand is LocalVariable { Type: { } type } && type == context.AppContext.SystemTypes.SystemBooleanType;
+
+    private static bool TryEmitNullablePresenceTest(
+        Instruction instruction,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (instruction.OpCode != OpCode.And
+            || instruction.Operands.Count != 3
+            || instruction.Operands[1] is not LocalVariable
+            {
+                Type: GenericInstanceTypeAnalysisContext
+                {
+                    GenericType.FullName: "System.Nullable`1"
+                }
+            } nullableSource
+            || instruction.Operands[2] is not Immediate { Value: 0xFF })
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var module = method.DeclaringModule!;
+        LoadLocalAddress(nullableSource, method, locals);
+
+        var nullableOwner = nullableSource.Type.ToTypeSignature(module).ToTypeDefOrRef();
+        var getter = new MemberReference(
+            nullableOwner,
+            "get_HasValue",
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Boolean));
+        instructions.Add(CilOpCodes.Call, module.DefaultImporter.ImportMethod(getter));
+        instructions.Add(CilOpCodes.Ldc_I4, 0xFF);
+        instructions.Add(CilOpCodes.And);
+        return true;
+    }
+
+    private static void LoadLocalAddress(
+        LocalVariable local,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var parameter = method.Parameters.FirstOrDefault(candidate => candidate.Name == local.Name);
+        if (parameter != null)
+            instructions.Add(CilOpCodes.Ldarga, parameter);
+        else
+            instructions.Add(CilOpCodes.Ldloca, locals[local]);
+    }
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 

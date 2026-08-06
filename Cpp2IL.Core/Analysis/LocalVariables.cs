@@ -237,6 +237,7 @@ public static class LocalVariables
         SeedMethodInfoTypes(method);
         SeedComparisonResults(method);
         SeedBooleanBitTestTypes(method);
+        SeedNullablePresenceTestResults(method);
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
         MetadataResolver.ResolveConstructorCalls(method);
@@ -356,15 +357,51 @@ public static class LocalVariables
         if (instruction.OpCode != OpCode.And
             || instruction.Operands.Count != 3
             || instruction.Operands[0] is not LocalVariable destination
-            || !destination.Register.Name.StartsWith("TEST_BIT_VALUE", StringComparison.Ordinal)
             || instruction.Operands[1] is not LocalVariable source
-            || instruction.Operands[2] is not Immediate { Value: 1 })
+            || instruction.Operands[2] is not Immediate { Value: 1 }
+            || (destination.Type != booleanType
+                && !destination.Register.Name.StartsWith("TEST_BIT_VALUE", StringComparison.Ordinal)))
             return false;
 
         var changed = destination.Type != booleanType || source.Type != booleanType;
         destination.Type = booleanType;
         source.Type = booleanType;
         return changed;
+    }
+
+    /// <summary>
+    /// ARM64用<c>AND Wd, Wn, #0xFF</c>读取Nullable值的低字节存在标志；
+    /// 目标是布尔值，而源仍必须保留原始Nullable类型供IL生成器读取HasValue。
+    /// </summary>
+    private static void SeedNullablePresenceTestResults(MethodAnalysisContext method)
+    {
+        var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            BindNullablePresenceTestResult(instruction, booleanType);
+    }
+
+    internal static bool BindNullablePresenceTestResult(
+        Instruction instruction,
+        TypeAnalysisContext booleanType)
+    {
+        if (instruction.OpCode != OpCode.And
+            || instruction.Operands.Count != 3
+            || instruction.Operands[0] is not LocalVariable destination
+            || instruction.Operands[1] is not LocalVariable
+            {
+                Type: GenericInstanceTypeAnalysisContext
+                {
+                    GenericType.FullName: "System.Nullable`1"
+                }
+            }
+            || instruction.Operands[2] is not Immediate { Value: 0xFF })
+            return false;
+
+        if (destination.Type == booleanType)
+            return false;
+
+        destination.Type = booleanType;
+        return true;
     }
     
     //Handles typing of locals for ref/out params
