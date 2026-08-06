@@ -128,6 +128,37 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return false;
     }
 
+    internal static bool TryDecodeScalarFloatingPointImmediate(
+        uint machineCode,
+        out int precisionBits,
+        out double immediate)
+    {
+        // A64标量FMOV立即数的imm8位于20..13位；Disarm当前会把部分负数解成错误的小数。
+        const uint encodingMask = 0xFFE01FE0u;
+        const uint singleEncoding = 0x1E201000u;
+        const uint doubleEncoding = 0x1E601000u;
+        var fixedEncoding = machineCode & encodingMask;
+        if (fixedEncoding != singleEncoding && fixedEncoding != doubleEncoding)
+        {
+            precisionBits = 0;
+            immediate = 0;
+            return false;
+        }
+
+        precisionBits = fixedEncoding == singleEncoding ? 32 : 64;
+        var imm8 = (byte)((machineCode >> 13) & 0xFFu);
+        var exponentSelector = (imm8 >> 6) & 0x1u;
+
+        // 按ARM VFPExpandImm规则构造IEEE-754双精度位型；四位尾数对单精度也可精确表示。
+        var exponent = ((1u - exponentSelector) << 10)
+                       | ((exponentSelector == 0 ? 0u : 0xFFu) << 2)
+                       | ((uint)imm8 >> 4 & 0x3u);
+        var fraction = ((ulong)imm8 & 0xFu) << 48;
+        var bits = ((ulong)imm8 >> 7 << 63) | ((ulong)exponent << 52) | fraction;
+        immediate = BitConverter.Int64BitsToDouble(unchecked((long)bits));
+        return true;
+    }
+
     internal static bool TryGetSignedIntegerWidthBits(Arm64Register register, out int bits)
     {
         if (register is >= Arm64Register.W0 and <= Arm64Register.W30)
@@ -797,7 +828,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 if (instruction.Op0Kind == Arm64OperandKind.Register)
                     adrpOffsets.Remove(instruction.Op0Reg);
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertMoveSourceOperand(instruction));
+                IOperand moveSource;
+                if (instruction.Mnemonic == Arm64Mnemonic.FMOV
+                    && instruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate)
+                {
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (!TryDecodeScalarFloatingPointImmediate(
+                            machineCode,
+                            out _,
+                            out var floatingImmediate))
+                    {
+                        throw new InvalidOperationException(
+                            $"FMOV浮点立即数原始编码无效：0x{machineCode:X8} @ 0x{address:X}");
+                    }
+
+                    moveSource = new DoubleLiteral(floatingImmediate);
+                }
+                else
+                {
+                    moveSource = ConvertMoveSourceOperand(instruction);
+                }
+
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), moveSource);
                 Add(address, OpCode.CheckEqual, new Register(null, "Z"), ConvertOperand(instruction, 0), Imm(0));
                 break;
             case Arm64Mnemonic.MOVK:
@@ -1500,16 +1552,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         for (var index = 0; index < disassembled.Count && index * sizeof(uint) + sizeof(uint) <= raw.Length; index++)
         {
             var decodedInstruction = disassembled[index];
+            var machineCode = BinaryPrimitives.ReadUInt32LittleEndian(
+                raw.Slice(index * sizeof(uint), sizeof(uint)));
+            var address = checked(context.UnderlyingPointer + (ulong)index * sizeof(uint));
             if (decodedInstruction.Mnemonic is not (
                     Arm64Mnemonic.INVALID or Arm64Mnemonic.UNIMPLEMENTED))
             {
+                if (decodedInstruction.Mnemonic == Arm64Mnemonic.FMOV
+                    && decodedInstruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate
+                    && TryDecodeScalarFloatingPointImmediate(
+                        machineCode,
+                        out _,
+                        out var floatingImmediate))
+                {
+                    lines.Add(
+                        $"0x{address:X8} FMOV "
+                        + $"{decodedInstruction.Op0Reg.ToString().ToUpperInvariant()}, "
+                        + floatingImmediate.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    continue;
+                }
+
                 lines.Add(decodedInstruction.ToString());
                 continue;
             }
 
-            var machineCode = BinaryPrimitives.ReadUInt32LittleEndian(
-                raw.Slice(index * sizeof(uint), sizeof(uint)));
-            var address = checked(context.UnderlyingPointer + (ulong)index * sizeof(uint));
             if (TryFormatRecoveredVectorInstruction(
                     machineCode,
                     address,

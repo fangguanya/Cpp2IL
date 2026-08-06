@@ -250,6 +250,56 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [TestCase(0x1E749000u, 64, -10.0d, TestName = "恢复JWT刷新窗口的双精度负十分钟")]
+    [TestCase(0x1E349000u, 32, -10.0d, TestName = "单精度编码保持同一精确数值")]
+    [Category("基本功能")]
+    public void ScalarFloatingImmediateDecodesExactNativeValue(
+        uint machineCode,
+        int expectedPrecisionBits,
+        double expectedImmediate)
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeScalarFloatingPointImmediate(
+            machineCode,
+            out var precisionBits,
+            out var immediate);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(precisionBits, Is.EqualTo(expectedPrecisionBits));
+            Assert.That(immediate, Is.EqualTo(expectedImmediate));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ScalarFloatingImmediateDecodesSmallestPositiveEncodedMagnitude()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeScalarFloatingPointImmediate(
+            0x1E681000u,
+            out var precisionBits,
+            out var immediate);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(precisionBits, Is.EqualTo(64));
+            Assert.That(immediate, Is.EqualTo(0.125d));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ScalarFloatingImmediateRejectsReservedPrecisionEncoding()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeScalarFloatingPointImmediate(
+                0x1EA01000u,
+                out _,
+                out _),
+            Is.False);
+    }
+
     [Test]
     [Category("基本功能")]
     public void FloatingRegisterWidthsMatchScalarPrecision()
