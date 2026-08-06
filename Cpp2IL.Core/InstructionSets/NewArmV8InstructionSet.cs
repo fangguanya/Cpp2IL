@@ -453,6 +453,44 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return immediateKind == Arm64OperandKind.Immediate && immediate == 0;
     }
 
+    internal static bool TryDecodeCmnSignedThreshold(
+        Arm64Register destinationRegister,
+        Arm64OperandKind rightOperandKind,
+        long rightImmediate,
+        out int registerWidthBits,
+        out long signedThreshold)
+    {
+        // ADDS WZR/XZR, Rn, #imm 是 CMN 别名；其后继有符号条件等价于 Rn 与 -imm 的比较。
+        // 只接入架构允许的非负立即数，避免把普通寄存器加法或畸形反汇编误写成比较。
+        if (!Arm64RegisterHelper.IsZeroRegister(destinationRegister)
+            || rightOperandKind != Arm64OperandKind.Immediate
+            || rightImmediate < 0)
+        {
+            registerWidthBits = 0;
+            signedThreshold = 0;
+            return false;
+        }
+
+        registerWidthBits = destinationRegister == Arm64Register.W31 ? 32 : 64;
+        signedThreshold = checked(-rightImmediate);
+        return true;
+    }
+
+    internal static bool CanEmitScalarFloatingNegate(
+        Arm64OperandKind destinationKind,
+        Arm64Register destinationRegister,
+        Arm64OperandKind sourceKind,
+        Arm64Register sourceRegister)
+    {
+        if (destinationKind != Arm64OperandKind.Register
+            || sourceKind != Arm64OperandKind.Register
+            || !TryGetFloatingPointPrecisionBits(destinationRegister, out var destinationBits)
+            || !TryGetFloatingPointPrecisionBits(sourceRegister, out var sourceBits))
+            return false;
+
+        return destinationBits == sourceBits;
+    }
+
     internal static bool IsUnconditionalBranchCode(Arm64ConditionCode conditionCode)
     {
         return conditionCode is Arm64ConditionCode.NONE
@@ -1354,6 +1392,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
+            case Arm64Mnemonic.FNEG:
+                {
+                    if (!CanEmitScalarFloatingNegate(
+                            instruction.Op0Kind,
+                            instruction.Op0Reg,
+                            instruction.Op1Kind,
+                            instruction.Op1Reg))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FNEG register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    break;
+                }
+
             case Arm64Mnemonic.FNMUL:
                 {
                     var product = new Register(null, $"FNMUL_PRODUCT_{address:X}");
@@ -1399,6 +1453,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var dest = ConvertOperand(instruction, 0);
                     var src1 = ConvertOperand(instruction, 1);
                     var src2 = ConvertOperand(instruction, 2);
+
+                    if (instruction.Mnemonic == Arm64Mnemonic.ADDS
+                        && TryDecodeCmnSignedThreshold(
+                            instruction.Op0Reg,
+                            instruction.Op2Kind,
+                            instruction.Op2Imm,
+                            out _,
+                            out var signedThreshold))
+                    {
+                        // CMN 不写通用寄存器；直接冻结比较两端，同时恢复 Z/N 供 EQ/NE/MI/PL 使用。
+                        // GT/LE/GE/LT 由同一对 FLAG_COMPARE 操作数恢复，完整保留加法溢出的有符号语义。
+                        var cmnCompareLeft = new Register(null, "FLAG_COMPARE_LEFT");
+                        var cmnCompareRight = new Register(null, "FLAG_COMPARE_RIGHT");
+                        var cmnDifference = new Register(null, "FLAG_COMPARE_DIFFERENCE");
+                        Add(address, OpCode.Move, cmnCompareLeft, src1);
+                        Add(address, OpCode.Move, cmnCompareRight, Imm(signedThreshold));
+                        Add(address, OpCode.Subtract, cmnDifference, cmnCompareLeft, cmnCompareRight);
+                        Add(address, OpCode.CheckEqual, new Register(null, "Z"), cmnCompareLeft, cmnCompareRight);
+                        Add(address, OpCode.CheckLess, new Register(null, "N"), cmnDifference, Imm(0));
+                        flagState = Arm64FlagState.Comparison;
+                        break;
+                    }
 
                     var opCode = instruction.Mnemonic switch
                     {

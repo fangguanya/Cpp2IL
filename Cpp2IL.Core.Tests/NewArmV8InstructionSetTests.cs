@@ -195,6 +195,97 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void WordCmnImmediateDecodesSignedSwitchThreshold()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeCmnSignedThreshold(
+            Arm64Register.W31,
+            Arm64OperandKind.Immediate,
+            2,
+            out var registerWidthBits,
+            out var signedThreshold);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(registerWidthBits, Is.EqualTo(32));
+            Assert.That(signedThreshold, Is.EqualTo(-2));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void WideCmnZeroImmediateKeepsZeroThreshold()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeCmnSignedThreshold(
+            Arm64Register.X31,
+            Arm64OperandKind.Immediate,
+            0,
+            out var registerWidthBits,
+            out var signedThreshold);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(registerWidthBits, Is.EqualTo(64));
+            Assert.That(signedThreshold, Is.Zero);
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void NonZeroDestinationIsRejectedAsCmnAlias()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeCmnSignedThreshold(
+                Arm64Register.W20,
+                Arm64OperandKind.Immediate,
+                2,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void SinglePrecisionFloatingNegateIsExactlySupported()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitScalarFloatingNegate(
+                Arm64OperandKind.Register,
+                Arm64Register.S0,
+                Arm64OperandKind.Register,
+                Arm64Register.S9),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void DoublePrecisionFloatingNegateIsExactlySupported()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitScalarFloatingNegate(
+                Arm64OperandKind.Register,
+                Arm64Register.D31,
+                Arm64OperandKind.Register,
+                Arm64Register.D0),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void MismatchedFloatingNegateWidthsAreRejected()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitScalarFloatingNegate(
+                Arm64OperandKind.Register,
+                Arm64Register.S0,
+                Arm64OperandKind.Register,
+                Arm64Register.D0),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void ReplicatedVectorMoveDecodesBleedFollowersNegativeSaturationValue()
     {
         var decoded = NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate32(
