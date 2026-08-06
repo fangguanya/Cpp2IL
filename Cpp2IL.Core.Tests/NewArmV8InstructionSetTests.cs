@@ -363,6 +363,99 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [TestCase(
+        0x0E020D00u,
+        (int)Arm64RecoveredVectorOperation.DuplicateInt16,
+        0,
+        8,
+        -1,
+        TestName = "恢复UIStats四半字复制")]
+    [TestCase(
+        0x2F10A400u,
+        (int)Arm64RecoveredVectorOperation.WidenUnsignedInt16ToInt32,
+        0,
+        0,
+        -1,
+        TestName = "恢复UIStats四通道无符号拓宽")]
+    [TestCase(
+        0x4F3F5400u,
+        (int)Arm64RecoveredVectorOperation.ShiftLeftInt32,
+        0,
+        0,
+        -1,
+        TestName = "恢复UIStats四通道左移")]
+    [TestCase(
+        0x4EA0A800u,
+        (int)Arm64RecoveredVectorOperation.CompareLessThanZeroInt32,
+        0,
+        0,
+        -1,
+        TestName = "恢复UIStats四通道负值比较")]
+    [TestCase(
+        0x6E631C80u,
+        (int)Arm64RecoveredVectorOperation.BitwiseSelect128,
+        0,
+        4,
+        3,
+        TestName = "恢复UIStats一百二十八位选择")]
+    [TestCase(
+        0x4F829000u,
+        (int)Arm64RecoveredVectorOperation.MultiplyFloat32ByElement,
+        0,
+        0,
+        2,
+        TestName = "恢复UIStats四通道单元素浮点乘法")]
+    [Category("基本功能")]
+    public void RecoveredUiStatsVectorInstructionsDecodeExactRegisters(
+        uint machineCode,
+        int expectedOperation,
+        int expectedDestination,
+        int expectedFirstSource,
+        int expectedSecondSource)
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(
+            machineCode,
+            out var instruction);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That((int)instruction.Operation, Is.EqualTo(expectedOperation));
+            Assert.That(instruction.DestinationRegister, Is.EqualTo(expectedDestination));
+            Assert.That(instruction.FirstSourceRegister, Is.EqualTo(expectedFirstSource));
+            Assert.That(instruction.SecondSourceRegister, Is.EqualTo(expectedSecondSource));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void RecoveredBitwiseSelectFormatterKeepsMaskAndBothInputs()
+    {
+        var formatted = NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(
+            0x6E611C80u,
+            0x02E684F4u,
+            out var text);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(formatted, Is.True);
+            Assert.That(
+                text,
+                Is.EqualTo("0x02E684F4 BSL V0.16B, V4.16B, V1.16B"));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void RecoveredVectorDecoderRejectsUnrelatedMachineCode()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(
+                0xFFFFFFFFu,
+                out _),
+            Is.False);
+    }
+
     [Test]
     [Category("基本功能")]
     public void InvalidDisassemblerAddressUsesMethodRelativeInstructionAddress()
@@ -512,6 +605,17 @@ public class NewArmV8InstructionSetTests
         Assert.That(
             NewArmV8InstructionSet.CanEmitConditionalBranch(
                 Arm64ConditionCode.PL,
+                Arm64FlagState.FloatingComparison),
+            Is.True);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void FloatingComparisonAllowsExactNegativeCondition()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.MI,
                 Arm64FlagState.FloatingComparison),
             Is.True);
     }

@@ -92,6 +92,27 @@ public enum OpCode
     /// <summary>把 op 2 向零舍入为 op 3 指定位宽的有符号整数，并写入 op 1</summary>
     ConvertFloatToSignedInteger,
 
+    /// <summary>把 op 2 的有符号整数按 op 3 目标浮点位宽和 op 4 源整数位宽转换，并写入 op 1</summary>
+    ConvertSignedIntegerToFloat,
+
+    /// <summary>把 op 2 的低位元素复制为 op 3 个 op 4 位向量通道，并写入 op 1</summary>
+    VectorDuplicate,
+
+    /// <summary>把 op 2 的无符号16位向量通道拓宽为32位，并写入 op 1；op 3 为通道数</summary>
+    VectorWidenUnsignedInt16ToInt32,
+
+    /// <summary>把 op 2 的向量通道左移 op 3 位并写入 op 1；op 4/5 为通道数和元素位宽</summary>
+    VectorShiftLeft,
+
+    /// <summary>逐通道判断 op 2 是否小于零并把掩码写入 op 1；op 3/4 为通道数和元素位宽</summary>
+    VectorCompareLessThanZero,
+
+    /// <summary>以 op 2 为掩码在 op 3 与 op 4 之间逐位选择并写入 op 1；op 5 为向量位宽</summary>
+    VectorBitwiseSelect,
+
+    /// <summary>把 op 2 的浮点向量乘以 op 3 的指定元素；op 4/5/6 为元素索引、通道数和元素位宽</summary>
+    VectorMultiplyByElement,
+
     /// <summary>把 op 2 向正无穷舍入，并按 op 3 指定的浮点位宽写入 op 1</summary>
     RoundFloatTowardPositiveInfinity,
 

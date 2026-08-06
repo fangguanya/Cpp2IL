@@ -20,6 +20,51 @@ internal enum Arm64FlagState
     FloatingComparison
 }
 
+internal enum Arm64RecoveredVectorOperation
+{
+    DuplicateInt16,
+    WidenUnsignedInt16ToInt32,
+    ShiftLeftInt32,
+    CompareLessThanZeroInt32,
+    BitwiseSelect128,
+    MultiplyFloat32ByElement
+}
+
+internal readonly struct Arm64RecoveredVectorInstruction
+{
+    internal Arm64RecoveredVectorInstruction(
+        Arm64RecoveredVectorOperation operation,
+        int destinationRegister,
+        int firstSourceRegister,
+        int secondSourceRegister = -1,
+        int laneCount = 0,
+        int elementWidthBits = 0,
+        int immediate = 0)
+    {
+        Operation = operation;
+        DestinationRegister = destinationRegister;
+        FirstSourceRegister = firstSourceRegister;
+        SecondSourceRegister = secondSourceRegister;
+        LaneCount = laneCount;
+        ElementWidthBits = elementWidthBits;
+        Immediate = immediate;
+    }
+
+    internal Arm64RecoveredVectorOperation Operation { get; }
+
+    internal int DestinationRegister { get; }
+
+    internal int FirstSourceRegister { get; }
+
+    internal int SecondSourceRegister { get; }
+
+    internal int LaneCount { get; }
+
+    internal int ElementWidthBits { get; }
+
+    internal int Immediate { get; }
+}
+
 public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 {
     [ThreadStatic]
@@ -139,6 +184,124 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         destinationRegister = (int)(machineCode & 0x1Fu);
         leftRegister = (int)((machineCode >> 5) & 0x1Fu);
         rightRegister = (int)((machineCode >> 16) & 0x1Fu);
+        return true;
+    }
+
+    internal static bool TryDecodeRecoveredVectorInstruction(
+        uint machineCode,
+        out Arm64RecoveredVectorInstruction instruction)
+    {
+        var destinationRegister = (int)(machineCode & 0x1Fu);
+        var firstSourceRegister = (int)((machineCode >> 5) & 0x1Fu);
+        var secondSourceRegister = (int)((machineCode >> 16) & 0x1Fu);
+
+        // DUP Vd.4H, Wn：将一个32位通用寄存器的低16位复制到四个半字通道。
+        if ((machineCode & 0xFFFFFC00u) == 0x0E020C00u)
+        {
+            instruction = new Arm64RecoveredVectorInstruction(
+                Arm64RecoveredVectorOperation.DuplicateInt16,
+                destinationRegister,
+                firstSourceRegister,
+                laneCount: 4,
+                elementWidthBits: 16);
+            return true;
+        }
+
+        // USHLL Vd.4S, Vn.4H, #0：无符号拓宽四个半字通道，不改变数值。
+        if ((machineCode & 0xFFFFFC00u) == 0x2F10A400u)
+        {
+            instruction = new Arm64RecoveredVectorInstruction(
+                Arm64RecoveredVectorOperation.WidenUnsignedInt16ToInt32,
+                destinationRegister,
+                firstSourceRegister,
+                laneCount: 4,
+                elementWidthBits: 32);
+            return true;
+        }
+
+        // SHL Vd.4S, Vn.4S, #31：把每个32位通道的低位推进到符号位。
+        if ((machineCode & 0xFFFFFC00u) == 0x4F3F5400u)
+        {
+            instruction = new Arm64RecoveredVectorInstruction(
+                Arm64RecoveredVectorOperation.ShiftLeftInt32,
+                destinationRegister,
+                firstSourceRegister,
+                laneCount: 4,
+                elementWidthBits: 32,
+                immediate: 31);
+            return true;
+        }
+
+        // CMLT Vd.4S, Vn.4S, #0：逐通道生成全一或全零选择掩码。
+        if ((machineCode & 0xFFFFFC00u) == 0x4EA0A800u)
+        {
+            instruction = new Arm64RecoveredVectorInstruction(
+                Arm64RecoveredVectorOperation.CompareLessThanZeroInt32,
+                destinationRegister,
+                firstSourceRegister,
+                laneCount: 4,
+                elementWidthBits: 32);
+            return true;
+        }
+
+        // BSL Vd.16B, Vn.16B, Vm.16B：Vd既是输入掩码也是输出。
+        if ((machineCode & 0xFFE0FC00u) == 0x6E601C00u)
+        {
+            instruction = new Arm64RecoveredVectorInstruction(
+                Arm64RecoveredVectorOperation.BitwiseSelect128,
+                destinationRegister,
+                firstSourceRegister,
+                secondSourceRegister,
+                laneCount: 16,
+                elementWidthBits: 8);
+            return true;
+        }
+
+        // FMUL Vd.4S, Vn.4S, Vm.S[0]：逐通道乘以指定寄存器的首个单精度元素。
+        if ((machineCode & 0xFFE0FC00u) == 0x4F809000u)
+        {
+            instruction = new Arm64RecoveredVectorInstruction(
+                Arm64RecoveredVectorOperation.MultiplyFloat32ByElement,
+                destinationRegister,
+                firstSourceRegister,
+                secondSourceRegister,
+                laneCount: 4,
+                elementWidthBits: 32,
+                immediate: 0);
+            return true;
+        }
+
+        instruction = default;
+        return false;
+    }
+
+    internal static bool TryFormatRecoveredVectorInstruction(
+        uint machineCode,
+        ulong address,
+        out string formatted)
+    {
+        if (!TryDecodeRecoveredVectorInstruction(machineCode, out var instruction))
+        {
+            formatted = string.Empty;
+            return false;
+        }
+
+        formatted = instruction.Operation switch
+        {
+            Arm64RecoveredVectorOperation.DuplicateInt16 =>
+                $"0x{address:X8} DUP V{instruction.DestinationRegister}.4H, W{instruction.FirstSourceRegister}",
+            Arm64RecoveredVectorOperation.WidenUnsignedInt16ToInt32 =>
+                $"0x{address:X8} USHLL V{instruction.DestinationRegister}.4S, V{instruction.FirstSourceRegister}.4H, #0",
+            Arm64RecoveredVectorOperation.ShiftLeftInt32 =>
+                $"0x{address:X8} SHL V{instruction.DestinationRegister}.4S, V{instruction.FirstSourceRegister}.4S, #{instruction.Immediate}",
+            Arm64RecoveredVectorOperation.CompareLessThanZeroInt32 =>
+                $"0x{address:X8} CMLT V{instruction.DestinationRegister}.4S, V{instruction.FirstSourceRegister}.4S, #0",
+            Arm64RecoveredVectorOperation.BitwiseSelect128 =>
+                $"0x{address:X8} BSL V{instruction.DestinationRegister}.16B, V{instruction.FirstSourceRegister}.16B, V{instruction.SecondSourceRegister}.16B",
+            Arm64RecoveredVectorOperation.MultiplyFloat32ByElement =>
+                $"0x{address:X8} FMUL V{instruction.DestinationRegister}.4S, V{instruction.FirstSourceRegister}.4S, V{instruction.SecondSourceRegister}.S[{instruction.Immediate}]",
+            _ => throw new ArgumentOutOfRangeException(nameof(instruction.Operation))
+        };
         return true;
     }
 
@@ -267,9 +430,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             ShouldInvertSignFlag(conditionCode) is not null)
             return true;
 
-        // FCMP 的 PL 精确表示 N == 0；在 ISIL 中等价于“不是小于”，并保留 NaN 时成立的 ARM64 语义。
+        // FCMP 的 MI/PL 分别精确表示 N == 1/0；在 ISIL 中等价于“小于”与“不是小于”，并保留NaN语义。
         if (flagState == Arm64FlagState.FloatingComparison &&
-            conditionCode == Arm64ConditionCode.PL)
+            ShouldInvertSignFlag(conditionCode) is not null)
             return true;
 
         return (flagState is Arm64FlagState.Comparison or Arm64FlagState.FloatingComparison) &&
@@ -446,18 +609,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
 
             if (inputFlagState == Arm64FlagState.FloatingComparison &&
-                conditionCode == Arm64ConditionCode.PL)
+                invertSignFlag is not null)
             {
                 var less = new Register(null, registerPrefix + "_LESS");
-                var notLess = new Register(null, registerPrefix + "_NOT_LESS");
                 Add(
                     address,
                     OpCode.CheckLess,
                     less,
                     new Register(null, "FLAG_COMPARE_LEFT"),
                     new Register(null, "FLAG_COMPARE_RIGHT"));
-                Add(address, OpCode.Not, notLess, less);
-                condition = notLess;
+                if (invertSignFlag.Value)
+                {
+                    var notLess = new Register(null, registerPrefix + "_NOT_LESS");
+                    Add(address, OpCode.Not, notLess, less);
+                    condition = notLess;
+                }
+                else
+                {
+                    condition = less;
+                }
                 return true;
             }
 
@@ -499,6 +669,85 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address, OpCode.ConditionalJump, Imm(address + sizeof(uint)), condition);
             Add(address, OpCode.Move, destination, preservedFalse);
             return true;
+        }
+
+        bool TryEmitRecoveredVectorInstruction(uint machineCode)
+        {
+            if (!TryDecodeRecoveredVectorInstruction(machineCode, out var decoded))
+                return false;
+
+            var destination = new Register(null, $"V{decoded.DestinationRegister}");
+            var firstVectorSource = new Register(null, $"V{decoded.FirstSourceRegister}");
+            switch (decoded.Operation)
+            {
+                case Arm64RecoveredVectorOperation.DuplicateInt16:
+                    Add(
+                        address,
+                        OpCode.VectorDuplicate,
+                        destination,
+                        new Register(null, $"W{decoded.FirstSourceRegister}"),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.WidenUnsignedInt16ToInt32:
+                    Add(
+                        address,
+                        OpCode.VectorWidenUnsignedInt16ToInt32,
+                        destination,
+                        firstVectorSource,
+                        Imm(decoded.LaneCount));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.ShiftLeftInt32:
+                    Add(
+                        address,
+                        OpCode.VectorShiftLeft,
+                        destination,
+                        firstVectorSource,
+                        Imm(decoded.Immediate),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.CompareLessThanZeroInt32:
+                    Add(
+                        address,
+                        OpCode.VectorCompareLessThanZero,
+                        destination,
+                        firstVectorSource,
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.BitwiseSelect128:
+                    Add(
+                        address,
+                        OpCode.VectorBitwiseSelect,
+                        destination,
+                        destination,
+                        firstVectorSource,
+                        new Register(null, $"V{decoded.SecondSourceRegister}"),
+                        Imm(decoded.LaneCount * decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.MultiplyFloat32ByElement:
+                    Add(
+                        address,
+                        OpCode.VectorMultiplyByElement,
+                        destination,
+                        firstVectorSource,
+                        new Register(
+                            null,
+                            $"V{decoded.SecondSourceRegister}.S[{decoded.Immediate}]"),
+                        Imm(decoded.Immediate),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(decoded.Operation));
+            }
         }
 
         switch (instruction.Mnemonic)
@@ -794,32 +1043,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.CSET:
                 {
                     var destination = ConvertOperand(instruction, 0);
-                    var relationalOpCode = GetConditionalSetRelationalOpCode(
-                        instruction.FinalOpConditionCode,
-                        flagState);
-                    if (relationalOpCode is not null)
-                    {
-                        Add(
-                            address,
-                            relationalOpCode.Value,
-                            destination,
-                            new Register(null, "FLAG_COMPARE_LEFT"),
-                            new Register(null, "FLAG_COMPARE_RIGHT"));
-                        break;
-                    }
-
-                    var invertZeroFlag = ShouldInvertZeroFlag(instruction.FinalOpConditionCode);
-                    if (invertZeroFlag is null)
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CSET_CONDITION",
+                            out var condition))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSET condition {instruction.FinalOpConditionCode} not yet implemented."));
                         break;
                     }
 
-                    var zeroFlag = new Register(null, "Z");
-                    if (invertZeroFlag.Value)
-                        Add(address, OpCode.Not, destination, zeroFlag);
-                    else
-                        Add(address, OpCode.Move, destination, zeroFlag);
+                    Add(address, OpCode.Move, destination, condition);
                     break;
                 }
 
@@ -870,6 +1103,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(
                         address,
                         OpCode.ConvertFloatToSignedInteger,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits),
+                        Imm(sourceBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.SCVTF:
+                {
+                    if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetSignedIntegerWidthBits(instruction.Op1Reg, out var sourceBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction SCVTF register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.ConvertSignedIntegerToFloat,
                         ConvertOperand(instruction, 0),
                         ConvertOperand(instruction, 1),
                         Imm(destinationBits),
@@ -984,6 +1236,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
+            case Arm64Mnemonic.FDIV:
+                Add(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
             case Arm64Mnemonic.FNMUL:
                 {
                     var product = new Register(null, $"FNMUL_PRODUCT_{address:X}");
@@ -1070,8 +1326,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
 
             case Arm64Mnemonic.INVALID:
+            case Arm64Mnemonic.UNIMPLEMENTED:
                 {
                     var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryEmitRecoveredVectorInstruction(machineCode))
+                        break;
+
                     if (!TryDecodeVectorFloatingMultiply(
                             machineCode,
                             out _,
@@ -1081,7 +1341,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             out var leftRegister,
                             out var rightRegister))
                     {
-                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction INVALID 0x{machineCode:X8} not yet implemented."));
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} 0x{machineCode:X8} not yet implemented."));
                         break;
                     }
 
@@ -1240,7 +1500,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         for (var index = 0; index < disassembled.Count && index * sizeof(uint) + sizeof(uint) <= raw.Length; index++)
         {
             var decodedInstruction = disassembled[index];
-            if (decodedInstruction.Mnemonic != Arm64Mnemonic.INVALID)
+            if (decodedInstruction.Mnemonic is not (
+                    Arm64Mnemonic.INVALID or Arm64Mnemonic.UNIMPLEMENTED))
             {
                 lines.Add(decodedInstruction.ToString());
                 continue;
@@ -1248,6 +1509,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             var machineCode = BinaryPrimitives.ReadUInt32LittleEndian(
                 raw.Slice(index * sizeof(uint), sizeof(uint)));
+            var address = checked(context.UnderlyingPointer + (ulong)index * sizeof(uint));
+            if (TryFormatRecoveredVectorInstruction(
+                    machineCode,
+                    address,
+                    out var recoveredVectorInstruction))
+            {
+                lines.Add(recoveredVectorInstruction);
+                continue;
+            }
+
             if (!TryDecodeVectorFloatingMultiply(
                     machineCode,
                     out _,
@@ -1261,7 +1532,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 continue;
             }
 
-            var address = checked(context.UnderlyingPointer + (ulong)index * sizeof(uint));
             var elementSuffix = elementWidthBits == 32 ? "S" : "D";
             lines.Add($"0x{address:X8} FMUL V{destinationRegister}.{laneCount}{elementSuffix}, V{leftRegister}.{laneCount}{elementSuffix}, V{rightRegister}.{laneCount}{elementSuffix}");
         }

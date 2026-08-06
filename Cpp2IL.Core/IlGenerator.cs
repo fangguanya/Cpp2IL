@@ -533,6 +533,7 @@ public static class IlGenerator
 
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
+            case OpCode.ConvertSignedIntegerToFloat:
             case OpCode.RoundFloatTowardPositiveInfinity:
             case OpCode.RoundFloatTowardNegativeInfinity:
                 {
@@ -557,6 +558,15 @@ public static class IlGenerator
                                 32 => CilOpCodes.Conv_I4,
                                 64 => CilOpCodes.Conv_I8,
                                 _ => throw new InvalidOperationException($"整数目标位宽无效：{destinationWidth.Value}"),
+                            });
+                            break;
+
+                        case OpCode.ConvertSignedIntegerToFloat:
+                            instructions.Add(destinationWidth.Value switch
+                            {
+                                32 => CilOpCodes.Conv_R4,
+                                64 => CilOpCodes.Conv_R8,
+                                _ => throw new InvalidOperationException($"浮点目标位宽无效：{destinationWidth.Value}"),
                             });
                             break;
 

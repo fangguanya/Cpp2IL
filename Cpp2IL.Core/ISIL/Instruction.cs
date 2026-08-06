@@ -103,6 +103,13 @@ public class Instruction : IOperand
             case OpCode.Negate:
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
+            case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.VectorDuplicate:
+            case OpCode.VectorWidenUnsignedInt16ToInt32:
+            case OpCode.VectorShiftLeft:
+            case OpCode.VectorCompareLessThanZero:
+            case OpCode.VectorBitwiseSelect:
+            case OpCode.VectorMultiplyByElement:
             case OpCode.RoundFloatTowardPositiveInfinity:
             case OpCode.RoundFloatTowardNegativeInfinity:
             case OpCode.CheckEqual:
@@ -155,9 +162,18 @@ public class Instruction : IOperand
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat
+                or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
+                or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
                 or OpCode.Newobj
                 => [_operands[1]],
+
+            OpCode.VectorBitwiseSelect
+                => [_operands[1], _operands[2], _operands[3]],
+
+            OpCode.VectorMultiplyByElement
+                => [_operands[1], _operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight
