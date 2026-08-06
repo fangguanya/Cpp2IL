@@ -417,9 +417,55 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
+                case OpCode.ConvertFloatingPointPrecision:
+                case OpCode.ConvertFloatToSignedInteger:
+                case OpCode.RoundFloatTowardPositiveInfinity:
+                case OpCode.RoundFloatTowardNegativeInfinity:
+                    changed |= PropagateNumericConversion(instruction, method);
+                    break;
             }
         }
 
+        return changed;
+    }
+
+    private static bool PropagateNumericConversion(
+        Instruction instruction,
+        MethodAnalysisContext method)
+    {
+        if (instruction.Operands.Count < 3 ||
+            instruction.Operands[0] is not LocalVariable destination ||
+            instruction.Operands[1] is not LocalVariable source ||
+            instruction.Operands[2] is not Immediate destinationWidth)
+            return false;
+
+        var systemTypes = method.AppContext.SystemTypes;
+        var destinationType = instruction.OpCode == OpCode.ConvertFloatToSignedInteger
+            ? destinationWidth.Value switch
+            {
+                32 => systemTypes.SystemInt32Type,
+                64 => systemTypes.SystemInt64Type,
+                _ => null,
+            }
+            : destinationWidth.Value switch
+            {
+                32 => systemTypes.SystemSingleType,
+                64 => systemTypes.SystemDoubleType,
+                _ => null,
+            };
+
+        var sourceWidth = instruction.Operands.Count >= 4 && instruction.Operands[3] is Immediate explicitSourceWidth
+            ? explicitSourceWidth.Value
+            : destinationWidth.Value;
+        var sourceType = sourceWidth switch
+        {
+            32 => systemTypes.SystemSingleType,
+            64 => systemTypes.SystemDoubleType,
+            _ => null,
+        };
+
+        var changed = SetTypeIfUnknown(destination, destinationType);
+        changed |= SetTypeIfUnknown(source, sourceType);
         return changed;
     }
 

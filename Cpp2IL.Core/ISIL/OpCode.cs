@@ -86,6 +86,18 @@ public enum OpCode
     /// <summary>Negates op 2, moves the result into op 1</summary>
     Negate,
 
+    /// <summary>按 op 3 指定的目标位宽转换浮点精度，并把 op 2 写入 op 1</summary>
+    ConvertFloatingPointPrecision,
+
+    /// <summary>把 op 2 向零舍入为 op 3 指定位宽的有符号整数，并写入 op 1</summary>
+    ConvertFloatToSignedInteger,
+
+    /// <summary>把 op 2 向正无穷舍入，并按 op 3 指定的浮点位宽写入 op 1</summary>
+    RoundFloatTowardPositiveInfinity,
+
+    /// <summary>把 op 2 向负无穷舍入，并按 op 3 指定的浮点位宽写入 op 1</summary>
+    RoundFloatTowardNegativeInfinity,
+
     /// <summary>Moves 1 into op 1, if op 2 and op 3 are equal</summary>
     CheckEqual,
 

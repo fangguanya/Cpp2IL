@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
@@ -248,6 +249,7 @@ public static class IlGenerator
 
         var module = method.DeclaringModule!;
         var importer = module.DefaultImporter!;
+        var factory = module.CorLibTypeFactory;
 
         switch (instruction.OpCode)
         {
@@ -528,6 +530,63 @@ public static class IlGenerator
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
+
+            case OpCode.ConvertFloatingPointPrecision:
+            case OpCode.ConvertFloatToSignedInteger:
+            case OpCode.RoundFloatTowardPositiveInfinity:
+            case OpCode.RoundFloatTowardNegativeInfinity:
+                {
+                    if (instruction.Operands.Count < 3 || instruction.Operands[2] is not Immediate destinationWidth)
+                        throw new InvalidOperationException($"数值转换指令缺少目标位宽：{instruction}");
+
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
+                    switch (instruction.OpCode)
+                    {
+                        case OpCode.ConvertFloatingPointPrecision:
+                            instructions.Add(destinationWidth.Value switch
+                            {
+                                32 => CilOpCodes.Conv_R4,
+                                64 => CilOpCodes.Conv_R8,
+                                _ => throw new InvalidOperationException($"浮点目标位宽无效：{destinationWidth.Value}"),
+                            });
+                            break;
+
+                        case OpCode.ConvertFloatToSignedInteger:
+                            instructions.Add(destinationWidth.Value switch
+                            {
+                                32 => CilOpCodes.Conv_I4,
+                                64 => CilOpCodes.Conv_I8,
+                                _ => throw new InvalidOperationException($"整数目标位宽无效：{destinationWidth.Value}"),
+                            });
+                            break;
+
+                        case OpCode.RoundFloatTowardPositiveInfinity:
+                        case OpCode.RoundFloatTowardNegativeInfinity:
+                            if (destinationWidth.Value is not (32 or 64))
+                                throw new InvalidOperationException($"舍入浮点位宽无效：{destinationWidth.Value}");
+
+                            if (destinationWidth.Value == 32)
+                                instructions.Add(CilOpCodes.Conv_R8);
+
+                            var methodName = instruction.OpCode == OpCode.RoundFloatTowardPositiveInfinity
+                                ? "Ceiling"
+                                : "Floor";
+                            var mathMethod = factory.CorLibScope
+                                .CreateTypeReference("System", "Math")
+                                .CreateMemberReference(
+                                    methodName,
+                                    MethodSignature.CreateStatic(factory.Double, [factory.Double]))
+                                .ImportWith(importer);
+                            instructions.Add(CilOpCodes.Call, mathMethod);
+
+                            if (destinationWidth.Value == 32)
+                                instructions.Add(CilOpCodes.Conv_R4);
+                            break;
+                    }
+
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
 
             default:
                 instructions.Add(CilOpCodes.Ldstr, $"Unknown instruction: {instruction}");

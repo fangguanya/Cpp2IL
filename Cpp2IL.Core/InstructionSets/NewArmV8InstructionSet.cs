@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using Disarm;
@@ -62,6 +63,98 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         clearMask = registerMask & ~halfwordMask;
         shiftedImmediate = (ulong)((machineCode >> 5) & 0xFFFFu) << halfwordShift;
         return true;
+    }
+
+    internal static bool TryGetFloatingPointPrecisionBits(Arm64Register register, out int bits)
+    {
+        if (register is >= Arm64Register.S0 and <= Arm64Register.S31)
+        {
+            bits = 32;
+            return true;
+        }
+
+        if (register is >= Arm64Register.D0 and <= Arm64Register.D31)
+        {
+            bits = 64;
+            return true;
+        }
+
+        bits = 0;
+        return false;
+    }
+
+    internal static bool TryGetSignedIntegerWidthBits(Arm64Register register, out int bits)
+    {
+        if (register is >= Arm64Register.W0 and <= Arm64Register.W30)
+        {
+            bits = 32;
+            return true;
+        }
+
+        if (register is >= Arm64Register.X0 and <= Arm64Register.X30)
+        {
+            bits = 64;
+            return true;
+        }
+
+        bits = 0;
+        return false;
+    }
+
+    internal static bool TryDecodeVectorFloatingMultiply(
+        uint machineCode,
+        out int vectorWidthBits,
+        out int elementWidthBits,
+        out int laneCount,
+        out int destinationRegister,
+        out int leftRegister,
+        out int rightRegister)
+    {
+        // Advanced SIMD 三同型 FMUL 仅放开 Q、size 与三个寄存器字段。
+        const uint encodingMask = 0xBFA0FC00u;
+        const uint encodingValue = 0x2E20DC00u;
+        if ((machineCode & encodingMask) != encodingValue)
+        {
+            vectorWidthBits = 0;
+            elementWidthBits = 0;
+            laneCount = 0;
+            destinationRegister = 0;
+            leftRegister = 0;
+            rightRegister = 0;
+            return false;
+        }
+
+        vectorWidthBits = (machineCode & (1u << 30)) == 0 ? 64 : 128;
+        elementWidthBits = (machineCode & (1u << 22)) == 0 ? 32 : 64;
+        if (vectorWidthBits == 64 && elementWidthBits == 64)
+        {
+            laneCount = 0;
+            destinationRegister = 0;
+            leftRegister = 0;
+            rightRegister = 0;
+            return false;
+        }
+
+        laneCount = vectorWidthBits / elementWidthBits;
+        destinationRegister = (int)(machineCode & 0x1Fu);
+        leftRegister = (int)((machineCode >> 5) & 0x1Fu);
+        rightRegister = (int)((machineCode >> 16) & 0x1Fu);
+        return true;
+    }
+
+    internal static ulong ResolveInstructionAddress(
+        ulong methodStart,
+        int instructionIndex,
+        Arm64Mnemonic mnemonic,
+        ulong reportedAddress)
+    {
+        if (reportedAddress != 0 || mnemonic != Arm64Mnemonic.INVALID)
+            return reportedAddress;
+
+        if (instructionIndex < 0)
+            throw new ArgumentOutOfRangeException(nameof(instructionIndex));
+
+        return checked(methodStart + checked((ulong)instructionIndex * sizeof(uint)));
     }
 
     internal static bool IsBranchOutsideMethod(ulong target, ulong methodStart, int methodLength)
@@ -211,8 +304,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var addresses = new List<ulong>();
         var flagState = Arm64FlagState.None;
 
-        foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context, ref flagState);
+        for (var index = 0; index < insns.Count; index++)
+        {
+            var instruction = insns[index];
+            var address = ResolveInstructionAddress(
+                context.UnderlyingPointer,
+                index,
+                instruction.Mnemonic,
+                instruction.Address);
+            ConvertInstructionStatement(instruction, address, instructions, addresses, context, ref flagState);
+        }
 
         // fix branches
         for (var i = 0; i < instructions.Count; i++)
@@ -243,12 +344,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private void ConvertInstructionStatement(
         Arm64Instruction instruction,
+        ulong address,
         List<Instruction> instructions,
         List<ulong> addresses,
         MethodAnalysisContext context,
         ref Arm64FlagState flagState)
     {
-        var address = instruction.Address;
         var inputFlagState = flagState;
 
         Instruction Add(ulong address, OpCode opCode, params List<IOperand> operands)
@@ -350,6 +451,26 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return false;
         }
 
+        bool TryEmitConditionalSelect(string registerPrefix)
+        {
+            if (!TryEmitCondition(
+                    instruction.FinalOpConditionCode,
+                    registerPrefix + "_CONDITION",
+                    out var condition))
+                return false;
+
+            var destination = ConvertOperand(instruction, 0);
+            var preservedTrue = new Register(null, registerPrefix + "_TRUE");
+            var preservedFalse = new Register(null, registerPrefix + "_FALSE");
+            Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
+            Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+            // 先保存两个源值，避免目标寄存器与任一源寄存器重叠时破坏假分支。
+            Add(address, OpCode.Move, destination, preservedTrue);
+            Add(address, OpCode.ConditionalJump, Imm(address + sizeof(uint)), condition);
+            Add(address, OpCode.Move, destination, preservedFalse);
+            return true;
+        }
+
         switch (instruction.Mnemonic)
         {
             case Arm64Mnemonic.MOV:
@@ -403,13 +524,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.MOVK:
                 {
                     // MOVK 保留目标寄存器其他半字；必须读原始编码的 hw 字段，不能从已移位的显示立即数反推。
-                    var binary = context.AppContext.Binary;
-                    var rawAddress = binary.MapVirtualAddressToRaw(address);
-                    var machineCodeBytes = binary.Reader.ReadByteArrayAtRawAddress(rawAddress, sizeof(uint));
-                    if (BitConverter.IsLittleEndian != binary.Reader.IsLittleEndian)
-                        Array.Reverse(machineCodeBytes);
-
-                    var machineCode = BitConverter.ToUInt32(machineCodeBytes, 0);
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
                     if (!TryDecodeMoveKeepImmediate(
                             machineCode,
                             out _,
@@ -673,26 +788,78 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.CSEL:
                 {
-                    if (!TryEmitCondition(
-                            instruction.FinalOpConditionCode,
-                            "CSEL_CONDITION",
-                            out var condition))
+                    if (!TryEmitConditionalSelect("CSEL"))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSEL condition {instruction.FinalOpConditionCode} not yet implemented."));
+                    }
+                    break;
+                }
+
+            case Arm64Mnemonic.FCSEL:
+                {
+                    if (!TryEmitConditionalSelect("FCSEL"))
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction FCSEL condition {instruction.FinalOpConditionCode} not yet implemented."));
+                    break;
+                }
+
+            case Arm64Mnemonic.FCVT:
+                {
+                    if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FCVT register widths not yet implemented."));
                         break;
                     }
 
-                    var destination = ConvertOperand(instruction, 0);
-                    var trueValue = ConvertOperand(instruction, 1);
-                    var falseValue = ConvertOperand(instruction, 2);
-                    var preservedTrue = new Register(null, "CSEL_TRUE");
-                    var preservedFalse = new Register(null, "CSEL_FALSE");
-                    Add(address, OpCode.Move, preservedTrue, trueValue);
-                    Add(address, OpCode.Move, preservedFalse, falseValue);
-                    // 先保存两个源值，避免目标寄存器与任一源寄存器重叠时破坏假分支。
-                    Add(address, OpCode.Move, destination, preservedTrue);
-                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
-                    Add(address, OpCode.Move, destination, preservedFalse);
+                    Add(
+                        address,
+                        OpCode.ConvertFloatingPointPrecision,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits),
+                        Imm(sourceBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FCVTZS:
+                {
+                    if (!TryGetSignedIntegerWidthBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FCVTZS register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.ConvertFloatToSignedInteger,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits),
+                        Imm(sourceBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FRINTP:
+            case Arm64Mnemonic.FRINTM:
+                {
+                    if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits) ||
+                        destinationBits != sourceBits)
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} register widths not yet implemented."));
+                        break;
+                    }
+
+                    var opCode = instruction.Mnemonic == Arm64Mnemonic.FRINTP
+                        ? OpCode.RoundFloatTowardPositiveInfinity
+                        : OpCode.RoundFloatTowardNegativeInfinity;
+                    Add(
+                        address,
+                        opCode,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits));
                     break;
                 }
 
@@ -780,6 +947,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
+            case Arm64Mnemonic.FNMUL:
+                {
+                    var product = new Register(null, $"FNMUL_PRODUCT_{address:X}");
+                    Add(address, OpCode.Multiply, product, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Negate, ConvertOperand(instruction, 0), product);
+                    break;
+                }
+
             case Arm64Mnemonic.ADD:
                 // ADD 的扩展寄存器和移位寄存器格式必须先恢复第三操作数语义。
                 if (!Arm64AddOperandHelper.TryEmit(
@@ -855,6 +1030,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 //Eor (aka xor) is (dest, src1, src2)
                 Add(address, OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
+
+            case Arm64Mnemonic.INVALID:
+                {
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (!TryDecodeVectorFloatingMultiply(
+                            machineCode,
+                            out _,
+                            out _,
+                            out _,
+                            out var destinationRegister,
+                            out var leftRegister,
+                            out var rightRegister))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction INVALID 0x{machineCode:X8} not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.Multiply,
+                        new Register(null, $"V{destinationRegister}"),
+                        new Register(null, $"V{leftRegister}"),
+                        new Register(null, $"V{rightRegister}"));
+                    break;
+                }
 
             default:
                 Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
@@ -988,7 +1188,58 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override BaseKeyFunctionAddresses CreateKeyFunctionAddressesInstance() => new NewArm64KeyFunctionAddresses();
 
-    public override string PrintAssembly(MethodAnalysisContext context) => context.RawBytes.Length <= 0 ? "" : string.Join("\n", Disassembler.Disassemble(context.RawBytes.AsSpan(), context.UnderlyingPointer, new Disassembler.Options(true, true, false)).ToList());
+    public override string PrintAssembly(MethodAnalysisContext context)
+    {
+        if (context.RawBytes.Length <= 0)
+            return "";
+
+        var raw = context.RawBytes.AsSpan();
+        var disassembled = Disassembler.Disassemble(
+            raw,
+            context.UnderlyingPointer,
+            new Disassembler.Options(true, true, false)).ToList();
+        var lines = new List<string>(disassembled.Count);
+        for (var index = 0; index < disassembled.Count && index * sizeof(uint) + sizeof(uint) <= raw.Length; index++)
+        {
+            var decodedInstruction = disassembled[index];
+            if (decodedInstruction.Mnemonic != Arm64Mnemonic.INVALID)
+            {
+                lines.Add(decodedInstruction.ToString());
+                continue;
+            }
+
+            var machineCode = BinaryPrimitives.ReadUInt32LittleEndian(
+                raw.Slice(index * sizeof(uint), sizeof(uint)));
+            if (!TryDecodeVectorFloatingMultiply(
+                    machineCode,
+                    out _,
+                    out var elementWidthBits,
+                    out var laneCount,
+                    out var destinationRegister,
+                    out var leftRegister,
+                    out var rightRegister))
+            {
+                lines.Add(decodedInstruction.ToString());
+                continue;
+            }
+
+            var address = checked(context.UnderlyingPointer + (ulong)index * sizeof(uint));
+            var elementSuffix = elementWidthBits == 32 ? "S" : "D";
+            lines.Add($"0x{address:X8} FMUL V{destinationRegister}.{laneCount}{elementSuffix}, V{leftRegister}.{laneCount}{elementSuffix}, V{rightRegister}.{laneCount}{elementSuffix}");
+        }
+
+        return string.Join("\n", lines);
+    }
+
+    private static uint ReadMachineCodeAtAddress(MethodAnalysisContext context, ulong address)
+    {
+        var binary = context.AppContext.Binary;
+        var rawAddress = binary.MapVirtualAddressToRaw(address);
+        var machineCodeBytes = binary.Reader.ReadByteArrayAtRawAddress(rawAddress, sizeof(uint));
+        if (BitConverter.IsLittleEndian != binary.Reader.IsLittleEndian)
+            Array.Reverse(machineCodeBytes);
+        return BitConverter.ToUInt32(machineCodeBytes, 0);
+    }
 
     private IOperand? GetReturnRegisterForContext(MethodAnalysisContext context)
     {

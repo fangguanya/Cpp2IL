@@ -2,6 +2,7 @@ using System;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Disarm;
+using Disarm.InternalDisassembly;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -226,6 +227,157 @@ public class NewArmV8InstructionSetTests
                 out _,
                 out _),
             Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void FloatingRegisterWidthsMatchScalarPrecision()
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryGetFloatingPointPrecisionBits(Arm64Register.S8, out var singleBits),
+                Is.True);
+            Assert.That(singleBits, Is.EqualTo(32));
+            Assert.That(
+                NewArmV8InstructionSet.TryGetFloatingPointPrecisionBits(Arm64Register.D9, out var doubleBits),
+                Is.True);
+            Assert.That(doubleBits, Is.EqualTo(64));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void SignedIntegerRegisterWidthsCoverLargestAllocatableRegisters()
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerWidthBits(Arm64Register.W30, out var wordBits),
+                Is.True);
+            Assert.That(wordBits, Is.EqualTo(32));
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerWidthBits(Arm64Register.X30, out var wideBits),
+                Is.True);
+            Assert.That(wideBits, Is.EqualTo(64));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void VectorRegisterIsRejectedAsScalarNumericWidth()
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryGetFloatingPointPrecisionBits(Arm64Register.V0, out _),
+                Is.False);
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerWidthBits(Arm64Register.S0, out _),
+                Is.False);
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void VectorFloatingMultiplyDecodesUiManagerPixelAverageInstruction()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeVectorFloatingMultiply(
+            0x6E22DC00u,
+            out var vectorWidthBits,
+            out var elementWidthBits,
+            out var laneCount,
+            out var destinationRegister,
+            out var leftRegister,
+            out var rightRegister);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidthBits, Is.EqualTo(128));
+            Assert.That(elementWidthBits, Is.EqualTo(32));
+            Assert.That(laneCount, Is.EqualTo(4));
+            Assert.That(destinationRegister, Is.EqualTo(0));
+            Assert.That(leftRegister, Is.EqualTo(0));
+            Assert.That(rightRegister, Is.EqualTo(2));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void VectorFloatingMultiplySupportsTwoDoubleLanes()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeVectorFloatingMultiply(
+            0x6E62DC00u,
+            out var vectorWidthBits,
+            out var elementWidthBits,
+            out var laneCount,
+            out _,
+            out _,
+            out _);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidthBits, Is.EqualTo(128));
+            Assert.That(elementWidthBits, Is.EqualTo(64));
+            Assert.That(laneCount, Is.EqualTo(2));
+        }
+    }
+
+    [TestCase(0x4E22DC00u, TestName = "FMULX编码不会冒充FMUL")]
+    [TestCase(0x2E62DC00u, TestName = "非法单通道双精度向量被拒绝")]
+    [Category("异常输入")]
+    public void VectorFloatingMultiplyRejectsDifferentOrReservedEncodings(uint machineCode)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeVectorFloatingMultiply(
+                machineCode,
+                out _,
+                out _,
+                out _,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void InvalidDisassemblerAddressUsesMethodRelativeInstructionAddress()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.ResolveInstructionAddress(
+                0x02E7B454,
+                345,
+                Arm64Mnemonic.INVALID,
+                0),
+            Is.EqualTo(0x02E7B9B8));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ReportedInstructionAddressRemainsAuthoritative()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.ResolveInstructionAddress(
+                0x1000,
+                int.MaxValue,
+                Arm64Mnemonic.FMUL,
+                0x4321),
+            Is.EqualTo(0x4321));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void NegativeInvalidInstructionIndexIsRejected()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            NewArmV8InstructionSet.ResolveInstructionAddress(
+                0x1000,
+                -1,
+                Arm64Mnemonic.INVALID,
+                0));
     }
 
     [TestCase(Arm64ConditionCode.GT, OpCode.CheckGreater, TestName = "有符号大于映射到有符号比较")]

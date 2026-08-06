@@ -131,7 +131,9 @@ public static class DeadCodeEliminator
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
-                or OpCode.Not or OpCode.Negate=> true,
+                or OpCode.Not or OpCode.Negate
+                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity => true,
             >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned => true,
             _ => false
         };

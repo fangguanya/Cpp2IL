@@ -101,6 +101,10 @@ public class Instruction : IOperand
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.ConvertFloatingPointPrecision:
+            case OpCode.ConvertFloatToSignedInteger:
+            case OpCode.RoundFloatTowardPositiveInfinity:
+            case OpCode.RoundFloatTowardNegativeInfinity:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -150,6 +154,8 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
+                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
                 or OpCode.Newobj
                 => [_operands[1]],
 
