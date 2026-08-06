@@ -113,6 +113,15 @@ public enum OpCode
     /// <summary>把 op 2 的浮点向量乘以 op 3 的指定元素；op 4/5/6 为元素索引、通道数和元素位宽</summary>
     VectorMultiplyByElement,
 
+    /// <summary>
+    /// 把op 2的四个16位累计低位与op 3对op 4..7四个常量的逐通道比较合并；
+    /// op 8的位掩码指定使用“标量大于常量”的反向通道，最终全通道成立时把true写入op 1。
+    /// </summary>
+    VectorAllLanesPredicate,
+
+    /// <summary>从op 2打包的低64位向量中提取op 3指定的无符号16位通道并写入op 1</summary>
+    VectorExtractUnsignedInt16,
+
     /// <summary>把 op 2 向正无穷舍入，并按 op 3 指定的浮点位宽写入 op 1</summary>
     RoundFloatTowardPositiveInfinity,
 

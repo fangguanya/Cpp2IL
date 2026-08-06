@@ -22,6 +22,44 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void Void方法尾部为普通调用时需要返回终结点()
+    {
+        var finalInstruction = new CilInstruction(CilOpCodes.Call, null);
+
+        Assert.That(IlGenerator.RequiresTerminalReturn(true, finalInstruction), Is.True);
+    }
+
+    [TestCaseSource(nameof(不可顺序落出的终结指令))]
+    public void Void方法已有控制流终结点时不重复补返回(CilOpCode opCode)
+    {
+        var finalInstruction = new CilInstruction(opCode);
+
+        Assert.That(IlGenerator.RequiresTerminalReturn(true, finalInstruction), Is.False);
+    }
+
+    [Test]
+    public void 非Void方法尾部为普通调用时不补无值返回()
+    {
+        var finalInstruction = new CilInstruction(CilOpCodes.Call, null);
+
+        Assert.That(IlGenerator.RequiresTerminalReturn(false, finalInstruction), Is.False);
+    }
+
+    private static IEnumerable<CilOpCode> 不可顺序落出的终结指令()
+    {
+        yield return CilOpCodes.Ret;
+        yield return CilOpCodes.Throw;
+        yield return CilOpCodes.Rethrow;
+        yield return CilOpCodes.Br;
+        yield return CilOpCodes.Br_S;
+        yield return CilOpCodes.Leave;
+        yield return CilOpCodes.Leave_S;
+        yield return CilOpCodes.Jmp;
+        yield return CilOpCodes.Endfinally;
+        yield return CilOpCodes.Endfilter;
+    }
+
+    [Test]
     public void StaticCall_DoesNotLoadMethodInfoOperand()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

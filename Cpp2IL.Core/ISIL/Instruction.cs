@@ -110,6 +110,8 @@ public class Instruction : IOperand
             case OpCode.VectorCompareLessThanZero:
             case OpCode.VectorBitwiseSelect:
             case OpCode.VectorMultiplyByElement:
+            case OpCode.VectorAllLanesPredicate:
+            case OpCode.VectorExtractUnsignedInt16:
             case OpCode.RoundFloatTowardPositiveInfinity:
             case OpCode.RoundFloatTowardNegativeInfinity:
             case OpCode.CheckEqual:
@@ -174,6 +176,12 @@ public class Instruction : IOperand
 
             OpCode.VectorMultiplyByElement
                 => [_operands[1], _operands[2]],
+
+            OpCode.VectorAllLanesPredicate
+                => [_operands[1], _operands[2]],
+
+            OpCode.VectorExtractUnsignedInt16
+                => [_operands[1]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight

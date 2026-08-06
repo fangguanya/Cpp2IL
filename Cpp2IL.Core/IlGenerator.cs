@@ -204,6 +204,32 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, "Warning: " + warning);
             instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
         }
+
+        // 分析警告会被附加到方法尾部；若 void 方法尾部仍可顺序落出，则补齐合法的 CIL 返回终结点。
+        // 这里仅修复方法体结构，不把未知的原生异常尾语义标记为已经恢复。
+        if (RequiresTerminalReturn(context.IsVoid, instructions.LastOrDefault()))
+            instructions.Add(CilOpCodes.Ret);
+    }
+
+    internal static bool RequiresTerminalReturn(bool isVoidMethod, CilInstruction? finalInstruction)
+    {
+        if (!isVoidMethod)
+            return false;
+
+        if (finalInstruction == null)
+            return true;
+
+        var opCode = finalInstruction.OpCode;
+        return opCode != CilOpCodes.Ret
+               && opCode != CilOpCodes.Throw
+               && opCode != CilOpCodes.Rethrow
+               && opCode != CilOpCodes.Br
+               && opCode != CilOpCodes.Br_S
+               && opCode != CilOpCodes.Leave
+               && opCode != CilOpCodes.Leave_S
+               && opCode != CilOpCodes.Jmp
+               && opCode != CilOpCodes.Endfinally
+               && opCode != CilOpCodes.Endfilter;
     }
     
     private static Block? TryResolveJumpTargetBlock(Instruction jumpInstruction, ISILControlFlowGraph cfg)
@@ -605,6 +631,76 @@ public static class IlGenerator
                             break;
                     }
 
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
+
+            case OpCode.VectorAllLanesPredicate:
+                {
+                    if (instruction.Operands.Count != 8
+                        || instruction.Operands[3] is not Immediate firstConstant
+                        || instruction.Operands[4] is not Immediate secondConstant
+                        || instruction.Operands[5] is not Immediate thirdConstant
+                        || instruction.Operands[6] is not Immediate fourthConstant
+                        || instruction.Operands[7] is not Immediate reverseLaneMask)
+                    {
+                        throw new InvalidOperationException($"向量全通道谓词参数无效：{instruction}");
+                    }
+
+                    var constants = new[]
+                    {
+                        firstConstant.Value,
+                        secondConstant.Value,
+                        thirdConstant.Value,
+                        fourthConstant.Value,
+                    };
+                    for (var lane = 0; lane < constants.Length; lane++)
+                    {
+                        // 先读取累计H通道的最低位；Shr_Un避免最高通道受符号扩展影响。
+                        LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
+                        if (lane != 0)
+                        {
+                            instructions.Add(CilOpCodes.Ldc_I4, lane * 16);
+                            instructions.Add(CilOpCodes.Shr_Un);
+                        }
+                        instructions.Add(CilOpCodes.Ldc_I8, 1L);
+                        instructions.Add(CilOpCodes.And);
+                        instructions.Add(CilOpCodes.Ldc_I8, 0L);
+                        instructions.Add(CilOpCodes.Cgt_Un);
+
+                        // 正常通道为constant > scalar，掩码指定的通道使用scalar > constant。
+                        LoadOperand(instruction.Operands[2], method, locals, writeLine, stringCtor);
+                        instructions.Add(CilOpCodes.Ldc_I4, checked((int)constants[lane]));
+                        instructions.Add((reverseLaneMask.Value & (1L << lane)) != 0
+                            ? CilOpCodes.Cgt
+                            : CilOpCodes.Clt);
+                        instructions.Add(CilOpCodes.Or);
+
+                        if (lane != 0)
+                            instructions.Add(CilOpCodes.And);
+                    }
+
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
+
+            case OpCode.VectorExtractUnsignedInt16:
+                {
+                    if (instruction.Operands.Count != 3
+                        || instruction.Operands[2] is not Immediate { Value: >= 0 and < 4 } laneIndex)
+                    {
+                        throw new InvalidOperationException($"向量半字提取参数无效：{instruction}");
+                    }
+
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
+                    if (laneIndex.Value != 0)
+                    {
+                        instructions.Add(CilOpCodes.Ldc_I4, checked((int)laneIndex.Value * 16));
+                        instructions.Add(CilOpCodes.Shr_Un);
+                    }
+                    instructions.Add(CilOpCodes.Ldc_I8, 0xFFFFL);
+                    instructions.Add(CilOpCodes.And);
+                    instructions.Add(CilOpCodes.Conv_I4);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                     break;
                 }

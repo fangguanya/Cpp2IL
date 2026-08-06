@@ -937,4 +937,168 @@ public class NewArmV8InstructionSetTests
             NewArmV8InstructionSet.GetIndirectBranchOpCode(Arm64Mnemonic.RET),
             Is.Null);
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void ReplicatedHalfwordMoveDecodesFourOnes()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate16(
+            0x0F008420u,
+            out var vectorWidth,
+            out var laneCount,
+            out var elementBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidth, Is.EqualTo(64));
+            Assert.That(laneCount, Is.EqualTo(4));
+            Assert.That(elementBits, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ReplicatedHalfwordMoveReportsEightLanesForQRegister()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate16(
+            0x4F008420u,
+            out var vectorWidth,
+            out var laneCount,
+            out var elementBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidth, Is.EqualTo(128));
+            Assert.That(laneCount, Is.EqualTo(8));
+            Assert.That(elementBits, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ReplicatedHalfwordMoveRejectsSinglePrecisionEncoding()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate16(
+                0x0F000420u,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void VectorQMemoryDecoderRestoresScaledByteOffset()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeUnsignedVector128Memory(
+            0x3DC00BE0u,
+            out var isLoad,
+            out var vectorRegister,
+            out var baseRegister,
+            out var byteOffset);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(isLoad, Is.True);
+            Assert.That(vectorRegister, Is.Zero);
+            Assert.That(baseRegister, Is.EqualTo(31));
+            Assert.That(byteOffset, Is.EqualTo(0x20));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void PackedHalfwordPredicateMatchesSchoolCompilerIdiom()
+    {
+        uint[] machineCodes =
+        [
+            0x4E040FA0u, 0x3DC12901u, 0x4EA03422u, 0x4EA13400u,
+            0x0E612841u, 0x0E612800u, 0x6E061401u, 0x3DC00BE0u,
+            0x0EA11C00u, 0x0F1F5400u, 0x0E60A800u, 0x2E71A800u,
+            0x1E260008u,
+        ];
+
+        var decoded = NewArmV8InstructionSet.TryDecodePackedHalfwordPredicatePattern(
+            machineCodes,
+            out var pattern);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(pattern.ScalarSourceRegister, Is.EqualTo(29));
+            Assert.That(pattern.ResultRegister, Is.EqualTo(8));
+            Assert.That(pattern.ConstantBaseRegister, Is.EqualTo(8));
+            Assert.That(pattern.ConstantByteOffset, Is.EqualTo(0x4A0));
+            Assert.That(pattern.AccumulatorBaseRegister, Is.EqualTo(31));
+            Assert.That(pattern.AccumulatorByteOffset, Is.EqualTo(0x20));
+            Assert.That(pattern.ReverseLaneMask, Is.EqualTo(2));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void PackedHalfwordPredicateRejectsChangedReductionOpcode()
+    {
+        uint[] machineCodes =
+        [
+            0x4E040FA0u, 0x3DC12901u, 0x4EA03422u, 0x4EA13400u,
+            0x0E612841u, 0x0E612800u, 0x6E061401u, 0x3DC00BE0u,
+            0x0EA11C00u, 0x0F1F5400u, 0x0E60A800u, 0x2E71A801u,
+            0x1E260008u,
+        ];
+
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodePackedHalfwordPredicatePattern(machineCodes, out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void UnsignedHalfwordMoveDecodesSecondPackedLane()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeUnsignedHalfwordMoveToGeneral(
+            0x0E063C08u,
+            out var generalRegister,
+            out var vectorRegister,
+            out var laneIndex);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(generalRegister, Is.EqualTo(8));
+            Assert.That(vectorRegister, Is.Zero);
+            Assert.That(laneIndex, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void UnsignedHalfwordMoveAcceptsHighestPackedLane()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeUnsignedHalfwordMoveToGeneral(
+                0x0E0E3C00u,
+                out _,
+                out _,
+                out var laneIndex),
+            Is.True);
+        Assert.That(laneIndex, Is.EqualTo(3));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void UnsignedHalfwordMoveRejectsLaneOutsidePackedLowerHalf()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeUnsignedHalfwordMoveToGeneral(
+                0x0E123C00u,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
 }

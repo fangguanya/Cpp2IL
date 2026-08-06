@@ -65,6 +65,41 @@ internal readonly struct Arm64RecoveredVectorInstruction
     internal int Immediate { get; }
 }
 
+internal readonly struct Arm64PackedHalfwordPredicatePattern
+{
+    internal Arm64PackedHalfwordPredicatePattern(
+        int scalarSourceRegister,
+        int resultRegister,
+        int constantBaseRegister,
+        int constantByteOffset,
+        int accumulatorBaseRegister,
+        int accumulatorByteOffset,
+        int reverseLaneMask)
+    {
+        ScalarSourceRegister = scalarSourceRegister;
+        ResultRegister = resultRegister;
+        ConstantBaseRegister = constantBaseRegister;
+        ConstantByteOffset = constantByteOffset;
+        AccumulatorBaseRegister = accumulatorBaseRegister;
+        AccumulatorByteOffset = accumulatorByteOffset;
+        ReverseLaneMask = reverseLaneMask;
+    }
+
+    internal int ScalarSourceRegister { get; }
+
+    internal int ResultRegister { get; }
+
+    internal int ConstantBaseRegister { get; }
+
+    internal int ConstantByteOffset { get; }
+
+    internal int AccumulatorBaseRegister { get; }
+
+    internal int AccumulatorByteOffset { get; }
+
+    internal int ReverseLaneMask { get; }
+}
+
 public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 {
     [ThreadStatic]
@@ -223,6 +258,236 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var immediate = (((machineCode >> 16) & 0x7u) << 5) | ((machineCode >> 5) & 0x1Fu);
         var shift = (int)((machineCode >> 13) & 0x3u) * 8;
         elementBits = immediate << shift;
+        return true;
+    }
+
+    internal static bool TryDecodeReplicatedVectorMoveImmediate16(
+        uint machineCode,
+        out int vectorWidthBits,
+        out int laneCount,
+        out ushort elementBits)
+    {
+        // Advanced SIMD MOVI 的16位立即数变体只允许LSL #0/#8；imm8复制到全部H通道。
+        const uint encodingMask = 0xBFF8DC00u;
+        const uint encodingValue = 0x0F008400u;
+        if ((machineCode & encodingMask) != encodingValue)
+        {
+            vectorWidthBits = 0;
+            laneCount = 0;
+            elementBits = 0;
+            return false;
+        }
+
+        vectorWidthBits = (machineCode & (1u << 30)) == 0 ? 64 : 128;
+        laneCount = vectorWidthBits / 16;
+        var immediate = (((machineCode >> 16) & 0x7u) << 5) | ((machineCode >> 5) & 0x1Fu);
+        var shift = (int)((machineCode >> 13) & 0x1u) * 8;
+        elementBits = checked((ushort)(immediate << shift));
+        return true;
+    }
+
+    internal static bool TryDecodeUnsignedVector128Memory(
+        uint machineCode,
+        out bool isLoad,
+        out int vectorRegister,
+        out int baseRegister,
+        out int byteOffset)
+    {
+        // LDR/STR Qt, [Xn|SP, #imm] 的imm12以16字节为单位；Disarm当前只暴露未缩放值。
+        var operation = machineCode & 0xFFC00000u;
+        if (operation is not (0x3D800000u or 0x3DC00000u))
+        {
+            isLoad = false;
+            vectorRegister = 0;
+            baseRegister = 0;
+            byteOffset = 0;
+            return false;
+        }
+
+        isLoad = operation == 0x3DC00000u;
+        vectorRegister = (int)(machineCode & 0x1Fu);
+        baseRegister = (int)((machineCode >> 5) & 0x1Fu);
+        byteOffset = checked((int)((machineCode >> 10) & 0xFFFu) * 16);
+        return true;
+    }
+
+    internal static bool TryDecodeUnsignedHalfwordMoveToGeneral(
+        uint machineCode,
+        out int generalRegister,
+        out int vectorRegister,
+        out int laneIndex)
+    {
+        // UMOV Wd, Vn.H[index]：imm5最低置位为H宽度标记，其余高位给出0..7通道索引。
+        if ((machineCode & 0xFFE0FC00u) != 0x0E003C00u)
+        {
+            generalRegister = 0;
+            vectorRegister = 0;
+            laneIndex = 0;
+            return false;
+        }
+
+        var imm5 = (int)((machineCode >> 16) & 0x1Fu);
+        if ((imm5 & 0x3) != 0x2)
+        {
+            generalRegister = 0;
+            vectorRegister = 0;
+            laneIndex = 0;
+            return false;
+        }
+
+        generalRegister = (int)(machineCode & 0x1Fu);
+        vectorRegister = (int)((machineCode >> 5) & 0x1Fu);
+        laneIndex = imm5 >> 2;
+        if (laneIndex >= 4)
+        {
+            generalRegister = 0;
+            vectorRegister = 0;
+            laneIndex = 0;
+            return false;
+        }
+        return true;
+    }
+
+    internal static bool TryDecodePackedHalfwordPredicatePattern(
+        ReadOnlySpan<uint> machineCodes,
+        out Arm64PackedHalfwordPredicatePattern pattern)
+    {
+        // 该编译器惯用序列把四个32位比较结果收窄为四个H通道，再与累计低位合并并做UMINV。
+        if (machineCodes.Length < 13)
+        {
+            pattern = default;
+            return false;
+        }
+
+        var duplicate = machineCodes[0];
+        if ((duplicate & 0xFFFFFC00u) != 0x4E040C00u)
+        {
+            pattern = default;
+            return false;
+        }
+
+        var duplicatedVector = (int)(duplicate & 0x1Fu);
+        var scalarSource = (int)((duplicate >> 5) & 0x1Fu);
+        if (!TryDecodeUnsignedVector128Memory(machineCodes[1], out var constantIsLoad,
+                out var constantVector, out var constantBase, out var constantOffset)
+            || !constantIsLoad)
+        {
+            pattern = default;
+            return false;
+        }
+
+        if (!TryDecodeVectorThreeRegister(machineCodes[2], 0x4EA03400u,
+                out var firstMask, out var firstLeft, out var firstRight)
+            || firstLeft != constantVector || firstRight != duplicatedVector
+            || !TryDecodeVectorThreeRegister(machineCodes[3], 0x4EA03400u,
+                out var secondMask, out var secondLeft, out var secondRight)
+            || secondLeft != duplicatedVector || secondRight != constantVector)
+        {
+            pattern = default;
+            return false;
+        }
+
+        if (!TryDecodeVectorTwoRegister(machineCodes[4], 0x0E612800u,
+                out var firstNarrowed, out var firstNarrowSource)
+            || firstNarrowSource != firstMask
+            || !TryDecodeVectorTwoRegister(machineCodes[5], 0x0E612800u,
+                out var secondNarrowed, out var secondNarrowSource)
+            || secondNarrowSource != secondMask)
+        {
+            pattern = default;
+            return false;
+        }
+
+        // MOV Vd.H[1], Vn.H[1]：只把第二通道替换为反向比较。
+        var laneMove = machineCodes[6];
+        if ((laneMove & 0xFFFFFC00u) != 0x6E061400u
+            || (int)(laneMove & 0x1Fu) != firstNarrowed
+            || (int)((laneMove >> 5) & 0x1Fu) != secondNarrowed)
+        {
+            pattern = default;
+            return false;
+        }
+
+        if (!TryDecodeUnsignedVector128Memory(machineCodes[7], out var accumulatorIsLoad,
+                out var accumulatorVector, out var accumulatorBase, out var accumulatorOffset)
+            || !accumulatorIsLoad || accumulatorVector != secondNarrowed)
+        {
+            pattern = default;
+            return false;
+        }
+
+        if (!TryDecodeVectorThreeRegister(machineCodes[8], 0x0EA01C00u,
+                out var orDestination, out var orLeft, out var orRight)
+            || orDestination != accumulatorVector || orLeft != accumulatorVector || orRight != firstNarrowed
+            || !TryDecodeVectorTwoRegister(machineCodes[9], 0x0F1F5400u,
+                out var shifted, out var shiftSource)
+            || shifted != accumulatorVector || shiftSource != accumulatorVector
+            || !TryDecodeVectorTwoRegister(machineCodes[10], 0x0E60A800u,
+                out var compared, out var compareSource)
+            || compared != accumulatorVector || compareSource != accumulatorVector
+            || !TryDecodeVectorTwoRegister(machineCodes[11], 0x2E71A800u,
+                out var minimumDestination, out var minimumSource)
+            || minimumDestination != accumulatorVector || minimumSource != accumulatorVector)
+        {
+            pattern = default;
+            return false;
+        }
+
+        var scalarMove = machineCodes[12];
+        if ((scalarMove & 0xFFFFFC00u) != 0x1E260000u
+            || (int)((scalarMove >> 5) & 0x1Fu) != accumulatorVector)
+        {
+            pattern = default;
+            return false;
+        }
+
+        pattern = new Arm64PackedHalfwordPredicatePattern(
+            scalarSource,
+            (int)(scalarMove & 0x1Fu),
+            constantBase,
+            constantOffset,
+            accumulatorBase,
+            accumulatorOffset,
+            reverseLaneMask: 1 << 1);
+        return true;
+    }
+
+    private static bool TryDecodeVectorTwoRegister(
+        uint machineCode,
+        uint encodingValue,
+        out int destination,
+        out int source)
+    {
+        if ((machineCode & 0xFFFFFC00u) != encodingValue)
+        {
+            destination = 0;
+            source = 0;
+            return false;
+        }
+
+        destination = (int)(machineCode & 0x1Fu);
+        source = (int)((machineCode >> 5) & 0x1Fu);
+        return true;
+    }
+
+    private static bool TryDecodeVectorThreeRegister(
+        uint machineCode,
+        uint encodingValue,
+        out int destination,
+        out int left,
+        out int right)
+    {
+        if ((machineCode & 0xFFE0FC00u) != encodingValue)
+        {
+            destination = 0;
+            left = 0;
+            right = 0;
+            return false;
+        }
+
+        destination = (int)(machineCode & 0x1Fu);
+        left = (int)((machineCode >> 5) & 0x1Fu);
+        right = (int)((machineCode >> 16) & 0x1Fu);
         return true;
     }
 
@@ -602,6 +867,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         for (var index = 0; index < insns.Count; index++)
         {
+            if (TryEmitPackedHalfwordPredicatePattern(
+                    insns,
+                    index,
+                    context,
+                    instructions,
+                    addresses,
+                    out var consumedInstructionCount))
+            {
+                index += consumedInstructionCount - 1;
+                continue;
+            }
+
             var instruction = insns[index];
             var address = ResolveInstructionAddress(
                 context.UnderlyingPointer,
@@ -636,6 +913,86 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         adrpOffsets.Clear();
         return instructions;
+    }
+
+    private bool TryEmitPackedHalfwordPredicatePattern(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        int startIndex,
+        MethodAnalysisContext context,
+        List<Instruction> instructions,
+        List<ulong> addresses,
+        out int consumedInstructionCount)
+    {
+        const int patternLength = 13;
+        if (startIndex < 0 || startIndex + patternLength > nativeInstructions.Count)
+        {
+            consumedInstructionCount = 0;
+            return false;
+        }
+
+        Span<uint> machineCodes = stackalloc uint[patternLength];
+        Span<ulong> nativeAddresses = stackalloc ulong[patternLength];
+        for (var offset = 0; offset < patternLength; offset++)
+        {
+            var nativeInstruction = nativeInstructions[startIndex + offset];
+            var nativeAddress = ResolveInstructionAddress(
+                context.UnderlyingPointer,
+                startIndex + offset,
+                nativeInstruction.Mnemonic,
+                nativeInstruction.Address);
+            nativeAddresses[offset] = nativeAddress;
+            machineCodes[offset] = ReadMachineCodeAtAddress(context, nativeAddress);
+        }
+
+        if (!TryDecodePackedHalfwordPredicatePattern(machineCodes, out var pattern))
+        {
+            consumedInstructionCount = 0;
+            return false;
+        }
+
+        var constantLoad = nativeInstructions[startIndex + 1];
+        if (!adrpOffsets.TryGetValue(constantLoad.MemBase, out var constantPage))
+        {
+            consumedInstructionCount = 0;
+            return false;
+        }
+
+        var constantAddress = checked(constantPage + (ulong)pattern.ConstantByteOffset);
+        var constantRawAddress = context.AppContext.Binary.MapVirtualAddressToRaw(constantAddress);
+        var constantBytes = context.AppContext.Binary.Reader.ReadByteArrayAtRawAddress(
+            constantRawAddress,
+            sizeof(int) * 4);
+        Span<int> constants = stackalloc int[4];
+        for (var lane = 0; lane < constants.Length; lane++)
+            constants[lane] = BinaryPrimitives.ReadInt32LittleEndian(
+                constantBytes.AsSpan(lane * sizeof(int), sizeof(int)));
+
+        // 为每个被折叠的原生地址保留可跳转锚点；真实谓词只在最终FMOV地址计算一次。
+        for (var offset = 0; offset < patternLength - 1; offset++)
+        {
+            addresses.Add(nativeAddresses[offset]);
+            instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
+        }
+
+        var accumulatorLoad = nativeInstructions[startIndex + 7];
+        var accumulator = new MemoryOperand(
+            new Register(null, Arm64RegisterHelper.CanonicalName(accumulatorLoad.MemBase)),
+            addend: pattern.AccumulatorByteOffset);
+        var predicate = new Instruction(
+            instructions.Count,
+            OpCode.VectorAllLanesPredicate,
+            ConvertOperand(nativeInstructions[startIndex + 12], 0),
+            accumulator,
+            new Register(null, $"X{pattern.ScalarSourceRegister}"),
+            Imm(constants[0]),
+            Imm(constants[1]),
+            Imm(constants[2]),
+            Imm(constants[3]),
+            Imm(pattern.ReverseLaneMask));
+        addresses.Add(nativeAddresses[patternLength - 1]);
+        instructions.Add(predicate);
+        consumedInstructionCount = patternLength;
+        return true;
     }
 
     private void ConvertInstructionStatement(
@@ -877,6 +1234,38 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case var scalarLoad when IsScalarLoadMnemonic(scalarLoad):
                 //Load and move are (dest, src)
 
+                if (instruction.Op1Kind == Arm64OperandKind.Memory)
+                {
+                    var vectorMemoryCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeUnsignedVector128Memory(
+                            vectorMemoryCode,
+                            out var isVectorLoad,
+                            out _,
+                            out _,
+                            out var vectorByteOffset)
+                        && isVectorLoad)
+                    {
+                        IOperand vectorSource;
+                        if (adrpOffsets.TryGetValue(instruction.MemBase, out var vectorPage)
+                            && instruction.MemAddendReg == Arm64Register.INVALID)
+                        {
+                            vectorSource = new MemoryOperand(
+                                addend: checked((long)vectorPage + vectorByteOffset));
+                        }
+                        else
+                        {
+                            vectorSource = new MemoryOperand(
+                                new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase)),
+                                addend: vectorByteOffset);
+                        }
+
+                        if (instruction.Op0Kind == Arm64OperandKind.Register)
+                            adrpOffsets.Remove(instruction.Op0Reg);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), vectorSource);
+                        break;
+                    }
+                }
+
                 if (instruction.MemIsPreIndexed) //  such as  X8, [X19,#0x30]! 
                 {
                     //Regardless of anything else, we're trashing any possible ADRP offsets in the dest here, so let's clear that
@@ -979,6 +1368,26 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.MOVI:
                 {
                     var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeReplicatedVectorMoveImmediate16(
+                            machineCode,
+                            out var vectorWidthBits16,
+                            out var laneCount16,
+                            out var elementBits16))
+                    {
+                        if (vectorWidthBits16 != 64 || laneCount16 != 4)
+                        {
+                            Add(address, OpCode.NotImplemented, new StringLiteral(
+                                $"Instruction MOVI {laneCount16}H requires 128-bit storage."));
+                            break;
+                        }
+
+                        ulong packed = 0;
+                        for (var lane = 0; lane < laneCount16; lane++)
+                            packed |= (ulong)elementBits16 << (lane * 16);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(packed));
+                        break;
+                    }
+
                     if (TryDecodeReplicatedVectorMoveImmediate32(
                             machineCode,
                             out _,
@@ -1003,8 +1412,29 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
             case var scalarStore when IsScalarStoreMnemonic(scalarStore):
                 //Store is (src, dest)
-                Add(address, OpCode.Move, ConvertOperand(instruction, 1), ConvertStoreSourceOperand(instruction));
-                break;
+                {
+                    var vectorMemoryCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeUnsignedVector128Memory(
+                            vectorMemoryCode,
+                            out var isVectorLoad,
+                            out _,
+                            out _,
+                            out var vectorByteOffset)
+                        && !isVectorLoad)
+                    {
+                        Add(
+                            address,
+                            OpCode.Move,
+                            new MemoryOperand(
+                                new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase)),
+                                addend: vectorByteOffset),
+                            ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 1), ConvertStoreSourceOperand(instruction));
+                    break;
+                }
             case Arm64Mnemonic.STP:
                 // store pair of registers (reg1, reg2, dest)
                 {
@@ -1519,6 +1949,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.UNIMPLEMENTED:
                 {
                     var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeUnsignedHalfwordMoveToGeneral(
+                            machineCode,
+                            out var generalRegister,
+                            out var vectorRegister,
+                            out var laneIndex))
+                    {
+                        Add(
+                            address,
+                            OpCode.VectorExtractUnsignedInt16,
+                            new Register(null, $"X{generalRegister}"),
+                            new Register(null, $"V{vectorRegister}"),
+                            Imm(laneIndex));
+                        break;
+                    }
+
                     if (TryEmitRecoveredVectorInstruction(machineCode))
                         break;
 

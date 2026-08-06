@@ -237,6 +237,8 @@ public static class LocalVariables
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
         SeedComparisonResults(method);
+        SeedPackedHalfwordPredicateTypes(method);
+        SeedPackedVectorExtractionTypes(method);
         SeedBooleanBitTestTypes(method);
         SeedNullablePresenceTestResults(method);
 
@@ -366,6 +368,38 @@ public static class LocalVariables
 
             if (instruction.Destination is LocalVariable destination)
                 destination.Type = booleanType;
+        }
+    }
+
+    private static void SeedPackedHalfwordPredicateTypes(MethodAnalysisContext method)
+    {
+        var systemTypes = method.AppContext.SystemTypes;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.VectorAllLanesPredicate || instruction.Operands.Count != 8)
+                continue;
+
+            if (instruction.Operands[0] is LocalVariable destination)
+                destination.Type = systemTypes.SystemBooleanType;
+            if (instruction.Operands[1] is LocalVariable accumulatedHalfwords)
+                accumulatedHalfwords.Type = systemTypes.SystemUInt64Type;
+            if (instruction.Operands[2] is LocalVariable scalarValue)
+                scalarValue.Type = systemTypes.SystemInt32Type;
+        }
+    }
+
+    private static void SeedPackedVectorExtractionTypes(MethodAnalysisContext method)
+    {
+        var systemTypes = method.AppContext.SystemTypes;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.VectorExtractUnsignedInt16 || instruction.Operands.Count != 3)
+                continue;
+
+            if (instruction.Operands[0] is LocalVariable destination)
+                destination.Type = systemTypes.SystemInt32Type;
+            if (instruction.Operands[1] is LocalVariable packedVector)
+                packedVector.Type = systemTypes.SystemUInt64Type;
         }
     }
 
