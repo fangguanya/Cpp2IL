@@ -171,6 +171,63 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void MoveKeepDecodesUiManagerOneDayThresholdHalfword()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeMoveKeepImmediate(
+            0x72A00028u,
+            out var registerWidth,
+            out var halfwordShift,
+            out var clearMask,
+            out var shiftedImmediate);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(registerWidth, Is.EqualTo(32));
+            Assert.That(halfwordShift, Is.EqualTo(16));
+            Assert.That(clearMask, Is.EqualTo(0x0000FFFFul));
+            Assert.That(shiftedImmediate, Is.EqualTo(0x00010000ul));
+            Assert.That((0x5180ul & clearMask) | shiftedImmediate, Is.EqualTo(86_400ul));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void MoveKeepCanClearHighestHalfwordOfSixtyFourBitRegister()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeMoveKeepImmediate(
+            0xF2F579A0u,
+            out var registerWidth,
+            out var halfwordShift,
+            out var clearMask,
+            out var shiftedImmediate);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(registerWidth, Is.EqualTo(64));
+            Assert.That(halfwordShift, Is.EqualTo(48));
+            Assert.That(clearMask, Is.EqualTo(0x0000FFFFFFFFFFFFul));
+            Assert.That(shiftedImmediate, Is.EqualTo(0xABCD000000000000ul));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void MoveKeepRejectsMoveZeroEncoding()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeMoveKeepImmediate(
+                0x528A3008u,
+                out _,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
+
     [TestCase(Arm64ConditionCode.GT, OpCode.CheckGreater, TestName = "有符号大于映射到有符号比较")]
     [TestCase(Arm64ConditionCode.LT, OpCode.CheckLess, TestName = "有符号小于映射到有符号比较")]
     [TestCase(Arm64ConditionCode.GE, OpCode.CheckGreaterOrEqual, TestName = "有符号大于等于映射到有符号比较")]

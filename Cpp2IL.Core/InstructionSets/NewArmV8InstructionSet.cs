@@ -27,6 +27,43 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private static Immediate Imm(long value) => new(value);
     private static Immediate Imm(ulong value) => new(unchecked((long)value));
 
+    internal static bool TryDecodeMoveKeepImmediate(
+        uint machineCode,
+        out int registerWidth,
+        out int halfwordShift,
+        out ulong clearMask,
+        out ulong shiftedImmediate)
+    {
+        // MOVK 属于 move-wide immediate 编码族，opc 必须为 3。
+        var isMoveWide = (machineCode & 0x1F800000u) == 0x12800000u;
+        var operation = (machineCode >> 29) & 0x3u;
+        if (!isMoveWide || operation != 0x3u)
+        {
+            registerWidth = 0;
+            halfwordShift = 0;
+            clearMask = 0;
+            shiftedImmediate = 0;
+            return false;
+        }
+
+        registerWidth = (machineCode & 0x80000000u) == 0 ? 32 : 64;
+        var halfwordIndex = (int)((machineCode >> 21) & 0x3u);
+        if (registerWidth == 32 && halfwordIndex > 1)
+        {
+            halfwordShift = 0;
+            clearMask = 0;
+            shiftedImmediate = 0;
+            return false;
+        }
+
+        halfwordShift = halfwordIndex * 16;
+        var registerMask = registerWidth == 32 ? uint.MaxValue : ulong.MaxValue;
+        var halfwordMask = 0xFFFFul << halfwordShift;
+        clearMask = registerMask & ~halfwordMask;
+        shiftedImmediate = (ulong)((machineCode >> 5) & 0xFFFFu) << halfwordShift;
+        return true;
+    }
+
     internal static bool IsBranchOutsideMethod(ulong target, ulong methodStart, int methodLength)
     {
         if (methodLength < 0)
@@ -363,6 +400,35 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertMoveSourceOperand(instruction));
                 Add(address, OpCode.CheckEqual, new Register(null, "Z"), ConvertOperand(instruction, 0), Imm(0));
                 break;
+            case Arm64Mnemonic.MOVK:
+                {
+                    // MOVK 保留目标寄存器其他半字；必须读原始编码的 hw 字段，不能从已移位的显示立即数反推。
+                    var binary = context.AppContext.Binary;
+                    var rawAddress = binary.MapVirtualAddressToRaw(address);
+                    var machineCodeBytes = binary.Reader.ReadByteArrayAtRawAddress(rawAddress, sizeof(uint));
+                    if (BitConverter.IsLittleEndian != binary.Reader.IsLittleEndian)
+                        Array.Reverse(machineCodeBytes);
+
+                    var machineCode = BitConverter.ToUInt32(machineCodeBytes, 0);
+                    if (!TryDecodeMoveKeepImmediate(
+                            machineCode,
+                            out _,
+                            out _,
+                            out var clearMask,
+                            out var shiftedImmediate))
+                    {
+                        throw new InvalidOperationException(
+                            $"MOVK原始编码无效：0x{machineCode:X8} @ 0x{address:X}");
+                    }
+
+                    if (instruction.Op0Kind == Arm64OperandKind.Register)
+                        adrpOffsets.Remove(instruction.Op0Reg);
+
+                    var destination = ConvertOperand(instruction, 0);
+                    Add(address, OpCode.And, destination, destination, Imm(clearMask));
+                    Add(address, OpCode.Or, destination, destination, Imm(shiftedImmediate));
+                    break;
+                }
             case Arm64Mnemonic.MOVN:
                 {
                     // dest = ~src
