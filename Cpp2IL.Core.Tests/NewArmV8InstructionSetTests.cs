@@ -195,6 +195,58 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void ReplicatedVectorMoveDecodesBleedFollowersNegativeSaturationValue()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate32(
+            0x0F0665E3u,
+            out var vectorWidthBits,
+            out var laneCount,
+            out var elementBits);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidthBits, Is.EqualTo(64));
+            Assert.That(laneCount, Is.EqualTo(2));
+            Assert.That(elementBits, Is.EqualTo(0xCF000000u));
+            Assert.That(BitConverter.Int32BitsToSingle(unchecked((int)elementBits)), Is.EqualTo(-2_147_483_648f));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ReplicatedVectorMoveDecodesFourLanesAndLargestShift()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate32(
+            0x4F0767E0u,
+            out var vectorWidthBits,
+            out var laneCount,
+            out var elementBits);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidthBits, Is.EqualTo(128));
+            Assert.That(laneCount, Is.EqualTo(4));
+            Assert.That(elementBits, Is.EqualTo(0xFF000000u));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ReplicatedVectorMoveRejectsShiftingOnesVariant()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate32(
+                0x0F06C5E3u,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void MoveKeepDecodesUiManagerOneDayThresholdHalfword()
     {
         var decoded = NewArmV8InstructionSet.TryDecodeMoveKeepImmediate(
@@ -347,6 +399,49 @@ public class NewArmV8InstructionSetTests
                 NewArmV8InstructionSet.TryGetSignedIntegerWidthBits(Arm64Register.S0, out _),
                 Is.False);
         }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void ScalarSimdRegistersExposeSignedIntegerPayloadWidthsForConversions()
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerPayloadWidthBits(Arm64Register.S1, out var singleBits),
+                Is.True);
+            Assert.That(singleBits, Is.EqualTo(32));
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerPayloadWidthBits(Arm64Register.D31, out var doubleBits),
+                Is.True);
+            Assert.That(doubleBits, Is.EqualTo(64));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void GeneralRegistersRemainValidSignedIntegerPayloads()
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerPayloadWidthBits(Arm64Register.W30, out var wordBits),
+                Is.True);
+            Assert.That(wordBits, Is.EqualTo(32));
+            Assert.That(
+                NewArmV8InstructionSet.TryGetSignedIntegerPayloadWidthBits(Arm64Register.X30, out var wideBits),
+                Is.True);
+            Assert.That(wideBits, Is.EqualTo(64));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void FullVectorRegisterIsRejectedAsSignedIntegerPayload()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryGetSignedIntegerPayloadWidthBits(Arm64Register.V0, out _),
+            Is.False);
     }
 
     [Test]

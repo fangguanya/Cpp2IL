@@ -181,6 +181,7 @@ public static class MetadataInitGuardRemover
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.Not or OpCode.Negate
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
                 or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned)
                 => instruction.Operands is [LocalVariable, ..],

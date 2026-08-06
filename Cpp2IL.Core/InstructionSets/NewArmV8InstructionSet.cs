@@ -177,6 +177,55 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return false;
     }
 
+    internal static bool TryGetSignedIntegerPayloadWidthBits(Arm64Register register, out int bits)
+    {
+        if (TryGetSignedIntegerWidthBits(register, out bits))
+            return true;
+
+        // FCVTZS/SCVTF 的标量 SIMD 编码会把有符号整数载荷保存在 S/D 物理寄存器中。
+        // 这里只恢复转换指令的载荷宽度，避免把所有浮点寄存器全局误判为整数寄存器。
+        if (register is >= Arm64Register.S0 and <= Arm64Register.S31)
+        {
+            bits = 32;
+            return true;
+        }
+
+        if (register is >= Arm64Register.D0 and <= Arm64Register.D31)
+        {
+            bits = 64;
+            return true;
+        }
+
+        bits = 0;
+        return false;
+    }
+
+    internal static bool TryDecodeReplicatedVectorMoveImmediate32(
+        uint machineCode,
+        out int vectorWidthBits,
+        out int laneCount,
+        out uint elementBits)
+    {
+        // Advanced SIMD MOVI 的 32 位移位立即数变体：
+        // Q 决定 64/128 位向量，cmode[2:1] 决定 0/8/16/24 位左移，imm8 被复制到每个 S 通道。
+        const uint encodingMask = 0xBFF89C00u;
+        const uint encodingValue = 0x0F000400u;
+        if ((machineCode & encodingMask) != encodingValue)
+        {
+            vectorWidthBits = 0;
+            laneCount = 0;
+            elementBits = 0;
+            return false;
+        }
+
+        vectorWidthBits = (machineCode & (1u << 30)) == 0 ? 64 : 128;
+        laneCount = vectorWidthBits / 32;
+        var immediate = (((machineCode >> 16) & 0x7u) << 5) | ((machineCode >> 5) & 0x1Fu);
+        var shift = (int)((machineCode >> 13) & 0x3u) * 8;
+        elementBits = immediate << shift;
+        return true;
+    }
+
     internal static bool TryDecodeVectorFloatingMultiply(
         uint machineCode,
         out int vectorWidthBits,
@@ -891,7 +940,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
             case Arm64Mnemonic.MOVI:
                 {
-                    // 当前ISIL以托管值表达向量清零；其他向量立即数需保留元素复制语义后再接入。
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeReplicatedVectorMoveImmediate32(
+                            machineCode,
+                            out _,
+                            out _,
+                            out var elementBits))
+                    {
+                        // 同一位型被复制到全部 S 通道；FloatLiteral 保留后续标量读取的精确 IEEE-754 语义。
+                        var elementValue = BitConverter.ToSingle(BitConverter.GetBytes(elementBits), 0);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), new FloatLiteral(elementValue));
+                        break;
+                    }
+
+                    // 其他已确认的零立即数仍可由托管零精确表达。
                     if (!IsExactlyRepresentableMovi(instruction.Op1Kind, instruction.Op1Imm))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction MOVI immediate {instruction.Op1Imm} not yet implemented."));
@@ -1145,7 +1207,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.FCVTZS:
                 {
-                    if (!TryGetSignedIntegerWidthBits(instruction.Op0Reg, out var destinationBits) ||
+                    if (!TryGetSignedIntegerPayloadWidthBits(instruction.Op0Reg, out var destinationBits) ||
                         !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FCVTZS register widths not yet implemented."));
@@ -1165,7 +1227,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.SCVTF:
                 {
                     if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
-                        !TryGetSignedIntegerWidthBits(instruction.Op1Reg, out var sourceBits))
+                        !TryGetSignedIntegerPayloadWidthBits(instruction.Op1Reg, out var sourceBits))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral("Instruction SCVTF register widths not yet implemented."));
                         break;

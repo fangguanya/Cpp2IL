@@ -521,6 +521,7 @@ public static class LocalVariables
                     break;
                 case OpCode.ConvertFloatingPointPrecision:
                 case OpCode.ConvertFloatToSignedInteger:
+                case OpCode.ConvertSignedIntegerToFloat:
                 case OpCode.RoundFloatTowardPositiveInfinity:
                 case OpCode.RoundFloatTowardNegativeInfinity:
                     changed |= PropagateNumericConversion(instruction, method);
@@ -559,12 +560,19 @@ public static class LocalVariables
         var sourceWidth = instruction.Operands.Count >= 4 && instruction.Operands[3] is Immediate explicitSourceWidth
             ? explicitSourceWidth.Value
             : destinationWidth.Value;
-        var sourceType = sourceWidth switch
-        {
-            32 => systemTypes.SystemSingleType,
-            64 => systemTypes.SystemDoubleType,
-            _ => null,
-        };
+        var sourceType = instruction.OpCode == OpCode.ConvertSignedIntegerToFloat
+            ? sourceWidth switch
+            {
+                32 => systemTypes.SystemInt32Type,
+                64 => systemTypes.SystemInt64Type,
+                _ => null,
+            }
+            : sourceWidth switch
+            {
+                32 => systemTypes.SystemSingleType,
+                64 => systemTypes.SystemDoubleType,
+                _ => null,
+            };
 
         var changed = SetTypeIfUnknown(destination, destinationType);
         changed |= SetTypeIfUnknown(source, sourceType);
