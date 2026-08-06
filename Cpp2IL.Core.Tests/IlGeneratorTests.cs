@@ -85,4 +85,108 @@ public class IlGeneratorTests
         Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(2),
             "expected exactly two Ldloc instructions for the two parameters of the target method");
     }
+
+    [Test]
+    public void 非This局部变量的构造调用生成Newobj并写回()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var constructedObject = new LocalVariable("constructedObject", new Register(null, "constructedObject"), systemObject);
+        var constructorContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            ".ctor",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.SpecialName |
+            ReflectionMethodAttributes.RTSpecialName,
+            []);
+        var callerContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "Caller",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        callerContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, constructorContext, constructedObject),
+            new Instruction(1, OpCode.Return),
+        ]);
+        callerContext.Locals = [constructedObject];
+        callerContext.ParameterLocals = [];
+        callerContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var typeDef = new TypeDefinition("Cpp2IL.Core.Tests", "ConstructedType", TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDef);
+        systemObject.PutExtraData("AsmResolverType", typeDef);
+        var constructorDefinition = new MethodDefinition(
+            ".ctor",
+            MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        typeDef.Methods.Add(constructorDefinition);
+        constructorContext.PutExtraData("AsmResolverMethod", constructorDefinition);
+        var callerDefinition = new MethodDefinition(
+            "Caller",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDef.Methods.Add(callerDefinition);
+
+        IlGenerator.GenerateIl(callerContext, callerDefinition);
+
+        var il = callerDefinition.CilMethodBody!.Instructions;
+        Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+        Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+        Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Call), Is.False);
+    }
+
+    [Test]
+    public void This上的构造调用保持普通Call()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var thisObject = new LocalVariable("this", new Register(null, "this"), systemObject) { IsThis = true };
+        var constructorContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            ".ctor",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.SpecialName |
+            ReflectionMethodAttributes.RTSpecialName,
+            []);
+        var callerContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "Caller",
+            systemVoid,
+            ReflectionMethodAttributes.Public,
+            []);
+        callerContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, constructorContext, thisObject),
+            new Instruction(1, OpCode.Return),
+        ]);
+        callerContext.Locals = [];
+        callerContext.ParameterLocals = [thisObject];
+        callerContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var typeDef = new TypeDefinition("Cpp2IL.Core.Tests", "ConstructedType", TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDef);
+        systemObject.PutExtraData("AsmResolverType", typeDef);
+        var constructorDefinition = new MethodDefinition(
+            ".ctor",
+            MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        typeDef.Methods.Add(constructorDefinition);
+        constructorContext.PutExtraData("AsmResolverMethod", constructorDefinition);
+        var callerDefinition = new MethodDefinition(
+            "Caller",
+            MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        typeDef.Methods.Add(callerDefinition);
+
+        IlGenerator.GenerateIl(callerContext, callerDefinition);
+
+        var il = callerDefinition.CilMethodBody!.Instructions;
+        Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Call), Is.EqualTo(1));
+        Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.False);
+        Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.False);
+    }
 }

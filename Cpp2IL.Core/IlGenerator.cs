@@ -360,6 +360,20 @@ public static class IlGenerator
 
                 var importedMethod = importer.ImportMethod(targetMethod.ToMethodDescriptor(module));
 
+                // IL2CPP 会把对象分配与构造器调用拆成两个原生调用。若分析阶段只恢复了后一个调用，
+                // 则对非 this 局部变量直接调用 .ctor 会生成不可由 C# 表达的伪成员；这里恢复成 newobj
+                // 并把新实例写回原局部变量。this 上的基类构造调用仍沿用普通 call。
+                if (instruction.OpCode == OpCode.CallVoid
+                    && targetMethod.Name == ".ctor"
+                    && instruction.Operands.Count > 1
+                    && instruction.Operands[1] is LocalVariable { IsThis: false } constructedObject)
+                {
+                    LoadCallParameters(instruction.Operands, 2, targetMethod, method, locals, writeLine, stringCtor);
+                    instructions.Add(CilOpCodes.Newobj, importedMethod);
+                    StoreToOperand(constructedObject, method, locals, writeLine);
+                    break;
+                }
+
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
 
                 if (!targetMethod.IsStatic) // Load 'this' param
@@ -379,16 +393,7 @@ public static class IlGenerator
                 // A call whose target was only identified after lifting still carries the operands the
                 // unknown-callee convention gave it, which may be fewer than the method actually takes.
                 // The stack still has to match the signature, so anything missing gets a placeholder.
-                var availableArgs = instruction.Operands.Count - callParamIndex;
-                for (var i = 0; i < targetMethod.Parameters.Count; i++)
-                {
-                    var parameterType = targetMethod.Parameters[i].ParameterType;
-
-                    if (i < availableArgs)
-                        LoadOperand(instruction.Operands[callParamIndex + i], method, locals, writeLine, stringCtor, parameterType);
-                    else
-                        PushDefaultOf(parameterType, instructions);
-                }
+                LoadCallParameters(instruction.Operands, callParamIndex, targetMethod, method, locals, writeLine, stringCtor);
 
                 instructions.Add(CilOpCodes.Call, importedMethod);
 
@@ -779,6 +784,21 @@ public static class IlGenerator
         operand is LocalVariable { Type: { } type } && type == context.AppContext.SystemTypes.SystemBooleanType;
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
+
+    private static void LoadCallParameters(IReadOnlyList<IOperand> operands, int firstParameterIndex,
+        MethodAnalysisContext targetMethod, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, MemberReference writeLine, MemberReference stringCtor)
+    {
+        var availableArgs = operands.Count - firstParameterIndex;
+        for (var i = 0; i < targetMethod.Parameters.Count; i++)
+        {
+            var parameterType = targetMethod.Parameters[i].ParameterType;
+            if (i < availableArgs)
+                LoadOperand(operands[firstParameterIndex + i], method, locals, writeLine, stringCtor, parameterType);
+            else
+                PushDefaultOf(parameterType, method.CilMethodBody!.Instructions);
+        }
+    }
     
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
         destination switch
