@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
@@ -235,6 +236,7 @@ public static class LocalVariables
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
         SeedComparisonResults(method);
+        SeedBooleanBitTestTypes(method);
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
         MetadataResolver.ResolveConstructorCalls(method);
@@ -332,6 +334,37 @@ public static class LocalVariables
             if (instruction.Destination is LocalVariable destination)
                 destination.Type = booleanType;
         }
+    }
+
+    /// <summary>
+    /// ARM64的<c>AND Wd, Wn, #1</c>位测试会被翻译为名为
+    /// <c>TEST_BIT_VALUE</c>的ISIL临时量。该指令在SSA中是布尔值的权威定义；
+    /// 如果同一物理返回寄存器随后又承载<see cref="Nullable{T}"/>，普通单调传播会把
+    /// 当前版本误标成可空结构，最终生成对结构执行按位与的非法IL。
+    /// </summary>
+    private static void SeedBooleanBitTestTypes(MethodAnalysisContext method)
+    {
+        var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            BindBooleanBitTestOperands(instruction, booleanType);
+    }
+
+    internal static bool BindBooleanBitTestOperands(
+        Instruction instruction,
+        TypeAnalysisContext booleanType)
+    {
+        if (instruction.OpCode != OpCode.And
+            || instruction.Operands.Count != 3
+            || instruction.Operands[0] is not LocalVariable destination
+            || !destination.Register.Name.StartsWith("TEST_BIT_VALUE", StringComparison.Ordinal)
+            || instruction.Operands[1] is not LocalVariable source
+            || instruction.Operands[2] is not Immediate { Value: 1 })
+            return false;
+
+        var changed = destination.Type != booleanType || source.Type != booleanType;
+        destination.Type = booleanType;
+        source.Type = booleanType;
+        return changed;
     }
     
     //Handles typing of locals for ref/out params
