@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Extensions;
@@ -219,11 +220,35 @@ public static class MetadataResolver
             if (targetMethods is not [{ } singleTargetMethod])
                 continue;
 
-            callInstruction.SetOperand(0, singleTargetMethod);
-            CallingConventionResolver.RemapRawArguments(callInstruction, singleTargetMethod);
+            BindCallTarget(callInstruction, singleTargetMethod);
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
+    }
+
+    /// <summary>
+    /// 把已解析的方法身份绑定到调用，并同步修正返回槽形状。
+    /// 原生提升阶段在目标未知时会按有返回值的Call保留X0；若目标随后解析为void，
+    /// 该X0只是伪返回槽，必须删除并改成CallVoid，否则IL生成会在call void后写入局部变量。
+    /// </summary>
+    internal static void BindCallTarget(Instruction call, MethodAnalysisContext target)
+    {
+        if (!call.IsCall)
+            throw new InvalidOperationException($"目标只能绑定到调用指令：{call.OpCode}");
+
+        call.SetOperand(0, target);
+
+        // 原始寄存器布局仍以Call的返回槽为基准，必须先完成参数重排，再删除伪返回槽。
+        CallingConventionResolver.RemapRawArguments(call, target);
+        if (call.OpCode != OpCode.Call || !target.IsVoid)
+            return;
+
+        var operands = call.Operands.ToList();
+        if (operands.Count > 1)
+            operands.RemoveAt(1);
+
+        call.OpCode = OpCode.CallVoid;
+        call.SetOperands(operands);
     }
 
     /// <summary>
@@ -257,8 +282,7 @@ public static class MetadataResolver
             if (AreInterchangeable(candidates))
             {
                 var preferred = PreferredOf(candidates);
-                instruction.SetOperand(0, preferred);
-                CallingConventionResolver.RemapRawArguments(instruction, preferred);
+                BindCallTarget(instruction, preferred);
                 changed = true;
                 continue;
             }
@@ -288,8 +312,7 @@ public static class MetadataResolver
             if (match == null)
                 continue;
 
-            instruction.SetOperand(0, match);
-            CallingConventionResolver.RemapRawArguments(instruction, match);
+            BindCallTarget(instruction, match);
             changed = true;
         }
 
@@ -357,8 +380,7 @@ public static class MetadataResolver
             if (constructor == null)
                 continue;
 
-            instruction.SetOperand(0, constructor);
-            CallingConventionResolver.RemapRawArguments(instruction, constructor);
+            BindCallTarget(instruction, constructor);
             changed = true;
         }
 
@@ -421,8 +443,7 @@ public static class MetadataResolver
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
                     continue;
 
-                instruction.SetOperand(0, representedMethod);
-                CallingConventionResolver.RemapRawArguments(instruction, representedMethod);
+                BindCallTarget(instruction, representedMethod);
                 changed = true;
                 continue;
             }
@@ -435,8 +456,7 @@ public static class MetadataResolver
             if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase)))
                 continue;
 
-            instruction.SetOperand(0, representedMethod);
-            CallingConventionResolver.RemapRawArguments(instruction, representedMethod);
+            BindCallTarget(instruction, representedMethod);
             changed = true;
         }
 
@@ -485,9 +505,8 @@ public static class MetadataResolver
 
             var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
 
-            instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
-            instruction.SetOperand(0, resolved);
-            CallingConventionResolver.RemapRawArguments(instruction, resolved);
+            instruction.OpCode = OpCode.Call; // 与IndirectCall共享返回槽和参数布局，再由统一绑定入口校正void形状。
+            BindCallTarget(instruction, resolved);
 
             // the MethodInfo field is also the same method, name it, for cleanliness and so it can
             // serve as a hidden final parameter if needed
