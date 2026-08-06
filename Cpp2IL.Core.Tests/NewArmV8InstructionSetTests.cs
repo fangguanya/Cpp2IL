@@ -277,6 +277,39 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void FloatingComparisonAllowsExactPositiveOrZeroBranch()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.PL,
+                Arm64FlagState.FloatingComparison),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void IntegerComparisonDoesNotPretendPositiveOrZeroIsGreaterOrEqual()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.PL,
+                Arm64FlagState.Comparison),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void MissingFlagProducerRejectsPositiveOrZeroBranch()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.PL,
+                Arm64FlagState.None),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void BlrMapsToIndirectCall()
     {
         Assert.That(

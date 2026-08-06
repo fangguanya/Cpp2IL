@@ -15,7 +15,8 @@ internal enum Arm64FlagState
 {
     None,
     ZeroOnly,
-    Comparison
+    Comparison,
+    FloatingComparison
 }
 
 public class NewArmV8InstructionSet : Cpp2IlInstructionSet
@@ -106,7 +107,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         Arm64ConditionCode conditionCode,
         Arm64FlagState flagState)
     {
-        return flagState == Arm64FlagState.Comparison
+        return flagState is Arm64FlagState.Comparison or Arm64FlagState.FloatingComparison
             ? GetRelationalBranchOpCode(conditionCode)
             : null;
     }
@@ -121,7 +122,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if (ShouldInvertZeroFlag(conditionCode) is not null)
             return true;
 
-        return flagState == Arm64FlagState.Comparison &&
+        // FCMP 的 PL 精确表示 N == 0；在 ISIL 中等价于“不是小于”，并保留 NaN 时成立的 ARM64 语义。
+        if (flagState == Arm64FlagState.FloatingComparison &&
+            conditionCode == Arm64ConditionCode.PL)
+            return true;
+
+        return (flagState is Arm64FlagState.Comparison or Arm64FlagState.FloatingComparison) &&
                GetRelationalBranchOpCode(conditionCode) is not null;
     }
 
@@ -206,6 +212,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         ref Arm64FlagState flagState)
     {
         var address = instruction.Address;
+        var inputFlagState = flagState;
 
         Instruction Add(ulong address, OpCode opCode, params List<IOperand> operands)
         {
@@ -249,6 +256,61 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 target,
                 new Register(null, nameof(Arm64Register.X0)));
             transfer.AddOperands(Arm64CallingConventionResolver.ResolveForUnmanaged());
+        }
+
+        bool TryEmitCondition(
+            Arm64ConditionCode conditionCode,
+            string registerPrefix,
+            out IOperand condition)
+        {
+            var invertZeroFlag = ShouldInvertZeroFlag(conditionCode);
+            if (invertZeroFlag is not null)
+            {
+                condition = new Register(null, "Z");
+                if (invertZeroFlag.Value)
+                {
+                    var inverted = new Register(null, registerPrefix + "_NOT_ZERO");
+                    Add(address, OpCode.Not, inverted, condition);
+                    condition = inverted;
+                }
+
+                return inputFlagState != Arm64FlagState.None;
+            }
+
+            if (inputFlagState == Arm64FlagState.FloatingComparison &&
+                conditionCode == Arm64ConditionCode.PL)
+            {
+                var less = new Register(null, registerPrefix + "_LESS");
+                var notLess = new Register(null, registerPrefix + "_NOT_LESS");
+                Add(
+                    address,
+                    OpCode.CheckLess,
+                    less,
+                    new Register(null, "FLAG_COMPARE_LEFT"),
+                    new Register(null, "FLAG_COMPARE_RIGHT"));
+                Add(address, OpCode.Not, notLess, less);
+                condition = notLess;
+                return true;
+            }
+
+            var relationalOpCode = GetConditionalSetRelationalOpCode(
+                conditionCode,
+                inputFlagState);
+            if (relationalOpCode is not null)
+            {
+                var relational = new Register(null, registerPrefix + "_RELATIONAL");
+                Add(
+                    address,
+                    relationalOpCode.Value,
+                    relational,
+                    new Register(null, "FLAG_COMPARE_LEFT"),
+                    new Register(null, "FLAG_COMPARE_RIGHT"));
+                condition = relational;
+                return true;
+            }
+
+            condition = null!;
+            return false;
         }
 
         switch (instruction.Mnemonic)
@@ -417,36 +479,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
-                    if (!CanEmitConditionalBranch(branchConditionCode, flagState))
+                    if (!CanEmitConditionalBranch(branchConditionCode, inputFlagState))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"Conditional branch {branchConditionCode} has no exactly modeled flag producer."));
                         break;
                     }
 
-                    IOperand branchCondition;
-                    var invertZeroFlag = ShouldInvertZeroFlag(branchConditionCode);
-                    if (invertZeroFlag is not null)
-                    {
-                        branchCondition = new Register(null, "Z");
-                        if (invertZeroFlag.Value)
-                        {
-                            var invertedCondition = new Register(null, "BRANCH_CONDITION");
-                            Add(address, OpCode.Not, invertedCondition, branchCondition);
-                            branchCondition = invertedCondition;
-                        }
-                    }
-                    else
-                    {
-                        var comparisonOpCode = GetRelationalBranchOpCode(branchConditionCode)!.Value;
-                        var comparisonResult = new Register(null, "BRANCH_CONDITION");
-                        Add(
-                            address,
-                            comparisonOpCode,
-                            comparisonResult,
-                            new Register(null, "FLAG_COMPARE_LEFT"),
-                            new Register(null, "FLAG_COMPARE_RIGHT"));
-                        branchCondition = comparisonResult;
-                    }
+                    if (!TryEmitCondition(
+                            branchConditionCode,
+                            "BRANCH_CONDITION",
+                            out var branchCondition))
+                        throw new InvalidOperationException("条件分支的可发射判定与条件构造结果不一致。");
 
                     Add(address, OpCode.ConditionalJump, Imm(target), branchCondition);
                     break;
@@ -495,8 +538,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Move, compareLeft, ConvertOperand(instruction, 0));
                 Add(address, OpCode.Move, compareRight, ConvertOperand(instruction, 1));
                 Add(address, OpCode.CheckEqual, new Register(null, "Z"), compareLeft, compareRight);
-                flagState = Arm64FlagState.Comparison;
+                flagState = instruction.Mnemonic == Arm64Mnemonic.FCMP
+                    ? Arm64FlagState.FloatingComparison
+                    : Arm64FlagState.Comparison;
                 break;
+
+            case Arm64Mnemonic.CCMP:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CCMP_CONDITION",
+                            out var ccmpCondition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CCMP condition {instruction.FinalOpConditionCode} has no exactly modeled flag producer."));
+                        break;
+                    }
+
+                    // CCMP 条件成立时更新比较标志；否则使用 NZCV 立即数。当前 ISIL 精确保留后继 EQ/NE 所需的 Z 位。
+                    var comparedZero = new Register(null, "CCMP_COMPARED_ZERO");
+                    Add(
+                        address,
+                        OpCode.CheckEqual,
+                        comparedZero,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Move, new Register(null, "Z"), comparedZero);
+                    Add(address, OpCode.ConditionalJump, Imm(address + 4), ccmpCondition);
+                    Add(
+                        address,
+                        OpCode.Move,
+                        new Register(null, "Z"),
+                        Imm((instruction.Op2Imm >> 2) & 1));
+                    flagState = Arm64FlagState.ZeroOnly;
+                    break;
+                }
 
             case Arm64Mnemonic.CSET:
                 {
@@ -532,8 +607,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.CSEL:
                 {
-                    var invertZeroFlag = ShouldInvertZeroFlag(instruction.FinalOpConditionCode);
-                    if (invertZeroFlag is null)
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CSEL_CONDITION",
+                            out var condition))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSEL condition {instruction.FinalOpConditionCode} not yet implemented."));
                         break;
@@ -542,18 +619,60 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var destination = ConvertOperand(instruction, 0);
                     var trueValue = ConvertOperand(instruction, 1);
                     var falseValue = ConvertOperand(instruction, 2);
-                    IOperand condition = new Register(null, "Z");
-                    if (invertZeroFlag.Value)
+                    var preservedTrue = new Register(null, "CSEL_TRUE");
+                    var preservedFalse = new Register(null, "CSEL_FALSE");
+                    Add(address, OpCode.Move, preservedTrue, trueValue);
+                    Add(address, OpCode.Move, preservedFalse, falseValue);
+                    // 先保存两个源值，避免目标寄存器与任一源寄存器重叠时破坏假分支。
+                    Add(address, OpCode.Move, destination, preservedTrue);
+                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
+                    Add(address, OpCode.Move, destination, preservedFalse);
+                    break;
+                }
+
+            case Arm64Mnemonic.CSINC:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CSINC_CONDITION",
+                            out var condition))
                     {
-                        var invertedCondition = new Register(null, "TEMP_CONDITION");
-                        Add(address, OpCode.Not, invertedCondition, condition);
-                        condition = invertedCondition;
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSINC condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
                     }
 
-                    // 条件成立时保留第一个源值并跳过假值写入；目标是下一条 ARM64 指令的首个 ISIL。
-                    Add(address, OpCode.Move, destination, trueValue);
+                    var destination = ConvertOperand(instruction, 0);
+                    var preservedTrue = new Register(null, "CSINC_TRUE");
+                    var preservedFalse = new Register(null, "CSINC_FALSE");
+                    var incrementedFalse = new Register(null, "CSINC_FALSE_INCREMENTED");
+                    Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Add, incrementedFalse, preservedFalse, Imm(1));
+                    Add(address, OpCode.Move, destination, preservedTrue);
                     Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
-                    Add(address, OpCode.Move, destination, falseValue);
+                    Add(address, OpCode.Move, destination, incrementedFalse);
+                    break;
+                }
+
+            case Arm64Mnemonic.CINC:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CINC_CONDITION",
+                            out var condition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CINC condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var preservedSource = new Register(null, "CINC_SOURCE");
+                    var incrementedSource = new Register(null, "CINC_INCREMENTED");
+                    Add(address, OpCode.Move, preservedSource, ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Add, incrementedSource, preservedSource, Imm(1));
+                    Add(address, OpCode.Move, destination, incrementedSource);
+                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
+                    Add(address, OpCode.Move, destination, preservedSource);
                     break;
                 }
 
