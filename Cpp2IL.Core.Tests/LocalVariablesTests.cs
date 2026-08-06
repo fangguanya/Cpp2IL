@@ -16,6 +16,90 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void ARM64标准序言恢复栈帧基址的原生指针类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stackPointer = new LocalVariable(
+            "stackPointer",
+            new Register(null, "X31", -1),
+            appContext.SystemTypes.SystemObjectType);
+        var frameBase = new LocalVariable(
+            "frameBase",
+            new Register(null, "X31", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var instruction = new Instruction(
+            0,
+            OpCode.Subtract,
+            frameBase,
+            stackPointer,
+            new Immediate(0x60));
+
+        var changed = LocalVariables.BindStackFrameBaseTypes(
+            instruction,
+            appContext.SystemTypes.SystemIntPtrType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(stackPointer.Type, Is.SameAs(appContext.SystemTypes.SystemIntPtrType));
+            Assert.That(frameBase.Type, Is.SameAs(appContext.SystemTypes.SystemIntPtrType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零帧长不得冒充ARM64栈帧序言()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stackPointer = new LocalVariable("stackPointer", new Register(null, "X31", -1));
+        var frameBase = new LocalVariable("frameBase", new Register(null, "X31", 1));
+        var instruction = new Instruction(
+            0,
+            OpCode.Subtract,
+            frameBase,
+            stackPointer,
+            new Immediate(0));
+
+        var changed = LocalVariables.BindStackFrameBaseTypes(
+            instruction,
+            appContext.SystemTypes.SystemIntPtrType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(stackPointer.Type, Is.Null);
+            Assert.That(frameBase.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通寄存器减法不得改变为栈帧指针()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable("source", new Register(null, "X0", 1));
+        var destination = new LocalVariable("destination", new Register(null, "X0", 2));
+        var instruction = new Instruction(
+            0,
+            OpCode.Subtract,
+            destination,
+            source,
+            new Immediate(0x60));
+
+        var changed = LocalVariables.BindStackFrameBaseTypes(
+            instruction,
+            appContext.SystemTypes.SystemIntPtrType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(source.Type, Is.Null);
+            Assert.That(destination.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 一位掩码恢复位测试两端的布尔类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

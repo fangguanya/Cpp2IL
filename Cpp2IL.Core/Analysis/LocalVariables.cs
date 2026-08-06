@@ -232,6 +232,7 @@ public static class LocalVariables
         // loads. Applied once up front and, being applied first, they win over anything inferred later.
         PropagateFromReturn(method);
         PropagateFromParameters(method);
+        SeedStackFrameBaseTypes(method);
         SeedRuntimeClassTypes(method);
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
@@ -265,6 +266,37 @@ public static class LocalVariables
             changed |= PropagateStaticFieldStorage(method);
             changed |= PropagateTypesOnce(method);
         }
+    }
+
+    /// <summary>
+    /// ARM64标准函数序言通过<c>SUB X31, X31, #frameSize</c>建立当前栈帧基址。
+    /// 该定义是原生指针的权威来源；若不先固定类型，后续栈槽读写可能把同一SSA局部量
+    /// 误传播成某个托管值类型，最终把<c>SP + offset</c>生成为非法托管算术。
+    /// </summary>
+    private static void SeedStackFrameBaseTypes(MethodAnalysisContext method)
+    {
+        var nativePointerType = method.AppContext.SystemTypes.SystemIntPtrType;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            BindStackFrameBaseTypes(instruction, nativePointerType);
+    }
+
+    internal static bool BindStackFrameBaseTypes(
+        Instruction instruction,
+        TypeAnalysisContext nativePointerType)
+    {
+        if (instruction.OpCode != OpCode.Subtract
+            || instruction.Operands.Count != 3
+            || instruction.Operands[0] is not LocalVariable destination
+            || instruction.Operands[1] is not LocalVariable source
+            || instruction.Operands[2] is not Immediate { Value: > 0 }
+            || destination.Register.Name != "X31"
+            || source.Register.Name != "X31")
+            return false;
+
+        var changed = destination.Type != nativePointerType || source.Type != nativePointerType;
+        destination.Type = nativePointerType;
+        source.Type = nativePointerType;
+        return changed;
     }
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
