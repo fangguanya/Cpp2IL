@@ -67,6 +67,27 @@ public class NewArmV8InstructionSetTests
             Is.EqualTo(expectedInversion));
     }
 
+    [TestCase(Arm64ConditionCode.MI, false, TestName = "MI直接读取整数减法的负标志")]
+    [TestCase(Arm64ConditionCode.PL, true, TestName = "PL反转整数减法的负标志")]
+    [Category("基本功能")]
+    public void SignConditionsMapToNegativeFlagPolarity(
+        Arm64ConditionCode conditionCode,
+        bool expectedInversion)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.ShouldInvertSignFlag(conditionCode),
+            Is.EqualTo(expectedInversion));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void OverflowConditionIsRejectedBySignFlagMapping()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.ShouldInvertSignFlag(Arm64ConditionCode.VS),
+            Is.Null);
+    }
+
     [Test]
     [Category("边界值")]
     public void AlwaysConditionIsNotMisclassifiedAsEqualityCondition()
@@ -496,13 +517,35 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void IntegerComparisonAllowsExactNegativeBranch()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.MI,
+                Arm64FlagState.Comparison),
+            Is.True);
+    }
+
+    [Test]
     [Category("边界值")]
-    public void IntegerComparisonDoesNotPretendPositiveOrZeroIsGreaterOrEqual()
+    public void IntegerComparisonAllowsExactPositiveOrZeroBranch()
     {
         Assert.That(
             NewArmV8InstructionSet.CanEmitConditionalBranch(
                 Arm64ConditionCode.PL,
                 Arm64FlagState.Comparison),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ZeroOnlyProducerDoesNotExposeNegativeFlag()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.MI,
+                Arm64FlagState.ZeroOnly),
             Is.False);
     }
 
@@ -513,6 +556,17 @@ public class NewArmV8InstructionSetTests
         Assert.That(
             NewArmV8InstructionSet.CanEmitConditionalBranch(
                 Arm64ConditionCode.PL,
+                Arm64FlagState.None),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void MissingFlagProducerRejectsNegativeBranch()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitConditionalBranch(
+                Arm64ConditionCode.MI,
                 Arm64FlagState.None),
             Is.False);
     }

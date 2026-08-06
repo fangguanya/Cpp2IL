@@ -176,6 +176,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         };
     }
 
+    internal static bool? ShouldInvertSignFlag(Arm64ConditionCode conditionCode)
+    {
+        return conditionCode switch
+        {
+            Arm64ConditionCode.MI => false,
+            Arm64ConditionCode.PL => true,
+            _ => null
+        };
+    }
+
     internal static bool IsScalarLoadMnemonic(Arm64Mnemonic mnemonic)
     {
         return mnemonic is Arm64Mnemonic.LDR
@@ -250,6 +260,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return false;
 
         if (ShouldInvertZeroFlag(conditionCode) is not null)
+            return true;
+
+        // 整数 CMP/SUBS 已显式物化减法结果的 N 标志，因此 MI/PL 可以无损读取或反转该标志。
+        if (flagState == Arm64FlagState.Comparison &&
+            ShouldInvertSignFlag(conditionCode) is not null)
             return true;
 
         // FCMP 的 PL 精确表示 N == 0；在 ISIL 中等价于“不是小于”，并保留 NaN 时成立的 ARM64 语义。
@@ -413,6 +428,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
                 return inputFlagState != Arm64FlagState.None;
+            }
+
+            var invertSignFlag = ShouldInvertSignFlag(conditionCode);
+            if (inputFlagState == Arm64FlagState.Comparison &&
+                invertSignFlag is not null)
+            {
+                condition = new Register(null, "N");
+                if (invertSignFlag.Value)
+                {
+                    var inverted = new Register(null, registerPrefix + "_NOT_NEGATIVE");
+                    Add(address, OpCode.Not, inverted, condition);
+                    condition = inverted;
+                }
+
+                return true;
             }
 
             if (inputFlagState == Arm64FlagState.FloatingComparison &&
@@ -719,6 +749,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Move, compareLeft, ConvertOperand(instruction, 0));
                 Add(address, OpCode.Move, compareRight, ConvertOperand(instruction, 1));
                 Add(address, OpCode.CheckEqual, new Register(null, "Z"), compareLeft, compareRight);
+                if (instruction.Mnemonic == Arm64Mnemonic.CMP)
+                {
+                    // CMP 是丢弃结果的 SUBS；保留固定宽度减法结果可精确重建 N 标志，不能把 MI 简化为 LT。
+                    var comparisonDifference = new Register(null, "FLAG_COMPARE_DIFFERENCE");
+                    Add(address, OpCode.Subtract, comparisonDifference, compareLeft, compareRight);
+                    Add(address, OpCode.CheckLess, new Register(null, "N"), comparisonDifference, Imm(0));
+                }
                 flagState = instruction.Mnemonic == Arm64Mnemonic.FCMP
                     ? Arm64FlagState.FloatingComparison
                     : Arm64FlagState.Comparison;
@@ -1009,6 +1046,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         Add(address, OpCode.Move, subsCompareLeft, src1);
                         Add(address, OpCode.Move, subsCompareRight, src2);
                         Add(address, opCode, dest, subsCompareLeft, subsCompareRight);
+                        Add(address, OpCode.CheckLess, new Register(null, "N"), dest, Imm(0));
                         flagState = Arm64FlagState.Comparison;
                     }
                     else
