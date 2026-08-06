@@ -8,6 +8,130 @@ namespace Cpp2IL.Core.Tests;
 
 public class NewArmV8InstructionSetTests
 {
+    [TestCase(Arm64Mnemonic.SUB, 0x100L, -0x100, TestName = "基本_建立256字节ARM64栈帧")]
+    [TestCase(Arm64Mnemonic.ADD, 0x100L, 0x100, TestName = "基本_释放256字节ARM64栈帧")]
+    [Category("基本功能")]
+    public void StackPointerImmediateArithmeticBecomesStackShift(
+        Arm64Mnemonic mnemonic,
+        long amount,
+        int expectedDelta)
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeStackPointerAdjustment(
+            mnemonic,
+            Arm64OperandKind.Register,
+            Arm64Register.X31,
+            Arm64OperandKind.Register,
+            Arm64Register.X31,
+            Arm64OperandKind.Immediate,
+            amount,
+            out var stackDelta);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(stackDelta, Is.EqualTo(expectedDelta));
+        }
+    }
+
+    [TestCase(0L, TestName = "边界_栈顶零偏移")]
+    [TestCase(-0x100L, TestName = "边界_栈顶负256偏移")]
+    [TestCase(0x100L, TestName = "边界_栈顶正256偏移")]
+    [Category("边界值")]
+    public void DirectStackMemoryBecomesStableStackSlot(long byteOffset)
+    {
+        var decoded = NewArmV8InstructionSet.TryCreateStackOffset(
+            Arm64Register.X31,
+            Arm64Register.INVALID,
+            byteOffset,
+            out var stackOffset);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(stackOffset.Offset, Is.EqualTo(byteOffset));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void IndexedStackMemoryIsNotCollapsedIntoSingleSlot()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateStackOffset(
+                Arm64Register.X31,
+                Arm64Register.X8,
+                0x20,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void OrdinaryRegisterArithmeticIsNotClassifiedAsStackShift()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeStackPointerAdjustment(
+                Arm64Mnemonic.SUB,
+                Arm64OperandKind.Register,
+                Arm64Register.X8,
+                Arm64OperandKind.Register,
+                Arm64Register.X8,
+                Arm64OperandKind.Immediate,
+                0x100,
+                out _),
+            Is.False);
+    }
+
+    [TestCase(Arm64Register.X0, 0L, 0, TestName = "基本_ADD恢复栈顶地址")]
+    [TestCase(Arm64Register.X8, 0x28L, 0x28, TestName = "基本_ADD恢复结构返回缓冲区地址")]
+    [TestCase(Arm64Register.X30, int.MaxValue, int.MaxValue, TestName = "边界_ADD接受最大栈地址偏移")]
+    [Category("基本功能")]
+    public void AddImmediateFromStackPointerBecomesStackAddress(
+        Arm64Register destination,
+        long amount,
+        int expectedOffset)
+    {
+        var decoded = NewArmV8InstructionSet.TryCreateStackAddressOffset(
+            Arm64Mnemonic.ADD,
+            Arm64OperandKind.Register,
+            destination,
+            Arm64OperandKind.Register,
+            Arm64Register.X31,
+            Arm64OperandKind.Immediate,
+            amount,
+            out var stackOffset);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(stackOffset.Offset, Is.EqualTo(expectedOffset));
+        }
+    }
+
+    [TestCase(Arm64Mnemonic.SUB, Arm64Register.X8, Arm64Register.X31, 0x28L, TestName = "异常_SUB不是栈地址形成")]
+    [TestCase(Arm64Mnemonic.ADD, Arm64Register.X31, Arm64Register.X31, 0x28L, TestName = "异常_SP目标属于栈调整")]
+    [TestCase(Arm64Mnemonic.ADD, Arm64Register.X8, Arm64Register.X7, 0x28L, TestName = "异常_普通源寄存器不是SP")]
+    [TestCase(Arm64Mnemonic.ADD, Arm64Register.X8, Arm64Register.X31, -1L, TestName = "异常_负立即数不属于ADD立即数地址")]
+    [Category("异常输入")]
+    public void NonStackAddressFormsAreRejected(
+        Arm64Mnemonic mnemonic,
+        Arm64Register destination,
+        Arm64Register source,
+        long amount)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateStackAddressOffset(
+                mnemonic,
+                Arm64OperandKind.Register,
+                destination,
+                Arm64OperandKind.Register,
+                source,
+                Arm64OperandKind.Immediate,
+                amount,
+                out _),
+            Is.False);
+    }
+
     [Test]
     [Category("基本功能")]
     public void BranchInsideMethodRemainsLocalJump()

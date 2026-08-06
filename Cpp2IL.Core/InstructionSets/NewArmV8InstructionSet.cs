@@ -108,6 +108,83 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private static Immediate Imm(long value) => new(value);
     private static Immediate Imm(ulong value) => new(unchecked((long)value));
 
+    internal static bool TryDecodeStackPointerAdjustment(
+        Arm64Mnemonic mnemonic,
+        Arm64OperandKind destinationKind,
+        Arm64Register destinationRegister,
+        Arm64OperandKind sourceKind,
+        Arm64Register sourceRegister,
+        Arm64OperandKind amountKind,
+        long amount,
+        out int stackDelta)
+    {
+        // ARM64把SP编码为31号寄存器；仅接受SP到SP的立即数ADD/SUB，避免把普通算术误判为栈调整。
+        if (mnemonic is not (Arm64Mnemonic.ADD or Arm64Mnemonic.SUB)
+            || destinationKind != Arm64OperandKind.Register
+            || sourceKind != Arm64OperandKind.Register
+            || amountKind != Arm64OperandKind.Immediate
+            || destinationRegister != Arm64Register.X31
+            || sourceRegister != Arm64Register.X31
+            || amount < 0
+            || amount > int.MaxValue)
+        {
+            stackDelta = 0;
+            return false;
+        }
+
+        var magnitude = checked((int)amount);
+        stackDelta = mnemonic == Arm64Mnemonic.SUB ? -magnitude : magnitude;
+        return true;
+    }
+
+    internal static bool TryCreateStackOffset(
+        Arm64Register baseRegister,
+        Arm64Register addendRegister,
+        long byteOffset,
+        out StackOffset stackOffset)
+    {
+        // 带索引寄存器的地址不是固定栈槽，必须继续走普通内存解析，禁止错误折叠。
+        if (baseRegister != Arm64Register.X31
+            || addendRegister != Arm64Register.INVALID
+            || byteOffset < int.MinValue
+            || byteOffset > int.MaxValue)
+        {
+            stackOffset = default;
+            return false;
+        }
+
+        stackOffset = new StackOffset(checked((int)byteOffset));
+        return true;
+    }
+
+    internal static bool TryCreateStackAddressOffset(
+        Arm64Mnemonic mnemonic,
+        Arm64OperandKind destinationKind,
+        Arm64Register destinationRegister,
+        Arm64OperandKind sourceKind,
+        Arm64Register sourceRegister,
+        Arm64OperandKind amountKind,
+        long amount,
+        out StackOffset stackOffset)
+    {
+        // ADD（立即数）允许把SP作为源寄存器；此形式计算的是栈槽地址，不是读取名为X31的普通值。
+        if (mnemonic != Arm64Mnemonic.ADD
+            || destinationKind != Arm64OperandKind.Register
+            || destinationRegister is < Arm64Register.X0 or > Arm64Register.X30
+            || sourceKind != Arm64OperandKind.Register
+            || sourceRegister != Arm64Register.X31
+            || amountKind != Arm64OperandKind.Immediate
+            || amount < 0
+            || amount > int.MaxValue)
+        {
+            stackOffset = default;
+            return false;
+        }
+
+        stackOffset = new StackOffset(checked((int)amount));
+        return true;
+    }
+
     internal static bool TryDecodeMoveKeepImmediate(
         uint machineCode,
         out int registerWidth,
@@ -1422,13 +1499,29 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             out var vectorByteOffset)
                         && !isVectorLoad)
                     {
-                        Add(
-                            address,
-                            OpCode.Move,
-                            new MemoryOperand(
+                        IOperand vectorDestination = TryCreateStackOffset(
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            vectorByteOffset,
+                            out var vectorStackOffset)
+                            ? vectorStackOffset
+                            : new MemoryOperand(
                                 new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase)),
-                                addend: vectorByteOffset),
-                            ConvertStoreSourceOperand(instruction));
+                                addend: vectorByteOffset);
+                        Add(address, OpCode.Move, vectorDestination, ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
+                    if (instruction.MemIsPreIndexed
+                        && TryCreateStackOffset(
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            instruction.MemOffset,
+                            out var preIndexedStoreOffset))
+                    {
+                        // 预索引先调整SP，再把值写入新SP的零偏移槽位。
+                        Add(address, OpCode.ShiftStack, Imm(preIndexedStoreOffset.Offset));
+                        Add(address, OpCode.Move, new StackOffset(0), ConvertStoreSourceOperand(instruction));
                         break;
                     }
 
@@ -1439,10 +1532,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 // store pair of registers (reg1, reg2, dest)
                 {
                     var dest3 = ConvertOperand(instruction, 2);
-                    if (dest3 is Register { Name: "X31" }) // if stack
+                    if (dest3 is StackOffset stackOffset)
                     {
-                        Add(address, OpCode.Move, dest3, ConvertOperand(instruction, 0));
-                        Add(address, OpCode.Move, dest3, ConvertOperand(instruction, 1));
+                        if (instruction.MemIsPreIndexed)
+                        {
+                            Add(address, OpCode.ShiftStack, Imm(stackOffset.Offset));
+                            stackOffset = new StackOffset(0);
+                        }
+
+                        var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
+                        Add(address, OpCode.Move, stackOffset, ConvertStorePairSourceOperand(instruction, 0));
+                        Add(address, OpCode.Move, new StackOffset(stackOffset.Offset + size), ConvertStorePairSourceOperand(instruction, 1));
                     }
                     else if (dest3 is MemoryOperand memory)
                     {
@@ -1492,9 +1592,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 var dest2 = ConvertOperand(instruction, 1);
                 var mem = ConvertOperand(instruction, 2);
 
-                //TODO clean this mess up
-                var memInternal = mem as MemoryOperand?;
-                var mem2 = new MemoryOperand((Register)memInternal!.Value.Base!, addend: memInternal.Value.Addend + destRegSize);
+                IOperand mem2;
+                if (mem is StackOffset stackOffset2)
+                {
+                    if (instruction.MemIsPreIndexed)
+                    {
+                        Add(address, OpCode.ShiftStack, Imm(stackOffset2.Offset));
+                        stackOffset2 = new StackOffset(0);
+                        mem = stackOffset2;
+                    }
+
+                    mem2 = new StackOffset(stackOffset2.Offset + destRegSize);
+                }
+                else
+                {
+                    // 非栈内存继续保持基址和第二寄存器宽度的精确偏移。
+                    var memInternal = (MemoryOperand)mem;
+                    mem2 = new MemoryOperand((Register)memInternal.Base!, addend: memInternal.Addend + destRegSize);
+                }
 
                 Add(address, OpCode.Move, dest1, mem);
                 Add(address, OpCode.Move, dest2, mem2);
@@ -1847,6 +1962,38 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
             case Arm64Mnemonic.ADD:
+                if (TryDecodeStackPointerAdjustment(
+                        instruction.Mnemonic,
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        instruction.Op2Kind,
+                        instruction.Op2Imm,
+                        out var addStackDelta))
+                {
+                    Add(address, OpCode.ShiftStack, Imm(addStackDelta));
+                    break;
+                }
+
+                if (TryCreateStackAddressOffset(
+                        instruction.Mnemonic,
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        instruction.Op2Kind,
+                        instruction.Op2Imm,
+                        out var addressedStackOffset))
+                {
+                    Add(
+                        address,
+                        OpCode.Move,
+                        ConvertOperand(instruction, 0),
+                        new AddressOf(addressedStackOffset));
+                    break;
+                }
+
                 // ADD 的扩展寄存器和移位寄存器格式必须先恢复第三操作数语义。
                 if (!Arm64AddOperandHelper.TryEmit(
                         instruction,
@@ -1866,6 +2013,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
 
             case Arm64Mnemonic.SUB:
+                if (TryDecodeStackPointerAdjustment(
+                        instruction.Mnemonic,
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        instruction.Op2Kind,
+                        instruction.Op2Imm,
+                        out var subtractStackDelta))
+                {
+                    Add(address, OpCode.ShiftStack, Imm(subtractStackDelta));
+                    break;
+                }
+
+                Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
             case Arm64Mnemonic.FSUB:
                 //Sub is (dest, src1, src2)
                 Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
@@ -2055,11 +2218,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             var reg = instruction.MemBase;
             var offset = instruction.MemOffset;
-            var isPreIndexed = instruction.MemIsPreIndexed;
 
             if (reg == Arm64Register.INVALID)
                 //Offset only
                 return new MemoryOperand(addend: offset);
+
+            if (TryCreateStackOffset(
+                    reg,
+                    instruction.MemAddendReg,
+                    offset,
+                    out var stackOffset))
+                return stackOffset;
 
             //TODO Handle more stuff here
             return new MemoryOperand(new Register(null, Arm64RegisterHelper.CanonicalName(reg)), addend: offset);
@@ -2117,6 +2286,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return Imm(0);
 
         return ConvertOperand(instruction, 0);
+    }
+
+    private IOperand ConvertStorePairSourceOperand(Arm64Instruction instruction, int operand)
+    {
+        var kind = operand switch
+        {
+            0 => instruction.Op0Kind,
+            1 => instruction.Op1Kind,
+            _ => throw new ArgumentOutOfRangeException(nameof(operand), operand, "STP源操作数只能是0或1。")
+        };
+        var register = operand switch
+        {
+            0 => instruction.Op0Reg,
+            1 => instruction.Op1Reg,
+            _ => Arm64Register.INVALID
+        };
+
+        // STP的源位置把31号通用寄存器解释为XZR/WZR，必须写入常量零。
+        if (kind == Arm64OperandKind.Register && Arm64RegisterHelper.IsZeroRegister(register))
+            return Imm(0);
+
+        return ConvertOperand(instruction, operand);
     }
 
     public override BaseKeyFunctionAddresses CreateKeyFunctionAddressesInstance() => new NewArm64KeyFunctionAddresses();
