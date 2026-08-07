@@ -537,6 +537,180 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 原生内存值与无构造器类型比较时生成同型原生零值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemBoolean = appContext.SystemTypes.SystemBooleanType;
+        var systemIntPtr = appContext.SystemTypes.SystemIntPtrType;
+        var pointer = new LocalVariable("runtimeClass", new Register(null, "X8"), systemIntPtr);
+        var memoryValue = new MemoryOperand(pointer);
+        var equal = new LocalVariable("equal", new Register(null, "W9"), systemBoolean);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "CompareRuntimeClassAddress",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CheckEqual, equal, memoryValue, systemVoid),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [pointer, equal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemIntPtr,
+            "IntPtr",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        绑定AsmResolver系统类型(
+            module,
+            systemBoolean,
+            "Boolean",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "RuntimeClassComparisonType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "CompareRuntimeClassAddress",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ceq), Is.EqualTo(1));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 托管引用与整数零比较时按引用空值生成()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemBoolean = appContext.SystemTypes.SystemBooleanType;
+        var target = new LocalVariable("target", new Register(null, "X8"), systemObject);
+        var equal = new LocalVariable("equal", new Register(null, "W9"), systemBoolean);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "CompareReferenceWithZero",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CheckEqual, equal, target, Imm(0)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [target, equal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemObject,
+            "Object",
+            TypeAttributes.Public | TypeAttributes.Class);
+        绑定AsmResolver系统类型(
+            module,
+            systemBoolean,
+            "Boolean",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ReferenceComparisonType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "CompareReferenceWithZero",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ceq), Is.EqualTo(1));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.False);
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 数值与整数零比较不得改写为引用空值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemBoolean = appContext.SystemTypes.SystemBooleanType;
+        var systemInt32 = appContext.SystemTypes.SystemInt32Type;
+        var value = new LocalVariable("value", new Register(null, "W8"), systemInt32);
+        var equal = new LocalVariable("equal", new Register(null, "W9"), systemBoolean);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "CompareIntegerWithZero",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CheckEqual, equal, value, Imm(0)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [value, equal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemInt32,
+            "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        绑定AsmResolver系统类型(
+            module,
+            systemBoolean,
+            "Boolean",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "IntegerComparisonType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "CompareIntegerWithZero",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ceq), Is.EqualTo(1));
+        }
+    }
+
+    [Test]
     [Category("边界值")]
     public void 未配对Newobj写入UIntPtr生成无符号原生零值()
     {

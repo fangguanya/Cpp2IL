@@ -505,8 +505,24 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine, stringCtor);
+                // 二元运算的零值或元数据类型操作数必须按另一侧的已知槽位类型发射。
+                // 否则运行时句柄会被写成ldnull，托管引用的零值又会被写成整数0。
+                var leftExpectedType = BinaryOperandRepresentationType(instruction.Operands[2], context);
+                var rightExpectedType = BinaryOperandRepresentationType(instruction.Operands[1], context);
+                LoadOperand(
+                    instruction.Operands[1],
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor,
+                    leftExpectedType);
+                LoadOperand(
+                    instruction.Operands[2],
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor,
+                    rightExpectedType);
 
                 switch (instruction.OpCode)
                 {
@@ -1072,6 +1088,17 @@ public static class IlGenerator
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
             _ => null
+        };
+
+    private static TypeAnalysisContext? BinaryOperandRepresentationType(
+        IOperand operand,
+        MethodAnalysisContext context) =>
+        operand switch
+        {
+            // 二元运算中的裸内存读数和元数据类型字面量都表示IL2CPP原生地址。
+            // 把这个事实集中在操作数类型推导处，避免每种比较或算术指令重复判断。
+            MemoryOperand or TypeAnalysisContext => context.AppContext.SystemTypes.SystemIntPtrType,
+            _ => DestinationType(operand)
         };
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
