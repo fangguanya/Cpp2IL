@@ -490,6 +490,53 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 运行时类型句柄默认值按IntPtr生成原生零值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var runtimeClass = new RuntimeClassTypeAnalysisContext(systemObject, systemObject.DeclaringAssembly);
+        var pointer = new LocalVariable("runtimeClass", new Register(null, "X8"), runtimeClass);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "LoadRuntimeClassAddress",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, pointer, systemVoid),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [pointer];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "RuntimeClassDefaultType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "LoadRuntimeClassAddress",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+        }
+    }
+
+    [Test]
     [Category("边界值")]
     public void 未配对Newobj写入UIntPtr生成无符号原生零值()
     {

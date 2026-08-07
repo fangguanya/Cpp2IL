@@ -925,6 +925,18 @@ public static class IlGenerator
     {
         //TODO Remove this, we should be handling arguments correctly in ISIL resolution, this is a hack to emit balanced stacks.
         //TODO At the *very* least we should emit a console.writeline saying that we did this.
+        if (type is RuntimeClassTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext)
+        {
+            // 四种合成上下文在分析层表示IL2CPP原生指针，虽然IsValueType为false，
+            // 但ToTypeSignature会把它们精确降低为System.IntPtr；默认值必须与最终槽位一致。
+            instructions.Add(CilOpCodes.Ldc_I4_0);
+            instructions.Add(CilOpCodes.Conv_I);
+            return;
+        }
+
         if (!type.IsValueType)
         {
             instructions.Add(CilOpCodes.Ldnull);
