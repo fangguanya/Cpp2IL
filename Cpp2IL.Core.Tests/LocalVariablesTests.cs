@@ -412,4 +412,31 @@ public class LocalVariablesTests
             Assert.That(destination.Type, Is.Null);
         });
     }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未解引用的地址不得污染槽位与载体类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var slot = new LocalVariable("slot", new Register(null, "stack_-24", 1));
+        var staleElementType = appContext.SystemTypes.SystemObjectType;
+        var carrier = new LocalVariable(
+            "carrier",
+            new Register(null, "X1", 8),
+            staleElementType.MakeByReferenceType());
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, new AddressOf(slot)),
+        };
+
+        var changed = LocalVariables.BindAddressCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(slot.Type, Is.Null);
+            Assert.That(((ByRefTypeAnalysisContext)carrier.Type!).ElementType,
+                Is.SameAs(staleElementType));
+        });
+    }
 }

@@ -761,8 +761,11 @@ public static class LocalVariables
 
             if (instruction.Operands[1] is AddressOf { Target: LocalVariable slot })
             {
-                if (addressedSlots.TryAdd(destination, slot))
+                if (!addressedSlots.ContainsKey(destination))
+                {
+                    addressedSlots.Add(destination, slot);
                     pendingCarriers.Enqueue(destination);
+                }
                 continue;
             }
 
@@ -774,16 +777,18 @@ public static class LocalVariables
             destinations.Add(destination);
         }
 
-        while (pendingCarriers.TryDequeue(out var source))
+        while (pendingCarriers.Count > 0)
         {
+            var source = pendingCarriers.Dequeue();
             if (!forwardCopies.TryGetValue(source, out var destinations))
                 continue;
 
             foreach (var destination in destinations)
             {
-                if (!addressedSlots.TryAdd(destination, addressedSlots[source]))
+                if (addressedSlots.ContainsKey(destination))
                     continue;
 
+                addressedSlots.Add(destination, addressedSlots[source]);
                 pendingCarriers.Enqueue(destination);
             }
         }
@@ -791,14 +796,34 @@ public static class LocalVariables
         if (addressedSlots.Count == 0)
             return false;
 
-        var changed = false;
-
-        // 已知的T&载体可以反向确定槽位T。
-        foreach (var (carrier, slot) in addressedSlots)
+        // 只有真正作为内存基址解引用的地址链才是托管地址载体。原生代码经常把栈地址直接
+        // 当作整数实参或算术操作数；若仅凭AddressOf就改成T&，会把这些合法的整数槽位
+        // 错写成另一个调用留下的引用类型。按槽位归组后，只保留至少存在一次直接解引用的链。
+        var dereferencedSlots = new HashSet<LocalVariable>();
+        foreach (var instruction in instructions)
         {
-            if (carrier.Type is ByRefTypeAnalysisContext { ElementType: { } existingElementType })
-                changed |= SetTypeIfUnknown(slot, existingElementType);
+            foreach (var operand in instruction.Operands)
+            {
+                if (operand is MemoryOperand
+                    {
+                        Base: LocalVariable carrier,
+                        Index: null,
+                        Addend: 0,
+                        Scale: 0
+                    }
+                    && addressedSlots.TryGetValue(carrier, out var slot))
+                    dereferencedSlots.Add(slot);
+            }
         }
+
+        if (dereferencedSlots.Count == 0)
+            return false;
+
+        addressedSlots = addressedSlots
+            .Where(pair => dereferencedSlots.Contains(pair.Value))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
+
+        var changed = false;
 
         // 再单次扫描直接解引用写入，从写入值确定槽位T。
         foreach (var instruction in instructions)
@@ -820,8 +845,10 @@ public static class LocalVariables
         }
 
         // 槽位类型确定后，结构性取址事实优先于此前从寄存器复用得到的普通对象猜测。
-        foreach (var (carrier, slot) in addressedSlots)
+        foreach (var pair in addressedSlots)
         {
+            var carrier = pair.Key;
+            var slot = pair.Value;
             if (slot.Type == null)
                 continue;
 
