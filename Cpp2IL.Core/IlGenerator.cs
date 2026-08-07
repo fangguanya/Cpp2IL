@@ -856,6 +856,12 @@ public static class IlGenerator
                     && memory.Base is LocalVariable local2)
                 {
                     LoadLocal(local2, method, locals);
+                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } byRefElementType })
+                    {
+                        // ref/out 参数寄存器保存的是托管地址；读取 [参数] 必须解引用元素，不能把地址交给算术指令。
+                        var importedElementType = importer.ImportTypeSignature(byRefElementType.ToTypeSignature(module));
+                        instructions.Add(CilOpCodes.Ldobj, importedElementType.ToTypeDefOrRef());
+                    }
                     break;
                 }
                 instructions.Add(CilOpCodes.Ldstr, "Unmanaged memory load: " + operand.ToString());
@@ -1110,6 +1116,19 @@ public static class IlGenerator
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
+                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } byRefElementType })
+                    {
+                        // stobj要求地址位于值下方；先暂存结果，再载入ref/out地址并写回其元素。
+                        var importedElementType = importer.ImportTypeSignature(byRefElementType.ToTypeSignature(module));
+                        var byRefScratch = new CilLocalVariable(importedElementType);
+                        method.CilMethodBody.LocalVariables.Add(byRefScratch);
+                        instructions.Add(CilOpCodes.Stloc, byRefScratch);
+                        LoadLocal(local2, method, locals);
+                        instructions.Add(CilOpCodes.Ldloc, byRefScratch);
+                        instructions.Add(CilOpCodes.Stobj, importedElementType.ToTypeDefOrRef());
+                        break;
+                    }
+
                     // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
                     instructions.Add(CilOpCodes.Stloc, locals[local2]);
                     break;

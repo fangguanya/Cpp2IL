@@ -348,4 +348,81 @@ public class IlGeneratorTests
                 Is.True);
         }
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void Ref浮点内存读写生成Ldobj和Stobj()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemSingle = appContext.SystemTypes.SystemSingleType;
+        var byRefSingle = systemSingle.MakeByReferenceType();
+        var runningHeight = new LocalVariable("runningHeight", new Register(null, "X5"), byRefSingle);
+        var increment = new LocalVariable("increment", new Register(null, "V1"), systemSingle);
+        var sum = new LocalVariable("sum", new Register(null, "V0"), systemSingle);
+        var runningHeightMemory = new MemoryOperand(runningHeight);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "AddHeight",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [byRefSingle]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, increment, new FloatLiteral(32f)),
+            new Instruction(1, OpCode.Add, sum, runningHeightMemory, increment),
+            new Instruction(2, OpCode.Move, runningHeightMemory, sum),
+            new Instruction(3, OpCode.Return),
+        ]);
+        context.Locals = [increment, sum];
+        context.ParameterLocals = [runningHeight];
+        context.AnalysisWarnings = [];
+
+        var corlibAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        var corlibModule = new ModuleDefinition("mscorlib.dll");
+        corlibAssembly.Modules.Add(corlibModule);
+        var valueTypeDefinition = new TypeDefinition(
+            "System",
+            "ValueType",
+            TypeAttributes.Public | TypeAttributes.Abstract);
+        var singleDefinition = new TypeDefinition(
+            "System",
+            "Single",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout)
+        {
+            BaseType = valueTypeDefinition
+        };
+        corlibModule.TopLevelTypes.Add(valueTypeDefinition);
+        corlibModule.TopLevelTypes.Add(singleDefinition);
+        systemSingle.PutExtraData("AsmResolverType", singleDefinition);
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference(corlibAssembly));
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ByRefMemoryType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "AddHeight",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(
+                module.CorLibTypeFactory.Void,
+                [module.CorLibTypeFactory.Single.MakeByReferenceType()]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(
+            1,
+            "runningHeight",
+            (ParameterAttributes)0));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldobj), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stobj), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Add), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldarg), Is.EqualTo(2));
+        }
+    }
 }
