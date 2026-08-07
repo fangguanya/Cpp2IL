@@ -186,6 +186,61 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    internal static ulong ResolveAdrpPageAddress(ulong instructionAddress, long pageRelativeImmediate)
+    {
+        var instructionPage = instructionAddress & ~0xFFFUL;
+        return unchecked((ulong)(unchecked((long)instructionPage) + pageRelativeImmediate));
+    }
+
+    internal static bool TryCreateAdrpMemoryOperand(
+        IReadOnlyDictionary<Arm64Register, ulong> pageAddresses,
+        Arm64Register baseRegister,
+        Arm64Register addendRegister,
+        long byteOffset,
+        out MemoryOperand memory)
+    {
+        // ADRP页基址加立即数是绝对地址；带索引的寻址仍保留寄存器表达，避免丢失动态偏移。
+        if (addendRegister != Arm64Register.INVALID
+            || !pageAddresses.TryGetValue(baseRegister, out var pageAddress))
+        {
+            memory = default;
+            return false;
+        }
+
+        memory = new MemoryOperand(addend: unchecked((long)(pageAddress + unchecked((ulong)byteOffset))));
+        return true;
+    }
+
+    internal static bool TryFindObservedIndirectReturnBuffer(
+        IReadOnlyList<Instruction> emittedInstructions,
+        out StackOffset stackOffset)
+    {
+        for (var index = emittedInstructions.Count - 1; index >= 0; index--)
+        {
+            var instruction = emittedInstructions[index];
+            if (instruction.IsCall
+                || instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return)
+                break;
+
+            if (instruction.Destination is not Register { Name: "X8" })
+                continue;
+
+            if (instruction.OpCode == OpCode.Move
+                && instruction.Operands.Count >= 2
+                && instruction.Operands[1] is AddressOf { Target: StackOffset observed })
+            {
+                stackOffset = observed;
+                return true;
+            }
+
+            // 同一基本块内最近一次X8定义不是栈地址，旧值已失效。
+            break;
+        }
+
+        stackOffset = default;
+        return false;
+    }
+
     internal static bool TryDecodeMoveKeepImmediate(
         uint machineCode,
         out int registerWidth,
@@ -1105,6 +1160,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         
         void AddCall(MethodAnalysisContext context, ulong address, ulong target)
         {
+            var hasObservedIndirectReturnBuffer =
+                TryFindObservedIndirectReturnBuffer(instructions, out _);
+
             if (!context.AppContext.MethodsByAddress.TryGetValue(target, out var methodsAtAddress))
             {
                 // 原生目标的签名尚未解析时保留 X0 返回值与全部 AAPCS64 参数，供后续 key function、
@@ -1115,6 +1173,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Imm(target),
                     new Register(null, nameof(Arm64Register.X0)));
                 unknownCall.AddOperands(Arm64CallingConventionResolver.ResolveForUnmanaged());
+                if (hasObservedIndirectReturnBuffer)
+                {
+                    // 共享泛型体可能尚未进入地址索引；仍按调用点事实保留X8，供MethodInfo解析后绑定。
+                    unknownCall.AddOperands([new Register(null, nameof(Arm64Register.X8))]);
+                }
                 return;
             }
 
@@ -1125,6 +1188,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 : Add(address, OpCode.Call, Imm(target), returnRegister);
 
             call.AddOperands(GetArgumentOperandsForCall(methodsAtAddress.First()));
+            if (returnRegister != null
+                && hasObservedIndirectReturnBuffer)
+            {
+                // 调用点已观察到X8=&stack且目标返回值类型；先保留候选，待SSA后绑定到唯一栈局部。
+                call.AddOperands([new Register(null, nameof(Arm64Register.X8))]);
+            }
         }
 
         void AddIndirectTransfer(Arm64Mnemonic mnemonic, ulong address, IOperand target)
@@ -1373,7 +1442,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         && isVectorLoad)
                     {
                         IOperand vectorSource;
-                        if (adrpOffsets.TryGetValue(instruction.MemBase, out var vectorPage)
+                        if (TryCreateStackOffset(
+                                instruction.MemBase,
+                                instruction.MemAddendReg,
+                                vectorByteOffset,
+                                out var vectorStackOffset))
+                        {
+                            // Q寄存器栈加载必须与标量栈加载使用相同槽位身份；否则16字节聚合复制会退化为普通指针内存。
+                            vectorSource = vectorStackOffset;
+                        }
+                        else if (adrpOffsets.TryGetValue(instruction.MemBase, out var vectorPage)
                             && instruction.MemAddendReg == Arm64Register.INVALID)
                         {
                             vectorSource = new MemoryOperand(
@@ -1562,6 +1640,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
+                    if (!instruction.MemIsPreIndexed
+                        && TryCreateAdrpMemoryOperand(
+                            adrpOffsets,
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            instruction.MemOffset,
+                            out var absoluteStoreDestination))
+                    {
+                        Add(address, OpCode.Move, absoluteStoreDestination, ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
                     if (instruction.MemIsPreIndexed
                         && TryCreateStackOffset(
                             instruction.MemBase,
@@ -1614,10 +1704,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
                 break;
             case Arm64Mnemonic.ADRP:
-                //Just handle as a move
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
-                var pageAddress = address & ~0xFFFUL;
-                adrpOffsets[instruction.Op0Reg] = (ulong)((long)pageAddress + instruction.Op1Imm);
+                // ADRP立即数相对当前指令页；ISIL局部量与后续内存折叠统一保存绝对页地址。
+                var absolutePageAddress = ResolveAdrpPageAddress(address, instruction.Op1Imm);
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(absolutePageAddress));
+                adrpOffsets[instruction.Op0Reg] = absolutePageAddress;
                 break;
             case Arm64Mnemonic.LDP when instruction.Op2Kind == Arm64OperandKind.Memory:
                 //LDP (dest1, dest2, [mem]) - basically just treat as two loads, with the second offset by the length of the first

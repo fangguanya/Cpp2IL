@@ -23,6 +23,7 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
         var runtimeOptions = Cpp2IlApi.RuntimeOptions;
         var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
         var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
+        var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
         var assemblies = IsilDumpSelectionHelper.SelectExact(
             context.Assemblies,
             assemblyFilters,
@@ -36,11 +37,19 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
         if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
             throw new InvalidOperationException("ISIL 类型筛选命中了注入类型或没有方法的类型。");
 
+        var methods = IsilDumpSelectionHelper.SelectExact(
+            types.SelectMany(type => type.Methods)
+                .Where(method => method is not InjectedMethodAnalysisContext),
+            methodFilters,
+            method => method.Definition?.HumanReadableSignature ?? string.Empty,
+            "ISIL 方法");
+
         var selectedTypes = new HashSet<TypeAnalysisContext>(types);
+        var selectedMethods = new HashSet<MethodAnalysisContext>(methods);
         var numAssemblies = assemblies.Count;
         var i = 1;
         Logger.InfoNewline(
-            $"ISIL 输出已精确选择 {numAssemblies} 个程序集与 {types.Count} 个类型。",
+            $"ISIL 输出已精确选择 {numAssemblies} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法。",
             "IsilOutputFormat");
         foreach (var assembly in assemblies)
         {
@@ -62,7 +71,7 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
 
                 foreach (var method in type.Methods)
                 {
-                    if (method is InjectedMethodAnalysisContext)
+                    if (method is InjectedMethodAnalysisContext || !selectedMethods.Contains(method))
                         continue;
 
                     typeDump.Append("Method: ").AppendLine(method.Definition!.HumanReadableSignature).AppendLine();

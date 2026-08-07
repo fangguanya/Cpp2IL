@@ -31,4 +31,5 @@ public class Cpp2IlRuntimeArgs
     // ISIL 精确输出范围使用完整名称匹配；空集合保持原有全量输出语义。
     public IReadOnlyList<string> IsilDumpAssemblyFilters = [];
     public IReadOnlyList<string> IsilDumpTypeFilters = [];
+    public IReadOnlyList<string> IsilDumpMethodFilters = [];
 }

@@ -18,6 +18,7 @@ namespace Cpp2IL.Core.OutputFormats;
 public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 {
     private HashSet<TypeAnalysisContext>? selectedRecoveryTypes;
+    private HashSet<MethodAnalysisContext>? selectedRecoveryMethods;
 
     public override string OutputFormatId => "dll_il_recovery";
 
@@ -28,7 +29,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         var runtimeOptions = Cpp2IlApi.RuntimeOptions;
         var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
         var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
-        if (assemblyFilters.Count == 0 && typeFilters.Count == 0)
+        var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
+        if (assemblyFilters.Count == 0 && typeFilters.Count == 0 && methodFilters.Count == 0)
             return base.BuildAssemblies(context);
 
         var assemblies = IsilDumpSelectionHelper.SelectExact(
@@ -44,9 +46,17 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
             throw new InvalidOperationException("IL恢复类型筛选命中了注入类型或没有方法的类型。");
 
+        var methods = IsilDumpSelectionHelper.SelectExact(
+            types.SelectMany(type => type.Methods)
+                .Where(method => method is not InjectedMethodAnalysisContext),
+            methodFilters,
+            method => method.Definition?.HumanReadableSignature ?? string.Empty,
+            "IL恢复方法");
+
         selectedRecoveryTypes = new HashSet<TypeAnalysisContext>(types);
+        selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(methods);
         Logger.InfoNewline(
-            $"IL恢复已精确选择 {assemblies.Count} 个程序集与 {types.Count} 个类型；其他类型只保留声明。",
+            $"IL恢复已精确选择 {assemblies.Count} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法；其他成员只保留声明。",
             "DllOutput");
         try
         {
@@ -55,6 +65,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         finally
         {
             selectedRecoveryTypes = null;
+            selectedRecoveryMethods = null;
         }
     }
 
@@ -76,6 +87,12 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         if (!methodDefinition.IsManagedMethodWithBody())
             return;
+
+        if (selectedRecoveryMethods != null && !selectedRecoveryMethods.Contains(methodContext))
+        {
+            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            return;
+        }
 
         methodDefinition.CilMethodBody = new();
         var instructions = methodDefinition.CilMethodBody.Instructions;

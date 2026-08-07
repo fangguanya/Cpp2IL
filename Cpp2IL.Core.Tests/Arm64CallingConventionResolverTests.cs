@@ -61,4 +61,34 @@ public class Arm64CallingConventionResolverTests
 
         Assert.That(Arm64CallingConventionResolver.HasRawArgumentLayout(call), Is.False);
     }
+
+    [Test]
+    [Category("边界值")]
+    public void TrailingX8IndirectReturnCandidateIsAccepted()
+    {
+        var operands = new IOperand[]
+        {
+            new Register(null, "X9"),
+            new Register(null, "X0")
+        }.Concat(Arm64CallingConventionResolver.ResolveForUnmanaged()).ToList();
+        operands.Add(new Register(null, "X8"));
+        var call = new Instruction(0, OpCode.IndirectCall, operands);
+
+        Assert.That(Arm64CallingConventionResolver.HasRawArgumentLayout(call), Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void TrailingOrdinaryRegisterIsRejectedAsReturnCandidate()
+    {
+        var operands = new IOperand[]
+        {
+            new Register(null, "X9"),
+            new Register(null, "X0")
+        }.Concat(Arm64CallingConventionResolver.ResolveForUnmanaged()).ToList();
+        operands.Add(new Register(null, "X10"));
+        var call = new Instruction(0, OpCode.IndirectCall, operands);
+
+        Assert.That(Arm64CallingConventionResolver.HasRawArgumentLayout(call), Is.False);
+    }
 }

@@ -252,22 +252,36 @@ public static class LocalVariables
         // fills a previously-unknown type - so the loop converges.
         var changed = true;
         var loopCount = 0;
+        var lastChangingPasses = new List<string>();
 
         while (changed)
         {
             if (MaxTypePropagationLoopCount != -1 && ++loopCount > MaxTypePropagationLoopCount)
-                throw new DecompilerException($"Type and field resolution not settling! (looped {MaxTypePropagationLoopCount} times)");
+                throw new DecompilerException(
+                    $"Type and field resolution not settling! (looped {MaxTypePropagationLoopCount} times; "
+                    + $"last changing passes: {string.Join(", ", lastChangingPasses)})");
 
             changed = false;
-            changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
-            changed |= MetadataResolver.ResolveAmbiguousCalls(method);
-            changed |= MetadataResolver.ResolveVirtualCalls(method);
-            changed |= PropagateFromCallParameters(method);
-            changed |= MetadataResolver.ResolveFieldOffsets(method);
-            changed |= RgctxResolver.Run(method);
-            changed |= PropagateStaticFieldStorage(method);
-            changed |= PropagateTypesOnce(method);
+            lastChangingPasses.Clear();
+            changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveCallsViaMethodInfo), MetadataResolver.ResolveCallsViaMethodInfo(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveAmbiguousCalls), MetadataResolver.ResolveAmbiguousCalls(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveVirtualCalls), MetadataResolver.ResolveVirtualCalls(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(GenericCallRebinder), GenericCallRebinder.Run(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), PropagateFromCallParameters(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveFieldOffsets), MetadataResolver.ResolveFieldOffsets(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(RgctxResolver), RgctxResolver.Run(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateStaticFieldStorage), PropagateStaticFieldStorage(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateTypesOnce), PropagateTypesOnce(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(AggregateStackCopyRecovery), AggregateStackCopyRecovery.Run(method));
         }
+    }
+
+    private static bool RecordChangingPass(List<string> changingPasses, string name, bool changed)
+    {
+        if (changed)
+            changingPasses.Add(name);
+
+        return changed;
     }
 
     /// <summary>

@@ -391,6 +391,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // single-assignment and a type, once known, is stable for that value.
         MetadataResolver.ResolveAll(this);
 
+        // ARM64大值类型通过X8指向调用方返回缓冲区；目标身份解析后才能把返回值绑定到真实栈局部。
+        HiddenReturnBufferRecovery.Run(this);
+
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
@@ -405,8 +408,14 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
         InterfaceDispatchRecovery.Run(this);
         DelegateInvokeRecovery.Run(this);
+
+        // 所有可解析目标此时已经绑定。在SSA单一定义仍有效时裁掉原生猜测出的多余隐参，
+        // 随后的死码删除才能精确移除只为MethodInfo隐参服务的全局加载；若等物理寄存器
+        // 合并后再做，同一寄存器的后续重定义会让旧加载被保守误判为仍有用途。
+        CallArgumentTrimmer.Run(this);
         BooleanFlagSimplifier.Run(this);
         DeadCodeEliminator.Run(this);
+        LogUnresolvedAbsoluteLoadsAfterSsaTrim();
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
@@ -433,12 +442,43 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
-        // Every call that was going to resolve now has. Any argument registers it ended up
-        // not using are just keeping their definitions alive, so drop them.
-        CallArgumentTrimmer.Run(this);
+        // 清理数组与地址局部等后期重写留下的无用定义。
         DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
+    }
+
+    private void LogUnresolvedAbsoluteLoadsAfterSsaTrim()
+    {
+        foreach (var instruction in ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands.Count < 2
+                || instruction.Operands[0] is not LocalVariable destination
+                || instruction.Operands[1] is not MemoryOperand
+                {
+                    Base: null,
+                    Index: null,
+                    Scale: 0,
+                    Addend: > 0
+                } memory
+                || AppContext.LibCpp2IlContext.GetAnyGlobalByAddress((ulong)memory.Addend) != null)
+                continue;
+
+            var definitionCount = ControlFlowGraph.Instructions.Count(candidate =>
+                ReferenceEquals(candidate.Destination, destination));
+            var useCount = ControlFlowGraph.Instructions.Sum(candidate =>
+                candidate.Operands.Count(operand => operand switch
+                {
+                    LocalVariable local => ReferenceEquals(local, destination) && !ReferenceEquals(candidate.Destination, local),
+                    MemoryOperand { Base: LocalVariable local } => ReferenceEquals(local, destination),
+                    AddressOf { Target: LocalVariable local } => ReferenceEquals(local, destination),
+                    _ => false,
+                }));
+            Logger.VerboseNewline(
+                $"SSA裁剪后未解析绝对加载：方法={FullName}，地址=0x{memory.Addend:X}，局部={destination.Name}，定义={definitionCount}，使用={useCount}",
+                "MethodAnalysisContext");
+        }
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);

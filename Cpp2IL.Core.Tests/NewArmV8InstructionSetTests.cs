@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Disarm;
@@ -82,6 +83,58 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void AdrpRelativePageBecomesAbsolutePage()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.ResolveAdrpPageAddress(0x02D379A4, 0x0313D000),
+            Is.EqualTo(0x05E74000UL));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void AdrpStoreAcceptsZeroByteOffset()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X20] = 0x05E74000,
+        };
+
+        var resolved = NewArmV8InstructionSet.TryCreateAdrpMemoryOperand(
+            pages,
+            Arm64Register.X20,
+            Arm64Register.INVALID,
+            0,
+            out var memory);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(memory.IsConstant, Is.True);
+            Assert.That(memory.Addend, Is.EqualTo(0x05E74000));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void IndexedAdrpStoreKeepsDynamicAddressing()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X20] = 0x05E74000,
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateAdrpMemoryOperand(
+                pages,
+                Arm64Register.X20,
+                Arm64Register.X8,
+                0x11F,
+                out _),
+            Is.False);
+    }
+
     [TestCase(Arm64Register.X0, 0L, 0, TestName = "基本_ADD恢复栈顶地址")]
     [TestCase(Arm64Register.X8, 0x28L, 0x28, TestName = "基本_ADD恢复结构返回缓冲区地址")]
     [TestCase(Arm64Register.X30, int.MaxValue, int.MaxValue, TestName = "边界_ADD接受最大栈地址偏移")]
@@ -129,6 +182,57 @@ public class NewArmV8InstructionSetTests
                 Arm64OperandKind.Immediate,
                 amount,
                 out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void LatestX8StackAddressIsObservedAsIndirectReturnBuffer()
+    {
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, new Register(null, "X8"), new AddressOf(new StackOffset(0x28))),
+            new(1, OpCode.Move, new Register(null, "X1"), new Register(null, "X23")),
+        };
+
+        var observed = NewArmV8InstructionSet.TryFindObservedIndirectReturnBuffer(
+            instructions,
+            out var stackOffset);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(observed, Is.True);
+            Assert.That(stackOffset.Offset, Is.EqualTo(0x28));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void PriorCallInvalidatesStaleX8StackAddress()
+    {
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, new Register(null, "X8"), new AddressOf(new StackOffset(0x28))),
+            new(1, OpCode.Call, new Immediate(0x1000), new Register(null, "X0")),
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.TryFindObservedIndirectReturnBuffer(instructions, out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void NewerX8OverwriteRejectsOldStackAddress()
+    {
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, new Register(null, "X8"), new AddressOf(new StackOffset(0x28))),
+            new(1, OpCode.Move, new Register(null, "X8"), new Immediate(7)),
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.TryFindObservedIndirectReturnBuffer(instructions, out _),
             Is.False);
     }
 

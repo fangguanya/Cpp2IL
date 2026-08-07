@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -47,18 +48,128 @@ public static class MetadataInitGuardRemover
         var initialisedFlagTest = guard.Instructions.Any(i => i.OpCode == OpCode.And
             && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask]
             && flag.Addend == initialisedFlagOffset && IsOne(mask));
+        var constantMetadataFlagTest = GuardPrefixBlocks(guard)
+            .Any(HasConstantMetadataFlagTest);
 
         // Either successor could be the init entry; the other is then the merge.
         var first = guard.Successors[0];
         var second = guard.Successors[1];
 
-        return TryExcise(cfg, guard, first, second, initialisedFlagTest)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest);
+        return TryExcise(cfg, guard, first, second, initialisedFlagTest, constantMetadataFlagTest)
+            || TryExcise(cfg, guard, second, first, initialisedFlagTest, constantMetadataFlagTest);
     }
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
-    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)
+    internal static bool IsConstantMetadataFlagTest(Instruction instruction) =>
+        instruction.OpCode == OpCode.And
+        && instruction.Operands is [LocalVariable, MemoryOperand { IsConstant: true }, { } mask]
+        && IsOne(mask);
+
+    private static bool HasConstantMetadataFlagTest(Block block) =>
+        block.Instructions.Any(IsConstantMetadataFlagTest)
+        || TryFindConstantMetadataFlagTestChain(block, out _, out _, out _);
+
+    internal static bool TryFindConstantMetadataFlagTestChain(
+        Block block,
+        out Instruction flagLoad,
+        out Instruction bitTest,
+        out Instruction conditionTest)
+    {
+        foreach (var load in block.Instructions)
+        {
+            if (load.OpCode != OpCode.Move
+                || load.Operands is not [LocalVariable loadedFlag, MemoryOperand { IsConstant: true }])
+                continue;
+
+            var and = block.Instructions.FirstOrDefault(instruction =>
+                instruction.OpCode == OpCode.And
+                && instruction.Operands is [LocalVariable, LocalVariable source, { } mask]
+                && ReferenceEquals(source, loadedFlag)
+                && IsOne(mask));
+            if (and?.Destination is not LocalVariable testedBit)
+                continue;
+
+            var comparison = block.Instructions.FirstOrDefault(instruction =>
+                instruction.OpCode == OpCode.CheckNotEqual
+                && instruction.Operands is [LocalVariable, LocalVariable source, Immediate { Value: 0 }]
+                && ReferenceEquals(source, testedBit));
+            if (comparison?.Destination is not LocalVariable condition
+                || block.Instructions[^1].OpCode != OpCode.ConditionalJump
+                || block.Instructions[^1].Operands.Count < 2
+                || !ReferenceEquals(block.Instructions[^1].Operands[1], condition))
+                continue;
+
+            flagLoad = load;
+            bitTest = and;
+            conditionTest = comparison;
+            return true;
+        }
+
+        flagLoad = null!;
+        bitTest = null!;
+        conditionTest = null!;
+        return false;
+    }
+
+    internal static int RemoveConstantMetadataFlagTests(Block guard)
+    {
+        var removed = 0;
+        if (TryFindConstantMetadataFlagTestChain(guard, out var flagLoad, out var bitTest, out var conditionTest))
+        {
+            foreach (var instruction in new[] { flagLoad, bitTest, conditionTest })
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+                removed++;
+            }
+        }
+
+        foreach (var instruction in guard.Instructions.Where(IsConstantMetadataFlagTest))
+        {
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+            removed++;
+        }
+
+        return removed;
+    }
+
+    internal static int RemoveConstantMetadataFlagTestsFromGuardPrefix(Block guard)
+    {
+        foreach (var block in GuardPrefixBlocks(guard))
+        {
+            var removed = RemoveConstantMetadataFlagTests(block);
+            if (removed > 0)
+                return removed;
+        }
+
+        return 0;
+    }
+
+    private static IEnumerable<Block> GuardPrefixBlocks(Block guard)
+    {
+        var current = guard;
+        var visited = new HashSet<Block>();
+        while (visited.Add(current))
+        {
+            yield return current;
+            if (current.Predecessors is not [{ } predecessor]
+                || predecessor.Successors.Count != 1
+                || predecessor.BlockType is BlockType.Entry or BlockType.Exit)
+                yield break;
+
+            current = predecessor;
+        }
+    }
+
+    private static bool TryExcise(
+        ISILControlFlowGraph cfg,
+        Block guard,
+        Block initEntry,
+        Block merge,
+        bool initialisedFlagTest,
+        bool constantMetadataFlagTest)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return false;
@@ -66,7 +177,7 @@ public static class MetadataInitGuardRemover
         if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region))
             return false;
 
-        Excise(cfg, guard, initEntry, merge, region);
+        Excise(cfg, guard, initEntry, merge, region, constantMetadataFlagTest);
         return true;
     }
 
@@ -188,7 +299,13 @@ public static class MetadataInitGuardRemover
             _ => false,
         };
 
-    private static void Excise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, HashSet<Block> region)
+    private static void Excise(
+        ISILControlFlowGraph cfg,
+        Block guard,
+        Block initEntry,
+        Block merge,
+        HashSet<Block> region,
+        bool constantMetadataFlagTest)
     {
         // 1. Repair the merge's phis: drop the inputs from the region's back-edges.
         for (var i = merge.Predecessors.Count - 1; i >= 0; i--)
@@ -208,6 +325,14 @@ public static class MetadataInitGuardRemover
         initEntry.Predecessors.Remove(guard);
 
         var terminator = guard.Instructions[^1];
+        // 仅在初始化区域已被完整证明后删除同一保护块的绝对地址位测试；普通业务条件不匹配此形态。
+        var removedFlagTests = 0;
+        if (constantMetadataFlagTest)
+            removedFlagTests = RemoveConstantMetadataFlagTestsFromGuardPrefix(guard);
+        Logger.VerboseNewline(
+            $"元数据初始化保护段删除：guard=b{guard.ID}，region={region.Count}，" +
+            $"prefix={string.Join(",", GuardPrefixBlocks(guard).Select(block => $"b{block.ID}"))}，" +
+            $"constantFlag={constantMetadataFlagTest}，removedFlagTests={removedFlagTests}");
         terminator.OpCode = OpCode.Jump;
         terminator.SetOperands(merge);
         guard.CalculateBlockType();

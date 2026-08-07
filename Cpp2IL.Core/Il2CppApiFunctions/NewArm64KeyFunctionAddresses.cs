@@ -123,4 +123,57 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         //Find all jumps to the target address
         return disassembly.Count(i => i.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BL && i.BranchTarget == toWhere);
     }
+
+    protected override void AttemptInstructionAnalysisToFillGaps()
+    {
+        TryGetArm64InitMetadataFromException();
+    }
+
+    private void TryGetArm64InitMetadataFromException()
+    {
+        Logger.VerboseNewline("\t正在通过 System.Exception.get_Message 定位 ARM64 元数据初始化函数……");
+
+        var exceptionType = ReflectionCache.GetType("Exception", "System");
+        var getMessage = exceptionType?.Methods?.FirstOrDefault(method => method.Name == "get_Message");
+        if (getMessage == null || getMessage.MethodPointer == 0)
+        {
+            Logger.VerboseNewline("\t\t类型或方法已被裁剪，未写入元数据初始化函数地址。");
+            return;
+        }
+
+        var instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(
+            _appContext.Binary,
+            getMessage.MethodPointer);
+        if (!TryGetFirstDirectCallTarget(instructions, out var target))
+        {
+            Logger.WarnNewline("System.Exception.get_Message 中未发现 ARM64 直接调用，未写入元数据初始化函数地址。");
+            return;
+        }
+
+        if (_appContext.MetadataVersion < 27)
+        {
+            il2cpp_codegen_initialize_method = target;
+            Logger.VerboseNewline($"\t\til2cpp_codegen_initialize_method => 0x{target:X}");
+        }
+        else
+        {
+            il2cpp_codegen_initialize_runtime_metadata = target;
+            Logger.VerboseNewline($"\t\til2cpp_codegen_initialize_runtime_metadata => 0x{target:X}");
+        }
+    }
+
+    internal static bool TryGetFirstDirectCallTarget(IEnumerable<Arm64Instruction> instructions, out ulong target)
+    {
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Mnemonic != Arm64Mnemonic.BL || instruction.BranchTarget == 0)
+                continue;
+
+            target = instruction.BranchTarget;
+            return true;
+        }
+
+        target = 0;
+        return false;
+    }
 }

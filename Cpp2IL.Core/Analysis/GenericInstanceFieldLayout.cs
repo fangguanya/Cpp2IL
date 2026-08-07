@@ -1,5 +1,6 @@
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -16,14 +17,16 @@ public static class GenericInstanceFieldLayout
             if (baseType.Fields.Any(f => !f.IsStatic))
                 return null;
 
-        var offset = 2L * pointerSize;
+        // 引用类型实例从对象头之后开始；值类型的未装箱字段布局从零开始。
+        var offset = type.IsValueType ? 0 : 2L * pointerSize;
 
         foreach (var field in definition.Fields)
         {
             if (field.IsStatic)
                 continue;
 
-            if (GetSizeAndAlignment(field.FieldType, pointerSize) is not var (size, alignment))
+            var concreteFieldType = GenericInstantiation.Instantiate(field.FieldType, type.GenericArguments, []);
+            if (GetSizeAndAlignment(concreteFieldType, pointerSize) is not var (size, alignment))
                 return null;
 
             offset = (offset + alignment - 1) & ~(alignment - 1);
@@ -35,6 +38,17 @@ public static class GenericInstanceFieldLayout
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 按具体泛型实例的未装箱偏移返回已经实例化字段类型的字段上下文。
+    /// </summary>
+    public static FieldAnalysisContext? FindConcreteFieldAtOffset(
+        GenericInstanceTypeAnalysisContext type,
+        long targetOffset)
+    {
+        var field = FindFieldAtOffset(type, targetOffset);
+        return field == null ? null : new ConcreteGenericFieldAnalysisContext(field, type);
     }
 
     private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)

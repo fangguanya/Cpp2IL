@@ -49,8 +49,11 @@ public static class Arm64CallingConventionResolver
     {
         var argumentBase = ArgumentBase(call);
         var expected = RawArgumentRegisterNames;
+        var expectedCount = argumentBase + expected.Count;
+        var actualCount = call.Operands.Count;
 
-        if (call.Operands.Count != argumentBase + expected.Count)
+        if (actualCount < expectedCount
+            || actualCount > expectedCount + 1)
             return false;
 
         for (var index = 0; index < expected.Count; index++)
@@ -59,7 +62,8 @@ public static class Arm64CallingConventionResolver
                 return false;
         }
 
-        return true;
+        return call.Operands.Count == expectedCount
+               || RegisterName(call.Operands[^1]) == "X8";
     }
 
     public static void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
@@ -69,6 +73,9 @@ public static class Arm64CallingConventionResolver
 
         var argumentBase = ArgumentBase(call);
         var slots = new List<(bool IsFloating, bool Emit)>();
+        var hasIndirectReturnCandidate = call.Operands.Count
+                                         == argumentBase + RawArgumentRegisterNames.Count + 1;
+        var indirectReturnCandidate = hasIndirectReturnCandidate ? call.Operands[^1] : null;
 
         if (!resolved.IsStatic)
             slots.Add((false, true));
@@ -97,6 +104,9 @@ public static class Arm64CallingConventionResolver
             if (emit)
                 operands.Add(call.Operands[argumentBase + rawOffset]);
         }
+
+        if (indirectReturnCandidate != null)
+            operands.Add(indirectReturnCandidate);
 
         call.SetOperands(operands);
     }

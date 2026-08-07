@@ -567,6 +567,11 @@ internal static class Program
         result.IsilDumpTypeFilters = IsilDumpSelectionHelper.NormalizeFilters(
             options.IsilTypeFilters,
             "ISIL 类型");
+        result.IsilDumpMethodFilters = IsilDumpSelectionHelper.NormalizeFilters(
+            options.IsilMethodFilters,
+            "ISIL 方法");
+        if (result.IsilDumpMethodFilters.Count > 0 && result.IsilDumpTypeFilters.Count == 0)
+            throw new SoftException("ISIL 方法筛选必须同时指定精确类型筛选。");
 
         // if(string.IsNullOrEmpty(options.OutputFormatId))      // throw new SoftException("No output format specified, so nothing to do!");
 

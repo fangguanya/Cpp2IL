@@ -55,6 +55,9 @@ public class CommandLineArgs
     [Option("isil-type-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确类型全名；空值表示全部类型。")]
     public IEnumerable<string> IsilTypeFilters { get; set; } = new List<string>();
 
+    [Option("isil-method-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确方法签名；必须同时指定类型筛选。")]
+    public IEnumerable<string> IsilMethodFilters { get; set; } = new List<string>();
+
     //Flags
 
     [Option("verbose", HelpText = "Enable Verbose Logging.")]
