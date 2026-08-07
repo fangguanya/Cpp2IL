@@ -275,11 +275,36 @@ public static class LocalVariables
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveVirtualCalls), MetadataResolver.ResolveVirtualCalls(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(GenericCallRebinder), GenericCallRebinder.Run(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), PropagateFromCallParameters(method));
+            changed |= RecordChangingPass(
+                lastChangingPasses,
+                nameof(BindAddressCarrierTypes),
+                BindAddressCarrierTypes(method.ControlFlowGraph!.Instructions));
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveFieldOffsets), MetadataResolver.ResolveFieldOffsets(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(RgctxResolver), RgctxResolver.Run(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateStaticFieldStorage), PropagateStaticFieldStorage(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateTypesOnce), PropagateTypesOnce(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(AggregateStackCopyRecovery), AggregateStackCopyRecovery.Run(method));
+        }
+    }
+
+    /// <summary>
+    /// 接口与委托分派在主类型不动点之后才把间接调用改写成真实方法。这里仅重放调用签名、
+    /// 地址载体和普通复制三种既有传播边，直到没有新类型；字段、调用目标和聚合分析均不重复。
+    /// </summary>
+    public static void ResolveLateCallTypesAndAddressCarriers(MethodAnalysisContext method)
+    {
+        var changed = true;
+        var loopCount = 0;
+
+        while (changed)
+        {
+            if (MaxTypePropagationLoopCount != -1 && ++loopCount > MaxTypePropagationLoopCount)
+                throw new DecompilerException(
+                    $"Late call and address type resolution not settling! (looped {MaxTypePropagationLoopCount} times)");
+
+            changed = PropagateFromCallParameters(method);
+            changed |= BindAddressCarrierTypes(method.ControlFlowGraph!.Instructions);
+            changed |= PropagateTypesOnce(method);
         }
     }
 
@@ -713,6 +738,121 @@ public static class LocalVariables
             return SetTypeIfUnknown(klassDest, new RuntimeClassTypeAnalysisContext(baseType, baseType.DeclaringAssembly));
 
         return false;
+    }
+
+    /// <summary>
+    /// 恢复由<c>Move pointer, &amp;slot</c>建立的托管地址关系，并让通过该地址完成的读写与
+    /// 栈槽元素类型双向收敛。地址载体本身必须是<c>T&amp;</c>，而不是槽内的<c>T</c>；否则
+    /// IL生成阶段会把<c>ldloca</c>写入对象局部，反编译后形成<c>object* -&gt; object</c>非法转换。
+    /// </summary>
+    internal static bool BindAddressCarrierTypes(IReadOnlyList<Instruction> instructions)
+    {
+        var addressedSlots = new Dictionary<LocalVariable, LocalVariable>();
+        var forwardCopies = new Dictionary<LocalVariable, List<LocalVariable>>();
+        var pendingCarriers = new Queue<LocalVariable>();
+
+        // 一次扫描同时建立直接取址根和局部量复制邻接表，后续用队列沿源到目标方向传播。
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands.Count < 2
+                || instruction.Operands[0] is not LocalVariable destination)
+                continue;
+
+            if (instruction.Operands[1] is AddressOf { Target: LocalVariable slot })
+            {
+                if (addressedSlots.TryAdd(destination, slot))
+                    pendingCarriers.Enqueue(destination);
+                continue;
+            }
+
+            if (instruction.Operands[1] is not LocalVariable source)
+                continue;
+
+            if (!forwardCopies.TryGetValue(source, out var destinations))
+                forwardCopies[source] = destinations = [];
+            destinations.Add(destination);
+        }
+
+        while (pendingCarriers.TryDequeue(out var source))
+        {
+            if (!forwardCopies.TryGetValue(source, out var destinations))
+                continue;
+
+            foreach (var destination in destinations)
+            {
+                if (!addressedSlots.TryAdd(destination, addressedSlots[source]))
+                    continue;
+
+                pendingCarriers.Enqueue(destination);
+            }
+        }
+
+        if (addressedSlots.Count == 0)
+            return false;
+
+        var changed = false;
+
+        // 已知的T&载体可以反向确定槽位T。
+        foreach (var (carrier, slot) in addressedSlots)
+        {
+            if (carrier.Type is ByRefTypeAnalysisContext { ElementType: { } existingElementType })
+                changed |= SetTypeIfUnknown(slot, existingElementType);
+        }
+
+        // 再单次扫描直接解引用写入，从写入值确定槽位T。
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands.Count < 2
+                || instruction.Operands[0] is not MemoryOperand
+                {
+                    Base: LocalVariable carrier,
+                    Index: null,
+                    Addend: 0,
+                    Scale: 0
+                }
+                || !addressedSlots.TryGetValue(carrier, out var slot)
+                || instruction.Operands[1] is not LocalVariable { Type: { } storedType })
+                continue;
+
+            changed |= SetTypeIfUnknown(slot, storedType);
+        }
+
+        // 槽位类型确定后，结构性取址事实优先于此前从寄存器复用得到的普通对象猜测。
+        foreach (var (carrier, slot) in addressedSlots)
+        {
+            if (slot.Type == null)
+                continue;
+
+            var expectedCarrierType = slot.Type.MakeByReferenceType();
+            if (!GenericCallRebinder.TypesEquivalent(carrier.Type, expectedCarrierType))
+            {
+                carrier.Type = expectedCarrierType;
+                changed = true;
+            }
+        }
+
+        // 通过T&读取的值就是T；该边用于继续解析读取结果后的字段和虚调用。
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands.Count < 2
+                || instruction.Operands[0] is not LocalVariable destination
+                || instruction.Operands[1] is not MemoryOperand
+                {
+                    Base: LocalVariable carrier,
+                    Index: null,
+                    Addend: 0,
+                    Scale: 0
+                }
+                || !addressedSlots.TryGetValue(carrier, out var slot))
+                continue;
+
+            changed |= SetTypeIfUnknown(destination, slot.Type);
+        }
+
+        return changed;
     }
 
     // A phi is a copy from each predecessor's value, so types flow both ways across it - mirroring

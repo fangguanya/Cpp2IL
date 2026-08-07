@@ -413,6 +413,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
         InterfaceDispatchRecovery.Run(this);
         DelegateInvokeRecovery.Run(this);
+        // 间接调用刚刚获得真实签名；立即把接收者、ref/out栈槽及其地址载体收敛为可生成CIL的精确类型。
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(this);
         RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
 
         // 所有可解析目标此时已经绑定。在SSA单一定义仍有效时裁掉原生猜测出的多余隐参，

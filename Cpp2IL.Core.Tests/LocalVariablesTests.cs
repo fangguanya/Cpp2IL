@@ -322,4 +322,94 @@ public class LocalVariablesTests
             Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 地址载体从解引用写入恢复引用槽位类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var slot = new LocalVariable("slot", new Register(null, "stack_-40", 1));
+        var carrier = new LocalVariable(
+            "carrier",
+            new Register(null, "X22", 4),
+            appContext.SystemTypes.SystemObjectType);
+        var storedValue = new LocalVariable(
+            "storedValue",
+            new Register(null, "X0", 19),
+            appContext.SystemTypes.SystemObjectType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, new AddressOf(slot)),
+            new(1, OpCode.Move, new MemoryOperand(carrier), storedValue),
+        };
+
+        var changed = LocalVariables.BindAddressCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(slot.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+            Assert.That(carrier.Type, Is.TypeOf<ByRefTypeAnalysisContext>());
+            Assert.That(
+                ((ByRefTypeAnalysisContext)carrier.Type!).ElementType,
+                Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 值类型槽位通过地址别名保持精确元素类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var slot = new LocalVariable(
+            "slot",
+            new Register(null, "stack_-16", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var carrier = new LocalVariable("carrier", new Register(null, "X20", 2));
+        var alias = new LocalVariable("alias", new Register(null, "X21", 3));
+        var loadedValue = new LocalVariable("loadedValue", new Register(null, "W0", 4));
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, new AddressOf(slot)),
+            new(1, OpCode.Move, alias, carrier),
+            new(2, OpCode.Move, loadedValue, new MemoryOperand(alias)),
+        };
+
+        var changed = LocalVariables.BindAddressCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(((ByRefTypeAnalysisContext)carrier.Type!).ElementType,
+                Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+            Assert.That(((ByRefTypeAnalysisContext)alias.Type!).ElementType,
+                Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+            Assert.That(loadedValue.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通局部量复制不得建立地址载体关系()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var destination = new LocalVariable("destination", new Register(null, "X1", 1));
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, destination, source),
+        };
+
+        var changed = LocalVariables.BindAddressCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+            Assert.That(destination.Type, Is.Null);
+        });
+    }
 }
