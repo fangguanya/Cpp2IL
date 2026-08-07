@@ -444,6 +444,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
 
+        // 数组布局恢复后，List<T>.Add 快速路径的 items.Length 与元素地址已经可被严格识别；
+        // 此处把完整容量菱形闭合为公开 Add 调用，避免输出运行库私有字段和 AddWithResize。
+        ListAddRecovery.Run(this);
+
         LocalVariables.TypeAddressedLocals(this);
 
         // Near-last, as it depends on the final block layout
