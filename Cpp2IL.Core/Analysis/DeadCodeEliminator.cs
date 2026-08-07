@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -22,48 +23,60 @@ public static class DeadCodeEliminator
 
     public static void Run(ISILControlFlowGraph cfg)
     {
-        // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
-        // This is monotonic (each pass only nops instructions) and therefore always terminates.
-        var changed = true;
-        while (changed)
+        // 从调用、存储、返回和分支等可观察根反向标记其定义依赖。
+        // 单纯按“使用次数为零”删除会保留互相引用但没有外部使用的Phi环；
+        // SSA单一定义允许一次标记清扫精确删除整个死强连通分量。
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var block in cfg.Blocks)
         {
-            changed = false;
-
-            var useCounts = CountUses(cfg);
-
-            foreach (var block in cfg.Blocks)
+            foreach (var instruction in block.Instructions)
             {
-                foreach (var instruction in block.Instructions)
-                {
-                    if (!IsRemovable(instruction.OpCode))
-                        continue;
+                if (instruction.Destination is not LocalVariable destination)
+                    continue;
 
-                    // Only definitions of a register local are candidates. Stores have a memory or
-                    // field destination (Destination is not a local) and are never dead.
-                    if (instruction.Destination is not LocalVariable destination)
-                        continue;
-
-                    if (useCounts.TryGetValue(destination, out var count) && count > 0)
-                        continue;
-
-                    instruction.OpCode = OpCode.Nop;
-                    instruction.SetOperands();
-                    changed = true;
-                }
+                if (!definitions.TryGetValue(destination, out var localDefinitions))
+                    definitions[destination] = localDefinitions = [];
+                localDefinitions.Add(instruction);
             }
         }
-    }
 
-    private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)
-    {
-        var counts = new Dictionary<LocalVariable, int>();
+        var live = new HashSet<Instruction>();
+        var workList = new Stack<Instruction>();
+        foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
+        {
+            // 可删除运算写入普通局部时才是候选；存储等非局部目标始终是根。
+            if (IsRemovable(instruction.OpCode) && instruction.Destination is LocalVariable)
+                continue;
 
-        foreach (var block in cfg.Blocks)
-            foreach (var instruction in block.Instructions)
-                foreach (var used in UsedLocals(instruction))
-                    counts[used] = counts.TryGetValue(used, out var c) ? c + 1 : 1;
+            if (live.Add(instruction))
+                workList.Push(instruction);
+        }
 
-        return counts;
+        while (workList.Count > 0)
+        {
+            var instruction = workList.Pop();
+            foreach (var used in UsedLocals(instruction))
+            {
+                if (!definitions.TryGetValue(used, out var localDefinitions))
+                    continue;
+
+                // 正式路径处于SSA；若调用者给出非SSA图，则保守保留同名局部的全部定义。
+                foreach (var definition in localDefinitions)
+                    if (live.Add(definition))
+                        workList.Push(definition);
+            }
+        }
+
+        foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
+        {
+            if (!IsRemovable(instruction.OpCode)
+                || instruction.Destination is not LocalVariable
+                || live.Contains(instruction))
+                continue;
+
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+        }
     }
 
     /// <summary>

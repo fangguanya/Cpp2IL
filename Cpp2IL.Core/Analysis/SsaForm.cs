@@ -36,8 +36,51 @@ public class SsaForm
         graph.BuildUseDefLists(ssa._clobbering);
 
         ssa.CollectRegisters(graph);
-        ssa.InsertPhiFunctions(graph, dominatorInfo);
+        ssa.InsertPhiFunctions(graph, dominatorInfo, ComputeLiveInRegisters(graph));
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+    }
+
+    /// <summary>
+    /// 计算未版本化寄存器在每个基本块入口的活跃集合，用于构造pruned SSA。
+    /// 只按寄存器编号比较，同一物理寄存器的入口值与后续定义属于同一数据流变量。
+    /// </summary>
+    private static Dictionary<Block, HashSet<int>> ComputeLiveInRegisters(ISILControlFlowGraph graph)
+    {
+        var liveIn = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var liveOut = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var uses = graph.Blocks.ToDictionary(
+            block => block,
+            block => new HashSet<int>(block.Use.OfType<Register>().Select(register => register.Number)));
+        var definitions = graph.Blocks.ToDictionary(
+            block => block,
+            block => new HashSet<int>(block.Def.OfType<Register>().Select(register => register.Number)));
+
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (var index = graph.Blocks.Count - 1; index >= 0; index--)
+            {
+                var block = graph.Blocks[index];
+                var nextOut = new HashSet<int>(block.Successors
+                    .SelectMany(successor => liveIn[successor]));
+                var nextIn = new HashSet<int>(uses[block].Concat(nextOut.Except(definitions[block])));
+
+                if (!liveOut[block].SetEquals(nextOut))
+                {
+                    liveOut[block] = nextOut;
+                    changed = true;
+                }
+
+                if (!liveIn[block].SetEquals(nextIn))
+                {
+                    liveIn[block] = nextIn;
+                    changed = true;
+                }
+            }
+        }
+
+        return liveIn;
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
@@ -163,7 +206,10 @@ public class SsaForm
         }
     }
 
-    private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
+    private void InsertPhiFunctions(
+        ISILControlFlowGraph graph,
+        DominatorInfo dominance,
+        IReadOnlyDictionary<Block, HashSet<int>> liveIn)
     {
         var defSites = GetDefinitionSites(graph);
 
@@ -185,6 +231,11 @@ public class SsaForm
 
                 foreach (var frontierBlock in frontier)
                 {
+                    // 值若在汇合块入口并不活跃，该Phi只会形成寄存器重用的死环；
+                    // pruned SSA在源头省略它，而不是等待后续启发式清理。
+                    if (!liveIn[frontierBlock].Contains(regNumber))
+                        continue;
+
                     // Only one phi per (block, register).
                     if (!hasPhi.Add(frontierBlock))
                         continue;

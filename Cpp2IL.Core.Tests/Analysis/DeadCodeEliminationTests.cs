@@ -98,4 +98,65 @@ public class DeadCodeEliminationTests
         Assert.That(Live(graph).Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Operands[0], index)), Is.True,
             "index definition is used inside the array operands and must survive");
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 删除没有可观察根的互相引用Phi环()
+    {
+        var first = new LocalVariable("first", new Register(null, "first"));
+        var second = new LocalVariable("second", new Register(null, "second"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Phi, first, second, second),
+            new(1, OpCode.Phi, second, first, first),
+            new(2, OpCode.Move, result, Imm(1)),
+            new(3, OpCode.Return, result),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        Assert.That(Live(graph).Any(instruction => instruction.OpCode == OpCode.Phi), Is.False);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Phi环被返回值触达时完整保留依赖闭包()
+    {
+        var seed = new LocalVariable("seed", new Register(null, "seed"));
+        var first = new LocalVariable("first", new Register(null, "first"));
+        var second = new LocalVariable("second", new Register(null, "second"));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, seed, Imm(1)),
+            new(1, OpCode.Phi, first, seed, second),
+            new(2, OpCode.Phi, second, first, seed),
+            new(3, OpCode.Return, first),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Live(graph).Count(instruction => instruction.OpCode == OpCode.Phi), Is.EqualTo(2));
+            Assert.That(Live(graph).Any(instruction => instruction.OpCode == OpCode.Move), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非SSA重复定义被可观察使用时保守全部保留()
+    {
+        var value = new LocalVariable("value", new Register(null, "value"));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, value, Imm(1)),
+            new(1, OpCode.Move, value, Imm(2)),
+            new(2, OpCode.Return, value),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        Assert.That(Live(graph).Count(instruction => instruction.OpCode == OpCode.Move), Is.EqualTo(2));
+    }
 }

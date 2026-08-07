@@ -142,6 +142,37 @@ public class SsaAndDominators
         Assert.That(phi.Operands.Count, Is.EqualTo(1 + header.Predecessors.Count));
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 汇合后不再读取的寄存器不插入死Phi()
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+
+        Add(0, OpCode.ConditionalJump, 3, new Register(null, "cond"));
+        Add(1, OpCode.Move, new Register(null, "x"), 1);
+        Add(2, OpCode.Jump, 4);
+        Add(3, OpCode.Move, new Register(null, "x"), 2);
+        Add(4, OpCode.Return);
+        var graph = BuildGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.That(Phis(graph).Any(phi => RegName(phi.Operands[0]) == "x"), Is.False);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 汇合入口读取寄存器时仍保留必要Phi()
+    {
+        var graph = BuildGraph(Diamond());
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.That(Phis(graph).Count(phi => RegName(phi.Operands[0]) == "x"), Is.EqualTo(1));
+    }
+
     // Two sibling leaves under the entry branch, one redefining x and one reading it. Both orders tested
     // since the rename walk can visit them either way round.
     private static List<Instruction> SiblingLeaves(bool defIsFallthrough)
