@@ -533,24 +533,68 @@ public static class MetadataResolver
         };
     }
 
-    private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
+    internal static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
         var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
 
         if (definition == null || slot >= definition.VtableCount)
             return null;
 
+        // 接口槽在原生虚表中指向类实现，但托管CIL必须引用已经按接收者具体化的接口声明。
+        // 直接引用显式实现会把方法名中的TKey/TValue原样泄漏到反编译源码。
+        foreach (var interfaceOffset in definition.InterfaceOffsets)
+        {
+            if (slot < interfaceOffset.offset)
+                continue;
+
+            var declaringInterface = appContext.ResolveIl2CppType(interfaceOffset.Type);
+            if (type is GenericInstanceTypeAnalysisContext receiver)
+                declaringInterface = GenericInstantiation.Instantiate(
+                    declaringInterface,
+                    receiver.GenericArguments,
+                    []);
+
+            var interfaceSlot = slot - interfaceOffset.offset;
+            var interfaceMethod = declaringInterface is GenericInstanceTypeAnalysisContext genericInterface
+                ? genericInterface.GenericType.Methods.FirstOrDefault(method => method.Definition?.slot == interfaceSlot)
+                : declaringInterface.Methods.FirstOrDefault(method => method.Definition?.slot == interfaceSlot);
+            if (interfaceMethod != null)
+                return SpecializeVTableMethodForReceiver(declaringInterface, interfaceMethod);
+        }
+
         if (appContext.ResolveContextForMethod(definition.VTable[slot]) is { } implementation)
-            return implementation;
+            return SpecializeVTableMethodForReceiver(type, implementation);
 
         // an abstract method has no implementation, try to resolve it
         for (var declarer = type; declarer != null; declarer = declarer.BaseType)
         {
             if (declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
-                return declaration;
+                return SpecializeVTableMethodForReceiver(type, declaration);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 虚表保存的是开放泛型方法定义；接收者已经是封闭泛型实例时，必须同步具体化声明类型、参数与返回值。
+    /// 否则CIL会泄漏TKey/TValue等开放占位符，反编译源码也会产生无法编译的!0。
+    /// </summary>
+    internal static MethodAnalysisContext SpecializeVTableMethodForReceiver(
+        TypeAnalysisContext receiverType,
+        MethodAnalysisContext method)
+    {
+        if (method is ConcreteGenericMethodAnalysisContext
+            || receiverType is not GenericInstanceTypeAnalysisContext receiver
+            || method.DeclaringType == null
+            || !SameTypeDefinition(receiver.GenericType, method.DeclaringType)
+            || method.DeclaringType.GenericParameters.Count != receiver.GenericArguments.Count)
+            return method;
+
+        return new ConcreteGenericMethodAnalysisContext(method, receiver.GenericArguments, []);
+
+        static bool SameTypeDefinition(TypeAnalysisContext left, TypeAnalysisContext right) =>
+            ReferenceEquals(left, right)
+            || (left.Definition != null && ReferenceEquals(left.Definition, right.Definition));
     }
 
     private static MethodAnalysisContext BaseMethodOf(MethodAnalysisContext method) =>

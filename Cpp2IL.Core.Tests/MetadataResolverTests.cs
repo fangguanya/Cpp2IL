@@ -1,7 +1,9 @@
 using System;
+using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using ReflectionMethodAttributes = System.Reflection.MethodAttributes;
 
 namespace Cpp2IL.Core.Tests;
@@ -81,5 +83,102 @@ public class MetadataResolverTests
         Assert.That(
             () => MetadataResolver.BindCallTarget(move, target),
             Throws.TypeOf<InvalidOperationException>());
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 开放泛型虚表方法按封闭接收者恢复返回类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var getItem = listDefinition.Methods.Single(method =>
+            method.Name == "get_Item" && method.Parameters.Count == 1);
+        var receiver = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+
+        var specialized = MetadataResolver.SpecializeVTableMethodForReceiver(receiver, getItem);
+
+        var concrete = (ConcreteGenericMethodAnalysisContext)specialized;
+        Assert.Multiple(() =>
+        {
+            Assert.That(specialized, Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+            Assert.That(concrete.TypeGenericParameters, Is.EqualTo(new[] { app.SystemTypes.SystemStringType }));
+            Assert.That(specialized.DeclaringType!.FullName, Is.EqualTo(receiver.FullName));
+            Assert.That(specialized.ReturnType, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 显式泛型接口虚表槽恢复为封闭接口声明()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var dictionaryDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.Dictionary`2")!;
+        var interfaceEntry = dictionaryDefinition.Definition!.InterfaceOffsets
+            .Select(entry => (entry, type: app.ResolveIl2CppType(entry.Type)))
+            .First(pair => pair.type is GenericInstanceTypeAnalysisContext generic
+                && generic.GenericType.Methods.Any(method => method.Definition?.slot != ushort.MaxValue));
+        var openInterface = (GenericInstanceTypeAnalysisContext)interfaceEntry.type;
+        var interfaceMethod = openInterface.GenericType.Methods.First(method =>
+            method.Definition?.slot != ushort.MaxValue
+            && (method.ReturnType is GenericParameterTypeAnalysisContext
+                || method.Parameters.Any(parameter => parameter.ParameterType is GenericParameterTypeAnalysisContext)));
+        var receiver = dictionaryDefinition.MakeGenericInstanceType([
+            app.SystemTypes.SystemStringType,
+            app.SystemTypes.SystemObjectType
+        ]);
+
+        var resolved = MetadataResolver.ResolveVTableSlot(
+            app,
+            receiver,
+            interfaceEntry.entry.offset + interfaceMethod.Definition!.slot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+            Assert.That(resolved!.Name, Is.EqualTo(interfaceMethod.Name));
+            Assert.That(resolved.DeclaringType!.FullName, Does.Not.Contain("!"));
+            Assert.That(resolved.DeclaringType.FullName, Does.Contain("System.String").Or.Contain("System.Object"));
+            Assert.That(
+                new[] { resolved.ReturnType }.Concat(resolved.Parameters.Select(parameter => parameter.ParameterType))
+                    .All(type => !type.FullName.Contains('!')),
+                Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已具体化虚表方法保持原身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var getItem = listDefinition.Methods.Single(method =>
+            method.Name == "get_Item" && method.Parameters.Count == 1);
+        var receiver = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var existing = new ConcreteGenericMethodAnalysisContext(
+            getItem,
+            [app.SystemTypes.SystemStringType],
+            []);
+
+        Assert.That(
+            MetadataResolver.SpecializeVTableMethodForReceiver(receiver, existing),
+            Is.SameAs(existing));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非泛型接收者不具体化泛型虚表方法()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var getItem = listDefinition.Methods.Single(method =>
+            method.Name == "get_Item" && method.Parameters.Count == 1);
+
+        Assert.That(
+            MetadataResolver.SpecializeVTableMethodForReceiver(app.SystemTypes.SystemObjectType, getItem),
+            Is.SameAs(getItem));
     }
 }
