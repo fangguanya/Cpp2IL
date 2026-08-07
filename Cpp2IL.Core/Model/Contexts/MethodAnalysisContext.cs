@@ -398,6 +398,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         KeyFunctionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
+        // 初始化保护区删除后不再能从CFG枚举其 MethodInfo 槽；因此先冻结槽地址目录，
+        // 后续只把该不可变证据用于清理同一方法内的隐藏元数据读取。
+        var initializedRuntimeMetadataSlots = RuntimeMetadataSlotResolver.CaptureInitializedSlotAddresses(this);
+
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
         MetadataInitGuardRemover.Run(this);
 
@@ -408,7 +412,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
         InterfaceDispatchRecovery.Run(this);
         DelegateInvokeRecovery.Run(this);
-        RuntimeMetadataSlotResolver.Run(this);
+        RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
 
         // 所有可解析目标此时已经绑定。在SSA单一定义仍有效时裁掉原生猜测出的多余隐参，
         // 随后的死码删除才能精确移除只为MethodInfo隐参服务的全局加载；若等物理寄存器

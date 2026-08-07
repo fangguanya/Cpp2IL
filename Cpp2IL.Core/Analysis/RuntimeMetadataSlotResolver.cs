@@ -20,15 +20,21 @@ public static class RuntimeMetadataSlotResolver
         LocalVariable Origin,
         string MethodIdentity);
 
-    public static bool Run(MethodAnalysisContext method)
+    public static HashSet<ulong> CaptureInitializedSlotAddresses(MethodAnalysisContext method)
     {
         var instructions = method.ControlFlowGraph!.Instructions;
-        var definitions = new Dictionary<LocalVariable, Instruction>();
-        foreach (var instruction in instructions)
-        {
-            if (instruction.Destination is LocalVariable destination)
-                definitions[destination] = instruction;
-        }
+        return CollectInitializedSlotAddresses(instructions, BuildDefinitions(instructions));
+    }
+
+    public static bool Run(MethodAnalysisContext method)
+        => Run(method, CaptureInitializedSlotAddresses(method));
+
+    public static bool Run(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong> capturedInitializedSlots)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitions = BuildDefinitions(instructions);
 
         var candidates = new List<SlotCandidate>();
         foreach (var call in instructions)
@@ -69,7 +75,7 @@ public static class RuntimeMetadataSlotResolver
             .Where(group => group.Select(candidate => candidate.MethodIdentity).Distinct().Count() == 1)
             .SelectMany(group => group.Select(candidate => candidate.Origin)));
 
-        var initializedSlots = CollectInitializedSlotAddresses(instructions, definitions);
+        var initializedSlots = new HashSet<ulong>(capturedInitializedSlots);
         foreach (var instruction in instructions)
         {
             if (instruction.OpCode == OpCode.Move
@@ -101,6 +107,19 @@ public static class RuntimeMetadataSlotResolver
                 $"initializedSlots={initializedSlots.Count}，proven={provenOrigins.Count}，changed={changed}");
         }
         return changed;
+    }
+
+    private static Dictionary<LocalVariable, Instruction> BuildDefinitions(
+        IReadOnlyList<Instruction> instructions)
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+        }
+
+        return definitions;
     }
 
     internal static HashSet<ulong> CollectInitializedSlotAddresses(
