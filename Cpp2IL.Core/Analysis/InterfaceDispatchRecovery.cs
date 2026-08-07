@@ -825,6 +825,7 @@ public static class InterfaceDispatchRecovery
                         or OpCode.Not or OpCode.Negate
                         or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
                         or OpCode.ConvertSignedIntegerToFloat
+                        or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
                         or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
                         or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned)
                         => instruction.Destination is LocalVariable,

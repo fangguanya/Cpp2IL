@@ -8,6 +8,7 @@ using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils.AsmResolver;
 using ReflectionMethodAttributes = System.Reflection.MethodAttributes;
 
 namespace Cpp2IL.Core.Tests;
@@ -226,5 +227,125 @@ public class IlGeneratorTests
         Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Call), Is.EqualTo(1));
         Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.False);
         Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Hfa返回值按原始浮点位重组为值类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var valueType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.ValueType")!;
+        var aggregate = appContext.InjectTypeIntoAllAssemblies(
+                "Cpp2IL.Core.Tests",
+                "RecoveredVector2",
+                valueType,
+                System.Reflection.TypeAttributes.Public
+                | System.Reflection.TypeAttributes.Sealed
+                | System.Reflection.TypeAttributes.SequentialLayout)
+            .InjectedTypes[0];
+        var xField = aggregate.InjectFieldContext(
+            "x",
+            appContext.SystemTypes.SystemSingleType,
+            System.Reflection.FieldAttributes.Public);
+        var yField = aggregate.InjectFieldContext(
+            "y",
+            appContext.SystemTypes.SystemSingleType,
+            System.Reflection.FieldAttributes.Public);
+        var context = aggregate.InjectMethodContext(
+            "GetActualSize",
+            aggregate,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+
+        var xBits = new LocalVariable("xBits", new Register(null, "X8"), appContext.SystemTypes.SystemInt32Type);
+        var yBits = new LocalVariable("yBits", new Register(null, "X9"), appContext.SystemTypes.SystemInt32Type);
+        var x = new LocalVariable("x", new Register(null, "V0"), appContext.SystemTypes.SystemSingleType);
+        var y = new LocalVariable("y", new Register(null, "V1"), appContext.SystemTypes.SystemSingleType);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, xBits, Imm(0x44480000)),
+            new Instruction(1, OpCode.Move, yBits, Imm(0x43870000)),
+            new Instruction(2, OpCode.ReinterpretIntegerBitsAsFloat, x, xBits, Imm(32)),
+            new Instruction(3, OpCode.ReinterpretIntegerBitsAsFloat, y, yBits, Imm(32)),
+            new Instruction(4, OpCode.Return, x, y),
+        ]);
+        context.Locals = [xBits, yBits, x, y];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var corlibAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        var corlibModule = new ModuleDefinition("mscorlib.dll");
+        corlibAssembly.Modules.Add(corlibModule);
+        var valueTypeDefinition = new TypeDefinition(
+            "System",
+            "ValueType",
+            TypeAttributes.Public | TypeAttributes.Abstract);
+        var int32Definition = new TypeDefinition(
+            "System",
+            "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout)
+        {
+            BaseType = valueTypeDefinition
+        };
+        var singleDefinition = new TypeDefinition(
+            "System",
+            "Single",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout)
+        {
+            BaseType = valueTypeDefinition
+        };
+        corlibModule.TopLevelTypes.Add(valueTypeDefinition);
+        corlibModule.TopLevelTypes.Add(int32Definition);
+        corlibModule.TopLevelTypes.Add(singleDefinition);
+        appContext.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType", int32Definition);
+        appContext.SystemTypes.SystemSingleType.PutExtraData("AsmResolverType", singleDefinition);
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference(corlibAssembly));
+        var aggregateDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "RecoveredVector2",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout)
+        {
+            BaseType = module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")
+        };
+        module.TopLevelTypes.Add(aggregateDefinition);
+        aggregate.PutExtraData("AsmResolverType", aggregateDefinition);
+
+        var xDefinition = new FieldDefinition("x", FieldAttributes.Public, module.CorLibTypeFactory.Single);
+        var yDefinition = new FieldDefinition("y", FieldAttributes.Public, module.CorLibTypeFactory.Single);
+        aggregateDefinition.Fields.Add(xDefinition);
+        aggregateDefinition.Fields.Add(yDefinition);
+        xField.PutExtraData("AsmResolverField", xDefinition);
+        yField.PutExtraData("AsmResolverField", yDefinition);
+
+        var definition = new MethodDefinition(
+            "GetActualSize",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(aggregate.ToTypeSignature(module)));
+        aggregateDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        var bitConversionCalls = il
+            .Where(instruction => instruction.OpCode == CilOpCodes.Call)
+            .Select(instruction => instruction.Operand)
+            .OfType<IMethodDescriptor>()
+            .Where(method => method.Name == "Int32BitsToSingle")
+            .ToArray();
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(bitConversionCalls, Has.Length.EqualTo(2));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Initobj), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stfld), Is.EqualTo(2));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ret), Is.EqualTo(1));
+            Assert.That(
+                il.Any(instruction => instruction.Operand is int value && value == 0x44480000),
+                Is.True);
+            Assert.That(
+                il.Any(instruction => instruction.Operand is int value && value == 0x43870000),
+                Is.True);
+        }
     }
 }

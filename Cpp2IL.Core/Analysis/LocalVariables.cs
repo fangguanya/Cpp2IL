@@ -73,12 +73,19 @@ public static class LocalVariables
         var retValIndex = 0;
         foreach (var instruction in instructions)
         {
-            if (instruction.OpCode != OpCode.Return || instruction.Operands.Count != 1) continue;
+            if (instruction.OpCode != OpCode.Return || instruction.Operands.Count == 0)
+                continue;
 
-            var returnLocal = (LocalVariable)instruction.Sources[0];
+            for (var componentIndex = 0; componentIndex < instruction.Sources.Count; componentIndex++)
+            {
+                if (instruction.Sources[componentIndex] is not LocalVariable returnLocal)
+                    continue;
 
-            returnLocal.Name = $"returnVal{retValIndex + 1}";
-            returnLocal.IsReturn = true;
+                returnLocal.Name = instruction.Sources.Count == 1
+                    ? $"returnVal{retValIndex + 1}"
+                    : $"returnVal{retValIndex + 1}Component{componentIndex + 1}";
+                returnLocal.IsReturn = true;
+            }
             retValIndex++;
         }
 
@@ -575,6 +582,8 @@ public static class LocalVariables
                 case OpCode.ConvertFloatingPointPrecision:
                 case OpCode.ConvertFloatToSignedInteger:
                 case OpCode.ConvertSignedIntegerToFloat:
+                case OpCode.ReinterpretIntegerBitsAsFloat:
+                case OpCode.ReinterpretFloatBitsAsInteger:
                 case OpCode.RoundFloatTowardPositiveInfinity:
                 case OpCode.RoundFloatTowardNegativeInfinity:
                     changed |= PropagateNumericConversion(instruction, method);
@@ -635,19 +644,37 @@ public static class LocalVariables
         var sourceWidth = instruction.Operands.Count >= 4 && instruction.Operands[3] is Immediate explicitSourceWidth
             ? explicitSourceWidth.Value
             : destinationWidth.Value;
-        var sourceType = instruction.OpCode == OpCode.ConvertSignedIntegerToFloat
+        var sourceType = instruction.OpCode is OpCode.ConvertSignedIntegerToFloat
+            or OpCode.ReinterpretIntegerBitsAsFloat
             ? sourceWidth switch
             {
                 32 => systemTypes.SystemInt32Type,
                 64 => systemTypes.SystemInt64Type,
                 _ => null,
             }
-            : sourceWidth switch
+            : instruction.OpCode == OpCode.ReinterpretFloatBitsAsInteger
+                ? sourceWidth switch
+                {
+                    32 => systemTypes.SystemSingleType,
+                    64 => systemTypes.SystemDoubleType,
+                    _ => null,
+                }
+                : sourceWidth switch
             {
                 32 => systemTypes.SystemSingleType,
                 64 => systemTypes.SystemDoubleType,
                 _ => null,
             };
+
+        if (instruction.OpCode == OpCode.ReinterpretFloatBitsAsInteger)
+        {
+            destinationType = destinationWidth.Value switch
+            {
+                32 => systemTypes.SystemInt32Type,
+                64 => systemTypes.SystemInt64Type,
+                _ => null,
+            };
+        }
 
         var changed = SetTypeIfUnknown(destination, destinationType);
         changed |= SetTypeIfUnknown(source, sourceType);
@@ -851,7 +878,22 @@ public static class LocalVariables
         foreach (var instruction in returns)
         {
             if (instruction.Operands.Count == 1 && instruction.Operands[0] is LocalVariable local)
+            {
                 local.Type = method.ReturnType;
+                continue;
+            }
+
+            if (!Arm64CallingConventionResolver.TryGetHomogeneousFloatingAggregateFields(
+                    method.ReturnType,
+                    out var fields)
+                || instruction.Operands.Count != fields.Count)
+                continue;
+
+            for (var index = 0; index < fields.Count; index++)
+            {
+                if (instruction.Operands[index] is LocalVariable component)
+                    component.Type = fields[index].FieldType;
+            }
         }
     }
 }

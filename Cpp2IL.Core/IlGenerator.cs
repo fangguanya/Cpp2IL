@@ -8,6 +8,7 @@ using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using Cpp2IL.Core.Utils.AsmResolver;
 
 namespace Cpp2IL.Core;
@@ -438,6 +439,16 @@ public static class IlGenerator
                 {
                     if (instruction.Operands.Count == 1)
                         LoadOperand(instruction.Operands[0], method, locals, writeLine, stringCtor, context.ReturnType);
+                    else if (TryEmitHomogeneousFloatingAggregateReturn(
+                                 instruction,
+                                 context,
+                                 method,
+                                 locals,
+                                 writeLine,
+                                 stringCtor))
+                    {
+                        // 聚合体已由各个 V 返回寄存器重组并压入求值栈。
+                    }
                     else
                         instructions.Add(CilOpCodes.Ldnull); // ret still pops a value even if we lost track of it
                 }
@@ -631,6 +642,40 @@ public static class IlGenerator
                             break;
                     }
 
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
+
+            case OpCode.ReinterpretIntegerBitsAsFloat:
+            case OpCode.ReinterpretFloatBitsAsInteger:
+                {
+                    if (instruction.Operands.Count != 3
+                        || instruction.Operands[2] is not Immediate { Value: 32 or 64 } width)
+                        throw new InvalidOperationException($"标量位重解释指令参数无效：{instruction}");
+
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
+                    var bitConverter = factory.CorLibScope.CreateTypeReference("System", "BitConverter");
+                    var descriptor = instruction.OpCode switch
+                    {
+                        OpCode.ReinterpretIntegerBitsAsFloat when width.Value == 32 =>
+                            bitConverter.CreateMemberReference(
+                                "Int32BitsToSingle",
+                                MethodSignature.CreateStatic(factory.Single, [factory.Int32])),
+                        OpCode.ReinterpretIntegerBitsAsFloat =>
+                            bitConverter.CreateMemberReference(
+                                "Int64BitsToDouble",
+                                MethodSignature.CreateStatic(factory.Double, [factory.Int64])),
+                        OpCode.ReinterpretFloatBitsAsInteger when width.Value == 32 =>
+                            bitConverter.CreateMemberReference(
+                                "SingleToInt32Bits",
+                                MethodSignature.CreateStatic(factory.Int32, [factory.Single])),
+                        OpCode.ReinterpretFloatBitsAsInteger =>
+                            bitConverter.CreateMemberReference(
+                                "DoubleToInt64Bits",
+                                MethodSignature.CreateStatic(factory.Int64, [factory.Double])),
+                        _ => throw new ArgumentOutOfRangeException(nameof(instruction.OpCode)),
+                    };
+                    instructions.Add(CilOpCodes.Call, importer.ImportMethod(descriptor));
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                     break;
                 }
@@ -928,6 +973,46 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldarga, parameter);
         else
             instructions.Add(CilOpCodes.Ldloca, locals[local]);
+    }
+
+    private static bool TryEmitHomogeneousFloatingAggregateReturn(
+        Instruction instruction,
+        MethodAnalysisContext context,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals,
+        MemberReference writeLine,
+        MemberReference stringCtor)
+    {
+        if (!Arm64CallingConventionResolver.TryGetHomogeneousFloatingAggregateFields(
+                context.ReturnType,
+                out var fields)
+            || fields.Count != instruction.Operands.Count)
+            return false;
+
+        var module = method.DeclaringModule!;
+        var instructions = method.CilMethodBody!.Instructions;
+        var aggregateType = context.ReturnType.ToTypeSignature(module);
+        var aggregateLocal = new CilLocalVariable(aggregateType);
+        method.CilMethodBody.LocalVariables.Add(aggregateLocal);
+
+        // 先构造零初始化的值类型局部，再按元数据字段顺序写入 V0..Vn 对应的浮点分量。
+        instructions.Add(CilOpCodes.Ldloca, aggregateLocal);
+        instructions.Add(CilOpCodes.Initobj, aggregateType.ToTypeDefOrRef());
+        for (var index = 0; index < fields.Count; index++)
+        {
+            instructions.Add(CilOpCodes.Ldloca, aggregateLocal);
+            LoadOperand(
+                instruction.Operands[index],
+                method,
+                locals,
+                writeLine,
+                stringCtor,
+                fields[index].FieldType);
+            instructions.Add(CilOpCodes.Stfld, fields[index].ToFieldDescriptor(module));
+        }
+
+        instructions.Add(CilOpCodes.Ldloc, aggregateLocal);
+        return true;
     }
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };

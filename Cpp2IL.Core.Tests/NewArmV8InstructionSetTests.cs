@@ -763,6 +763,70 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [TestCase(
+        Arm64Register.S0,
+        Arm64Register.W8,
+        OpCode.ReinterpretIntegerBitsAsFloat,
+        32,
+        TestName = "基本_FMOV把W寄存器位模式解释为Single")]
+    [TestCase(
+        Arm64Register.D31,
+        Arm64Register.X30,
+        OpCode.ReinterpretIntegerBitsAsFloat,
+        64,
+        TestName = "边界_FMOV把X寄存器位模式解释为Double")]
+    [TestCase(
+        Arm64Register.W30,
+        Arm64Register.S31,
+        OpCode.ReinterpretFloatBitsAsInteger,
+        32,
+        TestName = "基本_FMOV把Single位模式解释为Int32")]
+    [TestCase(
+        Arm64Register.X0,
+        Arm64Register.D0,
+        OpCode.ReinterpretFloatBitsAsInteger,
+        64,
+        TestName = "边界_FMOV把Double位模式解释为Int64")]
+    public void FmovGeneralAndFloatingRegistersPreserveRawBits(
+        Arm64Register destination,
+        Arm64Register source,
+        OpCode expectedOpCode,
+        int expectedWidth)
+    {
+        var recognized = NewArmV8InstructionSet.TryGetFmovBitReinterpretation(
+            Arm64OperandKind.Register,
+            destination,
+            Arm64OperandKind.Register,
+            source,
+            out var opCode,
+            out var widthBits);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(opCode, Is.EqualTo(expectedOpCode));
+            Assert.That(widthBits, Is.EqualTo(expectedWidth));
+        }
+    }
+
+    [TestCase(Arm64Register.S0, Arm64Register.X0, TestName = "异常_FMOV拒绝32位浮点与64位整数混宽")]
+    [TestCase(Arm64Register.V0, Arm64Register.X0, TestName = "异常_FMOV拒绝完整向量寄存器")]
+    [TestCase(Arm64Register.W0, Arm64Register.X1, TestName = "异常_FMOV拒绝两个通用寄存器")]
+    public void InvalidFmovRegisterPairsAreNotReinterpreted(
+        Arm64Register destination,
+        Arm64Register source)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryGetFmovBitReinterpretation(
+                Arm64OperandKind.Register,
+                destination,
+                Arm64OperandKind.Register,
+                source,
+                out _,
+                out _),
+            Is.False);
+    }
+
     [Test]
     [Category("基本功能")]
     public void VectorFloatingMultiplyDecodesUiManagerPixelAverageInstruction()

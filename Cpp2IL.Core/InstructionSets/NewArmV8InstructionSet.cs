@@ -345,6 +345,44 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return false;
     }
 
+    /// <summary>
+    /// 识别 FMOV 在通用寄存器与标量浮点寄存器之间的同宽位复制。
+    /// 该指令不执行数值转换，必须保留 IEEE-754 原始位模式。
+    /// </summary>
+    internal static bool TryGetFmovBitReinterpretation(
+        Arm64OperandKind destinationKind,
+        Arm64Register destinationRegister,
+        Arm64OperandKind sourceKind,
+        Arm64Register sourceRegister,
+        out OpCode opCode,
+        out int widthBits)
+    {
+        opCode = OpCode.Invalid;
+        widthBits = 0;
+        if (destinationKind != Arm64OperandKind.Register || sourceKind != Arm64OperandKind.Register)
+            return false;
+
+        if (TryGetFloatingPointPrecisionBits(destinationRegister, out var floatingWidth)
+            && TryGetSignedIntegerWidthBits(sourceRegister, out var integerWidth)
+            && floatingWidth == integerWidth)
+        {
+            opCode = OpCode.ReinterpretIntegerBitsAsFloat;
+            widthBits = floatingWidth;
+            return true;
+        }
+
+        if (TryGetSignedIntegerWidthBits(destinationRegister, out integerWidth)
+            && TryGetFloatingPointPrecisionBits(sourceRegister, out floatingWidth)
+            && integerWidth == floatingWidth)
+        {
+            opCode = OpCode.ReinterpretFloatBitsAsInteger;
+            widthBits = integerWidth;
+            return true;
+        }
+
+        return false;
+    }
+
     internal static bool TryGetSignedIntegerPayloadWidthBits(Arm64Register register, out int bits)
     {
         if (TryGetSignedIntegerWidthBits(register, out bits))
@@ -1182,7 +1220,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
 
             var calledMethod = methodsAtAddress.Count == 1 ? methodsAtAddress[0] : context;
-            var returnRegister = GetReturnRegisterForContext(calledMethod);
+            Register? returnRegister = calledMethod.IsVoid
+                ? null
+                : Arm64CallingConventionResolver.ReturnRegister(calledMethod);
             var call = returnRegister == null
                 ? Add(address, OpCode.CallVoid, Imm(target))
                 : Add(address, OpCode.Call, Imm(target), returnRegister);
@@ -1509,6 +1549,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 if (instruction.Op0Kind == Arm64OperandKind.Register)
                     adrpOffsets.Remove(instruction.Op0Reg);
 
+                if (instruction.Mnemonic == Arm64Mnemonic.FMOV
+                    && TryGetFmovBitReinterpretation(
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        out var reinterpretOpCode,
+                        out var reinterpretWidthBits))
+                {
+                    Add(
+                        address,
+                        reinterpretOpCode,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(reinterpretWidthBits));
+                    break;
+                }
+
                 IOperand moveSource;
                 if (instruction.Mnemonic == Arm64Mnemonic.FMOV
                     && instruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate)
@@ -1758,11 +1816,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 AddCall(context, address, instruction.BranchTarget);
                 break;
             case Arm64Mnemonic.RET:
-                var returnRegister = GetReturnRegisterForContext(context);
-                if (returnRegister == null)
-                    Add(address, OpCode.Return);
-                else
-                    Add(address, OpCode.Return, returnRegister);
+                Add(address, OpCode.Return, GetReturnOperandsForContext(context));
                 break;
             case Arm64Mnemonic.B:
                 var target = instruction.BranchTarget;
@@ -1795,13 +1849,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 if (IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
                 {
                     // 方法区间采用左闭右开语义；跳到相邻方法首地址属于尾调用，随后返回当前方法。
-                    var returnRegister2 = GetReturnRegisterForContext(context);
+                    var returnOperands = GetReturnOperandsForContext(context);
                     AddCall(context, address, target);
-
-                    if (returnRegister2 == null)
-                        Add(address, OpCode.Return);
-                    else
-                        Add(address, OpCode.Return, returnRegister2);
+                    Add(address, OpCode.Return, returnOperands);
                 }
                 else
                 {
@@ -2542,25 +2592,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return BitConverter.ToUInt32(machineCodeBytes, 0);
     }
 
-    private IOperand? GetReturnRegisterForContext(MethodAnalysisContext context)
-    {
-        var returnType = context.ReturnType;
-        if (returnType.Namespace == nameof(System))
-        {
-            return returnType.Name switch
-            {
-                "Void" => null, //Void is no return
-                "Double" => new Register(null, nameof(Arm64Register.V0)), //Builtin double is v0
-                "Single" => new Register(null, nameof(Arm64Register.V0)), //Builtin float is v0
-                _ => new Register(null, nameof(Arm64Register.X0)), //All other system types are x0 like any other pointer
-            };
-        }
-
-        //TODO Do certain value types have different return registers?
-
-        //Any user type is returned in x0
-        return new Register(null, nameof(Arm64Register.X0));
-    }
+    private static List<IOperand> GetReturnOperandsForContext(MethodAnalysisContext context)
+        => Arm64CallingConventionResolver.ReturnOperands(context).ToList();
 
     private List<IOperand> GetArgumentOperandsForCall(MethodAnalysisContext contextBeingCalled)
     {

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -27,7 +28,54 @@ public static class Arm64CallingConventionResolver
             .ToArray();
 
     public static Register ReturnRegister(MethodAnalysisContext method)
-        => new(null, X64CallingConventionResolver.IsFloatingPoint(method.ReturnType) ? "V0" : "X0");
+        => new(null, X64CallingConventionResolver.IsFloatingPoint(method.ReturnType)
+                     || TryGetHomogeneousFloatingAggregateFields(method.ReturnType, out _)
+            ? "V0"
+            : "X0");
+
+    /// <summary>
+    /// 返回方法在 AAPCS64 下承载直接返回值的全部寄存器。
+    /// 同质浮点聚合体的每个成员分别占用一个连续的 V 寄存器，不能退化成 X0 中的对象引用。
+    /// </summary>
+    public static IReadOnlyList<IOperand> ReturnOperands(MethodAnalysisContext method)
+    {
+        if (method.IsVoid)
+            return [];
+
+        if (TryGetHomogeneousFloatingAggregateFields(method.ReturnType, out var fields))
+            return fields
+                .Select((_, index) => (IOperand)new Register(null, $"V{index}"))
+                .ToArray();
+
+        return [ReturnRegister(method)];
+    }
+
+    /// <summary>
+    /// 按 AAPCS64 识别由一至四个同类型 Single 或 Double 实例字段组成的同质浮点聚合体。
+    /// 静态字段和常量不属于实例布局；混合类型、空聚合体和超过四个成员都必须拒绝。
+    /// </summary>
+    public static bool TryGetHomogeneousFloatingAggregateFields(
+        TypeAnalysisContext type,
+        out IReadOnlyList<FieldAnalysisContext> fields)
+    {
+        fields = [];
+        if (!type.IsValueType || X64CallingConventionResolver.IsFloatingPoint(type))
+            return false;
+
+        var instanceFields = type.Fields
+            .Where(field => !field.IsStatic && (field.Attributes & FieldAttributes.Literal) == 0)
+            .ToArray();
+        if (instanceFields.Length is < 1 or > 4)
+            return false;
+
+        var elementType = instanceFields[0].FieldType;
+        if (!X64CallingConventionResolver.IsFloatingPoint(elementType)
+            || instanceFields.Any(field => !TypesExactlyMatch(field.FieldType, elementType)))
+            return false;
+
+        fields = instanceFields;
+        return true;
+    }
 
     public static Register? HiddenReturnBufferRegister(MethodAnalysisContext method)
         => ReturnsViaHiddenBuffer(method) ? new Register(null, "X8") : null;
@@ -38,7 +86,9 @@ public static class Arm64CallingConventionResolver
             return false;
 
         var returnType = method.ReturnType;
-        if (!returnType.IsValueType || X64CallingConventionResolver.IsFloatingPoint(returnType))
+        if (!returnType.IsValueType
+            || X64CallingConventionResolver.IsFloatingPoint(returnType)
+            || TryGetHomogeneousFloatingAggregateFields(returnType, out _))
             return false;
 
         var size = TypeSizes.UnboxedSize(returnType, PointerSize);
@@ -120,4 +170,8 @@ public static class Arm64CallingConventionResolver
         LocalVariable { Register.Name: var name } => name,
         _ => null
     };
+
+    private static bool TypesExactlyMatch(TypeAnalysisContext left, TypeAnalysisContext right)
+        => ReferenceEquals(left, right)
+           || left.Namespace == right.Namespace && left.Name == right.Name;
 }

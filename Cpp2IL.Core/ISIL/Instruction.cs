@@ -104,6 +104,8 @@ public class Instruction : IOperand
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ReinterpretIntegerBitsAsFloat:
+            case OpCode.ReinterpretFloatBitsAsInteger:
             case OpCode.VectorDuplicate:
             case OpCode.VectorWidenUnsignedInt16ToInt32:
             case OpCode.VectorShiftLeft:
@@ -165,6 +167,7 @@ public class Instruction : IOperand
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
                 or OpCode.ConvertSignedIntegerToFloat
+                or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
                 or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
@@ -205,8 +208,8 @@ public class Instruction : IOperand
             _ => []
         };
 
-        if (OpCode == OpCode.Return && _operands.Count == 1)
-            sources.Add(_operands[0]);
+        if (OpCode == OpCode.Return)
+            sources.AddRange(_operands);
 
         if (constantsOnly)
             sources = sources.Where(o => !IsConstantValue(o)).ToList();
