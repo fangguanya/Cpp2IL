@@ -33,8 +33,11 @@ public static class CopyCoalescer
             var a = groups.Find(destination);
             var b = groups.Find(source);
 
-            // different types would need a cast at every use, so do this only when the types agree, or one side is null
-            if (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type))
+            // 两个独立构造的具体泛型上下文可能不是同一对象，但只要结构化类型一致，
+            // 副本合并就不需要任何转换；不同具体泛型仍保持独立。
+            if (a.Type != null
+                && b.Type != null
+                && !GenericCallRebinder.TypesEquivalent(a.Type, b.Type))
                 continue;
 
             if (a == b || Interferes(interference, groups, a, b))

@@ -15,6 +15,43 @@ public class AggregateStackCopyRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 类型收敛后完整复制还原为聚合赋值和目标字段引用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var concreteEnumerator = CreateEnumerator(app.SystemTypes.SystemStringType);
+        var sourceBase = Local("stack_-D8", concreteEnumerator);
+        var vector = Local("V0", concreteEnumerator);
+        var destinationBase = Local("stack_-80", concreteEnumerator);
+        var sourceTail = Local("stack_-C8", app.SystemTypes.SystemStringType);
+        var scalar = Local("X8", app.SystemTypes.SystemStringType);
+        var destinationTail = Local("stack_-70", app.SystemTypes.SystemStringType);
+        var observed = Local("observed", app.SystemTypes.SystemStringType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, vector, sourceBase),
+            new(1, OpCode.Move, scalar, sourceTail),
+            new(2, OpCode.Move, destinationBase, vector),
+            new(3, OpCode.Move, destinationTail, scalar),
+            new(4, OpCode.Move, observed, destinationTail),
+        };
+
+        var changed = AggregateStackCopyRecovery.RewriteResolvedBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(instructions[2].Operands[1], Is.SameAs(sourceBase));
+            Assert.That(instructions[1].OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(instructions[3].OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(instructions[4].Operands[1], Is.TypeOf<FieldReference>());
+            var field = (FieldReference)instructions[4].Operands[1];
+            Assert.That(field.Local, Is.SameAs(destinationBase));
+            Assert.That(field.Field.Name, Is.EqualTo("current"));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 向量主体加标量尾块恢复具体Enumerator及当前元素类型()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

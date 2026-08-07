@@ -138,9 +138,6 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     {
         foreach (var typeContext in context.Types)
         {
-            if (AsmResolverAssemblyPopulator.IsTypeContextModule(typeContext))
-                continue;
-
 #if !DEBUG
             try
 #endif
@@ -215,9 +212,16 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
         foreach (var il2CppTypeDefinition in assemblyContext.TopLevelTypes)
         {
-            if (il2CppTypeDefinition.Name != "<Module>")
-                //We skip module because I've never come across an il2cpp assembly with any top-level functions, and it's simpler to skip it as AsmResolver adds one by default.
+            if (AsmResolverAssemblyPopulator.IsTypeContextModule(il2CppTypeDefinition))
+            {
+                // AsmResolver 已为每个 CLI 模块创建唯一的 <Module> 全局类型；IL2CPP 元数据中确实
+                // 可能存在其字段与泛型方法，因此绑定到该既有类型，禁止创建第二个保留类型。
+                BindModuleTypeContext(il2CppTypeDefinition, managedModule);
+            }
+            else
+            {
                 managedModule.TopLevelTypes.Add(BuildStubType(il2CppTypeDefinition));
+            }
         }
 
         if (corLib == null)
@@ -242,6 +246,31 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         assemblyContext.PutExtraData("AsmResolverAssembly", ourAssembly);
 
         return ourAssembly;
+    }
+
+    internal static TypeDefinition BindModuleTypeContext(
+        TypeAnalysisContext typeContext,
+        ModuleDefinition managedModule)
+    {
+        if (!AsmResolverAssemblyPopulator.IsTypeContextModule(typeContext))
+            throw new ArgumentException("只有 IL2CPP <Module> 上下文可以绑定 CLI 全局类型。", nameof(typeContext));
+
+        var globalTypes = managedModule.TopLevelTypes
+            .Where(type => type.Name == "<Module>" && string.IsNullOrEmpty(type.Namespace))
+            .ToArray();
+        if (globalTypes.Length != 1)
+            throw new InvalidOperationException(
+                $"托管模块 {managedModule.Name} 必须且只能包含一个 <Module> 全局类型，实际为 {globalTypes.Length} 个。");
+
+        var globalType = globalTypes[0];
+        typeContext.PutExtraData("AsmResolverType", globalType);
+        if (typeContext.Definition != null)
+            AsmResolverUtils.TypeDefsByIndex[typeContext.Definition.TypeIndex] = globalType;
+
+        foreach (var nestedType in typeContext.NestedTypes)
+            globalType.NestedTypes.Add(BuildStubType(nestedType));
+
+        return globalType;
     }
 
     private static TypeDefinition BuildStubType(TypeAnalysisContext typeContext)

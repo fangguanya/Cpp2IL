@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -19,6 +20,19 @@ public static class AggregateStackCopyRecovery
         int LoadIndex,
         int StoreIndex);
 
+    private readonly record struct AggregateCopy(
+        StackTransfer Vector,
+        StackTransfer Scalar,
+        GenericInstanceTypeAnalysisContext AggregateType,
+        FieldAnalysisContext TailField,
+        int TailOffset);
+
+    private readonly record struct FieldAlias(
+        LocalVariable StackField,
+        LocalVariable Aggregate,
+        FieldAnalysisContext Field,
+        int Offset);
+
     public static bool Run(MethodAnalysisContext method)
     {
         var changed = false;
@@ -30,9 +44,119 @@ public static class AggregateStackCopyRecovery
 
     internal static bool RecoverBlock(IReadOnlyList<Instruction> instructions)
     {
+        var changed = false;
+        foreach (var copy in CollectAggregateCopies(instructions))
+        {
+            changed |= SetExactType(copy.Vector.TransferLocal, copy.AggregateType);
+            changed |= SetExactType(copy.Vector.DestinationStack, copy.AggregateType);
+            changed |= SetExactType(copy.Scalar.SourceStack, copy.TailField.FieldType);
+            changed |= SetExactType(copy.Scalar.TransferLocal, copy.TailField.FieldType);
+            changed |= SetExactType(copy.Scalar.DestinationStack, copy.TailField.FieldType);
+
+            Logger.VerboseNewline(
+                $"ARM64聚合复制证据：source={copy.Vector.SourceStack}，destination={copy.Vector.DestinationStack}，" +
+                $"tailSource={copy.Scalar.SourceStack}，tailDestination={copy.Scalar.DestinationStack}，" +
+                $"field={copy.TailField.Name}，fieldOffset=0x{copy.TailOffset:X}，" +
+                $"vector={copy.Vector.LoadIndex}->{copy.Vector.StoreIndex}，" +
+                $"scalar={copy.Scalar.LoadIndex}->{copy.Scalar.StoreIndex}");
+        }
+
+        return changed;
+    }
+
+    public static bool RewriteResolvedCopies(MethodAnalysisContext method)
+    {
+        var aliases = new List<FieldAlias>();
+        var changed = false;
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+            changed |= RewriteResolvedBlockCore(block.Instructions, aliases);
+
+        foreach (var block in method.ControlFlowGraph.Blocks)
+            changed |= RewriteFieldAliases(block.Instructions, aliases);
+
+        return changed;
+    }
+
+    internal static bool RewriteResolvedBlock(IReadOnlyList<Instruction> instructions)
+    {
+        var aliases = new List<FieldAlias>();
+        var changed = RewriteResolvedBlockCore(instructions, aliases);
+        return RewriteFieldAliases(instructions, aliases) || changed;
+    }
+
+    private static bool RewriteResolvedBlockCore(
+        IReadOnlyList<Instruction> instructions,
+        ICollection<FieldAlias> aliases)
+    {
+        var changed = false;
+        foreach (var copy in CollectAggregateCopies(instructions))
+        {
+            if (!GenericCallRebinder.TypesEquivalent(
+                    copy.Vector.DestinationStack.Type,
+                    copy.AggregateType))
+                continue;
+
+            var vectorStore = instructions[copy.Vector.StoreIndex];
+            if (vectorStore.OpCode != OpCode.Move
+                || vectorStore.Operands.Count < 2
+                || !ReferenceEquals(vectorStore.Operands[0], copy.Vector.DestinationStack)
+                || !ReferenceEquals(vectorStore.Operands[1], copy.Vector.TransferLocal))
+                continue;
+
+            // 类型已经收敛且标量尾块证明复制覆盖完整结构，此时才把 ABI 分块搬运
+            // 还原为一次托管值赋值；随后对字段槽的访问统一指向目标聚合字段。
+            vectorStore.SetOperand(1, copy.Vector.SourceStack);
+            foreach (var scalarIndex in new[] { copy.Scalar.LoadIndex, copy.Scalar.StoreIndex })
+            {
+                var scalarInstruction = instructions[scalarIndex];
+                scalarInstruction.OpCode = OpCode.Nop;
+                scalarInstruction.SetOperands();
+            }
+
+            aliases.Add(new(
+                copy.Scalar.DestinationStack,
+                copy.Vector.DestinationStack,
+                copy.TailField,
+                copy.TailOffset));
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static bool RewriteFieldAliases(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyCollection<FieldAlias> aliases)
+    {
+        var changed = false;
+        foreach (var instruction in instructions)
+        {
+            for (var index = 0; index < instruction.Operands.Count; index++)
+            {
+                if (instruction.Operands[index] is not LocalVariable local)
+                    continue;
+
+                var matches = aliases.Where(alias => ReferenceEquals(alias.StackField, local)).ToArray();
+                if (matches.Length != 1)
+                    continue;
+
+                var alias = matches[0];
+                instruction.SetOperand(index, new FieldReference(
+                    alias.Field,
+                    alias.Aggregate,
+                    alias.Offset));
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static List<AggregateCopy> CollectAggregateCopies(IReadOnlyList<Instruction> instructions)
+    {
         var vectorTransfers = CollectTransfers(instructions, IsVectorRegister);
         var scalarTransfers = CollectTransfers(instructions, IsScalarRegister);
-        var changed = false;
+        var copies = new List<AggregateCopy>();
 
         foreach (var vector in vectorTransfers)
         {
@@ -43,9 +167,6 @@ public static class AggregateStackCopyRecovery
                     IsValueType: true
                 } aggregateType)
                 continue;
-
-            changed |= SetExactType(vector.TransferLocal, aggregateType);
-            changed |= SetExactType(vector.DestinationStack, aggregateType);
 
             foreach (var scalar in scalarTransfers)
             {
@@ -66,19 +187,17 @@ public static class AggregateStackCopyRecovery
                     && TryGetStackOffset(candidate.SourceStack, out var candidateSourceBase)
                     && TryGetStackOffset(candidate.DestinationStack, out var candidateDestinationBase)
                     && sourceFieldOffset - candidateSourceBase == destinationFieldOffset - candidateDestinationBase);
-                if (matchingVectors != 1)
+                if (matchingVectors != 1
+                    || GenericInstanceFieldLayout.FindConcreteFieldAtOffset(
+                        aggregateType,
+                        sourceRelativeOffset) is not { } field)
                     continue;
 
-                if (GenericInstanceFieldLayout.FindConcreteFieldAtOffset(aggregateType, sourceRelativeOffset) is not { } field)
-                    continue;
-
-                changed |= SetExactType(scalar.SourceStack, field.FieldType);
-                changed |= SetExactType(scalar.TransferLocal, field.FieldType);
-                changed |= SetExactType(scalar.DestinationStack, field.FieldType);
+                copies.Add(new(vector, scalar, aggregateType, field, sourceRelativeOffset));
             }
         }
 
-        return changed;
+        return copies;
     }
 
     private static List<StackTransfer> CollectTransfers(

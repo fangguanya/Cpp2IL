@@ -6,12 +6,68 @@ using AsmResolver;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
 using AsmResolver.DotNet.Signatures;
+using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.OutputFormats;
+using Cpp2IL.Core.Utils.AsmResolver;
 
 namespace Cpp2IL.Core.Tests;
 
 public class DllOutputTests
 {
+    [Test]
+    [Category("基本功能")]
+    public void IL2CPP模块上下文绑定到唯一CLI全局类型()
+    {
+        var appContext = TestGameLoader.LoadSimple2019Game();
+        var moduleContext = appContext.Assemblies
+            .SelectMany(assembly => assembly.Types)
+            .First(AsmResolverAssemblyPopulator.IsTypeContextModule);
+        var managedModule = new ModuleDefinition("ModuleBindingTest.dll");
+
+        var bound = AsmResolverDllOutputFormat.BindModuleTypeContext(moduleContext, managedModule);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(bound.Name, Is.EqualTo("<Module>"));
+            Assert.That(bound, Is.SameAs(managedModule.TopLevelTypes.Single(type => type.Name == "<Module>")));
+            Assert.That(moduleContext.GetExtraData<TypeDefinition>("AsmResolverType"), Is.SameAs(bound));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 重复绑定模块上下文不创建第二个全局类型()
+    {
+        var appContext = TestGameLoader.LoadSimple2019Game();
+        var moduleContext = appContext.Assemblies
+            .SelectMany(assembly => assembly.Types)
+            .First(AsmResolverAssemblyPopulator.IsTypeContextModule);
+        var managedModule = new ModuleDefinition("RepeatedModuleBindingTest.dll");
+
+        var first = AsmResolverDllOutputFormat.BindModuleTypeContext(moduleContext, managedModule);
+        var second = AsmResolverDllOutputFormat.BindModuleTypeContext(moduleContext, managedModule);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(second, Is.SameAs(first));
+            Assert.That(managedModule.TopLevelTypes.Count(type => type.Name == "<Module>"), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通类型不得绑定到CLI全局类型()
+    {
+        var appContext = TestGameLoader.LoadSimple2019Game();
+        var ordinaryType = appContext.Assemblies
+            .SelectMany(assembly => assembly.Types)
+            .First(type => !AsmResolverAssemblyPopulator.IsTypeContextModule(type));
+        var managedModule = new ModuleDefinition("InvalidModuleBindingTest.dll");
+
+        Assert.Throws<ArgumentException>(() =>
+            AsmResolverDllOutputFormat.BindModuleTypeContext(ordinaryType, managedModule));
+    }
+
     [Test]
     public void AllAssembliesBuild()
     {

@@ -567,6 +567,11 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
+                case OpCode.Not:
+                    changed |= BindBooleanNotResult(
+                        instruction,
+                        method.AppContext.SystemTypes.SystemBooleanType);
+                    break;
                 case OpCode.ConvertFloatingPointPrecision:
                 case OpCode.ConvertFloatToSignedInteger:
                 case OpCode.ConvertSignedIntegerToFloat:
@@ -578,6 +583,28 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    internal static bool BindBooleanNotResult(
+        Instruction instruction,
+        TypeAnalysisContext booleanType)
+    {
+        // ARM64 的逻辑非和整数按位非共用同一个 ISIL 操作码；只有操作数已经被比较、位测试
+        // 或方法签名精确证明为布尔值时，结果才允许收敛为布尔类型。
+        if (instruction.OpCode != OpCode.Not
+            || instruction.Operands.Count != 2
+            || instruction.Operands[0] is not LocalVariable destination
+            || instruction.Operands[1] is not LocalVariable { Type: { } sourceType }
+            || !GenericCallRebinder.TypesEquivalent(sourceType, booleanType))
+            return false;
+
+        // 操作语义比寄存器复用留下的 object 占位类型更精确。该赋值只会收敛到唯一的
+        // System.Boolean，不会在定点迭代中来回改变类型。
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, booleanType))
+            return false;
+
+        destination.Type = booleanType;
+        return true;
     }
 
     private static bool PropagateNumericConversion(

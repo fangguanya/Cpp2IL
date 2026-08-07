@@ -408,6 +408,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InjectedCheckRemover.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        AggregateStackCopyRecovery.RewriteResolvedCopies(this);
 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
         InterfaceDispatchRecovery.Run(this);

@@ -267,9 +267,6 @@ public static class AsmResolverAssemblyPopulator
 
             foreach (var type in asmContext.Types)
             {
-                if (IsTypeContextModule(type))
-                    continue;
-
                 CopyCustomAttributes(type, type.GetExtraData<TypeDefinition>("AsmResolverType")!.CustomAttributes);
 
                 foreach (var method in type.Methods)
@@ -308,9 +305,6 @@ public static class AsmResolverAssemblyPopulator
 
         foreach (var typeContext in asmContext.Types)
         {
-            if (IsTypeContextModule(typeContext))
-                continue;
-
             var managedType = typeContext.GetExtraData<TypeDefinition>("AsmResolverType") ?? throw new($"AsmResolver type not found in type analysis context for {typeContext.Definition?.FullName}");
             // CopyCustomAttributes(typeContext, managedType.CustomAttributes);
 

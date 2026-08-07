@@ -248,4 +248,78 @@ public class LocalVariablesTests
             Assert.That(destination.Type, Is.Null);
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 布尔逻辑非覆盖寄存器复用留下的对象占位类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemBooleanType);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X0", 2),
+            appContext.SystemTypes.SystemObjectType);
+        var instruction = new Instruction(0, OpCode.Not, destination, source);
+
+        var changed = LocalVariables.BindBooleanNotResult(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 整数按位非不得被强制解释为布尔逻辑非()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X0", 2),
+            appContext.SystemTypes.SystemInt32Type);
+        var instruction = new Instruction(0, OpCode.Not, destination, source);
+
+        var changed = LocalVariables.BindBooleanNotResult(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 缺少源操作数的逻辑非不得修改目标类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X0", 2),
+            appContext.SystemTypes.SystemObjectType);
+        var instruction = new Instruction(0, OpCode.Not, destination);
+
+        var changed = LocalVariables.BindBooleanNotResult(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
 }

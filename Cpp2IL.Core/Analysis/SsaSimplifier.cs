@@ -97,6 +97,14 @@ public static class SsaSimplifier
                 case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement:
                     field.Local = fieldReplacement;
                     break;
+
+                // 取地址只能改写为另一个局部变量；聚合值复制若漏掉该路径，字段读取会
+                // 指向源值，而 MoveNext/Dispose 仍修改一个已失去定义的目标值。
+                case AddressOf { Target: LocalVariable addressed } addressOf
+                    when resolved.TryGetValue(addressed, out var addressValue)
+                         && addressValue is LocalVariable addressReplacement:
+                    addressOf.Target = addressReplacement;
+                    break;
             }
         }
     }
@@ -127,6 +135,9 @@ public static class SsaSimplifier
                             break;
                         case FieldReference field when field.Local is { } fieldLocal:
                             reads.Add(fieldLocal);
+                            break;
+                        case AddressOf { Target: LocalVariable addressed }:
+                            reads.Add(addressed);
                             break;
                     }
                 }
