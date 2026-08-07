@@ -15,6 +15,17 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    private static void 绑定AsmResolver系统类型(
+        ModuleDefinition module,
+        TypeAnalysisContext context,
+        string name,
+        TypeAttributes attributes)
+    {
+        var definition = new TypeDefinition("System", name, attributes);
+        module.TopLevelTypes.Add(definition);
+        context.PutExtraData("AsmResolverType", definition);
+    }
+
     [SetUp]
     public void Setup()
     {
@@ -423,6 +434,160 @@ public class IlGeneratorTests
             Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stobj), Is.EqualTo(1));
             Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Add), Is.EqualTo(1));
             Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldarg), Is.EqualTo(2));
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 无构造器类型操作数写入IntPtr生成原生零值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemIntPtr = appContext.SystemTypes.SystemIntPtrType;
+        var pointer = new LocalVariable("pointer", new Register(null, "X8"), systemIntPtr);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "LoadStaticTypeAddress",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, pointer, systemVoid),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [pointer];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemIntPtr,
+            "IntPtr",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "NativeDefaultType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "LoadStaticTypeAddress",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 未配对Newobj写入UIntPtr生成无符号原生零值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemUIntPtr = appContext.SystemTypes.SystemUIntPtrType;
+        var pointer = new LocalVariable("pointer", new Register(null, "X9"), systemUIntPtr);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "AllocateMetadataAddress",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Newobj, pointer),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [pointer];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemUIntPtr,
+            "UIntPtr",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "UnsignedNativeDefaultType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "AllocateMetadataAddress",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_U), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 无构造器类型操作数写入引用仍生成Null()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var target = new LocalVariable("target", new Register(null, "X10"), systemObject);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "LoadMissingReference",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, target, systemVoid),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [target];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemObject,
+            "Object",
+            TypeAttributes.Public | TypeAttributes.Class);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ReferenceDefaultType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "LoadMissingReference",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.EqualTo(1));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.False);
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_U), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
         }
     }
 }

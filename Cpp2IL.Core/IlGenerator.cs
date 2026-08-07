@@ -352,7 +352,10 @@ public static class IlGenerator
                 }
                 else
                 {
-                    instructions.Add(CilOpCodes.Ldnull);
+                    if (DestinationType(instruction.Operands[0]) is { } destinationType)
+                        PushDefaultOf(destinationType, instructions);
+                    else
+                        instructions.Add(CilOpCodes.Ldnull);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 }
                 break;
@@ -898,7 +901,11 @@ public static class IlGenerator
                 {
                     instructions.Add(CilOpCodes.Ldstr, $"Constructor not found for: {operand} (probably static type)");
                     instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                    instructions.Add(CilOpCodes.Ldnull);
+                    // 元数据类型操作数可能只是原生类地址占位；必须按目标槽位生成可赋值的默认值。
+                    if (expectedType != null)
+                        PushDefaultOf(expectedType, instructions);
+                    else
+                        instructions.Add(CilOpCodes.Ldnull);
                     break;
                 }
 
@@ -929,6 +936,14 @@ public static class IlGenerator
             case "System.Single": instructions.Add(CilOpCodes.Ldc_R4, 0f); break;
             case "System.Double": instructions.Add(CilOpCodes.Ldc_R8, 0d); break;
             case "System.Int64" or "System.UInt64": instructions.Add(CilOpCodes.Ldc_I8, 0L); break;
+            case "System.IntPtr":
+                instructions.Add(CilOpCodes.Ldc_I4_0);
+                instructions.Add(CilOpCodes.Conv_I);
+                break;
+            case "System.UIntPtr":
+                instructions.Add(CilOpCodes.Ldc_I4_0);
+                instructions.Add(CilOpCodes.Conv_U);
+                break;
             default: instructions.Add(CilOpCodes.Ldc_I4_0); break;
         }
     }
