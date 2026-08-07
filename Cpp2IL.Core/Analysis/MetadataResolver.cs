@@ -163,7 +163,12 @@ public static class MetadataResolver
                     // derived layout, so the whole chain is searched
                     field = null;
                     for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                        field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null) && f.BackingData?.FieldOffset == memory.Addend);
+                    {
+                        // FieldAnalysisContext.Offset统一封装原始元数据偏移、注入字段偏移和经过验证的布局覆盖。
+                        // 直接读取BackingData会绕过后两类权威输入，使合法字段永久停留为裸内存操作数。
+                        field = candidateOwner.Fields.FirstOrDefault(f =>
+                            f.IsStatic == (staticOwner != null) && f.Offset == memory.Addend);
+                    }
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)

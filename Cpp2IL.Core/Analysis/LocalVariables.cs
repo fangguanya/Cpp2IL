@@ -288,8 +288,10 @@ public static class LocalVariables
     }
 
     /// <summary>
-    /// 接口与委托分派在主类型不动点之后才把间接调用改写成真实方法。这里仅重放调用签名、
-    /// 地址载体和普通复制三种既有传播边，直到没有新类型；字段、调用目标和聚合分析均不重复。
+    /// 接口与委托分派在主类型不动点之后才把间接调用改写成真实方法。这里重放调用签名、
+    /// 地址载体、字段偏移和普通复制四种互相依赖的传播边，直到没有新类型或字段引用。
+    /// 后置调用的返回值可能正是下一条字段读取的基址，因此字段解析必须与类型传播处于同一不动点；
+    /// 否则合法的<c>[result + fieldOffset]</c>会进入IL生成器并退化为原生零值。
     /// </summary>
     public static void ResolveLateCallTypesAndAddressCarriers(MethodAnalysisContext method)
     {
@@ -304,6 +306,7 @@ public static class LocalVariables
 
             changed = PropagateFromCallParameters(method);
             changed |= BindAddressCarrierTypes(method.ControlFlowGraph!.Instructions);
+            changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= PropagateTypesOnce(method);
         }
     }

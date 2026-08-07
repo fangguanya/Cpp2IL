@@ -1,5 +1,7 @@
+using System.Reflection;
 using System.Linq;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -437,6 +439,173 @@ public class LocalVariablesTests
             Assert.That(slot.Type, Is.Null);
             Assert.That(((ByRefTypeAnalysisContext)carrier.Type!).ElementType,
                 Is.SameAs(staleElementType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 后置调用返回类型必须立即解析后续字段读取()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var assembly = appContext.Assemblies[0];
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Cpp2IL.Core.Tests",
+            "LateFieldOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var field = new InjectedFieldAnalysisContext(
+            "Text",
+            appContext.SystemTypes.SystemStringType,
+            FieldAttributes.Public,
+            owner,
+            0x10);
+        owner.Fields.Add(field);
+        var getter = new InjectedMethodAnalysisContext(
+            owner,
+            "GetOwner",
+            owner,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var returned = new LocalVariable("returned", new Register(null, "X0", 1));
+        var loaded = new LocalVariable("loaded", new Register(null, "X1", 1));
+        var call = new Instruction(0, OpCode.Call, getter, returned);
+        var load = new Instruction(1, OpCode.Move, loaded, new MemoryOperand(returned, addend: 0x10));
+        var method = new InjectedMethodAnalysisContext(
+            owner,
+            "ReadLateField",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([call, load, new Instruction(2, OpCode.Return)]);
+        method.Locals = [returned, loaded];
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(returned.Type, Is.SameAs(owner));
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)load.Operands[1]).Field, Is.SameAs(field));
+            Assert.That(loaded.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 后置字段链必须跨多轮收敛到末端值类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var assembly = appContext.Assemblies[0];
+        var inner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Cpp2IL.Core.Tests",
+            "LateInner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var valueField = new InjectedFieldAnalysisContext(
+            "Value",
+            appContext.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public,
+            inner,
+            0x18);
+        inner.Fields.Add(valueField);
+        var outer = new InjectedTypeAnalysisContext(
+            assembly,
+            "Cpp2IL.Core.Tests",
+            "LateOuter",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var innerField = new InjectedFieldAnalysisContext(
+            "Inner",
+            inner,
+            FieldAttributes.Public,
+            outer,
+            0x10);
+        outer.Fields.Add(innerField);
+        var getter = new InjectedMethodAnalysisContext(
+            outer,
+            "GetOuter",
+            outer,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var returned = new LocalVariable("returned", new Register(null, "X0", 1));
+        var innerValue = new LocalVariable("innerValue", new Register(null, "X1", 1));
+        var value = new LocalVariable("value", new Register(null, "W2", 1));
+        var firstLoad = new Instruction(1, OpCode.Move, innerValue, new MemoryOperand(returned, addend: 0x10));
+        var secondLoad = new Instruction(2, OpCode.Move, value, new MemoryOperand(innerValue, addend: 0x18));
+        var method = new InjectedMethodAnalysisContext(
+            outer,
+            "ReadNestedLateField",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Call, getter, returned),
+            firstLoad,
+            secondLoad,
+            new Instruction(3, OpCode.Return),
+        ]);
+        method.Locals = [returned, innerValue, value];
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstLoad.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(secondLoad.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(innerValue.Type, Is.SameAs(inner));
+            Assert.That(value.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 后置调用后的未知字段偏移必须保持未解析()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var assembly = appContext.Assemblies[0];
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Cpp2IL.Core.Tests",
+            "LateUnknownOffsetOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        owner.Fields.Add(new InjectedFieldAnalysisContext(
+            "Known",
+            appContext.SystemTypes.SystemStringType,
+            FieldAttributes.Public,
+            owner,
+            0x10));
+        var getter = new InjectedMethodAnalysisContext(
+            owner,
+            "GetOwner",
+            owner,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var returned = new LocalVariable("returned", new Register(null, "X0", 1));
+        var loaded = new LocalVariable("loaded", new Register(null, "X1", 1));
+        var unresolved = new MemoryOperand(returned, addend: 0x28);
+        var load = new Instruction(1, OpCode.Move, loaded, unresolved);
+        var method = new InjectedMethodAnalysisContext(
+            owner,
+            "ReadUnknownLateField",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Call, getter, returned),
+            load,
+            new Instruction(2, OpCode.Return),
+        ]);
+        method.Locals = [returned, loaded];
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(loaded.Type, Is.Null);
         });
     }
 }
