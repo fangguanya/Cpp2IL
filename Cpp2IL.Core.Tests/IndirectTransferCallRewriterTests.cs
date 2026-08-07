@@ -1,0 +1,112 @@
+using System.Linq;
+using System.Reflection;
+using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
+
+namespace Cpp2IL.Core.Tests;
+
+public class IndirectTransferCallRewriterTests
+{
+    [SetUp]
+    public void Setup()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Void尾调用恢复为CallVoid并追加Return()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemVoidType);
+        var target = CreateMethod("Target", app.SystemTypes.SystemVoidType);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), app.SystemTypes.SystemObjectType);
+        var transfer = CreateRawTransfer(OpCode.IndirectJump, receiver);
+        var block = CreateBlock(transfer);
+
+        IndirectTransferCallRewriter.Rewrite(owner, transfer, block, target);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(transfer.OpCode, Is.EqualTo(OpCode.CallVoid));
+            Assert.That(transfer.Operands[0], Is.SameAs(target));
+            Assert.That(transfer.Operands[1], Is.SameAs(receiver));
+            Assert.That(block.Instructions[^1].OpCode, Is.EqualTo(OpCode.Return));
+            Assert.That(block.Instructions[^1].Operands, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 非Void尾调用保留精确返回槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemInt32Type);
+        var target = CreateMethod("Target", app.SystemTypes.SystemInt32Type);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), app.SystemTypes.SystemObjectType);
+        var transfer = CreateRawTransfer(OpCode.IndirectJump, receiver);
+        var block = CreateBlock(transfer);
+
+        IndirectTransferCallRewriter.Rewrite(owner, transfer, block, target);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(transfer.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(transfer.Operands[0], Is.SameAs(target));
+            Assert.That(transfer.Operands[2], Is.SameAs(receiver));
+            Assert.That(transfer.Operands[1], Is.TypeOf<LocalVariable>());
+            Assert.That(block.Instructions[^1].Operands.Single(), Is.SameAs(transfer.Operands[1]));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通间接调用不追加尾返回()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemVoidType);
+        var target = CreateMethod("Target", app.SystemTypes.SystemVoidType);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), app.SystemTypes.SystemObjectType);
+        var transfer = CreateRawTransfer(OpCode.IndirectCall, receiver);
+        var block = CreateBlock(transfer);
+
+        IndirectTransferCallRewriter.Rewrite(owner, transfer, block, target);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(transfer.OpCode, Is.EqualTo(OpCode.CallVoid));
+            Assert.That(block.Instructions, Has.Count.EqualTo(1));
+        });
+    }
+
+    private static InjectedMethodAnalysisContext CreateMethod(string name, TypeAnalysisContext returnType) =>
+        new(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType,
+            name,
+            returnType,
+            MethodAttributes.Public,
+            []);
+
+    private static Instruction CreateRawTransfer(OpCode opCode, LocalVariable receiver)
+    {
+        var operands = new IOperand[]
+        {
+            new LocalVariable("target", new Register(null, "X9")),
+            new LocalVariable("rawReturn", new Register(null, "X0"))
+        }.Concat(Arm64CallingConventionResolver.ResolveForUnmanaged()).ToArray();
+
+        // X0是虚调用接收者，覆盖原始寄存器快照中的同槽位。
+        operands[2] = receiver;
+        return new Instruction(0, opCode, operands.ToList());
+    }
+
+    private static Block CreateBlock(Instruction transfer) => new()
+    {
+        ID = 0,
+        Instructions = [transfer]
+    };
+}

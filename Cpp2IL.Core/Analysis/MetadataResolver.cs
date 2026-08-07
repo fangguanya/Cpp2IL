@@ -468,8 +468,8 @@ public static class MetadataResolver
     private const long VTableOffset64 = 0x138;
     private const long VTableOffset32 = 0xC0;
     
-    // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
-    // as long as the klass local's represented type is known.
+    // 在类局部量的实际类型已知时，通过
+    // <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c> 恢复普通虚调用与尾虚调用。
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
@@ -486,39 +486,41 @@ public static class MetadataResolver
                 loads[destination] = load;
         }
 
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        foreach (var block in method.ControlFlowGraph.Blocks)
         {
-            if (instruction.OpCode != OpCode.IndirectCall)
-                continue;
-
-            if (SlotLoad(instruction.Operands[0]) is not { } target
-                || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
-                continue;
-
-            var offset = target.Addend - vtableOffset;
-            if (offset < 0 || offset % invokeDataSize != 0)
-                continue;
-
-            var slot = (int)(offset / invokeDataSize);
-            if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
-                continue;
-
-            var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
-
-            instruction.OpCode = OpCode.Call; // 与IndirectCall共享返回槽和参数布局，再由统一绑定入口校正void形状。
-            BindCallTarget(instruction, resolved);
-
-            // the MethodInfo field is also the same method, name it, for cleanliness and so it can
-            // serve as a hidden final parameter if needed
-            for (var i = 1; i < instruction.Operands.Count && assembly != null; i++)
+            // 尾调用重写会在块末追加Return，使用快照避免枚举期间修改集合。
+            foreach (var instruction in block.Instructions.ToArray())
             {
-                if (SlotLoad(instruction.Operands[i]) is { } methodInfoLoad
-                    && ReferenceEquals(methodInfoLoad.Base, klassLocal)
-                    && methodInfoLoad.Addend == target.Addend + pointerSize)
-                    instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
-            }
+                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
+                    continue;
 
-            changed = true;
+                if (SlotLoad(instruction.Operands[0]) is not { } target
+                    || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
+                    continue;
+
+                var offset = target.Addend - vtableOffset;
+                if (offset < 0 || offset % invokeDataSize != 0)
+                    continue;
+
+                var slot = (int)(offset / invokeDataSize);
+                if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
+                    continue;
+
+                var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+
+                // MethodInfo字段与目标方法属于同一VirtualInvokeData；先替换原始寄存器快照，
+                // 再交给统一间接转移重写器裁剪参数并恢复尾返回。
+                for (var i = 1; i < instruction.Operands.Count && assembly != null; i++)
+                {
+                    if (SlotLoad(instruction.Operands[i]) is { } methodInfoLoad
+                        && ReferenceEquals(methodInfoLoad.Base, klassLocal)
+                        && methodInfoLoad.Addend == target.Addend + pointerSize)
+                        instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+                }
+
+                IndirectTransferCallRewriter.Rewrite(method, instruction, block, resolved);
+                changed = true;
+            }
         }
 
         return changed;

@@ -19,6 +19,7 @@ public abstract class BaseKeyFunctionAddresses
     public ulong il2cpp_vm_metadatacache_initializemethodmetadata; //This is thunked from the above (but only pre-27?)
     public ulong il2cpp_runtime_class_init_export; //Api function (exported)
     public ulong il2cpp_runtime_class_init_actual; //Thunked from above
+    public ulong il2cpp_codegen_runtime_class_init; // 尾跳转到实际运行时类初始化函数的代码生成入口
     public ulong il2cpp_object_new; //Api Function (exported)
     public ulong il2cpp_vm_object_new; //Thunked from above
     public ulong il2cpp_codegen_object_new; //Thunked TO above
@@ -263,6 +264,18 @@ public abstract class BaseKeyFunctionAddresses
             Logger.VerboseNewline($"Found at 0x{il2cpp_runtime_class_init_actual:X}");
         }
 
+        if (il2cpp_runtime_class_init_actual != 0)
+        {
+            Logger.Verbose("\t\tLooking for il2cpp_codegen_runtime_class_init as a tail thunk of Runtime::ClassInit...");
+            il2cpp_codegen_runtime_class_init = FindAllThunkFunctions(
+                    il2cpp_runtime_class_init_actual,
+                    4,
+                    il2cpp_runtime_class_init_export)
+                .OrderByDescending(GetCallerCount)
+                .FirstOrDefault();
+            Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_runtime_class_init:X}");
+        }
+
         if (il2cpp_array_new_specific != 0)
         {
             Logger.Verbose("\t\tMapping il2cpp_array_new_specific to vm::Array::NewSpecific...");
@@ -321,6 +334,7 @@ public abstract class BaseKeyFunctionAddresses
         AddResolved(il2cpp_vm_metadatacache_initializemethodmetadata);
         AddResolved(il2cpp_runtime_class_init_export);
         AddResolved(il2cpp_runtime_class_init_actual);
+        AddResolved(il2cpp_codegen_runtime_class_init);
         AddResolved(il2cpp_object_new);
         AddResolved(il2cpp_vm_object_new);
         AddResolved(il2cpp_codegen_object_new);
