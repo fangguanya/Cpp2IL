@@ -467,19 +467,24 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
             var definitionCount = ControlFlowGraph.Instructions.Count(candidate =>
                 ReferenceEquals(candidate.Destination, destination));
-            var useCount = ControlFlowGraph.Instructions.Sum(candidate =>
-                candidate.Operands.Count(operand => operand switch
-                {
-                    LocalVariable local => ReferenceEquals(local, destination) && !ReferenceEquals(candidate.Destination, local),
-                    MemoryOperand { Base: LocalVariable local } => ReferenceEquals(local, destination),
-                    AddressOf { Target: LocalVariable local } => ReferenceEquals(local, destination),
-                    _ => false,
-                }));
+            var uses = ControlFlowGraph.Instructions
+                .Where(candidate => UsesLocal(candidate, destination))
+                .Select(candidate => candidate.ToString())
+                .ToArray();
             Logger.VerboseNewline(
-                $"SSA裁剪后未解析绝对加载：方法={FullName}，地址=0x{memory.Addend:X}，局部={destination.Name}，定义={definitionCount}，使用={useCount}",
+                $"SSA裁剪后未解析绝对加载：方法={FullName}，地址=0x{memory.Addend:X}，局部={destination.Name}，定义={definitionCount}，使用={uses.Length}，指令=[{string.Join(" | ", uses)}]",
                 "MethodAnalysisContext");
         }
     }
+
+    private static bool UsesLocal(Instruction instruction, LocalVariable target)
+        => instruction.Operands.Any(operand => operand switch
+        {
+            LocalVariable local => ReferenceEquals(local, target) && !ReferenceEquals(instruction.Destination, local),
+            MemoryOperand { Base: LocalVariable local } => ReferenceEquals(local, target),
+            AddressOf { Target: LocalVariable local } => ReferenceEquals(local, target),
+            _ => false,
+        });
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
 
