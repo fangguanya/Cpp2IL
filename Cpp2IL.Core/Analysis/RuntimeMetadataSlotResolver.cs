@@ -12,6 +12,9 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class RuntimeMetadataSlotResolver
 {
+    private const string InitializeRuntimeMetadata = "il2cpp_codegen_initialize_runtime_metadata";
+    private const string InitializeMethod = "il2cpp_codegen_initialize_method";
+
     private readonly record struct SlotCandidate(
         ulong Address,
         LocalVariable Origin,
@@ -36,18 +39,26 @@ public static class RuntimeMetadataSlotResolver
             var expected = CallArgumentTrimmer.ExpectedOperandCount(call, called);
             for (var index = expected; index < call.Operands.Count; index++)
             {
-                if (TryFindSlotOrigin(call.Operands[index], definitions, out var address, out var origin))
+                var origins = FindSlotOrigins(call.Operands[index], definitions);
+                if (origins.Count > 0)
                 {
-                    candidates.Add(new(address, origin, MethodIdentity(called)));
-                    Logger.VerboseNewline(
-                        $"运行时元数据槽证据：method={method.Name}，call={called.Name}，" +
-                        $"operand={index}，slot=0x{address:X}，origin={origin}");
+                    foreach (var (address, origin) in origins)
+                    {
+                        candidates.Add(new(address, origin, MethodIdentity(called)));
+                        Logger.VerboseNewline(
+                            $"运行时元数据槽证据：method={method.Name}，call={called.Name}，" +
+                            $"operand={index}，slot=0x{address:X}，origin={origin}");
+                    }
                 }
                 else
                 {
+                    var definitionDetail = call.Operands[index] is LocalVariable unmatchedLocal
+                                           && definitions.TryGetValue(unmatchedLocal, out var unmatchedDefinition)
+                        ? unmatchedDefinition.ToString()
+                        : "<无局部定义>";
                     Logger.VerboseNewline(
                         $"运行时元数据槽未匹配隐参：method={method.Name}，call={called.Name}，" +
-                        $"operand={index}，value={call.Operands[index]}");
+                        $"operand={index}，value={call.Operands[index]}，definition={definitionDetail}");
                 }
             }
         }
@@ -58,18 +69,64 @@ public static class RuntimeMetadataSlotResolver
             .Where(group => group.Select(candidate => candidate.MethodIdentity).Distinct().Count() == 1)
             .SelectMany(group => group.Select(candidate => candidate.Origin)));
 
+        var initializedSlots = CollectInitializedSlotAddresses(instructions, definitions);
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode == OpCode.Move
+                && instruction.Operands is
+                [LocalVariable destination, MemoryOperand
+                    {
+                        Base: null,
+                        Index: null,
+                        Scale: 0,
+                        Addend: >= 0
+                    } absolute]
+                && initializedSlots.Contains((ulong)absolute.Addend))
+            {
+                // 初始化保护区已证明该绝对地址保存运行时元数据；同一方法内再次读取
+                // 该地址仍是隐藏 MethodInfo，不会成为托管业务值。
+                provenOrigins.Add(destination);
+            }
+        }
+
         var changed = RepairMixedPhis(instructions, provenOrigins);
         // 该加载已被“绑定调用签名之外的隐藏实参”证明为 MethodInfo 槽值。
         // 在裁参前精确删除其唯一定义，可避免后续退 SSA/副本合并把同一物理寄存器
         // 的业务布尔值重新与元数据加载合并；调用上的多余引用随后由统一裁参器删除。
         changed |= RemoveProvenLoads(definitions, provenOrigins);
-        if (candidates.Count > 0)
+        if (candidates.Count > 0 || initializedSlots.Count > 0)
         {
             Logger.VerboseNewline(
                 $"运行时元数据槽汇总：method={method.Name}，candidates={candidates.Count}，" +
-                $"proven={provenOrigins.Count}，changed={changed}");
+                $"initializedSlots={initializedSlots.Count}，proven={provenOrigins.Count}，changed={changed}");
         }
         return changed;
+    }
+
+    internal static HashSet<ulong> CollectInitializedSlotAddresses(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var slots = new HashSet<ulong>();
+        foreach (var instruction in instructions)
+        {
+            if (!instruction.IsCall
+                || instruction.Operands.Count < 2
+                || instruction.Operands[0] is not StringLiteral { Value: var name }
+                || name is not (InitializeRuntimeMetadata or InitializeMethod))
+                continue;
+
+            // 目标与可能的返回局部变量都不会形成槽证据；从其余操作数反向遍历
+            // Move/Phi，可同时覆盖 ARM64 直接绝对加载与间接槽指针形态。
+            var firstArgument = instruction.OpCode == OpCode.Call ? 2 : 1;
+            for (var index = firstArgument; index < instruction.Operands.Count; index++)
+            {
+                foreach (var (address, _) in FindSlotOrigins(instruction.Operands[index], definitions))
+                    slots.Add(address);
+            }
+        }
+
+        return slots;
     }
 
     internal static bool RemoveProvenLoads(
@@ -99,38 +156,75 @@ public static class RuntimeMetadataSlotResolver
         out ulong address,
         out LocalVariable origin)
     {
-        if (operand is MemoryOperand
-            {
-                Base: LocalVariable argumentSlotPointer,
-                Index: null,
-                Scale: 0,
-                Addend: 0
-            }
-            && definitions.TryGetValue(argumentSlotPointer, out var argumentSlotDefinition)
-            && argumentSlotDefinition.OpCode == OpCode.Move
-            && argumentSlotDefinition.Operands.Count >= 2
-            && argumentSlotDefinition.Operands[1] is MemoryOperand
-            {
-                Base: null,
-                Index: null,
-                Scale: 0,
-                Addend: >= 0
-            } argumentAbsolute)
+        var origins = FindSlotOrigins(operand, definitions);
+        if (origins.Count > 0)
         {
-            // LDR Xn,[绝对槽] 后直接以 [Xn] 作为 MethodInfo 实参时，调用操作数
-            // 自身就是第二次解引用，不会再生成承接结果的局部变量。
-            address = (ulong)argumentAbsolute.Addend;
-            origin = argumentSlotPointer;
+            (address, origin) = origins[0];
             return true;
         }
 
+        address = 0;
+        origin = null!;
+        return false;
+    }
+
+    internal static IReadOnlyList<(ulong Address, LocalVariable Origin)> FindSlotOrigins(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var results = new List<(ulong Address, LocalVariable Origin)>();
         var visited = new HashSet<LocalVariable>();
-        while (operand is LocalVariable local && visited.Add(local))
+        var pending = new Stack<IOperand>();
+        pending.Push(operand);
+
+        void AddResult(ulong address, LocalVariable origin)
         {
-            if (!definitions.TryGetValue(local, out var definition)
-                || definition.OpCode != OpCode.Move
-                || definition.Operands.Count < 2)
-                break;
+            if (!results.Any(result => result.Address == address && ReferenceEquals(result.Origin, origin)))
+                results.Add((address, origin));
+        }
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (current is MemoryOperand
+                {
+                    Base: LocalVariable argumentSlotPointer,
+                    Index: null,
+                    Scale: 0,
+                    Addend: 0
+                }
+                && definitions.TryGetValue(argumentSlotPointer, out var argumentSlotDefinition)
+                && argumentSlotDefinition.OpCode == OpCode.Move
+                && argumentSlotDefinition.Operands.Count >= 2
+                && argumentSlotDefinition.Operands[1] is MemoryOperand
+                {
+                    Base: null,
+                    Index: null,
+                    Scale: 0,
+                    Addend: >= 0
+                } argumentAbsolute)
+            {
+                // LDR Xn,[绝对槽] 后直接以 [Xn] 作为 MethodInfo 实参时，调用操作数
+                // 自身就是第二次解引用，不会再生成承接结果的局部变量。
+                AddResult((ulong)argumentAbsolute.Addend, argumentSlotPointer);
+                continue;
+            }
+
+            if (current is not LocalVariable local || !visited.Add(local)
+                || !definitions.TryGetValue(local, out var definition))
+                continue;
+
+            if (definition.OpCode == OpCode.Phi)
+            {
+                // 隐藏实参可能经过循环汇合；遍历全部来源才能找到被业务寄存器重用
+                // 包裹住的元数据槽，而不是把整个 Phi 误当成一个普通局部变量。
+                for (var index = 1; index < definition.Operands.Count; index++)
+                    pending.Push(definition.Operands[index]);
+                continue;
+            }
+
+            if (definition.OpCode != OpCode.Move || definition.Operands.Count < 2)
+                continue;
 
             var source = definition.Operands[1];
             if (source is MemoryOperand
@@ -143,9 +237,8 @@ public static class RuntimeMetadataSlotResolver
             {
                 // ARM64 常见形态是 ADRP+LDR 已折叠成一次绝对地址加载；该局部变量
                 // 本身就是传给托管调用的 MethodInfo，而不是槽地址指针。
-                address = (ulong)directSlot.Addend;
-                origin = local;
-                return true;
+                AddResult((ulong)directSlot.Addend, local);
+                continue;
             }
 
             if (source is MemoryOperand
@@ -166,17 +259,13 @@ public static class RuntimeMetadataSlotResolver
                     Addend: >= 0
                 } absolute)
             {
-                address = (ulong)absolute.Addend;
-                origin = local;
-                return true;
+                AddResult((ulong)absolute.Addend, local);
             }
 
-            operand = source;
+            pending.Push(source);
         }
 
-        address = 0;
-        origin = null!;
-        return false;
+        return results;
     }
 
     internal static bool RepairMixedPhis(

@@ -8,6 +8,57 @@ public class RuntimeMetadataSlotResolverTests
 {
     [Test]
     [Category("基本功能")]
+    public void 初始化调用建立元数据槽地址目录()
+    {
+        var slotValue = Local("slotValue");
+        var callResult = Local("callResult");
+        var load = new Instruction(0, OpCode.Move, slotValue, new MemoryOperand(addend: 0x5A3B030));
+        var initialize = new Instruction(
+            1,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_initialize_runtime_metadata"),
+            callResult,
+            slotValue);
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [slotValue] = load,
+            [callResult] = initialize,
+        };
+
+        var slots = RuntimeMetadataSlotResolver.CollectInitializedSlotAddresses(
+            [load, initialize],
+            definitions);
+
+        Assert.That(slots, Is.EquivalentTo(new[] { 0x5A3B030UL }));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 隐藏实参经过Phi时仍能枚举其中的元数据槽来源()
+    {
+        var slot = Local("slot");
+        var business = Local("business");
+        var merged = Local("merged");
+        var load = new Instruction(0, OpCode.Move, slot, new MemoryOperand(addend: 0x5A3B030));
+        var phi = new Instruction(1, OpCode.Phi, merged, slot, business);
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [slot] = load,
+            [merged] = phi,
+        };
+
+        var origins = RuntimeMetadataSlotResolver.FindSlotOrigins(merged, definitions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(origins, Has.Count.EqualTo(1));
+            Assert.That(origins[0].Address, Is.EqualTo(0x5A3B030));
+            Assert.That(origins[0].Origin, Is.SameAs(slot));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 调用实参直接解引用槽指针时可回溯绝对地址()
     {
         var slotPointer = Local("slotPointer");
