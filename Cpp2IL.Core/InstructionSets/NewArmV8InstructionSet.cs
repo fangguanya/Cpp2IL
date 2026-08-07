@@ -16,6 +16,7 @@ internal enum Arm64FlagState
 {
     None,
     ZeroOnly,
+    CarryAndZero,
     Comparison,
     FloatingComparison
 }
@@ -875,6 +876,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             : null;
     }
 
+    internal static bool CanEmitCarryZeroCondition(
+        Arm64ConditionCode conditionCode,
+        Arm64FlagState flagState)
+    {
+        // CCMP 的立即 NZCV 分支与真实比较分支都能精确物化 C、Z；仅放行只依赖这两位的无符号条件。
+        return flagState == Arm64FlagState.CarryAndZero
+            && conditionCode is Arm64ConditionCode.HI
+                or Arm64ConditionCode.LS
+                or Arm64ConditionCode.CS
+                or Arm64ConditionCode.CC;
+    }
+
     internal static bool CanEmitConditionalBranch(
         Arm64ConditionCode conditionCode,
         Arm64FlagState flagState)
@@ -1181,6 +1194,43 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     condition = less;
                 }
                 return true;
+            }
+
+            if (CanEmitCarryZeroCondition(conditionCode, inputFlagState))
+            {
+                var carry = new Register(null, "C");
+                var zero = new Register(null, "Z");
+                switch (conditionCode)
+                {
+                    case Arm64ConditionCode.CS:
+                        condition = carry;
+                        return true;
+                    case Arm64ConditionCode.CC:
+                    {
+                        var notCarry = new Register(null, registerPrefix + "_NOT_CARRY");
+                        Add(address, OpCode.Not, notCarry, carry);
+                        condition = notCarry;
+                        return true;
+                    }
+                    case Arm64ConditionCode.HI:
+                    {
+                        var notZero = new Register(null, registerPrefix + "_NOT_ZERO");
+                        var higher = new Register(null, registerPrefix + "_HIGHER");
+                        Add(address, OpCode.Not, notZero, zero);
+                        Add(address, OpCode.And, higher, carry, notZero);
+                        condition = higher;
+                        return true;
+                    }
+                    case Arm64ConditionCode.LS:
+                    {
+                        var notCarry = new Register(null, registerPrefix + "_NOT_CARRY");
+                        var lowerOrSame = new Register(null, registerPrefix + "_LOWER_OR_SAME");
+                        Add(address, OpCode.Not, notCarry, carry);
+                        Add(address, OpCode.Or, lowerOrSame, notCarry, zero);
+                        condition = lowerOrSame;
+                        return true;
+                    }
+                }
             }
 
             var relationalOpCode = GetConditionalSetRelationalOpCode(
@@ -1720,20 +1770,33 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     // CCMP 条件成立时更新比较标志；否则使用 NZCV 立即数。当前 ISIL 精确保留后继 EQ/NE 所需的 Z 位。
                     var comparedZero = new Register(null, "CCMP_COMPARED_ZERO");
+                    var comparedCarry = new Register(null, "CCMP_COMPARED_CARRY");
                     Add(
                         address,
                         OpCode.CheckEqual,
                         comparedZero,
                         ConvertOperand(instruction, 0),
                         ConvertOperand(instruction, 1));
+                    Add(
+                        address,
+                        OpCode.CheckGreaterOrEqualUnsigned,
+                        comparedCarry,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1));
                     Add(address, OpCode.Move, new Register(null, "Z"), comparedZero);
+                    Add(address, OpCode.Move, new Register(null, "C"), comparedCarry);
                     Add(address, OpCode.ConditionalJump, Imm(address + 4), ccmpCondition);
                     Add(
                         address,
                         OpCode.Move,
                         new Register(null, "Z"),
                         Imm((instruction.Op2Imm >> 2) & 1));
-                    flagState = Arm64FlagState.ZeroOnly;
+                    Add(
+                        address,
+                        OpCode.Move,
+                        new Register(null, "C"),
+                        Imm((instruction.Op2Imm >> 1) & 1));
+                    flagState = Arm64FlagState.CarryAndZero;
                     break;
                 }
 

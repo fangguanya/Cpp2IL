@@ -905,6 +905,39 @@ public class NewArmV8InstructionSetTests
             Is.Null);
     }
 
+    [TestCase(Arm64ConditionCode.HI, TestName = "基本_CCMP无符号大于可由C与Z精确恢复")]
+    [TestCase(Arm64ConditionCode.LS, TestName = "边界_CCMP无符号小于等于可由C与Z精确恢复")]
+    [TestCase(Arm64ConditionCode.CS, TestName = "边界_CCMP进位条件可直接读取C")]
+    [TestCase(Arm64ConditionCode.CC, TestName = "边界_CCMP无进位条件可反转C")]
+    [Category("基本功能")]
+    public void CarryZeroProducerAcceptsOnlyUnsignedConditions(Arm64ConditionCode conditionCode)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.CanEmitCarryZeroCondition(
+                conditionCode,
+                Arm64FlagState.CarryAndZero),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void CarryZeroProducerRejectsSignedConditionAndWrongProducer()
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                NewArmV8InstructionSet.CanEmitCarryZeroCondition(
+                    Arm64ConditionCode.GT,
+                    Arm64FlagState.CarryAndZero),
+                Is.False);
+            Assert.That(
+                NewArmV8InstructionSet.CanEmitCarryZeroCondition(
+                    Arm64ConditionCode.HI,
+                    Arm64FlagState.ZeroOnly),
+                Is.False);
+        }
+    }
+
     [TestCase(Arm64ConditionCode.NONE)]
     [TestCase(Arm64ConditionCode.AL)]
     [TestCase(Arm64ConditionCode.NV)]
