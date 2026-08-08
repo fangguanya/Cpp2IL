@@ -384,7 +384,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
-        DeadCodeEliminator.Run(this);
 
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
@@ -395,8 +394,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         HiddenReturnBufferRecovery.Run(this);
 
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
-        KeyFunctionRecovery.Run(this);
-        DeadCodeEliminator.Run(this);
+        KeyFunctionRecovery.RewriteAllocationsAndBarriers(this);
 
         // 初始化保护区删除后不再能从CFG枚举其 MethodInfo 槽；因此先冻结槽地址目录，
         // 后续只把该不可变证据用于清理同一方法内的隐藏元数据读取。
@@ -405,9 +403,12 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
         MetadataInitGuardRemover.Run(this);
 
-        InjectedCheckRemover.Run(this);
-
         LocalVariables.ResolveTypesAndFields(this);
+        // 值类型通过主不动点到达取址栈槽后，再把Object::Box唯一恢复为托管box。
+        KeyFunctionRecovery.RewriteBoxing(this);
+        InjectedCheckRemover.Run(this);
+        // 装箱消费栈槽后再统一删除标志、写屏障与原生地址临时量，避免提前丢失值写入。
+        DeadCodeEliminator.Run(this);
         AggregateStackCopyRecovery.RewriteResolvedCopies(this);
 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。

@@ -360,6 +360,18 @@ public static class IlGenerator
                 }
                 break;
 
+            case OpCode.Box:
+                if (instruction.Operands is not
+                    [{ } boxDestination, { } boxedValue, TypeAnalysisContext { IsValueType: true } boxedType])
+                    throw new InvalidOperationException($"Box指令操作数不完整: {instruction}");
+
+                LoadOperand(boxedValue, method, locals, writeLine, stringCtor, boxedType);
+                instructions.Add(
+                    CilOpCodes.Box,
+                    importer.ImportTypeSignature(boxedType.ToTypeSignature(module)).ToTypeDefOrRef());
+                StoreToOperand(boxDestination, method, locals, writeLine);
+                break;
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)

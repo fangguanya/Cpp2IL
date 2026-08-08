@@ -169,6 +169,9 @@ public enum OpCode
     /// </summary>
     Newobj,
 
+    /// <summary>把 op 2 的值类型值装箱为 op 3 指定的值类型，并把对象写入 op 1。</summary>
+    Box,
+
     /// <summary>
     /// Allocates a new array of the type described by op 2, with the length in op 3, into op 1.
     /// </summary>

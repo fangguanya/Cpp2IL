@@ -215,4 +215,114 @@ public class SsaAndDominators
         // the read arm is only reachable via the entry, so it can't see the sibling's version
         Assert.That(((Register)use.Operands[1]).Version, Is.EqualTo(((Register)entryDef.Operands[0]).Version));
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 装箱数据地址被识别为只读输入()
+    {
+        const ulong boxTarget = 0x2162514;
+        var value = new Register(null, "stack_-24");
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate((long)boxTarget),
+            new Register(null, "X0"),
+            new Register(null, "X1"),
+            new AddressOf(value));
+
+        Assert.That(
+            SsaForm.IsReadOnlyBoxDataAddress(call, 3, new HashSet<ulong> { boxTarget }),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 装箱类句柄位置不是数据地址()
+    {
+        const ulong boxTarget = 0x2162514;
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate((long)boxTarget),
+            new Register(null, "X0"),
+            new AddressOf(new Register(null, "X1")),
+            new Register(null, "X2"));
+
+        Assert.That(
+            SsaForm.IsReadOnlyBoxDataAddress(call, 2, new HashSet<ulong> { boxTarget }),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未知原生调用的取址参数仍按可能写回处理()
+    {
+        const ulong boxTarget = 0x2162514;
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x123456),
+            new Register(null, "X0"),
+            new Register(null, "X1"),
+            new AddressOf(new Register(null, "stack_-24")));
+
+        Assert.That(
+            SsaForm.IsReadOnlyBoxDataAddress(call, 3, new HashSet<ulong> { boxTarget }),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 纯地址计算沿用调用前栈槽版本()
+    {
+        var stack = new Register(null, "stack_-24");
+        var pointer = new Register(null, "X1");
+        var result = new Register(null, "X0");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, stack, new Immediate(1)),
+            new(1, OpCode.Move, pointer, new AddressOf(stack)),
+            new(2, OpCode.Move, result, stack),
+            new(3, OpCode.Return, result),
+        };
+        var graph = BuildGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        var stackDefinition = (Register)instructions[0].Operands[0];
+        var addressed = (Register)((AddressOf)instructions[1].Operands[1]).Target;
+        var laterRead = (Register)instructions[2].Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(addressed.Version, Is.EqualTo(stackDefinition.Version));
+            Assert.That(laterRead.Version, Is.EqualTo(stackDefinition.Version));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 可能写回的调用地址生成新栈槽版本()
+    {
+        var stack = new Register(null, "stack_-24");
+        var result = new Register(null, "X0");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, stack, new Immediate(1)),
+            new(1, OpCode.CallVoid, new StringLiteral("mutate"), new AddressOf(stack)),
+            new(2, OpCode.Move, result, stack),
+            new(3, OpCode.Return, result),
+        };
+        var graph = BuildGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        var stackDefinition = (Register)instructions[0].Operands[0];
+        var addressed = (Register)((AddressOf)instructions[1].Operands[1]).Target;
+        var laterRead = (Register)instructions[2].Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(addressed.Version, Is.Not.EqualTo(stackDefinition.Version));
+            Assert.That(laterRead.Version, Is.EqualTo(addressed.Version));
+        });
+    }
 }

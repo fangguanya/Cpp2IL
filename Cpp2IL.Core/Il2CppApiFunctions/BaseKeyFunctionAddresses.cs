@@ -39,6 +39,7 @@ public abstract class BaseKeyFunctionAddresses
 
     public ulong il2cpp_value_box; //Api function (exported)
     public ulong il2cpp_vm_object_box; //Thunked from above
+    public ulong il2cpp_codegen_object_box; //直接尾跳转到Object::Box的代码生成入口
 
     public ulong il2cpp_object_unbox; //Api function
     public ulong il2cpp_vm_object_unbox; //Thunked from above
@@ -236,6 +237,16 @@ public abstract class BaseKeyFunctionAddresses
             Logger.VerboseNewline($"Found at 0x{il2cpp_vm_object_box:X}");
         }
 
+        if (il2cpp_vm_object_box != 0)
+        {
+            Logger.Verbose("\t\tMapping Object::Box to il2cpp_codegen_object_box...");
+            il2cpp_codegen_object_box = FindAllThunkFunctions(
+                il2cpp_vm_object_box,
+                0,
+                il2cpp_value_box).FirstOrDefault();
+            Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_object_box:X}");
+        }
+
         if (il2cpp_object_unbox != 0)
         {
             Logger.Verbose("\t\tMapping il2cpp_object_unbox to Object::Unbox...");
@@ -354,6 +365,7 @@ public abstract class BaseKeyFunctionAddresses
 
         AddResolved(il2cpp_value_box);
         AddResolved(il2cpp_vm_object_box);
+        AddResolved(il2cpp_codegen_object_box);
 
         AddResolved(il2cpp_object_unbox);
         AddResolved(il2cpp_vm_object_unbox);

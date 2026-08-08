@@ -127,6 +127,32 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 方法布尔返回值经过普通寄存器一位掩码后保持布尔类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0", 7),
+            appContext.SystemTypes.SystemBooleanType);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X8", 3));
+        var instruction = new Instruction(0, OpCode.And, destination, source, new Immediate(1));
+
+        var changed = LocalVariables.BindBooleanBitTestOperands(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 非一位掩码保持原始数值类型()
     {

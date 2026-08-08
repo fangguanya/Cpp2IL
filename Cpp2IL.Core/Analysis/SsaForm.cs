@@ -26,12 +26,29 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!);
+    {
+        var keyFunctions = method.AppContext.GetOrCreateKeyFunctionAddresses();
+        var readOnlyBoxTargets = new HashSet<ulong>(
+            new[]
+            {
+                keyFunctions.il2cpp_value_box,
+                keyFunctions.il2cpp_vm_object_box,
+                keyFunctions.il2cpp_codegen_object_box,
+            }.Where(address => address != 0));
+
+        Build(method.ControlFlowGraph!, method.DominatorInfo!, readOnlyBoxTargets);
+    }
 
     public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
+        => Build(graph, dominatorInfo, new HashSet<ulong>());
+
+    private static void Build(
+        ISILControlFlowGraph graph,
+        DominatorInfo dominatorInfo,
+        ISet<ulong> readOnlyBoxTargets)
     {
         var ssa = new SsaForm();
-        ssa.FindClobberingAddressTakes(graph);
+        ssa.FindClobberingAddressTakes(graph, readOnlyBoxTargets);
 
         graph.BuildUseDefLists(ssa._clobbering);
 
@@ -86,7 +103,9 @@ public class SsaForm
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
     private readonly HashSet<Instruction> _clobbering = [];
 
-    private void FindClobberingAddressTakes(ISILControlFlowGraph graph)
+    private void FindClobberingAddressTakes(
+        ISILControlFlowGraph graph,
+        ISet<ulong> readOnlyBoxTargets)
     {
         foreach (var block in graph.Blocks)
         {
@@ -94,14 +113,35 @@ public class SsaForm
             {
                 var instruction = block.Instructions[i];
 
-                foreach (var operand in instruction.Operands)
+                // 纯Move/lea只计算槽地址，不会写入槽；只有把地址交给调用时才存在写回语义。
+                if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall))
+                    continue;
+
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
                 {
+                    var operand = instruction.Operands[operandIndex];
                     if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    {
+                        // Object::Box的第2个原生参数是只读数据指针；它读取调用前的槽值，绝不写回槽。
+                        if (IsReadOnlyBoxDataAddress(instruction, operandIndex, readOnlyBoxTargets))
+                            continue;
+
                         _clobbering.Add(instruction);
+                    }
                 }
             }
         }
     }
+
+    internal static bool IsReadOnlyBoxDataAddress(
+        Instruction instruction,
+        int operandIndex,
+        ISet<ulong> readOnlyBoxTargets)
+        => instruction.OpCode == OpCode.Call
+            && operandIndex == 3
+            && instruction.Operands.Count > 3
+            && instruction.Operands[0] is Immediate target
+            && readOnlyBoxTargets.Contains(target.UnsignedValue);
 
     private static bool IsReadAfter(Block block, int index, Register register)
     {

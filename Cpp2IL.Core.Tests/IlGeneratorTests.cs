@@ -41,6 +41,57 @@ public class IlGeneratorTests
         Assert.That(IlGenerator.RequiresTerminalReturn(true, finalInstruction), Is.True);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void Box指令生成值类型装箱而非原生地址传递()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = app.SystemTypes.SystemObjectType;
+        var systemBoolean = app.SystemTypes.SystemBooleanType;
+        var systemVoid = app.SystemTypes.SystemVoidType;
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "BoxBoolean",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        var value = new LocalVariable("value", new Register(null, "value"), systemBoolean);
+        var result = new LocalVariable("result", new Register(null, "result"), systemObject);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, value, new Immediate(1)),
+            new Instruction(1, OpCode.Box, result, value, systemBoolean),
+            new Instruction(2, OpCode.Return),
+        ]);
+        context.Locals = [value, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "BoxTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        绑定AsmResolver系统类型(
+            module,
+            systemBoolean,
+            "Boolean",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var type = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "BoxTestType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition(
+            "BoxBoolean",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var box = method.CilMethodBody!.Instructions.Single(instruction => instruction.OpCode == CilOpCodes.Box);
+        Assert.That(box.Operand!.ToString(), Does.Contain("System.Boolean"));
+    }
+
     [TestCaseSource(nameof(不可顺序落出的终结指令))]
     public void Void方法已有控制流终结点时不重复补返回(CilOpCode opCode)
     {

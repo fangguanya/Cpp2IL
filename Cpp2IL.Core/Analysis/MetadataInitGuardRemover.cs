@@ -29,13 +29,8 @@ public static class MetadataInitGuardRemover
 
     public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
     {
-        var removedAny = false;
-
         foreach (var guard in cfg.Blocks.ToList())
-            removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
-
-        if (removedAny)
-            DeadCodeEliminator.Run(cfg);
+            TryRemoveGuard(cfg, guard, initialisedFlagOffset);
     }
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)

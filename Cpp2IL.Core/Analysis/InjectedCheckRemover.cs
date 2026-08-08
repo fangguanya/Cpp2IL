@@ -49,7 +49,6 @@ public static class InjectedCheckRemover
 
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
-        DeadCodeEliminator.Run(cfg);
     }
 
     private static bool IsInjectedCheck(Instruction definition, string thrownType) =>

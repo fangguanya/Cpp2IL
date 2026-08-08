@@ -246,7 +246,6 @@ public static class LocalVariables
         SeedComparisonResults(method);
         SeedPackedHalfwordPredicateTypes(method);
         SeedPackedVectorExtractionTypes(method);
-        SeedBooleanBitTestTypes(method);
         SeedNullablePresenceTestResults(method);
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
@@ -282,6 +281,7 @@ public static class LocalVariables
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveFieldOffsets), MetadataResolver.ResolveFieldOffsets(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(RgctxResolver), RgctxResolver.Run(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateStaticFieldStorage), PropagateStaticFieldStorage(method));
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateBooleanBitTestTypes), PropagateBooleanBitTestTypes(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateTypesOnce), PropagateTypesOnce(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(AggregateStackCopyRecovery), AggregateStackCopyRecovery.Run(method));
         }
@@ -307,6 +307,7 @@ public static class LocalVariables
             changed = PropagateFromCallParameters(method);
             changed |= BindAddressCarrierTypes(method.ControlFlowGraph!.Instructions);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= PropagateBooleanBitTestTypes(method);
             changed |= PropagateTypesOnce(method);
         }
     }
@@ -458,11 +459,13 @@ public static class LocalVariables
     /// 如果同一物理返回寄存器随后又承载<see cref="Nullable{T}"/>，普通单调传播会把
     /// 当前版本误标成可空结构，最终生成对结构执行按位与的非法IL。
     /// </summary>
-    private static void SeedBooleanBitTestTypes(MethodAnalysisContext method)
+    private static bool PropagateBooleanBitTestTypes(MethodAnalysisContext method)
     {
         var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        var changed = false;
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
-            BindBooleanBitTestOperands(instruction, booleanType);
+            changed |= BindBooleanBitTestOperands(instruction, booleanType);
+        return changed;
     }
 
     internal static bool BindBooleanBitTestOperands(
@@ -475,6 +478,7 @@ public static class LocalVariables
             || instruction.Operands[1] is not LocalVariable source
             || instruction.Operands[2] is not Immediate { Value: 1 }
             || (destination.Type != booleanType
+                && source.Type != booleanType
                 && !destination.Register.Name.StartsWith("TEST_BIT_VALUE", StringComparison.Ordinal)))
             return false;
 
@@ -602,6 +606,9 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
+                case OpCode.Box:
+                    changed |= PropagateBox(instruction, method);
+                    break;
                 case OpCode.Not:
                     changed |= BindBooleanNotResult(
                         instruction,
@@ -617,6 +624,29 @@ public static class LocalVariables
                     changed |= PropagateNumericConversion(instruction, method);
                     break;
             }
+        }
+
+        return changed;
+    }
+
+    private static bool PropagateBox(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction.Operands is not
+            [LocalVariable destination, LocalVariable value, TypeAnalysisContext boxedType])
+            return false;
+
+        var changed = false;
+        if (!GenericCallRebinder.TypesEquivalent(value.Type, boxedType))
+        {
+            value.Type = boxedType;
+            changed = true;
+        }
+
+        var objectType = method.AppContext.SystemTypes.SystemObjectType;
+        if (!GenericCallRebinder.TypesEquivalent(destination.Type, objectType))
+        {
+            destination.Type = objectType;
+            changed = true;
         }
 
         return changed;
