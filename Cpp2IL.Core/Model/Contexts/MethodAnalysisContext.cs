@@ -467,6 +467,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // 清理数组与地址局部等后期重写留下的无用定义。
         DeadCodeEliminator.Run(this);
+        DeadAddressCarrierRecovery.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }
