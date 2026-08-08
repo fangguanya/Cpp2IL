@@ -452,6 +452,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 此处把完整容量菱形闭合为公开 Add 调用，避免输出运行库私有字段和 AddWithResize。
         ListAddRecovery.Run(this);
 
+        // List<T>.Clear 的原生内联会先清零字段再按旧大小清理数组；字段不是SSA值，
+        // 必须在最终控制流上把完整版本递增、清零和Array.Clear分支闭合为公开Clear调用。
+        ListClearRecovery.Run(this);
+
         LocalVariables.TypeAddressedLocals(this);
 
         // Near-last, as it depends on the final block layout
