@@ -47,11 +47,19 @@ public static class KeyFunctionRecovery
         var instructions = method.ControlFlowGraph!.Blocks
             .SelectMany(block => block.Instructions)
             .ToList();
+        if (!instructions.Any(instruction =>
+                instruction.Operands is [StringLiteral { Value: var keyFunction }, ..]
+                && ObjectBoxFunctions.Contains(keyFunction)))
+            return;
+
         var definitions = instructions
             .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            // 多定义局部不满足SSA唯一生产者证明；保留原始调用，禁止任选一个版本。
+            .Where(group => group.Count() == 1)
             .ToDictionary(
-                instruction => (LocalVariable)instruction.Destination!,
-                instruction => instruction);
+                group => group.Key,
+                group => group.Single());
 
         foreach (var block in method.ControlFlowGraph.Blocks)
         {

@@ -147,6 +147,44 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    [Category("异常输入")]
+    public void 多定义地址载体保持原始调用且不选择任一版本()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var firstValue = Local("firstValue", app.SystemTypes.SystemBooleanType);
+        var secondValue = Local("secondValue", app.SystemTypes.SystemInt32Type);
+        var carrier = Local("carrier", app.SystemTypes.SystemIntPtrType);
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var firstDefinition = new Instruction(0, OpCode.Move, carrier, new AddressOf(firstValue));
+        var secondDefinition = new Instruction(1, OpCode.Move, carrier, new AddressOf(secondValue));
+        var call = new Instruction(
+            2,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            result,
+            app.SystemTypes.SystemBooleanType,
+            carrier);
+        var method = CreateMethod(firstDefinition, secondDefinition, call);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 无装箱方法允许同一局部存在多个定义()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var local = Local("local", app.SystemTypes.SystemInt32Type);
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, local, new Immediate(1)),
+            new Instruction(1, OpCode.Move, local, new Immediate(2)));
+
+        Assert.DoesNotThrow(() => KeyFunctionRecovery.RewriteBoxing(method));
+    }
+
+    [Test]
     [Category("基本功能")]
     public void 先取地址后写栈槽时选择调用前最近值版本()
     {
