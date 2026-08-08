@@ -200,6 +200,35 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("异常输入")]
+    public void 一位掩码不得覆盖静态字段存储载体且第二次传播稳定()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var owner = appContext.SystemTypes.SystemObjectType;
+        var storageType = new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly);
+        var source = new LocalVariable("source", new Register(null, "X8", 7), storageType);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "TEST_BIT_VALUE", 3));
+        var instruction = new Instruction(0, OpCode.And, destination, source, new Immediate(1));
+
+        var firstChanged = LocalVariables.BindBooleanBitTestOperands(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+        var secondChanged = LocalVariables.BindBooleanBitTestOperands(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstChanged, Is.True);
+            Assert.That(secondChanged, Is.False);
+            Assert.That(source.Type, Is.SameAs(storageType));
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
     [Category("基本功能")]
     public void 可空低字节掩码恢复存在标志类型()
     {

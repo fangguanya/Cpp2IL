@@ -482,9 +482,18 @@ public static class LocalVariables
                 && !destination.Register.Name.StartsWith("TEST_BIT_VALUE", StringComparison.Ordinal)))
             return false;
 
-        var changed = destination.Type != booleanType || source.Type != booleanType;
+        // 运行时元数据载体来自确定的原生结构字段，优先级高于寄存器名启发式；
+        // 位测试只把结果绑定为布尔值，禁止反向覆盖静态字段、类、方法或rgctx指针。
+        var bindSource = source.Type is not (
+            StaticFieldStorageTypeAnalysisContext
+            or RuntimeClassTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext
+            or RgctxTableTypeAnalysisContext);
+        var changed = destination.Type != booleanType
+            || (bindSource && source.Type != booleanType);
         destination.Type = booleanType;
-        source.Type = booleanType;
+        if (bindSource)
+            source.Type = booleanType;
         return changed;
     }
 
