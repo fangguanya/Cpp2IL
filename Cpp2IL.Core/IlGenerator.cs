@@ -876,6 +876,27 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Callvirt, importer.ImportMethod(lengthGetter));
                 break;
             case AddressOf { Target: LocalVariable addressed }:
+                if (expectedType is { IsValueType: false }
+                    && expectedType is not (
+                        ByRefTypeAnalysisContext
+                        or PointerTypeAnalysisContext
+                        or RuntimeClassTypeAnalysisContext
+                        or RuntimeMethodInfoAnalysisContext
+                        or StaticFieldStorageTypeAnalysisContext
+                        or RgctxTableTypeAnalysisContext)
+                    && addressed.Type is { IsValueType: false }
+                    && addressed.Type is not (
+                        ByRefTypeAnalysisContext
+                        or PointerTypeAnalysisContext
+                        or RuntimeClassTypeAnalysisContext
+                        or RuntimeMethodInfoAnalysisContext
+                        or StaticFieldStorageTypeAnalysisContext
+                        or RgctxTableTypeAnalysisContext))
+                {
+                    // 中文注释：托管引用槽被错误提升为地址时，恢复原引用而非发射object*。
+                    LoadLocal(addressed, method, locals);
+                    break;
+                }
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
@@ -901,6 +922,17 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor(module));
                 break;
             case MemoryOperand memory:
+                if (expectedType is RuntimeClassTypeAnalysisContext
+                    && memory.Base is LocalVariable
+                    {
+                        Type: { IsValueType: false } baseType
+                    }
+                    && baseType is not RuntimeClassTypeAnalysisContext)
+                {
+                    // 中文注释：Il2CppClass布局探针不是托管实例字段，禁止把IEnumerator等引用压入nint槽。
+                    PushDefaultOf(expectedType, instructions);
+                    break;
+                }
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {

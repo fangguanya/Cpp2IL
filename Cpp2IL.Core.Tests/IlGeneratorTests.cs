@@ -589,6 +589,102 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 托管引用上的运行时类布局探针生成原生零值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var runtimeClass = new RuntimeClassTypeAnalysisContext(
+            systemObject,
+            systemObject.DeclaringAssembly);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), systemObject);
+        var pointer = new LocalVariable("runtimeClass", new Register(null, "X8"), runtimeClass);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "ProbeRuntimeClass",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, pointer, new MemoryOperand(receiver)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [receiver, pointer];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "RuntimeClassProbeType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "ProbeRuntimeClass",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.True);
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.True);
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloc), Is.False);
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 托管引用取址写入托管槽时恢复原引用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var source = new LocalVariable("source", new Register(null, "X0"), systemObject);
+        var destination = new LocalVariable("destination", new Register(null, "X1"), systemObject);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "RecoverManagedReference",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, destination, new AddressOf(source)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [source, destination];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ManagedReferenceProbeType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "RecoverManagedReference",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloc), Is.True);
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloca), Is.False);
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 原生内存值与无构造器类型比较时生成同型原生零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
