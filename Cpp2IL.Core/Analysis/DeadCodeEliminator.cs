@@ -19,9 +19,14 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class DeadCodeEliminator
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method)
+        => Run(method.ControlFlowGraph!, KeyFunctionRecovery.FindBoxDataWriteRoots(method));
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(cfg, []);
+
+    private static void Run(
+        ISILControlFlowGraph cfg,
+        IReadOnlyCollection<Instruction> additionalRoots)
     {
         // 从调用、存储、返回和分支等可观察根反向标记其定义依赖。
         // 单纯按“使用次数为零”删除会保留互相引用但没有外部使用的Phi环；
@@ -42,6 +47,12 @@ public static class DeadCodeEliminator
 
         var live = new HashSet<Instruction>();
         var workList = new Stack<Instruction>();
+        foreach (var root in additionalRoots)
+        {
+            if (live.Add(root))
+                workList.Push(root);
+        }
+
         foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
         {
             // 可删除运算写入普通局部时才是候选；存储等非局部目标始终是根。

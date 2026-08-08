@@ -25,12 +25,25 @@ public static class MetadataInitGuardRemover
     private const long InitialisedFlagOffset32 = 0xBD;
 
     public static void Run(MethodAnalysisContext method)
-        => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
+    {
+        if (RemoveGuards(
+                method.ControlFlowGraph!,
+                method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64))
+            DeadCodeEliminator.Run(method);
+    }
 
     public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
     {
+        if (RemoveGuards(cfg, initialisedFlagOffset))
+            DeadCodeEliminator.Run(cfg);
+    }
+
+    private static bool RemoveGuards(ISILControlFlowGraph cfg, long initialisedFlagOffset)
+    {
+        var removedAny = false;
         foreach (var guard in cfg.Blocks.ToList())
-            TryRemoveGuard(cfg, guard, initialisedFlagOffset);
+            removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
+        return removedAny;
     }
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)

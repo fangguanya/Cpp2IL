@@ -52,14 +52,7 @@ public static class KeyFunctionRecovery
                 && ObjectBoxFunctions.Contains(keyFunction)))
             return;
 
-        var definitions = instructions
-            .Where(instruction => instruction.Destination is LocalVariable)
-            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
-            // 多定义局部不满足SSA唯一生产者证明；保留原始调用，禁止任选一个版本。
-            .Where(group => group.Count() == 1)
-            .ToDictionary(
-                group => group.Key,
-                group => group.Single());
+        var definitions = BuildUniqueDefinitions(instructions);
 
         foreach (var block in method.ControlFlowGraph.Blocks)
         {
@@ -80,6 +73,76 @@ public static class KeyFunctionRecovery
             }
         }
     }
+
+    internal static IReadOnlyCollection<Instruction> FindBoxDataWriteRoots(MethodAnalysisContext method)
+    {
+        var blocks = method.ControlFlowGraph?.Blocks;
+        if (blocks == null)
+            return [];
+
+        var instructions = blocks.SelectMany(block => block.Instructions).ToList();
+        var hasImmediateTarget = instructions.Any(instruction =>
+            instruction.OpCode == OpCode.Call
+            && instruction.Operands.FirstOrDefault() is Immediate);
+        HashSet<ulong> boxAddresses = [];
+        if (hasImmediateTarget)
+        {
+            var addresses = method.AppContext.GetOrCreateKeyFunctionAddresses();
+            boxAddresses =
+            [
+                addresses.il2cpp_value_box,
+                addresses.il2cpp_vm_object_box,
+                addresses.il2cpp_codegen_object_box,
+            ];
+            boxAddresses.Remove(0);
+        }
+
+        var definitions = BuildUniqueDefinitions(instructions);
+        var roots = new HashSet<Instruction>();
+        foreach (var block in blocks)
+        {
+            for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
+            {
+                var instruction = block.Instructions[instructionIndex];
+                if (!IsObjectBoxCall(instruction, boxAddresses)
+                    || instruction.Operands.Count < 4
+                    || ResolveAddressedValue(instruction.Operands[3], definitions) is not { } addressed)
+                    continue;
+
+                var value = ResolveLatestStackValue(
+                    addressed,
+                    blocks,
+                    block,
+                    instructionIndex,
+                    instruction.Index,
+                    method.DominatorInfo);
+                if (definitions.TryGetValue(value, out var definition))
+                    roots.Add(definition);
+            }
+        }
+
+        return roots;
+    }
+
+    private static IReadOnlyDictionary<LocalVariable, Instruction> BuildUniqueDefinitions(
+        IEnumerable<Instruction> instructions)
+        => instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            // 多定义局部不满足SSA唯一生产者证明；保留原始调用，禁止任选一个版本。
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+
+    private static bool IsObjectBoxCall(
+        Instruction instruction,
+        ISet<ulong> boxAddresses)
+        => instruction.OpCode == OpCode.Call
+            && instruction.Operands.FirstOrDefault() switch
+            {
+                StringLiteral { Value: var name } => ObjectBoxFunctions.Contains(name),
+                Immediate address => boxAddresses.Contains(address.UnsignedValue),
+                _ => false,
+            };
 
     private static void RemoveWriteBarrier(Instruction instruction)
     {

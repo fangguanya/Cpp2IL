@@ -9,9 +9,11 @@ namespace Cpp2IL.Core.Analysis;
 // Remove null and bounds checks which are explicit in il2cpp but implicit in IL
 public static class InjectedCheckRemover
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!, method);
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(cfg, null);
+
+    private static void Run(ISILControlFlowGraph cfg, MethodAnalysisContext? method)
     {
         var defOf = BuildDefMap(cfg);
         var removedAny = false;
@@ -49,6 +51,10 @@ public static class InjectedCheckRemover
 
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
+        if (method == null)
+            DeadCodeEliminator.Run(cfg);
+        else
+            DeadCodeEliminator.Run(method);
     }
 
     private static bool IsInjectedCheck(Instruction definition, string thrownType) =>

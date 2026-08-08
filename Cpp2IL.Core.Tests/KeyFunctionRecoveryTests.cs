@@ -186,6 +186,40 @@ public class KeyFunctionRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 死代码清理保留Box数据槽的调用前写入链()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const int stackNumber = 240;
+        var oldValue = new LocalVariable("oldValue", new Register(stackNumber, "stack_-24", 1));
+        var writtenValue = new LocalVariable(
+            "writtenValue",
+            new Register(stackNumber, "stack_-24", 2),
+            app.SystemTypes.SystemBooleanType);
+        var carrier = Local("carrier", app.SystemTypes.SystemIntPtrType);
+        var source = Local("source", app.SystemTypes.SystemBooleanType);
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var takeAddress = new Instruction(0, OpCode.Move, carrier, new AddressOf(oldValue));
+        var writeValue = new Instruction(1, OpCode.Move, writtenValue, source);
+        var call = new Instruction(
+            2,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            result,
+            app.SystemTypes.SystemBooleanType,
+            carrier);
+        var method = CreateMethod(takeAddress, writeValue, call);
+
+        DeadCodeEliminator.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(takeAddress.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(writeValue.OpCode, Is.EqualTo(OpCode.Move));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 先取地址后写栈槽时选择调用前最近值版本()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
