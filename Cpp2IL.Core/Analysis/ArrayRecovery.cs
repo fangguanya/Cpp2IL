@@ -19,9 +19,78 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        RecoverPointerDerivedAccesses(method.ControlFlowGraph!, method.AppContext.Binary.PointerSizeBytes);
         RecoverAccesses(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);
+    }
+
+    /// <summary>
+    /// ARM64 对引用数组的访问通常先计算 <c>array + ElementsOffset</c>，再用
+    /// <c>[data + index * pointerSize]</c> 取元素。若只看最终内存操作，基址已经是
+    /// IntPtr，普通数组恢复就会遗漏，后续会把元素退化成 object 与原生指针算术。
+    /// 这里沿单一定义回溯地址仿射式，只有根节点、元素偏移和步长全部精确匹配时才
+    /// 改写为 ArrayAccess；多定义、非数组根或不完整步长保持原始操作。
+    /// </summary>
+    internal static void RecoverPointerDerivedAccesses(ISILControlFlowGraph cfg, int pointerSize)
+    {
+        var definitions = SingleDefinitions(cfg);
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand memory)
+                    continue;
+
+                if (ReferenceArrayIndex(memory, pointerSize, definitions) is { } access)
+                    instruction.SetOperand(i, access);
+            }
+        }
+    }
+
+    private static ArrayAccess? ReferenceArrayIndex(
+        MemoryOperand memory,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (memory.Base is not LocalVariable baseLocal
+            || Evaluate(baseLocal, definitions, 0) is not
+            {
+                Root: LocalVariable { Type: SzArrayTypeAnalysisContext arrayType } array,
+                Multiplier: 1,
+                Offset: var baseOffset
+            })
+            return null;
+
+        var elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        if (elementSize == 0)
+            return null;
+
+        var offset = baseOffset;
+        try
+        {
+            checked
+            {
+                offset += memory.Addend - ElementsOffset(pointerSize);
+            }
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+
+        if (offset < 0 || offset % elementSize != 0)
+            return null;
+
+        if (memory.Index == null)
+            return memory.Scale == 0
+                ? new ArrayAccess(array, new Immediate(offset / elementSize))
+                : null;
+
+        return offset == 0 && memory.Scale == elementSize
+            ? new ArrayAccess(array, memory.Index)
+            : null;
     }
 
     private static void RecoverAccesses(MethodAnalysisContext method)
