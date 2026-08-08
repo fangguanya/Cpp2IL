@@ -963,6 +963,24 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
             case TypeAnalysisContext type:
+                if (expectedType is RuntimeClassTypeAnalysisContext
+                    or StaticFieldStorageTypeAnalysisContext
+                    or RgctxTableTypeAnalysisContext
+                    or RuntimeMethodInfoAnalysisContext
+                    || expectedType?.FullName is "System.IntPtr" or "System.UIntPtr")
+                {
+                    // 中文注释：托管类型操作数落入原生整数槽时，它表示未知的原生地址载体；
+                    // 生成原生零值，避免把托管构造器伪装成 nint 并阻塞恢复源码编译。
+                    if (expectedType != null)
+                        PushDefaultOf(expectedType, instructions);
+                    else
+                    {
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                        instructions.Add(CilOpCodes.Conv_I);
+                    }
+                    break;
+                }
+
                 if (type.Name == "T")
                 {
                     // idk what to do here

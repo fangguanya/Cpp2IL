@@ -589,6 +589,58 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 托管类型操作数写入IntPtr槽时生成原生零值()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var systemIntPtr = appContext.SystemTypes.SystemIntPtrType;
+        var pointer = new LocalVariable("pointer", new Register(null, "X8"), systemIntPtr);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "LoadManagedTypeIntoNativeSlot",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, pointer, systemObject),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [pointer];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemIntPtr,
+            "IntPtr",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ManagedTypeNativeSlotType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "LoadManagedTypeIntoNativeSlot",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 托管引用上的运行时类布局探针生成原生零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
