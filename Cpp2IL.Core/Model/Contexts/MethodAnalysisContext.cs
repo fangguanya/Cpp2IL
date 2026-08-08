@@ -404,6 +404,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         MetadataInitGuardRemover.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        // 原生优化可省略从未被被调方法观察的this实参；仅在当前寄存器类型与托管签名矛盾时恢复入口this。
+        ErasedInstanceReceiverRecovery.Run(this);
         // 值类型通过主不动点到达取址栈槽后，再把Object::Box唯一恢复为托管box。
         KeyFunctionRecovery.RewriteBoxing(this);
         InjectedCheckRemover.Run(this);
