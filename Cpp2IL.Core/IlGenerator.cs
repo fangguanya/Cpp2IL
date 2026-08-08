@@ -863,6 +863,11 @@ public static class IlGenerator
             case StringLength stringLength:
                 LoadLocal(stringLength.Value, method, locals);
                 var stringType = module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "String");
+                if (stringLength.Value.Type?.FullName != "System.String")
+                {
+                    // 控制流合并可能把接收者类型擦除为object；公开属性调用前恢复精确的字符串栈类型。
+                    instructions.Add(CilOpCodes.Castclass, importer.ImportType(stringType));
+                }
                 var lengthGetter = new MemberReference(
                     stringType,
                     "get_Length",

@@ -38,16 +38,17 @@ public class StringLengthRecoveryTests
 
     [Test]
     [Category("边界值")]
-    public void 字符串布局字段写入保持原方向()
+    public void 接收者类型被擦除时仍按精确字段恢复()
     {
-        var fixture = CreateFixture(writeField: true);
+        var fixture = CreateFixture(useErasedReceiver: true);
 
         var recovered = StringLengthRecovery.Run(fixture.Method);
 
         Assert.Multiple(() =>
         {
-            Assert.That(recovered, Is.Zero);
-            Assert.That(fixture.ReadInstruction.Operands[0], Is.InstanceOf<FieldReference>());
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.ReadInstruction.Operands[1], Is.InstanceOf<StringLength>());
+            Assert.That(fixture.Receiver.Type?.FullName, Is.EqualTo("System.Object"));
         });
     }
 
@@ -66,7 +67,25 @@ public class StringLengthRecoveryTests
         });
     }
 
-    private static Fixture CreateFixture(bool writeField = false, bool useForeignOwner = false)
+    [Test]
+    [Category("异常输入")]
+    public void 字符串布局字段写入保持原方向()
+    {
+        var fixture = CreateFixture(writeField: true);
+
+        var recovered = StringLengthRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.ReadInstruction.Operands[0], Is.InstanceOf<FieldReference>());
+        });
+    }
+
+    private static Fixture CreateFixture(
+        bool writeField = false,
+        bool useForeignOwner = false,
+        bool useErasedReceiver = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var stringType = app.SystemTypes.SystemStringType;
@@ -77,7 +96,8 @@ public class StringLengthRecoveryTests
             FieldAttributes.Private,
             owner,
             offset: 16);
-        var receiver = new LocalVariable("text", new Register(null, "X0"), stringType);
+        var receiverType = useErasedReceiver ? app.SystemTypes.SystemObjectType : stringType;
+        var receiver = new LocalVariable("text", new Register(null, "X0"), receiverType);
         var length = new LocalVariable("length", new Register(null, "W8"), app.SystemTypes.SystemInt32Type);
         var fieldReference = new FieldReference(field, receiver, 16);
         var read = writeField
