@@ -332,6 +332,12 @@ public static class Simplifier
                             return true;
                         }
 
+                        if (operand is StringLength stringLength && stringLength.Value == local)
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+
                         if (operand is AddressOf { Target: LocalVariable addressed } && addressed == local)
                         {
                             usedByMemory = true;

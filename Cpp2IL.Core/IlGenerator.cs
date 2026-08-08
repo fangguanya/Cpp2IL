@@ -77,6 +77,9 @@ public static class IlGenerator
             if (operand is ArrayLength arrayLength)
                 local = arrayLength.Array;
 
+            if (operand is StringLength stringLength)
+                local = stringLength.Value;
+
             if (operand is AddressOf { Target: LocalVariable addressed })
                 local = addressed;
 
@@ -856,6 +859,16 @@ public static class IlGenerator
                 LoadLocal(arrayLength.Array, method, locals);
                 instructions.Add(CilOpCodes.Ldlen);
                 instructions.Add(CilOpCodes.Conv_I4);
+                break;
+            case StringLength stringLength:
+                LoadLocal(stringLength.Value, method, locals);
+                var stringType = module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "String");
+                var lengthGetter = new MemberReference(
+                    stringType,
+                    "get_Length",
+                    MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
+                // callvirt同时保持原生字段解引用在空接收者上的NullReferenceException语义。
+                instructions.Add(CilOpCodes.Callvirt, importer.ImportMethod(lengthGetter));
                 break;
             case AddressOf { Target: LocalVariable addressed }:
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);

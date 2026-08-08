@@ -256,7 +256,7 @@ public class Instruction : IOperand
         operand switch
         {
             Register or StackOffset or LocalVariable => false,
-            AddressOf or ArrayAccess or ArrayLength => false,
+            AddressOf or ArrayAccess or ArrayLength or StringLength => false,
             MemoryOperand memory => memory.IsConstant,
             _ => true
         };
