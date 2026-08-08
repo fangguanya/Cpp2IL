@@ -24,7 +24,13 @@ public static class ListAddRecovery
 
         foreach (var slowBlock in graph.Blocks.ToList())
         {
-            if (!TryMatchSlowPath(slowBlock, out var slowCall, out var addWithResize, out var receiver, out var value))
+            if (!TryMatchSlowPath(
+                    slowBlock,
+                    out var slowCall,
+                    out var addWithResize,
+                    out var receiver,
+                    out var value,
+                    out var slowTail))
                 continue;
 
             if (slowBlock.Predecessors is not [var head])
@@ -42,7 +48,7 @@ public static class ListAddRecovery
                 continue;
             if (!TryGetFastBlock(head, slowBlock, merge, out var fastBlock))
                 continue;
-            if (!TryMatchFastPath(fastBlock, merge, receiver, items, value))
+            if (!TryMatchFastPath(fastBlock, merge, receiver, items, value, slowTail))
                 continue;
             if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
                 continue;
@@ -56,6 +62,7 @@ public static class ListAddRecovery
                 merge,
                 itemsLoad,
                 slowCall,
+                slowTail,
                 addTarget,
                 receiver,
                 value);
@@ -70,27 +77,41 @@ public static class ListAddRecovery
         out Instruction call,
         out ConcreteGenericMethodAnalysisContext target,
         out LocalVariable receiver,
-        out IOperand value)
+        out IOperand value,
+        out List<Instruction> tail)
     {
         call = null!;
         target = null!;
         receiver = null!;
         value = null!;
+        tail = [];
 
         var instructions = SemanticInstructions(block);
-        if (instructions.Count != 1
-            || instructions[0] is not { OpCode: OpCode.CallVoid } candidate
+        var callIndex = instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.CallVoid, Operands.Count: 3 }
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        if (callIndex < 0
+            || instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands.FirstOrDefault() is MethodAnalysisContext { Name: "AddWithResize" }) != 1
+            || instructions[callIndex] is not { OpCode: OpCode.CallVoid } candidate
             || candidate.Operands.Count != 3
             || candidate.Operands[0] is not ConcreteGenericMethodAnalysisContext method
             || candidate.Operands[1] is not LocalVariable list
             || method.Name != "AddWithResize"
-            || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1")
+            || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
+            || instructions.Take(callIndex).Any(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+            || instructions.Skip(callIndex + 1).Any(instruction => instruction.OpCode != OpCode.Move))
             return false;
 
         call = candidate;
         target = method;
         receiver = list;
         value = candidate.Operands[2];
+        tail = instructions
+            .Skip(callIndex + 1)
+            .Where(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+            .ToList();
         return true;
     }
 
@@ -151,7 +172,7 @@ public static class ListAddRecovery
         while (true)
         {
             reversePath.Add(current);
-            semanticCount += SemanticInstructions(current).Count;
+            semanticCount += PatternInstructions(current).Count;
             if (semanticCount >= instructionCount)
                 break;
 
@@ -171,7 +192,7 @@ public static class ListAddRecovery
         reversePath.Reverse();
         path = reversePath;
         var entries = path
-            .SelectMany(block => SemanticInstructions(block).Select(instruction => (block, instruction)))
+            .SelectMany(block => PatternInstructions(block).Select(instruction => (block, instruction)))
             .ToList();
         suffix = entries.GetRange(entries.Count - instructionCount, instructionCount);
         return true;
@@ -200,18 +221,17 @@ public static class ListAddRecovery
         Block merge,
         LocalVariable receiver,
         LocalVariable items,
-        IOperand value)
+        IOperand value,
+        IReadOnlyList<Instruction> slowTail)
     {
         var instructions = SemanticInstructions(block);
-        if (instructions is not
-            [
-                { Operands: [LocalVariable elementOffset, var sizeForOffset, Immediate] } scale,
-                { OpCode: OpCode.Add, Operands: [LocalVariable elementAddress, var addressLeft, var addressRight] },
-                { OpCode: OpCode.Add, Operands: [LocalVariable newSize, var sizeSource, Immediate { Value: 1 }] },
-                { OpCode: OpCode.Move, Operands: [FieldReference sizeDestination, var sizeValue] },
-                { OpCode: OpCode.Move, Operands: [MemoryOperand memory, var storedValue] },
-                { OpCode: OpCode.Jump, Operands: [Block target] }
-            ]
+        if (instructions.Count < 6
+            || instructions[0] is not { Operands: [LocalVariable elementOffset, var sizeForOffset, Immediate] } scale
+            || instructions[1] is not { OpCode: OpCode.Add, Operands: [LocalVariable elementAddress, var addressLeft, var addressRight] }
+            || instructions[2] is not { OpCode: OpCode.Add, Operands: [LocalVariable newSize, var sizeSource, Immediate { Value: 1 }] }
+            || instructions[3] is not { OpCode: OpCode.Move, Operands: [FieldReference sizeDestination, var sizeValue] }
+            || instructions[4] is not { OpCode: OpCode.Move, Operands: [MemoryOperand memory, var storedValue] }
+            || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
             || scale.OpCode is not (OpCode.ShiftLeft or OpCode.Multiply)
             || sizeForOffset is not FieldReference offsetSize
             || sizeSource is not FieldReference incrementSize
@@ -221,11 +241,17 @@ public static class ListAddRecovery
             || !ReferenceEquals(newSize, sizeValue)
             || !ReferenceEquals(elementAddress, memory.Base)
             || !ReferenceEquals(storedValue, value)
-            || !ReferenceEquals(target, merge))
+            || !ReferenceEquals(target, merge)
+            || !HaveIdenticalCarrierMoves(
+                instructions
+                    .GetRange(5, instructions.Count - 6)
+                    .Where(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+                    .ToList(),
+                slowTail))
             return false;
 
-        return (ReferenceEquals(addressLeft, items) && ReferenceEquals(addressRight, elementOffset))
-               || (ReferenceEquals(addressRight, items) && ReferenceEquals(addressLeft, elementOffset));
+        return (IsItemsAddressBase(addressLeft, receiver, items) && ReferenceEquals(addressRight, elementOffset))
+               || (IsItemsAddressBase(addressRight, receiver, items) && ReferenceEquals(addressLeft, elementOffset));
     }
 
     private static bool TryCreatePublicAddTarget(
@@ -254,6 +280,7 @@ public static class ListAddRecovery
         Block merge,
         Instruction itemsLoad,
         Instruction slowCall,
+        IReadOnlyList<Instruction> slowTail,
         ConcreteGenericMethodAnalysisContext addTarget,
         LocalVariable receiver,
         IOperand value)
@@ -261,6 +288,7 @@ public static class ListAddRecovery
         var firstRemovedIndex = rewriteHead.Instructions.IndexOf(itemsLoad);
         rewriteHead.Instructions.RemoveRange(firstRemovedIndex, rewriteHead.Instructions.Count - firstRemovedIndex);
         rewriteHead.Instructions.Add(new Instruction(slowCall.Index, OpCode.CallVoid, addTarget, receiver, value));
+        rewriteHead.Instructions.AddRange(slowTail);
 
         foreach (var pathBlock in headPath.Skip(1).ToList())
             Detach(graph, pathBlock);
@@ -288,6 +316,48 @@ public static class ListAddRecovery
     private static List<Instruction> SemanticInstructions(Block block)
         => block.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToList();
 
+    private static List<Instruction> PatternInstructions(Block block)
+        => SemanticInstructions(block)
+            .Where(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+            .ToList();
+
     private static bool IsField(FieldReference field, LocalVariable receiver, string name)
         => ReferenceEquals(field.Local, receiver) && field.Field.Name == name;
+
+    private static bool IsItemsAddressBase(IOperand operand, LocalVariable receiver, LocalVariable loadedItems)
+        => ReferenceEquals(operand, loadedItems)
+           || operand is FieldReference field && IsField(field, receiver, "_items");
+
+    // 泛型List内联会夹带methodof、Il2CppClass和rgctx句柄装载；调用目标已经解析后，
+    // 这些值只服务原生隐藏参数，不属于公开托管Add的可观察语义。
+    private static bool IsIgnorableRuntimeMetadataMove(Instruction instruction)
+        => instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, var source] }
+           && destination.Type is RuntimeClassTypeAnalysisContext
+               or RgctxTableTypeAnalysisContext
+               or RuntimeMethodInfoAnalysisContext
+           && source is MemoryOperand
+               or RuntimeMethodInfoAnalysisContext
+               or RuntimeClassTypeAnalysisContext
+               or RgctxTableTypeAnalysisContext
+               or Immediate;
+
+    private static bool HaveIdenticalCarrierMoves(
+        IReadOnlyList<Instruction> fastTail,
+        IReadOnlyList<Instruction> slowTail)
+    {
+        if (fastTail.Count != slowTail.Count)
+            return false;
+
+        for (var index = 0; index < fastTail.Count; index++)
+        {
+            if (fastTail[index] is not { OpCode: OpCode.Move, Operands: [var fastDestination, var fastSource] }
+                || slowTail[index] is not { OpCode: OpCode.Move, Operands: [var slowDestination, var slowSource] }
+                || !ReferenceEquals(fastDestination, slowDestination)
+                || !ReferenceEquals(fastSource, slowSource))
+                return false;
+        }
+
+        return true;
+    }
+
 }

@@ -60,6 +60,93 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 快路径重新读取同一Items字段时仍闭合为Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectItemsFieldForAddress: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var call = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(call.Operands[1], Is.SameAs(fixture.Receiver));
+            Assert.That(call.Operands[2], Is.SameAs(fixture.Value));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 快慢路径含相同载体复制时保留一次复制并闭合Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            includeMatchingCarrierMove: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var carrierMoves = fixture.Graph.Instructions.Where(instruction =>
+            instruction.OpCode == OpCode.Move
+            && instruction.Operands.Count == 2
+            && ReferenceEquals(instruction.Operands[0], fixture.Carrier)).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(carrierMoves, Has.Count.EqualTo(1));
+            Assert.That(carrierMoves[0].Operands[1], Is.SameAs(fixture.Value));
+            Assert.That(fixture.Graph.Instructions.Single(instruction => instruction.IsCall).Operands[0],
+                Is.InstanceOf<MethodAnalysisContext>().And.Property("Name").EqualTo("Add"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 慢路径含已解析运行时元数据读取时仍闭合Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            includeRuntimeMetadataPrefix: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.Destination is LocalVariable { Type: RuntimeClassTypeAnalysisContext
+                    or RgctxTableTypeAnalysisContext
+                    or RuntimeMethodInfoAnalysisContext }), Is.False);
+            Assert.That(((MethodAnalysisContext)fixture.Graph.Instructions.Single(instruction => instruction.IsCall).Operands[0]).Name,
+                Is.EqualTo("Add"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 方法句柄在头部及快慢路径来源不同时仍按隐藏元数据删除()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            includeDivergentRuntimeMetadataCarrier: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.Destination is LocalVariable { Type: RuntimeMethodInfoAnalysisContext }), Is.False);
+            Assert.That(((MethodAnalysisContext)fixture.Graph.Instructions.Single(instruction => instruction.IsCall).Operands[0]).Name,
+                Is.EqualTo("Add"));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 快速路径写入不同元素时保持原控制流()
     {
@@ -80,10 +167,37 @@ public class ListAddRecoveryTests
         });
     }
 
+    [Test]
+    [Category("异常输入")]
+    public void 快慢路径载体来源不同时保持容量分支()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            includeMatchingCarrierMove: true,
+            mismatchCarrierSource: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
     private static Fixture CreateFixture(
         TypeAnalysisContext elementType,
         bool includeNops = false,
-        bool mismatchStoredValue = false)
+        bool mismatchStoredValue = false,
+        bool useDirectItemsFieldForAddress = false,
+        bool includeMatchingCarrierMove = false,
+        bool mismatchCarrierSource = false,
+        bool includeRuntimeMetadataPrefix = false,
+        bool includeDivergentRuntimeMetadataCarrier = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -124,6 +238,7 @@ public class ListAddRecoveryTests
         var elementOffset = Local("elementOffset", app.SystemTypes.SystemIntPtrType);
         var elementAddress = Local("elementAddress", app.SystemTypes.SystemIntPtrType);
         var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
+        var carrier = Local("carrier", elementType);
 
         FieldReference Field(FieldAnalysisContext field) => new(field, receiver, 0);
         var instructions = new List<Instruction>
@@ -132,42 +247,83 @@ public class ListAddRecoveryTests
             new(1, OpCode.Add, version, Field(versionField), new Immediate(1)),
             new(2, OpCode.Move, Field(versionField), version),
             new(3, OpCode.CheckGreaterOrEqualUnsigned, condition, Field(sizeField), new ArrayLength(items)),
-            new(4, OpCode.ConditionalJump, new Immediate(11), condition),
+            new(4, OpCode.ConditionalJump, new Immediate(-1), condition),
             new(5, OpCode.ShiftLeft, elementOffset, Field(sizeField), new Immediate(3)),
-            new(6, OpCode.Add, elementAddress, items, elementOffset),
+            new(6, OpCode.Add, elementAddress, useDirectItemsFieldForAddress ? Field(itemsField) : items, elementOffset),
             new(7, OpCode.Add, newSize, Field(sizeField), new Immediate(1)),
             new(8, OpCode.Move, Field(sizeField), newSize),
             new(9, OpCode.Move, new MemoryOperand(elementAddress, null, 0x20), mismatchStoredValue ? otherValue : value),
-            new(10, OpCode.Jump, new Immediate(includeNops ? 14 : 12)),
         };
 
+        if (includeMatchingCarrierMove)
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, carrier, mismatchCarrierSource ? otherValue : value));
+        var fastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(fastJump);
+
+        var slowEntryIndex = instructions.Count;
         if (includeNops)
         {
-            instructions.Add(new Instruction(11, OpCode.Nop));
-            instructions.Add(new Instruction(12, OpCode.Nop));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
         }
 
-        var slowIndex = instructions.Count;
-        instructions.Add(new Instruction(slowIndex, OpCode.CallVoid, addWithResizeTarget, receiver, value));
+        if (includeRuntimeMetadataPrefix)
+        {
+            var referencedFrom = listDefinition.DeclaringAssembly;
+            var runtimeClass = Local("runtimeClass", new RuntimeClassTypeAnalysisContext(listType, referencedFrom));
+            var runtimeContext = Local("runtimeContext", new RgctxTableTypeAnalysisContext(listType, referencedFrom));
+            var runtimeMethod = Local("runtimeMethod", new RuntimeMethodInfoAnalysisContext(addWithResize, referencedFrom));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                runtimeClass,
+                new MemoryOperand(receiver, null, 0x20)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                runtimeContext,
+                new MemoryOperand(runtimeClass, null, 0xC0)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                runtimeMethod,
+                new MemoryOperand(runtimeContext, null, 0x70)));
+        }
+        var slowCallIndex = instructions.Count;
+        instructions.Add(new Instruction(slowCallIndex, OpCode.CallVoid, addWithResizeTarget, receiver, value));
+        var mergeEntryIndex = instructions.Count;
         if (includeNops)
-            instructions.Add(new Instruction(slowIndex + 1, OpCode.Nop));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
         var mergeIndex = instructions.Count;
         instructions.Add(new Instruction(mergeIndex, OpCode.Return, receiver));
 
-        foreach (var instruction in instructions)
-        {
-            if (instruction.OpCode is not (OpCode.Jump or OpCode.ConditionalJump))
-                continue;
-
-            instruction.SetOperand(0, instructions[(int)((Immediate)instruction.Operands[0]).Value]);
-        }
+        instructions[4].SetOperand(0, instructions[slowEntryIndex]);
+        fastJump.SetOperand(0, instructions[mergeEntryIndex]);
 
         var graph = new ISILControlFlowGraph(instructions);
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
         method.ControlFlowGraph = graph;
-        var slowBlock = graph.FindBlockByInstruction(instructions[slowIndex])!;
+        var slowBlock = graph.FindBlockByInstruction(instructions[slowCallIndex])!;
         var fastBlock = graph.FindBlockByInstruction(instructions[5])!;
-        return new Fixture(method, graph, receiver, value, fastBlock, slowBlock);
+        // Phi消除发生在CFG构建之后，实际产物会把索引为-1的边复制追加到既有调用块。
+        if (includeMatchingCarrierMove)
+            slowBlock.Instructions.Add(new Instruction(-1, OpCode.Move, carrier, value));
+        if (includeDivergentRuntimeMetadataCarrier)
+        {
+            var metadataType = new RuntimeMethodInfoAnalysisContext(addWithResize, listDefinition.DeclaringAssembly);
+            var metadataCarrier = Local("metadataCarrier", metadataType);
+            var headBlock = graph.FindBlockByInstruction(instructions[0])!;
+            headBlock.Instructions.Insert(
+                1,
+                new Instruction(-1, OpCode.Move, metadataCarrier, metadataType));
+            fastBlock.Instructions.Insert(
+                fastBlock.Instructions.Count - 1,
+                new Instruction(-1, OpCode.Move, metadataCarrier, new Immediate(0)));
+            slowBlock.Instructions.Insert(
+                0,
+                new Instruction(-1, OpCode.Move, metadataCarrier, new MemoryOperand(receiver, null, 0x70)));
+        }
+        return new Fixture(method, graph, receiver, value, carrier, fastBlock, slowBlock);
     }
 
     private static LocalVariable Local(string name, TypeAnalysisContext type)
@@ -183,6 +339,7 @@ public class ListAddRecoveryTests
         ISILControlFlowGraph Graph,
         LocalVariable Receiver,
         LocalVariable Value,
+        LocalVariable Carrier,
         Block FastBlock,
         Block SlowBlock);
 }

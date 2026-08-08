@@ -18,7 +18,9 @@ public static class InjectedCheckRemover
 
         foreach (var block in cfg.Blocks)
         {
-            if (block.BlockType != BlockType.TwoWay || block.Instructions.Count == 0)
+            // 早期元数据保护段和SSA变换会重写块尾，但块类型缓存可能尚未同步；
+            // 条件跳转指令及其目标才是删除注入检查的权威控制流证据。
+            if (block.Instructions.Count == 0)
                 continue;
 
             var terminator = block.Instructions[^1];
@@ -26,10 +28,9 @@ public static class InjectedCheckRemover
             if (terminator.OpCode != OpCode.ConditionalJump)
                 continue;
 
-            if (terminator.Operands[0] is not Block target || GetInjectedThrowType(target) is not { } thrownType)
-                continue;
-
-            if (terminator.Operands[1] is not LocalVariable condition
+            if (terminator.Operands[0] is not Block target
+                || GetInjectedThrowType(target) is not { } thrownType
+                || terminator.Operands[1] is not LocalVariable condition
                 || !defOf.TryGetValue(condition, out var definition)
                 || !IsInjectedCheck(definition, thrownType))
                 continue;
@@ -68,7 +69,9 @@ public static class InjectedCheckRemover
         {
             switch (instruction.OpCode)
             {
-                case OpCode.Nop or OpCode.Interrupt:
+                // 抛出块中的Phi只合并到该异常边上的寄存器状态，Throw不读取这些结果；
+                // 它们是SSA结构证据，不构成业务副作用。
+                case OpCode.Nop or OpCode.Interrupt or OpCode.Phi:
                 case OpCode.Return when thrown != null:
                     continue;
 
