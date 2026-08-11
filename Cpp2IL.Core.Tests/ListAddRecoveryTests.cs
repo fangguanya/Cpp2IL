@@ -147,6 +147,64 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 连续添加复用状态载体并规范化索引时仍闭合Add()
+    {
+        var fixture = CreateCarriedStateFixture();
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var call = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(call.Operands[1], Is.SameAs(fixture.Receiver));
+            Assert.That(call.Operands[2], Is.SameAs(fixture.Value));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.FastBlock));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SlowBlock));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 连续添加索引掩码漂移时保持原控制流()
+    {
+        var fixture = CreateCarriedStateFixture(wrongMask: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 连续添加状态载体来自不同集合时保持原控制流()
+    {
+        var fixture = CreateCarriedStateFixture(wrongSizeReceiver: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 快速路径写入不同元素时保持原控制流()
     {
@@ -324,6 +382,99 @@ public class ListAddRecoveryTests
                 new Instruction(-1, OpCode.Move, metadataCarrier, new MemoryOperand(receiver, null, 0x70)));
         }
         return new Fixture(method, graph, receiver, value, carrier, fastBlock, slowBlock);
+    }
+
+    private static Fixture CreateCarriedStateFixture(
+        bool wrongMask = false,
+        bool wrongSizeReceiver = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var elementType = app.SystemTypes.SystemStringType;
+        var listType = listDefinition.MakeGenericInstanceType([elementType]);
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [genericElement]);
+        var addWithResizeTarget = new ConcreteGenericMethodAnalysisContext(addWithResize, [elementType], []);
+        var itemsField = new InjectedFieldAnalysisContext(
+            "_items",
+            genericElement.MakeSzArrayType(),
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var sizeField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var versionField = new InjectedFieldAnalysisContext(
+            "_version",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+
+        var receiver = Local("list", listType);
+        var otherReceiver = Local("otherList", listType);
+        var value = Local("value", elementType);
+        var items = Local("items", elementType.MakeSzArrayType());
+        var sizeState = Local("sizeState", app.SystemTypes.SystemInt32Type);
+        var versionState = Local("versionState", app.SystemTypes.SystemInt32Type);
+        var versionResult = Local("versionResult", app.SystemTypes.SystemInt32Type);
+        var condition = Local("condition", app.SystemTypes.SystemBooleanType);
+        var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
+        var masked = Local("masked", app.SystemTypes.SystemIntPtrType);
+        var biased = Local("biased", app.SystemTypes.SystemIntPtrType);
+        var normalized = Local("normalized", app.SystemTypes.SystemIntPtrType);
+        var elementOffset = Local("elementOffset", app.SystemTypes.SystemIntPtrType);
+        var elementAddress = Local("elementAddress", app.SystemTypes.SystemIntPtrType);
+        var unusedCarrier = Local("unusedCarrier", elementType);
+
+        FieldReference Field(FieldAnalysisContext field, LocalVariable? owner = null)
+            => new(field, owner ?? receiver, 0);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, sizeState, Field(sizeField, wrongSizeReceiver ? otherReceiver : receiver)),
+            new(1, OpCode.Move, versionState, Field(versionField)),
+            new(2, OpCode.Add, versionResult, versionState, new Immediate(1)),
+            // 真实 ARM64 连续添加会把 items 读取排在版本加法之后。
+            new(3, OpCode.Move, items, Field(itemsField)),
+            new(4, OpCode.Move, Field(versionField), versionResult),
+            new(5, OpCode.CheckGreaterOrEqualUnsigned, condition, sizeState, new ArrayLength(items)),
+            new(6, OpCode.ConditionalJump, new Immediate(-1), condition),
+            new(7, OpCode.Add, newSize, sizeState, new Immediate(1)),
+            new(8, OpCode.And, masked, sizeState, new Immediate(wrongMask ? 0xFFFFFFFEL : 0xFFFFFFFFL)),
+            new(9, OpCode.Xor, biased, masked, new Immediate(0x80000000L)),
+            new(10, OpCode.Subtract, normalized, biased, new Immediate(0x80000000L)),
+            new(11, OpCode.ShiftLeft, elementOffset, normalized, new Immediate(3)),
+            new(12, OpCode.Add, elementAddress, items, elementOffset),
+            new(13, OpCode.Move, Field(sizeField), newSize),
+            new(14, OpCode.Move, new MemoryOperand(elementAddress, null, 0x20), value),
+            new(15, OpCode.Jump, new Immediate(-1)),
+            new(16, OpCode.CallVoid, addWithResizeTarget, receiver, value),
+            new(17, OpCode.Return, receiver),
+        };
+        instructions[6].SetOperand(0, instructions[16]);
+        instructions[15].SetOperand(0, instructions[17]);
+
+        var graph = new ISILControlFlowGraph(instructions);
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        var slowBlock = graph.FindBlockByInstruction(instructions[16])!;
+        // 慢路径刷新供下一次 Add 使用的状态载体；真实 Phi 消除同样把边复制追加到调用块。
+        slowBlock.Instructions.Add(new Instruction(-1, OpCode.Move, newSize, Field(sizeField)));
+        slowBlock.Instructions.Add(new Instruction(-1, OpCode.Move, versionResult, Field(versionField)));
+        return new Fixture(
+            method,
+            graph,
+            receiver,
+            value,
+            unusedCarrier,
+            graph.FindBlockByInstruction(instructions[7])!,
+            slowBlock);
     }
 
     private static LocalVariable Local(string name, TypeAnalysisContext type)
