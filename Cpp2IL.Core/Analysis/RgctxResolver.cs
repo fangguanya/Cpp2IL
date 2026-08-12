@@ -58,12 +58,16 @@ public static class RgctxResolver
         return changed;
     }
 
-    private static bool DescribesSameThing(TypeAnalysisContext? existing, TypeAnalysisContext candidate) =>
+    internal static bool DescribesSameThing(TypeAnalysisContext? existing, TypeAnalysisContext candidate) =>
         (existing, candidate) switch
         {
-            (RuntimeClassTypeAnalysisContext a, RuntimeClassTypeAnalysisContext b) => ReferenceEquals(a.RepresentedType, b.RepresentedType),
-            (RgctxTableTypeAnalysisContext a, RgctxTableTypeAnalysisContext b) => ReferenceEquals(a.OwnerType, b.OwnerType),
-            _ => ReferenceEquals(existing, candidate),
+            // 泛型膨胀会按需创建新的上下文实例；引用不同不表示类型不同。若这里只做
+            // ReferenceEquals，同一个RGCTXData槽会在每轮被等价包装器覆盖并虚报变化。
+            (RuntimeClassTypeAnalysisContext a, RuntimeClassTypeAnalysisContext b) =>
+                GenericCallRebinder.TypesEquivalent(a.RepresentedType, b.RepresentedType),
+            (RgctxTableTypeAnalysisContext a, RgctxTableTypeAnalysisContext b) =>
+                GenericCallRebinder.TypesEquivalent(a.OwnerType, b.OwnerType),
+            _ => GenericCallRebinder.TypesEquivalent(existing, candidate),
         };
 
     private static TypeAnalysisContext? ResolveEntry(TypeAnalysisContext instance, int index)
