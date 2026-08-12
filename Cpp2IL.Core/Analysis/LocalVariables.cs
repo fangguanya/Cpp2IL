@@ -447,6 +447,14 @@ public static class LocalVariables
     // RepresentedMethod).
     private static void SeedMethodInfoTypes(MethodAnalysisContext method)
     {
+        // 泛型方法以及泛型类型上的共享方法都通过末尾隐藏MethodInfo访问方法RGCTXData。
+        // 参数局部在CreateAll阶段已被识别，必须在解析[methodInfo+rgctx_data]之前绑定真实方法身份。
+        if ((method.GenericParameters.Count > 0 || method.DeclaringType?.GenericParameters.Count > 0)
+            && method.ParameterLocals.FirstOrDefault(local => local.IsMethodInfo) is { } hiddenMethodInfo)
+            hiddenMethodInfo.Type = new RuntimeMethodInfoAnalysisContext(
+                method,
+                method.DeclaringType!.DeclaringAssembly);
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)

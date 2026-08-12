@@ -28,7 +28,7 @@ public static class ContextToTypeSignature
         SentinelTypeAnalysisContext => SentinelTypeSignature.Instance,
         // An Il2CppClass*/MethodInfo*/static storage runtime handle has no managed type; lower it to a raw pointer-sized value.
         RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
-            or RgctxTableTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
             => parentModule.CorLibTypeFactory.IntPtr,
         _ => throw new ArgumentException($"Unknown referenced type context {context.GetType()}", nameof(context))
     };

@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -79,6 +80,32 @@ public static class Arm64CallingConventionResolver
 
     public static Register? HiddenReturnBufferRegister(MethodAnalysisContext method)
         => ReturnsViaHiddenBuffer(method) ? new Register(null, "X8") : null;
+
+    /// <summary>
+    /// 计算整数/引用/非HFA值类型形参占用的AAPCS64通用寄存器槽数。
+    /// 至多16字节的值类型按8字节向上取整；更大的值通过地址传递，只占一个槽。
+    /// </summary>
+    public static int GeneralRegisterSlotCount(TypeAnalysisContext type)
+    {
+        if (X64CallingConventionResolver.IsFloatingPoint(type)
+            || TryGetHomogeneousFloatingAggregateFields(type, out _))
+            return 0;
+
+        if (!type.IsValueType)
+            return 1;
+
+        var size = type is GenericInstanceTypeAnalysisContext generic
+                   && GenericInstanceFieldLayout.GetConcreteFieldLayout(generic) is { Count: > 0 } layout
+            ? layout.Max(field => field.Offset + field.Size)
+            : TypeSizes.UnboxedSize(type, PointerSize);
+        return size is > 0 and <= 16
+            ? checked((int)((size + PointerSize - 1) / PointerSize))
+            : 1;
+    }
+
+    public static bool RequiresHiddenMethodInfo(MethodAnalysisContext method)
+        => method.GenericParameters.Count > 0
+           || method.DeclaringType?.GenericParameters.Count > 0;
 
     public static bool ReturnsViaHiddenBuffer(MethodAnalysisContext method)
     {

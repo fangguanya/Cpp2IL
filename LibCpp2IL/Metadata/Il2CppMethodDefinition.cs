@@ -135,6 +135,33 @@ public class Il2CppMethodDefinition : ReadableClass
     }
 
     public Il2CppGenericContainer? GenericContainer => genericContainerIndex.IsNull ? null : OwningContext.Metadata.GetGenericContainerFromIndex(genericContainerIndex);
+
+    /// <summary>
+    /// 返回以当前方法token为键的运行时泛型上下文。类型和方法拥有各自独立的token范围，
+    /// 因而泛型共享方法读取MethodInfo::rgctx_data时必须查询这里，不能借用声明类型范围。
+    /// </summary>
+    public Il2CppRGCTXDefinition[] RgctXs
+    {
+        get
+        {
+            if (MetadataVersion < 24.2f)
+                return OwningContext.Metadata.RgctxDefinitions!
+                    .Skip(rgctxStartIndex)
+                    .Take(rgctxCount)
+                    .ToArray();
+
+            var module = DeclaringType?.CodeGenModule;
+            if (module == null)
+                return [];
+
+            var range = OwningContext.Binary
+                .GetRgctxRangePairsForModule(module)
+                .FirstOrDefault(candidate => candidate.token == token);
+            return range == null
+                ? []
+                : OwningContext.Binary.GetRgctxDataForPair(module, range);
+        }
+    }
     
     public bool IsUnmanagedCallersOnly => (iflags & 0xF000) != 0;
     

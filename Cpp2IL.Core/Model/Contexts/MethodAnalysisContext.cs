@@ -418,6 +418,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         AggregateStackCopyRecovery.RewriteResolvedCopies(this);
 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
+        MetadataResolver.ResolveMethodRgctxCalls(this);
         InterfaceDispatchRecovery.Run(this);
         DelegateInvokeRecovery.Run(this);
         // 间接调用刚刚获得真实签名；立即把接收者、ref/out栈槽及其地址载体收敛为可生成CIL的精确类型。

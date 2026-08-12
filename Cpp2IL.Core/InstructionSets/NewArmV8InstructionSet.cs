@@ -2622,14 +2622,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     default:
                         ret.Add(new Register(null, (Arm64Register.X0 + nonVectorCount++).ToString().ToUpperInvariant()));
+                        nonVectorCount += Arm64CallingConventionResolver.GeneralRegisterSlotCount(paramType) - 1;
                         break;
                 }
             }
             else
             {
                 ret.Add(new Register(null, (Arm64Register.X0 + nonVectorCount++).ToString().ToUpperInvariant()));
+                nonVectorCount += Arm64CallingConventionResolver.GeneralRegisterSlotCount(paramType) - 1;
             }
         }
+
+        if (Arm64CallingConventionResolver.RequiresHiddenMethodInfo(contextBeingCalled)
+            && nonVectorCount < 8)
+            ret.Add(new Register(null, (Arm64Register.X0 + nonVectorCount).ToString().ToUpperInvariant()));
 
         return ret;
     }

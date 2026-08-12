@@ -1,7 +1,9 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using LibCpp2IL;
 using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
@@ -15,6 +17,7 @@ public static class RgctxResolver
     {
         var is32Bit = method.AppContext.Binary.is32Bit;
         var klassOffset = is32Bit ? 0x10 : 0x20;
+        var methodRgctxOffset = is32Bit ? 0x1C : 0x38;
         var rgctxOffset = is32Bit ? 0x60 : 0xC0;
         var pointerSize = is32Bit ? 4 : 8;
 
@@ -37,11 +40,18 @@ public static class RgctxResolver
                 RuntimeMethodInfoAnalysisContext info when memory.Addend == klassOffset && info.RepresentedMethod.DeclaringType is { } declaring
                     => new RuntimeClassTypeAnalysisContext(declaring, declaring.DeclaringAssembly),
 
+                RuntimeMethodInfoAnalysisContext info when memory.Addend == methodRgctxOffset
+                    => new MethodRgctxTableTypeAnalysisContext(info.RepresentedMethod, info.CustomAttributeAssembly),
+
                 RuntimeClassTypeAnalysisContext { RepresentedType: var owner } when memory.Addend == rgctxOffset
                     => new RgctxTableTypeAnalysisContext(owner, owner.DeclaringAssembly),
 
                 RgctxTableTypeAnalysisContext { OwnerType: var instance } when memory.Addend % pointerSize == 0
                     => ResolveEntry(instance, (int)(memory.Addend / pointerSize)),
+
+                MethodRgctxTableTypeAnalysisContext { OwnerMethod: var ownerMethod }
+                    when memory.Addend % pointerSize == 0
+                    => ResolveMethodEntry(ownerMethod, (int)(memory.Addend / pointerSize)),
 
                 _ => null,
             };
@@ -67,10 +77,71 @@ public static class RgctxResolver
                 GenericCallRebinder.TypesEquivalent(a.RepresentedType, b.RepresentedType),
             (RgctxTableTypeAnalysisContext a, RgctxTableTypeAnalysisContext b) =>
                 GenericCallRebinder.TypesEquivalent(a.OwnerType, b.OwnerType),
+            (MethodRgctxTableTypeAnalysisContext a, MethodRgctxTableTypeAnalysisContext b) =>
+                ReferenceEquals(BaseMethod(a.OwnerMethod), BaseMethod(b.OwnerMethod)),
             _ => GenericCallRebinder.TypesEquivalent(existing, candidate),
         };
 
-    private static TypeAnalysisContext? ResolveEntry(TypeAnalysisContext instance, int index)
+    private static MethodAnalysisContext BaseMethod(MethodAnalysisContext method)
+        => method is ConcreteGenericMethodAnalysisContext concrete
+            ? concrete.BaseMethodContext
+            : method;
+
+    private static TypeAnalysisContext? ResolveMethodEntry(MethodAnalysisContext method, int index)
+    {
+        var definition = method.Definition ?? BaseMethod(method).Definition;
+        if (definition == null)
+            return null;
+
+        var entries = definition.RgctXs;
+        if (index < 0 || index >= entries.Length)
+            return null;
+
+        var entry = entries[index];
+        var typeArguments = method is ConcreteGenericMethodAnalysisContext concrete
+            ? concrete.TypeGenericParameters
+            : method.DeclaringType is GenericInstanceTypeAnalysisContext instance
+                ? instance.GenericArguments
+                : method.DeclaringType?.GenericParameters ?? [];
+        var methodArguments = method is ConcreteGenericMethodAnalysisContext
+        {
+            MethodGenericParameters.Count: > 0
+        } concreteMethod
+            ? concreteMethod.MethodGenericParameters
+            : method.GenericParameters;
+        return ResolveEntryValue(method.AppContext, entry, typeArguments, methodArguments);
+    }
+
+    private static TypeAnalysisContext? ResolveEntryValue(
+        ApplicationAnalysisContext app,
+        Il2CppRGCTXDefinition entry,
+        IReadOnlyList<TypeAnalysisContext> typeArguments,
+        IReadOnlyList<TypeAnalysisContext> methodArguments)
+    {
+        if (entry.type == Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_METHOD)
+        {
+            var represented = app.ResolveContextForMethod(
+                new Cpp2IlMethodRef(entry.MethodSpec));
+            return represented == null
+                ? null
+                : new RuntimeMethodInfoAnalysisContext(
+                    represented,
+                    represented.DeclaringType!.DeclaringAssembly);
+        }
+
+        if (entry.type is not (Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CLASS
+            or Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_TYPE))
+            return null;
+
+        var entryType = app.ResolveIl2CppType(entry.Type);
+        var inflated = GenericInstantiation.Instantiate(
+            entryType,
+            typeArguments,
+            methodArguments);
+        return new RuntimeClassTypeAnalysisContext(inflated, inflated.DeclaringAssembly);
+    }
+
+    internal static TypeAnalysisContext? ResolveEntry(TypeAnalysisContext instance, int index)
     {
         var definition = (instance as GenericInstanceTypeAnalysisContext)?.GenericType ?? instance;
 
@@ -83,6 +154,14 @@ public static class RgctxResolver
             return null;
 
         var entry = entries[index];
+
+        if (entry.type == Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_METHOD)
+        {
+            IReadOnlyList<TypeAnalysisContext> typeArguments = instance is GenericInstanceTypeAnalysisContext generic
+                ? generic.GenericArguments
+                : instance.GenericParameters.Cast<TypeAnalysisContext>().ToArray();
+            return ResolveEntryValue(instance.AppContext, entry, typeArguments, []);
+        }
 
         if (entry.type is not (Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CLASS or Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_TYPE))
             return null;

@@ -537,6 +537,69 @@ public static class MetadataResolver
         };
     }
 
+    /// <summary>
+    /// 方法RGCTXData的METHOD项已经携带精确托管方法身份。IL2CPP共享泛型代码常从该项的
+    /// MethodInfo中读取虚调用入口并以BR尾调；目标地址本身无需再次猜测。
+    /// </summary>
+    public static bool ResolveMethodRgctxCalls(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToDictionary(
+                instruction => (LocalVariable)instruction.Destination!,
+                instruction => instruction);
+
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        {
+            foreach (var instruction in block.Instructions.ToArray())
+            {
+                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump)
+                    || ResolveTargetMethodInfo(instruction.Operands[0], definitions) is not
+                    {
+                        RepresentedMethod: { } resolved
+                    })
+                    continue;
+
+                IndirectTransferCallRewriter.Rewrite(method, instruction, block, resolved);
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static RuntimeMethodInfoAnalysisContext? ResolveTargetMethodInfo(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (true)
+        {
+            switch (operand)
+            {
+                case MemoryOperand
+                {
+                    Base: LocalVariable methodInfoLocal,
+                    Index: null,
+                    Scale: 0,
+                    Addend: 0
+                }:
+                    return ResolveTargetMethodInfo(methodInfoLocal, definitions);
+                case LocalVariable { Type: RuntimeMethodInfoAnalysisContext typed }:
+                    return typed;
+                case LocalVariable local when visited.Add(local)
+                                                  && definitions.TryGetValue(local, out var definition)
+                                                  && definition.OpCode == OpCode.Move
+                                                  && definition.Operands.Count >= 2:
+                    operand = definition.Operands[1];
+                    continue;
+                default:
+                    return null;
+            }
+        }
+    }
+
     internal static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
         // 未约束泛型参数的共享代码仍通过实际运行时类型的对象虚表分派；槽身份来自 System.Object，

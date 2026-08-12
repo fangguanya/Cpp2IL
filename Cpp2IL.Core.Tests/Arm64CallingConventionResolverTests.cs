@@ -196,6 +196,43 @@ public class Arm64CallingConventionResolverTests
         Assert.That(instruction.Sources, Is.EqualTo(new IOperand[] { first, second }));
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 十六字节泛型KeyValuePair占用两个通用寄存器槽()
+    {
+        var definition = Cpp2IlApi.CurrentAppContext!
+            .GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var pair = definition.MakeGenericInstanceType(definition.GenericParameters);
+
+        Assert.That(Arm64CallingConventionResolver.GeneralRegisterSlotCount(pair), Is.EqualTo(2));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 普通引用参数只占一个通用寄存器槽()
+    {
+        Assert.That(
+            Arm64CallingConventionResolver.GeneralRegisterSlotCount(
+                Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType),
+            Is.EqualTo(1));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通非泛型方法不追加隐藏MethodInfo()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Read",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        Assert.That(Arm64CallingConventionResolver.RequiresHiddenMethodInfo(method), Is.False);
+    }
+
     private static InjectedTypeAnalysisContext CreateValueType(
         string name,
         params TypeAnalysisContext[] fieldTypes)
