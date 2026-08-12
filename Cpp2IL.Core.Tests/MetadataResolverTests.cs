@@ -87,6 +87,100 @@ public class MetadataResolverTests
 
     [Test]
     [Category("基本功能")]
+    public void 泛型参数虚表槽映射到对象声明()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericParameter = listDefinition.GenericParameters.Single();
+        var objectEquals = app.SystemTypes.SystemObjectType.Methods.Single(method =>
+            method.Name == "Equals" && method.Parameters.Count == 1);
+
+        var resolved = MetadataResolver.ResolveVTableSlot(app, genericParameter, objectEquals.Definition!.slot);
+
+        Assert.That(resolved, Is.SameAs(objectEquals));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 泛型参数对象虚表末槽仍可解析()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericParameter = listDefinition.GenericParameters.Single();
+        var slot = app.SystemTypes.SystemObjectType.Definition!.VtableCount - 1;
+
+        Assert.That(MetadataResolver.ResolveVTableSlot(app, genericParameter, slot), Is.Not.Null);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 泛型参数负虚表槽不返回伪方法()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+
+        Assert.That(
+            MetadataResolver.ResolveVTableSlot(app, listDefinition.GenericParameters.Single(), -1),
+            Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 泛型抽象虚表槽从开放声明恢复具体方法()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var comparerDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.EqualityComparer`1")!;
+        var equals = comparerDefinition.Methods.Single(method =>
+            method.Name == "Equals" && method.Parameters.Count == 2);
+        var receiver = comparerDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+
+        var resolved = MetadataResolver.ResolveVTableSlot(app, receiver, equals.Definition!.slot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+            Assert.That(resolved!.Name, Is.EqualTo("Equals"));
+            Assert.That(resolved.Parameters.Select(parameter => parameter.ParameterType),
+                Is.All.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 泛型抽象虚表解析保留接收者类型实参()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var comparerDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.EqualityComparer`1")!;
+        var hashCode = comparerDefinition.Methods.Single(method =>
+            method.Name == "GetHashCode" && method.Parameters.Count == 1);
+        var receiver = comparerDefinition.MakeGenericInstanceType([app.SystemTypes.SystemObjectType]);
+
+        var resolved = MetadataResolver.ResolveVTableSlot(app, receiver, hashCode.Definition!.slot);
+
+        Assert.That(resolved!.Parameters.Single().ParameterType, Is.SameAs(app.SystemTypes.SystemObjectType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 泛型虚表越界槽不返回伪方法()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var comparerDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.EqualityComparer`1")!;
+        var receiver = comparerDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+
+        Assert.That(
+            MetadataResolver.ResolveVTableSlot(app, receiver, int.MaxValue),
+            Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 开放泛型虚表方法按封闭接收者恢复返回类型()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

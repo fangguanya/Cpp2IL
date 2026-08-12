@@ -145,16 +145,14 @@ public static class MetadataResolver
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? local.Type;
-                var genericOwner = owner as GenericInstanceTypeAnalysisContext;
+                // 泛型声明的字段元数据偏移均可能为零；必须先以声明自身的 T 参数构造开放布局实例，
+                // 否则委托字段无法获得 Func<T>/Comparison<T> 等精确类型，后续 BR 尾调用也无法绑定 Invoke。
+                var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
 
                 FieldAnalysisContext? field;
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
-                        continue;
-
+                    // 泛型定义的字段元数据偏移不可信，统一按具体或开放实例重新计算布局。
                     field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, memory.Addend);
                 }
                 else
@@ -175,7 +173,8 @@ public static class MetadataResolver
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
-                if (genericOwner != null)
+                if (genericOwner != null
+                    && field is not ConcreteGenericFieldAnalysisContext)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
@@ -540,9 +539,14 @@ public static class MetadataResolver
 
     internal static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
-        var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
+        // 未约束泛型参数的共享代码仍通过实际运行时类型的对象虚表分派；槽身份来自 System.Object，
+        // CIL 生成阶段再使用 constrained. T 保留引用类型和值类型各自的重写语义。
+        var lookupType = type is GenericParameterTypeAnalysisContext
+            ? appContext.SystemTypes.SystemObjectType
+            : type;
+        var definition = (lookupType as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? lookupType.Definition;
 
-        if (definition == null || slot >= definition.VtableCount)
+        if (definition == null || slot < 0 || slot >= definition.VtableCount)
             return null;
 
         // 接口槽在原生虚表中指向类实现，但托管CIL必须引用已经按接收者具体化的接口声明。
@@ -553,7 +557,7 @@ public static class MetadataResolver
                 continue;
 
             var declaringInterface = appContext.ResolveIl2CppType(interfaceOffset.Type);
-            if (type is GenericInstanceTypeAnalysisContext receiver)
+            if (lookupType is GenericInstanceTypeAnalysisContext receiver)
                 declaringInterface = GenericInstantiation.Instantiate(
                     declaringInterface,
                     receiver.GenericArguments,
@@ -568,13 +572,18 @@ public static class MetadataResolver
         }
 
         if (appContext.ResolveContextForMethod(definition.VTable[slot]) is { } implementation)
-            return SpecializeVTableMethodForReceiver(type, implementation);
+            return SpecializeVTableMethodForReceiver(lookupType, implementation);
 
         // an abstract method has no implementation, try to resolve it
-        for (var declarer = type; declarer != null; declarer = declarer.BaseType)
+        for (var declarer = lookupType; declarer != null; declarer = declarer.BaseType)
         {
-            if (declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
-                return SpecializeVTableMethodForReceiver(type, declaration);
+            // 泛型实例包装器自身没有方法列表；声明仍位于开放 GenericType 上，
+            // 找到后再按实际接收者具体化返回值与参数。
+            var methods = declarer is GenericInstanceTypeAnalysisContext genericDeclarer
+                ? genericDeclarer.GenericType.Methods
+                : declarer.Methods;
+            if (methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
+                return SpecializeVTableMethodForReceiver(lookupType, declaration);
         }
 
         return null;

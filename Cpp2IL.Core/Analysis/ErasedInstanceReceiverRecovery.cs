@@ -34,6 +34,12 @@ public static class ErasedInstanceReceiverRecovery
                 || instruction.Operands[receiverIndex] is not LocalVariable { Type: { } receiverType })
                 continue;
 
+            // 泛型值T既可能是值类型，也可能是引用类型；它对Object实例方法的调用必须由
+            // constrained.callvirt保留真实接收者。IsAssignableTo在开放泛型上没有足够信息，
+            // 因此绝不能把T误判成原生残留寄存器并改写成当前方法的this。
+            if (receiverType is GenericParameterTypeAnalysisContext)
+                continue;
+
             // 已经可赋值的接收者保留原身份；只有原生寄存器值与托管签名矛盾时才恢复入口this。
             if (receiverType.IsAssignableTo(targetType)
                 || !method.DeclaringType.IsAssignableTo(targetType))

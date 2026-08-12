@@ -43,6 +43,44 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 泛型参数接收者要求Constrained虚调用()
+    {
+        var definition = Cpp2IlApi.CurrentAppContext!
+            .GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericParameter = definition.GenericParameters.Single();
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), genericParameter);
+
+        Assert.That(IlGenerator.ConstrainedReceiverType(receiver), Is.SameAs(genericParameter));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 泛型参数传入Object形参要求BoxT()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var definition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var argument = new LocalVariable(
+            "argument",
+            new Register(null, "X1"),
+            definition.GenericParameters.Single());
+
+        Assert.That(IlGenerator.ShouldBoxGenericArgument(argument, app.SystemTypes.SystemObjectType), Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通引用参数不生成泛型Box()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var argument = new LocalVariable("argument", new Register(null, "X1"), app.SystemTypes.SystemStringType);
+
+        Assert.That(IlGenerator.ShouldBoxGenericArgument(argument, app.SystemTypes.SystemObjectType), Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void Box指令生成值类型装箱而非原生地址传递()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

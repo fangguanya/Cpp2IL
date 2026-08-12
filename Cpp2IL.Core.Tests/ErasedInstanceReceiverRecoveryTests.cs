@@ -88,6 +88,36 @@ public class ErasedInstanceReceiverRecoveryTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 开放泛型接收者调用Object方法时保持原身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericReceiverType = owner.GenericParameters.Single();
+        var target = Method(
+            app.SystemTypes.SystemObjectType,
+            "Equals",
+            app.SystemTypes.SystemBooleanType,
+            isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("value", genericReceiverType, 4);
+        var argument = Local("other", app.SystemTypes.SystemObjectType, 5);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 6);
+        var call = new Instruction(0, OpCode.Call, target, result, receiver, argument);
+        Prepare(caller, call, receiver, argument, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.Operands[2], Is.SameAs(receiver));
+            Assert.That(caller.ParameterLocals, Is.Empty);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 无关调用者类型保持错误证据而不改写()
     {

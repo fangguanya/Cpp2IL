@@ -432,11 +432,19 @@ public static class IlGenerator
                 }
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+                GenericParameterTypeAnalysisContext? constrainedReceiver = null;
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
-                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, stringCtor, targetMethod.DeclaringType);
+                    {
+                        var receiverOperand = instruction.Operands[thisParamIndex];
+                        constrainedReceiver = ConstrainedReceiverType(receiverOperand);
+                        if (constrainedReceiver != null && receiverOperand is LocalVariable receiverLocal)
+                            LoadLocalAddress(receiverLocal, method, locals);
+                        else
+                            LoadOperand(receiverOperand, method, locals, writeLine, stringCtor, targetMethod.DeclaringType);
+                    }
                     else
                     {
                         instructions.Add(CilOpCodes.Ldstr, $"Non static method called without 'this' param ({instruction})");
@@ -452,7 +460,17 @@ public static class IlGenerator
                 // The stack still has to match the signature, so anything missing gets a placeholder.
                 LoadCallParameters(instruction.Operands, callParamIndex, targetMethod, method, locals, writeLine, stringCtor);
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                if (constrainedReceiver != null)
+                {
+                    // 对未知 T 的实例虚调用必须同时覆盖引用类型与值类型：地址接收者配合 constrained.
+                    // 让 CLR 在运行时选择直接值类型实现或对象虚分派，不引入装箱后的错误 this 身份。
+                    instructions.Add(
+                        CilOpCodes.Constrained,
+                        importer.ImportTypeSignature(constrainedReceiver.ToTypeSignature(module)).ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Callvirt, importedMethod);
+                }
+                else
+                    instructions.Add(CilOpCodes.Call, importedMethod);
 
                 if (instruction.OpCode == OpCode.Call) // Store return value
                     StoreToOperand(instruction.Operands[1], method, locals, writeLine);
@@ -873,6 +891,13 @@ public static class IlGenerator
                 break;
             case LocalVariable local:
                 LoadLocal(local, method, locals);
+                if (ShouldBoxGenericArgument(local, expectedType))
+                {
+                    // 泛型实参传给 object 或接口形参时，box T 对引用类型保持原引用、对值类型执行真实装箱。
+                    instructions.Add(
+                        CilOpCodes.Box,
+                        importer.ImportTypeSignature(local.Type!.ToTypeSignature(module)).ToTypeDefOrRef());
+                }
                 break;
             case ArrayLength arrayLength:
                 LoadLocal(arrayLength.Array, method, locals);
@@ -937,8 +962,15 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadLocal(field.Local, method, locals);
+                LoadFieldReceiver(field, method, locals);
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor(module));
+                if (ShouldBoxGenericArgument(field, expectedType))
+                {
+                    // 泛型结构字段传入object或接口时必须按字段声明类型装箱。
+                    instructions.Add(
+                        CilOpCodes.Box,
+                        importer.ImportTypeSignature(field.Field.FieldType.ToTypeSignature(module)).ToTypeDefOrRef());
+                }
                 break;
             case MemoryOperand memory:
                 if (expectedType is RuntimeClassTypeAnalysisContext
@@ -1165,6 +1197,27 @@ public static class IlGenerator
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 
+    internal static GenericParameterTypeAnalysisContext? ConstrainedReceiverType(IOperand operand)
+        => operand is LocalVariable { Type: GenericParameterTypeAnalysisContext genericParameter }
+            ? genericParameter
+            : null;
+
+    internal static bool ShouldBoxGenericArgument(IOperand operand, TypeAnalysisContext? expectedType)
+        => OperandType(operand) is GenericParameterTypeAnalysisContext
+           && expectedType is { IsValueType: false }
+           && expectedType is not (GenericParameterTypeAnalysisContext
+               or RuntimeClassTypeAnalysisContext
+               or RuntimeMethodInfoAnalysisContext
+               or StaticFieldStorageTypeAnalysisContext
+               or RgctxTableTypeAnalysisContext);
+
+    private static TypeAnalysisContext? OperandType(IOperand operand) => operand switch
+    {
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        _ => null
+    };
+
     private static void LoadCallParameters(IReadOnlyList<IOperand> operands, int firstParameterIndex,
         MethodAnalysisContext targetMethod, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, MemberReference writeLine, MemberReference stringCtor)
@@ -1218,6 +1271,17 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldloc, locals[local]);
     }
 
+    private static void LoadFieldReceiver(
+        FieldReference field,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (field.Local.Type?.IsValueType == true)
+            LoadLocalAddress(field.Local, method, locals);
+        else
+            LoadLocal(field.Local, method, locals);
+    }
+
     private static void StoreToOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, MemberReference writeLine)
     {
@@ -1247,7 +1311,7 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadLocal(field.Local, method, locals);
+                LoadFieldReceiver(field, method, locals);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;

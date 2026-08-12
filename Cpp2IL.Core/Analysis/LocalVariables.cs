@@ -239,6 +239,9 @@ public static class LocalVariables
         // loads. Applied once up front and, being applied first, they win over anything inferred later.
         PropagateFromReturn(method);
         PropagateFromParameters(method);
+        // 开放泛型KeyValuePair等小型值类型在ARM64入口被拆为连续X寄存器；
+        // 签名类型落定后立即把物理分量恢复为同一托管参数的字段读取。
+        AggregateParameterRecovery.Run(method);
         SeedStackFrameBaseTypes(method);
         SeedRuntimeClassTypes(method);
         SeedNewobjResults(method);
