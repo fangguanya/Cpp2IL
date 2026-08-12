@@ -67,6 +67,57 @@ public class SsaAndDominators
 
     private static string? RegName(object operand) => operand is Register r ? r.Name : null;
 
+    /// <summary>
+    /// 把测试图中的SSA寄存器转换为局部变量，完整复现正式流水线在
+    /// <see cref="SsaForm.Build(ISILControlFlowGraph, DominatorInfo)"/> 之后的表示。
+    /// </summary>
+    private static void ConvertRegistersToLocals(ISILControlFlowGraph graph)
+    {
+        var registers = graph.Blocks
+            .SelectMany(block => block.Instructions)
+            .SelectMany(instruction => instruction.Operands)
+            .SelectMany(RegistersIn)
+            .Distinct()
+            .ToDictionary(register => register, register => new LocalVariable(register.ToString(), register));
+
+        foreach (var instruction in graph.Blocks.SelectMany(block => block.Instructions))
+        {
+            for (var index = 0; index < instruction.Operands.Count; index++)
+            {
+                switch (instruction.Operands[index])
+                {
+                    case Register register:
+                        instruction.SetOperand(index, registers[register]);
+                        break;
+                    case MemoryOperand memory:
+                        if (memory.Base is Register memoryBase)
+                            memory.Base = registers[memoryBase];
+                        if (memory.Index is Register memoryIndex)
+                            memory.Index = registers[memoryIndex];
+                        instruction.SetOperand(index, memory);
+                        break;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<Register> RegistersIn(IOperand operand)
+    {
+        if (operand is Register register)
+            yield return register;
+        if (operand is MemoryOperand { Base: Register memoryBase })
+            yield return memoryBase;
+        if (operand is MemoryOperand { Index: Register memoryIndex })
+            yield return memoryIndex;
+    }
+
+    private static string DescribeGraph(ISILControlFlowGraph graph, string stage) =>
+        $"===== {stage} ====={Environment.NewLine}"
+        + string.Join(Environment.NewLine, graph.Blocks.Select(block =>
+            $"块{block.ID} 前驱[{string.Join(',', block.Predecessors.Select(item => item.ID))}] "
+            + $"后继[{string.Join(',', block.Successors.Select(item => item.ID))}] "
+            + $"指令[{string.Join(" | ", block.Instructions)}]"));
+
     [Test]
     public void DiamondDominatorsAreCorrect()
     {
@@ -171,6 +222,182 @@ public class SsaAndDominators
         SsaForm.Build(graph, new DominatorInfo(graph));
 
         Assert.That(Phis(graph).Count(phi => RegName(phi.Operands[0]) == "x"), Is.EqualTo(1));
+    }
+
+    private static ISILControlFlowGraph ConditionalSelectGraph(bool includeSecondValue)
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+
+        Add(0, OpCode.Move, new Register(null, "x"), 10);
+        if (includeSecondValue)
+            Add(1, OpCode.Move, new Register(null, "y"), 30);
+        var branchIndex = instructions.Count;
+        var falseMoveIndex = branchIndex + 1;
+        var returnIndex = includeSecondValue ? falseMoveIndex + 2 : falseMoveIndex + 1;
+        Add(branchIndex, OpCode.ConditionalJump, returnIndex, new Register(null, "cond"));
+        Add(falseMoveIndex, OpCode.Move, new Register(null, "x"), 20);
+        if (includeSecondValue)
+            Add(falseMoveIndex + 1, OpCode.Move, new Register(null, "y"), 40);
+        if (includeSecondValue)
+            Add(returnIndex, OpCode.Return, new Register(null, "x"), new Register(null, "y"));
+        else
+            Add(returnIndex, OpCode.Return, new Register(null, "x"));
+        return BuildGraph(instructions);
+    }
+
+    private static ISILControlFlowGraph ConsecutiveConditionalSelectGraph()
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+
+        // 精确模拟两条连续 ARM64 CSEL：真分支跳过同地址的假值写入，随后两路汇合。
+        Add(0, OpCode.Move, new Register(null, "X8"), 10);
+        Add(1, OpCode.Move, new Register(null, "X9"), 20);
+        Add(2, OpCode.Move, new Register(null, "CSEL_TRUE"), new Register(null, "X8"));
+        Add(3, OpCode.Move, new Register(null, "CSEL_FALSE"), new Register(null, "X9"));
+        Add(4, OpCode.Move, new Register(null, "X8"), new Register(null, "CSEL_TRUE"));
+        Add(5, OpCode.ConditionalJump, 7, new Register(null, "cond1"));
+        Add(6, OpCode.Move, new Register(null, "X8"), new Register(null, "CSEL_FALSE"));
+
+        Add(7, OpCode.Move, new Register(null, "X9"), 30);
+        Add(8, OpCode.Move, new Register(null, "CSEL_TRUE"), new Register(null, "X9"));
+        Add(9, OpCode.Move, new Register(null, "CSEL_FALSE"), new Register(null, "X8"));
+        Add(10, OpCode.Move, new Register(null, "X8"), new Register(null, "CSEL_TRUE"));
+        Add(11, OpCode.ConditionalJump, 13, new Register(null, "cond2"));
+        Add(12, OpCode.Move, new Register(null, "X8"), new Register(null, "CSEL_FALSE"));
+        Add(13, OpCode.Move, new Register(null, "X0"), new MemoryOperand(new Register(null, "X8")));
+        Add(14, OpCode.Return, new Register(null, "X0"));
+        return BuildGraph(instructions);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 连续条件选择经过SSA清理后必须保留两条分支()
+    {
+        var graph = ConsecutiveConditionalSelectGraph();
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        ConvertRegistersToLocals(graph);
+        var stageSsa = DescribeGraph(graph, "SSA建立后");
+
+        SsaSimplifier.Run(graph, []);
+        DeadCodeEliminator.Run(graph);
+        var stageDce = DescribeGraph(graph, "SSA简化与死码清理后");
+        SsaForm.Remove(graph);
+        var stageRemove = DescribeGraph(graph, "退SSA后");
+        CopyCoalescer.Run(graph);
+        var stageCoalesce = DescribeGraph(graph, "副本合并后");
+
+        var branches = graph.Blocks
+            .Where(block => block.Instructions.LastOrDefault()?.OpCode == OpCode.ConditionalJump)
+            .ToList();
+        var graphDetail = string.Join(Environment.NewLine, stageSsa, stageDce, stageRemove, stageCoalesce);
+        Assert.Multiple(() =>
+        {
+            Assert.That(branches.Count, Is.EqualTo(2), graphDetail);
+            Assert.That(branches.All(block => block.Successors.Count == 2), Is.True, graphDetail);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 连续条件选择返回内存读取必须继续使用目标寄存器族()
+    {
+        var graph = ConsecutiveConditionalSelectGraph();
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        ConvertRegistersToLocals(graph);
+        SsaSimplifier.Run(graph, []);
+        DeadCodeEliminator.Run(graph);
+        SsaForm.Remove(graph);
+        CopyCoalescer.Run(graph);
+
+        var load = graph.Blocks.SelectMany(block => block.Instructions)
+            .Single(instruction => instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand] });
+        var memoryBase = (LocalVariable)((MemoryOperand)load.Operands[1]).Base!;
+        Assert.That(memoryBase.Register.Name, Is.EqualTo("X8"));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 条件选择的目标寄存器活值缺失时不得伪造其他寄存器来源()
+    {
+        var graph = ConsecutiveConditionalSelectGraph();
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        ConvertRegistersToLocals(graph);
+        SsaSimplifier.Run(graph, []);
+        DeadCodeEliminator.Run(graph);
+
+        var phis = graph.Blocks.SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.OpCode == OpCode.Phi)
+            .ToList();
+        var x8Phis = phis.Where(phi => ((LocalVariable)phi.Operands[0]).Register.Name == "X8").ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(x8Phis, Is.Not.Empty);
+            Assert.That(x8Phis, Has.All.Matches<Instruction>(phi => phi.Operands.Skip(1)
+                .OfType<LocalVariable>()
+                .All(source => source.Register.Name == "X8")));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 退SSA必须拆分条件真分支的Phi关键边()
+    {
+        var graph = ConditionalSelectGraph(includeSecondValue: false);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        SsaForm.Remove(graph);
+
+        var branch = BlockWith(graph, instruction => instruction.OpCode == OpCode.ConditionalJump);
+        var edge = branch.Successors.Single(successor =>
+            successor.Instructions.Any(instruction => instruction.OpCode == OpCode.Move)
+            && successor.Instructions.Last().OpCode == OpCode.Jump);
+        Assert.Multiple(() =>
+        {
+            Assert.That(branch.Instructions[^1].Operands[0], Is.SameAs(edge));
+            Assert.That(edge.Predecessors, Is.EqualTo(new[] { branch }));
+            Assert.That(edge.Instructions.Count(instruction => instruction.OpCode == OpCode.Move), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一关键边的多个Phi必须共享一个边块()
+    {
+        var graph = ConditionalSelectGraph(includeSecondValue: true);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        SsaForm.Remove(graph);
+
+        var branch = BlockWith(graph, instruction => instruction.OpCode == OpCode.ConditionalJump);
+        var edgeBlocks = branch.Successors.Where(successor => successor.Instructions.Last().OpCode == OpCode.Jump).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(edgeBlocks.Count, Is.EqualTo(1));
+            Assert.That(edgeBlocks[0].Instructions.Count(instruction => instruction.OpCode == OpCode.Move), Is.EqualTo(2));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 没有活跃Phi的条件分支不得创建边块()
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+        Add(0, OpCode.ConditionalJump, 2, new Register(null, "cond"));
+        Add(1, OpCode.Nop);
+        Add(2, OpCode.Return);
+        var graph = BuildGraph(instructions);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        var blockCount = graph.Blocks.Count;
+
+        SsaForm.Remove(graph);
+
+        Assert.That(graph.Blocks.Count, Is.LessThanOrEqualTo(blockCount));
     }
 
     // Two sibling leaves under the entry branch, one redefining x and one reading it. Both orders tested

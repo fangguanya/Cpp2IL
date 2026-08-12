@@ -67,7 +67,7 @@ public class SsaForm
         var liveOut = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
         var uses = graph.Blocks.ToDictionary(
             block => block,
-            block => new HashSet<int>(block.Use.OfType<Register>().Select(register => register.Number)));
+            block => new HashSet<int>(block.Use.SelectMany(EnumerateOperandRegisters).Select(register => register.Number)));
         var definitions = graph.Blocks.ToDictionary(
             block => block,
             block => new HashSet<int>(block.Def.OfType<Register>().Select(register => register.Number)));
@@ -98,6 +98,33 @@ public class SsaForm
         }
 
         return liveIn;
+    }
+
+    /// <summary>
+    /// 枚举一个读取操作数携带的全部寄存器。内存基址、索引与取地址目标同样是活值；
+    /// 只检查顶层寄存器会漏掉 <c>LDR X0, [X8]</c> 对 X8 的读取，继而在条件汇合处少建Phi。
+    /// </summary>
+    private static IEnumerable<Register> EnumerateOperandRegisters(IOperand operand)
+    {
+        switch (operand)
+        {
+            case Register register:
+                yield return register;
+                break;
+            case MemoryOperand { Base: Register baseRegister, Index: Register indexRegister }:
+                yield return baseRegister;
+                yield return indexRegister;
+                break;
+            case MemoryOperand { Base: Register baseRegister }:
+                yield return baseRegister;
+                break;
+            case MemoryOperand { Index: Register indexRegister }:
+                yield return indexRegister;
+                break;
+            case AddressOf { Target: Register addressed }:
+                yield return addressed;
+                break;
+        }
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
@@ -454,9 +481,15 @@ public class SsaForm
     /// </summary>
     public static void Remove(MethodAnalysisContext method)
     {
-        var cfg = method.ControlFlowGraph!;
+        Remove(method.ControlFlowGraph!);
+    }
 
-        foreach (var block in cfg.Blocks)
+    internal static void Remove(ISILControlFlowGraph cfg)
+    {
+        var edgeBlocks = new List<Block>();
+        var nextBlockId = cfg.Blocks.Count == 0 ? 0 : cfg.Blocks.Max(block => block.ID) + 1;
+
+        foreach (var block in cfg.Blocks.ToList())
         {
             var phiInstructions = block.Instructions
                 .Where(i => i.OpCode == OpCode.Phi)
@@ -485,7 +518,28 @@ public class SsaForm
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
 
-                InsertBeforeTerminator(predecessor, moves);
+                if (moves.Count == 0)
+                    continue;
+
+                if (predecessor.Successors.Count <= 1)
+                {
+                    InsertBeforeTerminator(predecessor, moves);
+                    continue;
+                }
+
+                // 条件前驱上的Phi复制属于一条特定边；直接塞进前驱会让另一分支也执行复制。
+                // 为该边建立唯一中间块，多个Phi共享同一组复制与同一个跳转。
+                var edgeBlock = new Block
+                {
+                    ID = nextBlockId++,
+                    BlockType = BlockType.OneWay,
+                    Instructions = [.. moves, new Instruction(-1, OpCode.Jump, block)],
+                    Predecessors = [predecessor],
+                    Successors = [block]
+                };
+                RedirectEdge(predecessor, block, edgeBlock);
+                block.Predecessors[predIndex] = edgeBlock;
+                edgeBlocks.Add(edgeBlock);
             }
 
             foreach (var phi in phiInstructions)
@@ -495,8 +549,28 @@ public class SsaForm
             }
         }
 
+        cfg.Blocks.AddRange(edgeBlocks);
+
         cfg.RemoveNops();
         cfg.RemoveEmptyBlocks();
+    }
+
+    /// <summary>
+    /// 把前驱到目标的单条边重定向到边块，同时修正显式真分支目标；假分支由Successors顺序保持。
+    /// </summary>
+    private static void RedirectEdge(Block predecessor, Block target, Block edgeBlock)
+    {
+        var successorIndex = predecessor.Successors.IndexOf(target);
+        if (successorIndex < 0)
+            throw new DecompilerException($"退SSA关键边缺少后继：from={predecessor.ID}，to={target.ID}");
+
+        predecessor.Successors[successorIndex] = edgeBlock;
+        if (predecessor.Instructions.LastOrDefault() is
+            { OpCode: OpCode.Jump or OpCode.ConditionalJump, Operands.Count: > 0 } terminator
+            && ReferenceEquals(terminator.Operands[0], target))
+        {
+            terminator.SetOperand(0, edgeBlock);
+        }
     }
 
     /// <summary>

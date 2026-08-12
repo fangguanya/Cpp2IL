@@ -164,6 +164,11 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 methodContext.FullName,
                 ClassifyFailure(detail),
                 detail));
+
+            // 保留失败方法的最终 CFG，账本中的 CIL 窗口可由同一方法图追溯到具体 SSA/边复制。
+            var outputRoot = Cpp2IlApi.RuntimeOptions?.OutputRootDirectory;
+            if (!string.IsNullOrWhiteSpace(outputRoot) && methodContext.ControlFlowGraph != null)
+                WriteControlFlowGraph(methodContext, Path.Combine(outputRoot, "FailedMethodGraphs"));
             
             methodDefinition.CilMethodBody = new();
             instructions = methodDefinition.CilMethodBody.Instructions;
