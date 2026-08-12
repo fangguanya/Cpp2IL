@@ -64,6 +64,24 @@ public static class LocalVariables
 
                     instruction.SetOperand(i, memory);
                 }
+
+                if (operand is HomogeneousFloatingAggregateArgument aggregate)
+                {
+                    for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                    {
+                        var component = aggregate.Components[componentIndex];
+                        if (component is Register componentRegister)
+                            aggregate.Components[componentIndex] = locals[componentRegister];
+                        else if (component is MemoryOperand componentMemory)
+                        {
+                            if (componentMemory.Base is Register baseRegister)
+                                componentMemory.Base = locals[baseRegister];
+                            if (componentMemory.Index is Register indexRegister)
+                                componentMemory.Index = locals[indexRegister];
+                            aggregate.Components[componentIndex] = componentMemory;
+                        }
+                    }
+                }
             }
         }
 
@@ -215,6 +233,22 @@ public static class LocalVariables
                     var index = (Register)memory.Index;
                     if (!registers.Contains(index))
                         registers.Add(index);
+                }
+            }
+
+            if (operand is HomogeneousFloatingAggregateArgument aggregate)
+            {
+                foreach (var component in aggregate.Components)
+                {
+                    if (component is Register componentRegister && !registers.Contains(componentRegister))
+                        registers.Add(componentRegister);
+                    if (component is MemoryOperand componentMemory)
+                    {
+                        if (componentMemory.Base is Register baseRegister && !registers.Contains(baseRegister))
+                            registers.Add(baseRegister);
+                        if (componentMemory.Index is Register indexRegister && !registers.Contains(indexRegister))
+                            registers.Add(indexRegister);
+                    }
                 }
             }
         }
@@ -1149,6 +1183,18 @@ public static class LocalVariables
                     continue;
 
                 var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
+
+                if (instruction.Operands[i] is HomogeneousFloatingAggregateArgument aggregate
+                    && Arm64CallingConventionResolver.TryGetHomogeneousFloatingAggregateFields(
+                        parameterType,
+                        out var aggregateFields)
+                    && aggregateFields.Count == aggregate.Components.Count)
+                {
+                    for (var componentIndex = 0; componentIndex < aggregateFields.Count; componentIndex++)
+                        if (aggregate.Components[componentIndex] is LocalVariable component)
+                            changed |= SetTypeIfUnknown(component, aggregateFields[componentIndex].FieldType);
+                    continue;
+                }
 
                 if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType }
                     && Addressed(instruction.Operands[i]) is { } referenced)

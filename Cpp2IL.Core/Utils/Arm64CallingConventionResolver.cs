@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -52,6 +53,93 @@ public static class Arm64CallingConventionResolver
     }
 
     /// <summary>
+    /// 按 AAPCS64 C.1-C.15 计算一个已知托管方法在调用点的实参载体。
+    /// 浮点标量与 HFA 使用独立的 V0-V7 序列；HFA 若不能完整放入剩余 V 寄存器，
+    /// 整体进入栈参数区。整数寄存器耗尽后的引用和标量同样依序进入该栈参数区。
+    /// </summary>
+    public static IReadOnlyList<IOperand> ArgumentOperands(MethodAnalysisContext method)
+    {
+        var operands = new List<IOperand>();
+        var integerIndex = 0;
+        var floatingIndex = 0;
+        var stackOffset = 0;
+
+        void AddStackArgument(int sizeBytes)
+        {
+            stackOffset = AlignUp(stackOffset, PointerSize);
+            operands.Add(new StackOffset(stackOffset));
+            stackOffset = checked(stackOffset + AlignUp(Math.Max(sizeBytes, 1), PointerSize));
+        }
+
+        void AddGeneralArgument(TypeAnalysisContext type)
+        {
+            var slots = Math.Max(GeneralRegisterSlotCount(type), 1);
+            if (integerIndex + slots <= IntegerRegisters.Length)
+            {
+                operands.Add(new Register(null, IntegerRegisters[integerIndex]));
+                integerIndex += slots;
+                return;
+            }
+
+            // 一个多槽值若无法完整落入剩余 X 寄存器，AAPCS64 要求从栈重新开始，
+            // 不得把同一个托管值拆成“部分寄存器、部分栈”。
+            integerIndex = IntegerRegisters.Length;
+            AddStackArgument(ArgumentSizeBytes(type));
+        }
+
+        if (!method.IsStatic)
+            AddGeneralArgument(method.DeclaringType!);
+
+        foreach (var parameter in method.Parameters)
+        {
+            var parameterType = parameter.ParameterType;
+            if (TryGetHomogeneousFloatingAggregateFields(parameterType, out var fields))
+            {
+                if (floatingIndex + fields.Count <= FloatingRegisters.Length)
+                {
+                    var components = new IOperand[fields.Count];
+                    for (var fieldIndex = 0; fieldIndex < fields.Count; fieldIndex++)
+                        components[fieldIndex] = new Register(null, FloatingRegisters[floatingIndex + fieldIndex]);
+
+                    operands.Add(new HomogeneousFloatingAggregateArgument(parameterType, components));
+                    floatingIndex += fields.Count;
+                }
+                else
+                {
+                    // HFA 不能部分占用 V6/V7；一旦溢出，后续 HFA 也从栈参数区取得。
+                    floatingIndex = FloatingRegisters.Length;
+                    AddStackArgument(ArgumentSizeBytes(parameterType));
+                }
+
+                continue;
+            }
+
+            if (X64CallingConventionResolver.IsFloatingPoint(parameterType))
+            {
+                if (floatingIndex < FloatingRegisters.Length)
+                    operands.Add(new Register(null, FloatingRegisters[floatingIndex++]));
+                else
+                    AddStackArgument(ArgumentSizeBytes(parameterType));
+                continue;
+            }
+
+            AddGeneralArgument(parameterType);
+        }
+
+        // 具体泛型调用的 RGCTX 恢复仍需观察物理 MethodInfo 载体；它不是托管形参，
+        // 后续 CallArgumentTrimmer 会在 RGCTX 解析完成后统一删除。
+        if (RequiresHiddenMethodInfo(method))
+        {
+            if (integerIndex < IntegerRegisters.Length)
+                operands.Add(new Register(null, IntegerRegisters[integerIndex]));
+            else
+                AddStackArgument(PointerSize);
+        }
+
+        return operands;
+    }
+
+    /// <summary>
     /// 按 AAPCS64 识别由一至四个同类型 Single 或 Double 实例字段组成的同质浮点聚合体。
     /// 静态字段和常量不属于实例布局；混合类型、空聚合体和超过四个成员都必须拒绝。
     /// </summary>
@@ -102,6 +190,31 @@ public static class Arm64CallingConventionResolver
             ? checked((int)((size + PointerSize - 1) / PointerSize))
             : 1;
     }
+
+    private static int ArgumentSizeBytes(TypeAnalysisContext type)
+    {
+        if (!type.IsValueType)
+            return PointerSize;
+
+        if (TryGetHomogeneousFloatingAggregateFields(type, out var fields))
+        {
+            var elementSize = fields[0].FieldType.FullName == "System.Double"
+                ? sizeof(double)
+                : sizeof(float);
+            return checked(fields.Count * elementSize);
+        }
+
+        if (type.FullName == "System.Single")
+            return sizeof(float);
+        if (type.FullName == "System.Double")
+            return sizeof(double);
+
+        var size = TypeSizes.UnboxedSize(type, PointerSize);
+        return size is > 0 and <= int.MaxValue ? checked((int)size) : PointerSize;
+    }
+
+    private static int AlignUp(int value, int alignment)
+        => checked((value + alignment - 1) / alignment * alignment);
 
     public static bool RequiresHiddenMethodInfo(MethodAnalysisContext method)
         => method.GenericParameters.Count > 0

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -105,6 +106,15 @@ public static class SsaSimplifier
                          && addressValue is LocalVariable addressReplacement:
                     addressOf.Target = addressReplacement;
                     break;
+
+                case HomogeneousFloatingAggregateArgument aggregate:
+                    for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                    {
+                        if (aggregate.Components[componentIndex] is LocalVariable component
+                            && resolved.TryGetValue(component, out var componentValue))
+                            aggregate.Components[componentIndex] = componentValue;
+                    }
+                    break;
             }
         }
     }
@@ -138,6 +148,10 @@ public static class SsaSimplifier
                             break;
                         case AddressOf { Target: LocalVariable addressed }:
                             reads.Add(addressed);
+                            break;
+                        case HomogeneousFloatingAggregateArgument aggregate:
+                            foreach (var component in aggregate.Components.OfType<LocalVariable>())
+                                reads.Add(component);
                             break;
                     }
                 }

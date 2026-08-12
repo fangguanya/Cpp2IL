@@ -213,11 +213,20 @@ public class Instruction : IOperand
         if (OpCode == OpCode.Return)
             sources.AddRange(_operands);
 
+        // HFA 在托管签名中是一个实参，但数据流上由多个连续 V 寄存器共同组成。
+        // use/def 必须看到每个分量，否则死代码删除会误删构造该值的 FMOV/MOVI。
+        sources = sources.SelectMany(ExpandAggregateSource).ToList();
+
         if (constantsOnly)
             sources = sources.Where(o => !IsConstantValue(o)).ToList();
 
         return sources;
     }
+
+    private static IEnumerable<IOperand> ExpandAggregateSource(IOperand operand)
+        => operand is HomogeneousFloatingAggregateArgument aggregate
+            ? aggregate.Components.SelectMany(ExpandAggregateSource)
+            : [operand];
 
     public override string ToString()
     {

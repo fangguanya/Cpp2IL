@@ -215,6 +215,10 @@ public static class CopyCoalescer
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
+                case HomogeneousFloatingAggregateArgument aggregate:
+                    foreach (var component in aggregate.Components.OfType<LocalVariable>())
+                        yield return component;
+                    break;
             }
         }
     }
@@ -255,6 +259,11 @@ public static class CopyCoalescer
                             break;
                         case AddressOf { Target: LocalVariable addressed } addressOf:
                             addressOf.Target = groups.Find(addressed);
+                            break;
+                        case HomogeneousFloatingAggregateArgument aggregate:
+                            for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                                if (aggregate.Components[componentIndex] is LocalVariable component)
+                                    aggregate.Components[componentIndex] = groups.Find(component);
                             break;
                     }
                 }

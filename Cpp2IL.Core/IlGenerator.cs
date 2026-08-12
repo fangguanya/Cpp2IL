@@ -6,6 +6,7 @@ using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -82,6 +83,13 @@ public static class IlGenerator
 
             if (operand is AddressOf { Target: LocalVariable addressed })
                 local = addressed;
+
+            if (operand is HomogeneousFloatingAggregateArgument aggregate)
+            {
+                foreach (var componentLocal in aggregate.Components.OfType<LocalVariable>())
+                    if (!context.Locals.Contains(componentLocal))
+                        context.Locals.Add(componentLocal);
+            }
 
             if (local != null && !context.Locals.Contains(local))
                 context.Locals.Add(local);
@@ -341,11 +349,16 @@ public static class IlGenerator
                 // If we can't, just fall back to an Ldnull.
                 if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
                 {
-                    // Operands are [ctor, newObject, arguments..., methodInfo], so take only as many as
-                    // the constructor declares (i.e. drop methodInfo)
-                    var constructorArgs = constructorCall.Operands.Skip(2).Take(constructor.Parameters.Count).ToList();
-                    for (var i = 0; i < constructorArgs.Count; i++)
-                        LoadOperand(constructorArgs[i], method, locals, writeLine, stringCtor, constructor.Parameters[i].ParameterType);
+                    // 构造器融合和普通构造调用必须共用同一套实参装载规则；分别切片会在最后一个
+                    // 可选形参落到栈上时少压一个值，最终把生产者错误延迟成 newobj 栈不平衡。
+                    LoadCallParameters(
+                        constructorCall.Operands,
+                        2,
+                        constructor,
+                        method,
+                        locals,
+                        writeLine,
+                        stringCtor);
 
                     instructions.Add(CilOpCodes.Newobj, importer.ImportMethod(constructor.ToMethodDescriptor(module)));
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
@@ -872,6 +885,14 @@ public static class IlGenerator
             return;
         }
 
+        if (expectedType is { IsValueType: true } valueType
+            && IsZeroConstant(operand)
+            && RequiresInitializedValueType(valueType))
+        {
+            EmitInitializedValueType(valueType, method);
+            return;
+        }
+
         switch (operand)
         {
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
@@ -888,6 +909,15 @@ public static class IlGenerator
                 break;
             case StringLiteral s:
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                EmitHomogeneousFloatingAggregateArgument(
+                    aggregate,
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor,
+                    expectedType);
                 break;
             case LocalVariable local:
                 LoadLocal(local, method, locals);
@@ -1066,6 +1096,70 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+    }
+
+    private static void EmitHomogeneousFloatingAggregateArgument(
+        HomogeneousFloatingAggregateArgument aggregate,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals,
+        MemberReference writeLine,
+        MemberReference stringCtor,
+        TypeAnalysisContext? expectedType)
+    {
+        if (expectedType == null
+            || !GenericCallRebinder.TypesEquivalent(expectedType, aggregate.AggregateType)
+            || !Arm64CallingConventionResolver.TryGetHomogeneousFloatingAggregateFields(
+                aggregate.AggregateType,
+                out var fields)
+            || fields.Count != aggregate.Components.Count)
+            throw new DecompilerException($"HFA实参与托管形参不一致：{aggregate}");
+
+        var module = method.DeclaringModule!;
+        var instructions = method.CilMethodBody!.Instructions;
+        var aggregateType = aggregate.AggregateType.ToTypeSignature(module);
+        var aggregateLocal = new CilLocalVariable(aggregateType);
+        method.CilMethodBody.LocalVariables.Add(aggregateLocal);
+
+        // 一个托管值由连续 V 寄存器的独立浮点分量组成；先初始化完整结构，再逐字段写入，
+        // 这样生成的 CIL 与托管构造器签名保持一一对应，也不会伪造整数到结构体的转换。
+        instructions.Add(CilOpCodes.Ldloca, aggregateLocal);
+        instructions.Add(CilOpCodes.Initobj, aggregateType.ToTypeDefOrRef());
+        for (var index = 0; index < fields.Count; index++)
+        {
+            instructions.Add(CilOpCodes.Ldloca, aggregateLocal);
+            LoadOperand(
+                aggregate.Components[index],
+                method,
+                locals,
+                writeLine,
+                stringCtor,
+                fields[index].FieldType);
+            instructions.Add(CilOpCodes.Stfld, fields[index].ToFieldDescriptor(module));
+        }
+
+        instructions.Add(CilOpCodes.Ldloc, aggregateLocal);
+    }
+
+    private static bool RequiresInitializedValueType(TypeAnalysisContext type)
+        => !type.IsEnumType
+           && type.FullName is not (
+               "System.Boolean" or "System.Char"
+               or "System.SByte" or "System.Byte"
+               or "System.Int16" or "System.UInt16"
+               or "System.Int32" or "System.UInt32"
+               or "System.Int64" or "System.UInt64"
+               or "System.Single" or "System.Double"
+               or "System.IntPtr" or "System.UIntPtr");
+
+    private static void EmitInitializedValueType(TypeAnalysisContext type, MethodDefinition method)
+    {
+        var module = method.DeclaringModule!;
+        var signature = type.ToTypeSignature(module);
+        var local = new CilLocalVariable(signature);
+        method.CilMethodBody!.LocalVariables.Add(local);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, local);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloc, local);
     }
 
     private static void PushDefaultOf(TypeAnalysisContext type, CilInstructionCollection instructions)

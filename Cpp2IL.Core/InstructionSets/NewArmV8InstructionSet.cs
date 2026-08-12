@@ -2596,49 +2596,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         => Arm64CallingConventionResolver.ReturnOperands(context).ToList();
 
     private List<IOperand> GetArgumentOperandsForCall(MethodAnalysisContext contextBeingCalled)
-    {
-        var vectorCount = 0;
-        var nonVectorCount = 0;
-
-        var ret = new List<IOperand>();
-
-        //Handle 'this' if it's an instance method
-        if (!contextBeingCalled.IsStatic)
-        {
-            ret.Add(new Register(null, nameof(Arm64Register.X0)));
-            nonVectorCount++;
-        }
-
-        foreach (var parameter in contextBeingCalled.Parameters)
-        {
-            var paramType = parameter.ParameterType;
-            if (paramType.Namespace == nameof(System))
-            {
-                switch (paramType.Name)
-                {
-                    case "Single":
-                    case "Double":
-                        ret.Add(new Register(null, (Arm64Register.V0 + vectorCount++).ToString().ToUpperInvariant()));
-                        break;
-                    default:
-                        ret.Add(new Register(null, (Arm64Register.X0 + nonVectorCount++).ToString().ToUpperInvariant()));
-                        nonVectorCount += Arm64CallingConventionResolver.GeneralRegisterSlotCount(paramType) - 1;
-                        break;
-                }
-            }
-            else
-            {
-                ret.Add(new Register(null, (Arm64Register.X0 + nonVectorCount++).ToString().ToUpperInvariant()));
-                nonVectorCount += Arm64CallingConventionResolver.GeneralRegisterSlotCount(paramType) - 1;
-            }
-        }
-
-        if (Arm64CallingConventionResolver.RequiresHiddenMethodInfo(contextBeingCalled)
-            && nonVectorCount < 8)
-            ret.Add(new Register(null, (Arm64Register.X0 + nonVectorCount).ToString().ToUpperInvariant()));
-
-        return ret;
-    }
+        => Arm64CallingConventionResolver.ArgumentOperands(contextBeingCalled).ToList();
     
     private List<IOperand> GetArgumentOperandsForCall(MethodAnalysisContext contextBeingAnalyzed, ulong callAddr)
     {

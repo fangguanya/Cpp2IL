@@ -233,6 +233,91 @@ public class Arm64CallingConventionResolverTests
         Assert.That(Arm64CallingConventionResolver.RequiresHiddenMethodInfo(method), Is.False);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void Hfa实参由连续浮点寄存器组成一个托管操作数()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var color = CreateValueType(
+            "ArgumentColor",
+            app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemSingleType);
+        var method = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Consume",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            [app.SystemTypes.SystemSingleType, color]);
+
+        var operands = Arm64CallingConventionResolver.ArgumentOperands(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(((Register)operands[0]).Name, Is.EqualTo("V0"));
+            Assert.That(operands[1], Is.TypeOf<HomogeneousFloatingAggregateArgument>());
+            Assert.That(
+                ((HomogeneousFloatingAggregateArgument)operands[1]).Components
+                    .Cast<Register>()
+                    .Select(register => register.Name),
+                Is.EqualTo(new[] { "V1", "V2", "V3", "V4" }));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Hfa剩余浮点寄存器不足时整体进入栈参数区()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var color = CreateValueType(
+            "SpilledColor",
+            app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemSingleType);
+        var parameterTypes = Enumerable
+            .Repeat(app.SystemTypes.SystemSingleType, 6)
+            .Concat(new TypeAnalysisContext[] { color, color })
+            .ToArray();
+        var method = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Consume",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            parameterTypes);
+
+        var operands = Arm64CallingConventionResolver.ArgumentOperands(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(operands[6], Is.EqualTo(new StackOffset(0)));
+            Assert.That(operands[7], Is.EqualTo(new StackOffset(16)));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 通用寄存器耗尽后的引用实参按八字节依序落栈()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Consume",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            Enumerable.Repeat(app.SystemTypes.SystemObjectType, 10).ToArray());
+
+        var operands = Arm64CallingConventionResolver.ArgumentOperands(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(((Register)operands[7]).Name, Is.EqualTo("X7"));
+            Assert.That(operands[8], Is.EqualTo(new StackOffset(0)));
+            Assert.That(operands[9], Is.EqualTo(new StackOffset(8)));
+        }
+    }
+
     private static InjectedTypeAnalysisContext CreateValueType(
         string name,
         params TypeAnalysisContext[] fieldTypes)

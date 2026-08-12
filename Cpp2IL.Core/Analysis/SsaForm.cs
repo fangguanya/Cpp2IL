@@ -124,6 +124,11 @@ public class SsaForm
             case AddressOf { Target: Register addressed }:
                 yield return addressed;
                 break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var componentRegister in EnumerateOperandRegisters(component))
+                    yield return componentRegister;
+                break;
         }
     }
 
@@ -269,6 +274,12 @@ public class SsaForm
                     yield return baseRegister;
                 if (memory.Index is Register indexRegister)
                     yield return indexRegister;
+            }
+            else if (operand is HomogeneousFloatingAggregateArgument aggregate)
+            {
+                foreach (var component in aggregate.Components)
+                foreach (var componentRegister in EnumerateOperandRegisters(component))
+                    yield return componentRegister;
             }
         }
     }
@@ -439,6 +450,23 @@ public class SsaForm
                     memory.Index = CurrentVersion(indexRegister.Number);
 
                 instruction.SetOperand(i, memory); // MemoryOperand is a struct, write the copy back
+            }
+            else if (operand is HomogeneousFloatingAggregateArgument aggregate)
+            {
+                for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                {
+                    var component = aggregate.Components[componentIndex];
+                    if (component is Register componentRegister)
+                        aggregate.Components[componentIndex] = CurrentVersion(componentRegister.Number);
+                    else if (component is MemoryOperand componentMemory)
+                    {
+                        if (componentMemory.Base is Register baseRegister)
+                            componentMemory.Base = CurrentVersion(baseRegister.Number);
+                        if (componentMemory.Index is Register indexRegister)
+                            componentMemory.Index = CurrentVersion(indexRegister.Number);
+                        aggregate.Components[componentIndex] = componentMemory;
+                    }
+                }
             }
         }
     }
