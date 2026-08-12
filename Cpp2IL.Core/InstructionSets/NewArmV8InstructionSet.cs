@@ -867,6 +867,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return target < methodStart || target >= methodEndExclusive;
     }
 
+    /// <summary>
+    /// 从方法体内部跳回自身首地址会重新执行原生序言，只可能是已完成当前栈帧恢复后的自尾调用。
+    /// 普通循环必须跳到序言之后的局部标签；分支指令自身位于首地址时不构成递归证据。
+    /// </summary>
+    internal static bool IsSelfTailBranch(ulong target, ulong methodStart, ulong branchAddress)
+        => target == methodStart && branchAddress > methodStart;
+
     internal static bool? ShouldInvertZeroFlag(Arm64ConditionCode conditionCode)
     {
         return conditionCode switch
@@ -1873,9 +1880,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                if (IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
+                if (IsSelfTailBranch(target, context.UnderlyingPointer, address)
+                    || IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
                 {
-                    // 方法区间采用左闭右开语义；跳到相邻方法首地址属于尾调用，随后返回当前方法。
+                    // 跳到相邻方法首地址或自身原生序言均属于尾调用，随后返回当前托管方法。
                     var returnOperands = GetReturnOperandsForContext(context);
                     AddCall(context, address, target);
                     Add(address, OpCode.Return, returnOperands);

@@ -309,6 +309,33 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 方法体内部跳回自身入口识别为自尾调用()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.IsSelfTailBranch(0x1000, 0x1000, 0x1100),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 方法入口自身分支不构成递归证据()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.IsSelfTailBranch(0x1000, 0x1000, 0x1000),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 跳到序言后的局部标签保持普通回边()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.IsSelfTailBranch(0x1010, 0x1000, 0x1100),
+            Is.False);
+    }
+
+    [Test]
     [Category("异常输入")]
     public void NegativeMethodLengthIsRejected()
     {
