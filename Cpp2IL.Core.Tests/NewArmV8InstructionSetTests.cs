@@ -1144,6 +1144,120 @@ public class NewArmV8InstructionSetTests
             Is.Null);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void ConditionalComparisonMapsSignedGreaterForCsel()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalComparisonOpCode(Arm64ConditionCode.GT),
+            Is.EqualTo(OpCode.CheckGreater));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ConditionalComparisonFallbackHonorsZeroFlagForGreater()
+    {
+        var supported = NewArmV8InstructionSet.TryEvaluateConditionFromNzcv(
+            Arm64ConditionCode.GT,
+            0b0100,
+            out var result);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(supported, Is.True);
+            Assert.That(result, Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ConditionalComparisonRejectsMissingConditionCode()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryEvaluateConditionFromNzcv(
+                Arm64ConditionCode.NONE,
+                0,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void AdrAndByteJumpTableResolveExactTargets()
+    {
+        var branchBase = NewArmV8InstructionSet.ResolveAdrAddress(0x02D22914, 0x10);
+        var resolved = NewArmV8InstructionSet.TryResolveByteJumpTableTargets(
+            [0, 2, 5],
+            branchBase,
+            0x02D228C0,
+            0x02D229B8,
+            out var targets);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(branchBase, Is.EqualTo(0x02D22924));
+            Assert.That(resolved, Is.True);
+            Assert.That(targets, Is.EqualTo(new ulong[] { 0x02D22924, 0x02D2292C, 0x02D22938 }));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ByteJumpTableRejectsTargetAtMethodEnd()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryResolveByteJumpTableTargets(
+                [2],
+                0x1000,
+                0x1000,
+                0x1008,
+                out var targets),
+            Is.False);
+        Assert.That(targets, Is.Empty);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void EmptyByteJumpTableIsRejected()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryResolveByteJumpTableTargets(
+                [],
+                0x1000,
+                0x1000,
+                0x2000,
+                out var targets),
+            Is.False);
+        Assert.That(targets, Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void ConditionalNegateMapsFalseValueToArithmeticNegation()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalFalseTransformOpCode(Arm64Mnemonic.CSNEG),
+            Is.EqualTo(OpCode.Negate));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ConditionalInvertMapsFalseValueToBitwiseNot()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalFalseTransformOpCode(Arm64Mnemonic.CSINV),
+            Is.EqualTo(OpCode.Not));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void OrdinaryConditionalSelectHasNoFalseValueTransform()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetConditionalFalseTransformOpCode(Arm64Mnemonic.CSEL),
+            Is.Null);
+    }
+
     [TestCase(Arm64ConditionCode.HI, TestName = "基本_CCMP无符号大于可由C与Z精确恢复")]
     [TestCase(Arm64ConditionCode.LS, TestName = "边界_CCMP无符号小于等于可由C与Z精确恢复")]
     [TestCase(Arm64ConditionCode.CS, TestName = "边界_CCMP进位条件可直接读取C")]

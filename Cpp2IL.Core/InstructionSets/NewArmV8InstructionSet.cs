@@ -18,6 +18,7 @@ internal enum Arm64FlagState
     ZeroOnly,
     CarryAndZero,
     Comparison,
+    ConditionalComparison,
     FloatingComparison
 }
 
@@ -998,6 +999,83 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             : null;
     }
 
+    internal static OpCode? GetConditionalComparisonOpCode(Arm64ConditionCode conditionCode)
+    {
+        return conditionCode switch
+        {
+            Arm64ConditionCode.EQ => OpCode.CheckEqual,
+            Arm64ConditionCode.NE => OpCode.CheckNotEqual,
+            _ => GetRelationalBranchOpCode(conditionCode)
+        };
+    }
+
+    internal static bool TryEvaluateConditionFromNzcv(
+        Arm64ConditionCode conditionCode,
+        long nzcv,
+        out bool result)
+    {
+        var negative = (nzcv & 0b1000) != 0;
+        var zero = (nzcv & 0b0100) != 0;
+        var carry = (nzcv & 0b0010) != 0;
+        var overflow = (nzcv & 0b0001) != 0;
+        result = conditionCode switch
+        {
+            Arm64ConditionCode.EQ => zero,
+            Arm64ConditionCode.NE => !zero,
+            Arm64ConditionCode.CS => carry,
+            Arm64ConditionCode.CC => !carry,
+            Arm64ConditionCode.MI => negative,
+            Arm64ConditionCode.PL => !negative,
+            Arm64ConditionCode.VS => overflow,
+            Arm64ConditionCode.VC => !overflow,
+            Arm64ConditionCode.HI => carry && !zero,
+            Arm64ConditionCode.LS => !carry || zero,
+            Arm64ConditionCode.GE => negative == overflow,
+            Arm64ConditionCode.LT => negative != overflow,
+            Arm64ConditionCode.GT => !zero && negative == overflow,
+            Arm64ConditionCode.LE => zero || negative != overflow,
+            Arm64ConditionCode.AL or Arm64ConditionCode.NV => true,
+            _ => false
+        };
+        return conditionCode != Arm64ConditionCode.NONE;
+    }
+
+    internal static ulong ResolveAdrAddress(ulong instructionAddress, long pcRelativeImmediate)
+        => unchecked((ulong)(unchecked((long)instructionAddress) + pcRelativeImmediate));
+
+    internal static OpCode? GetConditionalFalseTransformOpCode(Arm64Mnemonic mnemonic)
+    {
+        return mnemonic switch
+        {
+            Arm64Mnemonic.CSNEG => OpCode.Negate,
+            Arm64Mnemonic.CSINV => OpCode.Not,
+            _ => null
+        };
+    }
+
+    internal static bool TryResolveByteJumpTableTargets(
+        ReadOnlySpan<byte> table,
+        ulong branchBaseAddress,
+        ulong methodStart,
+        ulong methodEnd,
+        out ulong[] targets)
+    {
+        targets = new ulong[table.Length];
+        for (var index = 0; index < table.Length; index++)
+        {
+            var target = checked(branchBaseAddress + (ulong)table[index] * sizeof(uint));
+            if (target < methodStart || target >= methodEnd || (target - methodStart) % sizeof(uint) != 0)
+            {
+                targets = [];
+                return false;
+            }
+
+            targets[index] = target;
+        }
+
+        return targets.Length > 0;
+    }
+
     internal static bool CanEmitCarryZeroCondition(
         Arm64ConditionCode conditionCode,
         Arm64FlagState flagState)
@@ -1068,6 +1146,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
 
+        if (TryRecoverByteJumpTableMethod(insns, context, out var jumpTableInstructions))
+            return jumpTableInstructions;
+
         if (adrpOffsets == null!) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
         else
@@ -1076,6 +1157,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
         var flagState = Arm64FlagState.None;
+        var conditionalComparisonFallbackNzcv = 0L;
 
         for (var index = 0; index < insns.Count; index++)
         {
@@ -1097,7 +1179,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 index,
                 instruction.Mnemonic,
                 instruction.Address);
-            ConvertInstructionStatement(instruction, address, instructions, addresses, context, ref flagState);
+            ConvertInstructionStatement(
+                instruction,
+                address,
+                instructions,
+                addresses,
+                context,
+                ref flagState,
+                ref conditionalComparisonFallbackNzcv);
         }
 
         // fix branches
@@ -1125,6 +1214,189 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         adrpOffsets.Clear();
         return instructions;
+    }
+
+    private bool TryRecoverByteJumpTableMethod(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        MethodAnalysisContext context,
+        out List<Instruction> instructions)
+    {
+        instructions = [];
+        for (var branchIndex = 4; branchIndex < nativeInstructions.Count; branchIndex++)
+        {
+            var branch = nativeInstructions[branchIndex];
+            if (branch.Mnemonic != Arm64Mnemonic.BR
+                || nativeInstructions[branchIndex - 1].Mnemonic != Arm64Mnemonic.ADD
+                || nativeInstructions[branchIndex - 2].Mnemonic != Arm64Mnemonic.LDRB
+                || nativeInstructions[branchIndex - 3].Mnemonic != Arm64Mnemonic.ADR)
+                continue;
+
+            var tableLoad = nativeInstructions[branchIndex - 2];
+            var branchBaseLoad = nativeInstructions[branchIndex - 3];
+            if (branch.Op0Reg != nativeInstructions[branchIndex - 1].Op0Reg
+                || nativeInstructions[branchIndex - 1].Op1Reg != branchBaseLoad.Op0Reg
+                || tableLoad.Op0Kind != Arm64OperandKind.Register
+                || tableLoad.Op1Kind != Arm64OperandKind.Memory
+                || tableLoad.MemAddendReg == Arm64Register.INVALID
+                || branchBaseLoad.Op1Kind is not (
+                    Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative))
+                continue;
+
+            var tableBaseAdd = nativeInstructions
+                .Take(branchIndex - 2)
+                .LastOrDefault(candidate =>
+                    candidate.Mnemonic == Arm64Mnemonic.ADD
+                    && candidate.Op0Reg == tableLoad.MemBase
+                    && candidate.Op1Reg == tableLoad.MemBase
+                    && candidate.Op2Kind == Arm64OperandKind.Immediate);
+            if (tableBaseAdd.Mnemonic != Arm64Mnemonic.ADD)
+                continue;
+
+            var tablePageLoad = nativeInstructions
+                .TakeWhile(candidate => candidate.Address < tableBaseAdd.Address)
+                .LastOrDefault(candidate =>
+                    candidate.Mnemonic == Arm64Mnemonic.ADRP
+                    && candidate.Op0Reg == tableLoad.MemBase);
+            if (tablePageLoad.Mnemonic != Arm64Mnemonic.ADRP)
+                continue;
+
+            var indexAdjust = nativeInstructions
+                .Take(branchIndex - 3)
+                .LastOrDefault(candidate =>
+                    candidate.Mnemonic == Arm64Mnemonic.ADD
+                    && Arm64RegisterHelper.CanonicalName(candidate.Op0Reg)
+                        == Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg)
+                    && Arm64RegisterHelper.CanonicalName(candidate.Op1Reg)
+                        == Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg)
+                    && candidate.Op2Kind == Arm64OperandKind.Immediate);
+            if (indexAdjust.Mnemonic != Arm64Mnemonic.ADD)
+                continue;
+
+            var tableAddress = checked(
+                ResolveAdrpPageAddress(tablePageLoad.Address, tablePageLoad.Op1Imm)
+                + (ulong)tableBaseAdd.Op2Imm);
+            var branchBaseAddress = ResolveAdrAddress(branchBaseLoad.Address, branchBaseLoad.Op1Imm);
+            var methodEnd = checked(context.UnderlyingPointer + (ulong)context.RawBytes.Length);
+            var maximumEntryCount = checked((int)Math.Min(
+                256UL,
+                methodEnd > branchBaseAddress ? (methodEnd - branchBaseAddress) / sizeof(uint) : 0));
+            if (maximumEntryCount == 0)
+                continue;
+
+            byte[] table;
+            try
+            {
+                var rawTableAddress = context.AppContext.Binary.MapVirtualAddressToRaw(tableAddress);
+                table = context.AppContext.Binary.Reader.ReadByteArrayAtRawAddress(
+                    rawTableAddress,
+                    maximumEntryCount);
+            }
+            catch
+            {
+                continue;
+            }
+
+            var targetAddresses = new List<ulong>();
+            foreach (var entry in table)
+            {
+                var target = checked(branchBaseAddress + (ulong)entry * sizeof(uint));
+                if (target < context.UnderlyingPointer
+                    || target >= methodEnd
+                    || (target - context.UnderlyingPointer) % sizeof(uint) != 0)
+                    break;
+                targetAddresses.Add(target);
+            }
+
+            if (targetAddresses.Count < 2
+                || !TryResolveByteJumpTableTargets(
+                    table.AsSpan(0, targetAddresses.Count),
+                    branchBaseAddress,
+                    context.UnderlyingPointer,
+                    methodEnd,
+                    out var validatedTargets))
+                continue;
+
+            var convertedPrefix = new List<Instruction>();
+            var convertedAddresses = new List<ulong>();
+            var prefixFlagState = Arm64FlagState.None;
+            var prefixFallbackNzcv = 0L;
+            for (var index = 0; index <= branchIndex - 4; index++)
+            {
+                var native = nativeInstructions[index];
+                ConvertInstructionStatement(
+                    native,
+                    native.Address,
+                    convertedPrefix,
+                    convertedAddresses,
+                    context,
+                    ref prefixFlagState,
+                    ref prefixFallbackNzcv);
+            }
+
+            var targetAnchors = validatedTargets
+                .Distinct()
+                .ToDictionary(target => target, _ => new Instruction(0, OpCode.Nop));
+            var result = new List<Instruction>(convertedPrefix);
+            var resultAddresses = new List<ulong>(convertedAddresses);
+            var indexOperand = new Register(null, Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg));
+            for (var tableIndex = 0; tableIndex < validatedTargets.Length; tableIndex++)
+            {
+                var condition = new Register(null, $"JUMP_TABLE_CASE_{tableIndex}");
+                result.Add(new Instruction(result.Count, OpCode.CheckEqual, condition, indexOperand, Imm(tableIndex)));
+                resultAddresses.Add(branch.Address);
+                result.Add(new Instruction(
+                    result.Count,
+                    OpCode.ConditionalJump,
+                    targetAnchors[validatedTargets[tableIndex]],
+                    condition));
+                resultAddresses.Add(branch.Address);
+            }
+
+            result.Add(new Instruction(result.Count, OpCode.Jump, targetAnchors[validatedTargets[^1]]));
+            resultAddresses.Add(branch.Address);
+            var suffixFlagState = prefixFlagState;
+            var suffixFallbackNzcv = prefixFallbackNzcv;
+            for (var index = branchIndex + 1; index < nativeInstructions.Count; index++)
+            {
+                var native = nativeInstructions[index];
+                if (targetAnchors.TryGetValue(native.Address, out var anchor))
+                {
+                    anchor.Index = result.Count;
+                    result.Add(anchor);
+                    resultAddresses.Add(native.Address);
+                }
+
+                ConvertInstructionStatement(
+                    native,
+                    native.Address,
+                    result,
+                    resultAddresses,
+                    context,
+                    ref suffixFlagState,
+                    ref suffixFallbackNzcv);
+            }
+
+            for (var index = 0; index < result.Count; index++)
+            {
+                result[index].Index = index;
+                if (result[index].OpCode is not (OpCode.Jump or OpCode.ConditionalJump)
+                    || result[index].Operands[0] is not Immediate immediate)
+                    continue;
+
+                var targetIndex = resultAddresses.FindIndex(candidate => candidate == immediate.UnsignedValue);
+                if (targetIndex < 0)
+                {
+                    instructions = [];
+                    return false;
+                }
+
+                result[index].SetOperand(0, result[targetIndex]);
+            }
+            instructions = result;
+            return true;
+        }
+
+        return false;
     }
 
     private bool TryEmitPackedHalfwordPredicatePattern(
@@ -1213,9 +1485,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         List<Instruction> instructions,
         List<ulong> addresses,
         MethodAnalysisContext context,
-        ref Arm64FlagState flagState)
+        ref Arm64FlagState flagState,
+        ref long conditionalComparisonFallbackNzcv)
     {
         var inputFlagState = flagState;
+        var inputConditionalComparisonFallbackNzcv = conditionalComparisonFallbackNzcv;
 
         Instruction Add(ulong address, OpCode opCode, params List<IOperand> operands)
         {
@@ -1282,6 +1556,32 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             string registerPrefix,
             out IOperand condition)
         {
+            if (inputFlagState == Arm64FlagState.ConditionalComparison
+                && GetConditionalComparisonOpCode(conditionCode) is { } comparisonOpCode
+                && TryEvaluateConditionFromNzcv(
+                    conditionCode,
+                    inputConditionalComparisonFallbackNzcv,
+                    out var fallbackResult))
+            {
+                var comparedCondition = new Register(null, registerPrefix + "_CCMP_COMPARED");
+                var selectedCondition = new Register(null, registerPrefix + "_CCMP_SELECTED");
+                Add(
+                    address,
+                    comparisonOpCode,
+                    comparedCondition,
+                    new Register(null, "CCMP_COMPARE_LEFT"),
+                    new Register(null, "CCMP_COMPARE_RIGHT"));
+                Add(
+                    address,
+                    OpCode.ConditionalSelect,
+                    selectedCondition,
+                    new Register(null, "CCMP_GATE"),
+                    comparedCondition,
+                    Imm(fallbackResult ? 1 : 0));
+                condition = selectedCondition;
+                return true;
+            }
+
             var invertZeroFlag = ShouldInvertZeroFlag(conditionCode);
             if (invertZeroFlag is not null)
             {
@@ -1943,35 +2243,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
-                    // CCMP 条件成立时更新比较标志；否则使用 NZCV 立即数。当前 ISIL 精确保留后继 EQ/NE 所需的 Z 位。
-                    var comparedZero = new Register(null, "CCMP_COMPARED_ZERO");
-                    var comparedCarry = new Register(null, "CCMP_COMPARED_CARRY");
-                    Add(
-                        address,
-                        OpCode.CheckEqual,
-                        comparedZero,
-                        ConvertOperand(instruction, 0),
-                        ConvertOperand(instruction, 1));
-                    Add(
-                        address,
-                        OpCode.CheckGreaterOrEqualUnsigned,
-                        comparedCarry,
-                        ConvertOperand(instruction, 0),
-                        ConvertOperand(instruction, 1));
-                    Add(address, OpCode.Move, new Register(null, "Z"), comparedZero);
-                    Add(address, OpCode.Move, new Register(null, "C"), comparedCarry);
-                    Add(address, OpCode.ConditionalJump, Imm(address + 4), ccmpCondition);
+                    // CCMP 必须把门条件、比较两端与回退 NZCV 一并冻结；后继分支或 CSEL
+                    // 按自身条件码只计算一次比较，再原子选择真实比较结果或回退标志结果。
                     Add(
                         address,
                         OpCode.Move,
-                        new Register(null, "Z"),
-                        Imm((instruction.Op2Imm >> 2) & 1));
+                        new Register(null, "CCMP_GATE"),
+                        ccmpCondition);
                     Add(
                         address,
                         OpCode.Move,
-                        new Register(null, "C"),
-                        Imm((instruction.Op2Imm >> 1) & 1));
-                    flagState = Arm64FlagState.CarryAndZero;
+                        new Register(null, "CCMP_COMPARE_LEFT"),
+                        ConvertOperand(instruction, 0));
+                    Add(
+                        address,
+                        OpCode.Move,
+                        new Register(null, "CCMP_COMPARE_RIGHT"),
+                        ConvertOperand(instruction, 1));
+                    conditionalComparisonFallbackNzcv = instruction.Op2Imm & 0xF;
+                    flagState = Arm64FlagState.ConditionalComparison;
                     break;
                 }
 
@@ -2108,6 +2398,35 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, OpCode.Move, destination, preservedTrue);
                     Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
                     Add(address, OpCode.Move, destination, incrementedFalse);
+                    break;
+                }
+
+            case Arm64Mnemonic.CSNEG:
+            case Arm64Mnemonic.CSINV:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            instruction.Mnemonic + "_CONDITION",
+                            out var condition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var preservedTrue = new Register(null, instruction.Mnemonic + "_TRUE");
+                    var preservedFalse = new Register(null, instruction.Mnemonic + "_FALSE");
+                    var transformedFalse = new Register(null, instruction.Mnemonic + "_FALSE_TRANSFORMED");
+                    Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+                    var falseTransform = GetConditionalFalseTransformOpCode(instruction.Mnemonic)
+                        ?? throw new InvalidOperationException($"条件变换指令未映射：{instruction.Mnemonic}");
+                    Add(
+                        address,
+                        falseTransform,
+                        transformedFalse,
+                        preservedFalse);
+                    Add(address, OpCode.ConditionalSelect, destination, condition, preservedTrue, transformedFalse);
                     break;
                 }
 
