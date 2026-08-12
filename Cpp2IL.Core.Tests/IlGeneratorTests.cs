@@ -303,6 +303,190 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void CallVoid调用非Void目标时必须丢弃返回值并保持栈平衡()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var targetContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "CreateObject",
+            systemObject,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        var callerContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "DiscardCreatedObject",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        callerContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, targetContext),
+            new Instruction(1, OpCode.Return),
+        ]);
+        callerContext.Locals = [];
+        callerContext.ParameterLocals = [];
+        callerContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "DiscardReturnTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "DiscardReturnType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var targetDefinition = new MethodDefinition(
+            "CreateObject",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Object));
+        var callerDefinition = new MethodDefinition(
+            "DiscardCreatedObject",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(targetDefinition);
+        typeDefinition.Methods.Add(callerDefinition);
+        targetContext.PutExtraData("AsmResolverMethod", targetDefinition);
+
+        IlGenerator.GenerateIl(callerContext, callerDefinition);
+        var validation = CilStackValidator.Validate(
+            callerDefinition.CilMethodBody!,
+            "DiscardReturnType::DiscardCreatedObject");
+        var emitted = callerDefinition.CilMethodBody!.Instructions.ToArray();
+        var callIndex = Array.FindIndex(emitted, instruction => instruction.OpCode == CilOpCodes.Call);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(callIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(emitted[callIndex + 1].OpCode, Is.EqualTo(CilOpCodes.Pop));
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Pop), Is.EqualTo(1));
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ret), Is.True);
+            Assert.That(validation.MaxStack, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void CallVoid调用Void目标时不得生成Pop()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var targetContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "Run",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        var callerContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "CallRun",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        callerContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, targetContext),
+            new Instruction(1, OpCode.Return),
+        ]);
+        callerContext.Locals = [];
+        callerContext.ParameterLocals = [];
+        callerContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "VoidCallTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "VoidCallType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var targetDefinition = new MethodDefinition(
+            "Run",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        var callerDefinition = new MethodDefinition(
+            "CallRun",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(targetDefinition);
+        typeDefinition.Methods.Add(callerDefinition);
+        targetContext.PutExtraData("AsmResolverMethod", targetDefinition);
+
+        IlGenerator.GenerateIl(callerContext, callerDefinition);
+        CilStackValidator.Validate(callerDefinition.CilMethodBody!, "VoidCallType::CallRun");
+
+        Assert.That(
+            callerDefinition.CilMethodBody!.Instructions.Any(instruction => instruction.OpCode == CilOpCodes.Pop),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void CallVoid构造器融合为Newobj写回时不得额外生成Pop()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var constructedObject = new LocalVariable(
+            "constructedObject",
+            new Register(null, "X0"),
+            systemObject);
+        var constructorContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            ".ctor",
+            appContext.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.SpecialName |
+            ReflectionMethodAttributes.RTSpecialName,
+            []);
+        var callerContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "Construct",
+            appContext.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        callerContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, constructorContext, constructedObject),
+            new Instruction(1, OpCode.Return),
+        ]);
+        callerContext.Locals = [constructedObject];
+        callerContext.ParameterLocals = [];
+        callerContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "ConstructorDiscardTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ConstructorDiscardType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        systemObject.PutExtraData("AsmResolverType", typeDefinition);
+        var constructorDefinition = new MethodDefinition(
+            ".ctor",
+            MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        var callerDefinition = new MethodDefinition(
+            "Construct",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(constructorDefinition);
+        typeDefinition.Methods.Add(callerDefinition);
+        constructorContext.PutExtraData("AsmResolverMethod", constructorDefinition);
+
+        IlGenerator.GenerateIl(callerContext, callerDefinition);
+        CilStackValidator.Validate(callerDefinition.CilMethodBody!, "ConstructorDiscardType::Construct");
+        var il = callerDefinition.CilMethodBody!.Instructions;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Pop), Is.False);
+        });
+    }
+
+    [Test]
     public void This上的构造调用保持普通Call()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

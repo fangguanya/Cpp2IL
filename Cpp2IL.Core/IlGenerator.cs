@@ -456,6 +456,13 @@ public static class IlGenerator
 
                 if (instruction.OpCode == OpCode.Call) // Store return value
                     StoreToOperand(instruction.Operands[1], method, locals, writeLine);
+                else if (!targetMethod.IsVoid)
+                {
+                    // ARM64调用结果只在寄存器仍有后续读取时才会提升为Call；结果未使用时ISIL
+                    // 保持CallVoid。托管call仍按真实签名压入返回值，必须显式丢弃，否则该值会
+                    // 穿过后续基本块残留到ret并破坏整条控制流的求值栈。
+                    instructions.Add(CilOpCodes.Pop);
+                }
 
                 break;
 
