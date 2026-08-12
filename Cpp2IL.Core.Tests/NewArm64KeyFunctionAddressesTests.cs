@@ -95,6 +95,55 @@ public class NewArm64KeyFunctionAddressesTests
         Assert.That(thunks, Is.EqualTo(new[] { 0x1004UL }));
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 普通返回前最后一个直接调用可定位IsInst()
+    {
+        var instructions = Decode(
+            0x02, 0x00, 0x00, 0x94, // 直接调用 0x1008
+            0xC0, 0x03, 0x5F, 0xD6); // 返回
+
+        var found = NewArm64KeyFunctionAddresses.TryGetObjectIsInstCallTarget(instructions, out var target);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(found, Is.True);
+            Assert.That(target, Is.EqualTo(0x1008UL));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void GetType后接间接尾调不得登记为IsInst()
+    {
+        var instructions = Decode(
+            0x02, 0x00, 0x00, 0x94, // 直接调用 0x1008
+            0x60, 0x00, 0x1F, 0xD6); // 通过 X3 间接尾调
+
+        var found = NewArm64KeyFunctionAddresses.TryGetObjectIsInstCallTarget(instructions, out var target);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(found, Is.False);
+            Assert.That(target, Is.Zero);
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 无直接调用的方法不产生IsInst地址()
+    {
+        var instructions = Decode(0xC0, 0x03, 0x5F, 0xD6); // 返回
+
+        var found = NewArm64KeyFunctionAddresses.TryGetObjectIsInstCallTarget(instructions, out var target);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(found, Is.False);
+            Assert.That(target, Is.Zero);
+        }
+    }
+
     private static Arm64Instruction[] Decode(params byte[] bytes) =>
         Disassembler.Disassemble(bytes, 0x1000, new Disassembler.Options(true, true, false)).ToList().ToArray();
 }

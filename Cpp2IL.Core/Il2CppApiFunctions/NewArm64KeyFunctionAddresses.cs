@@ -65,16 +65,46 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         Logger.Verbose($"IsInstanceOfType found at 0x{typeIsInstanceOfType.MethodPointer:X}...");
         var instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext.Binary, typeIsInstanceOfType.MethodPointer, true);
 
-        var lastCall = instructions.LastOrDefault(i => i.Mnemonic == Arm64Mnemonic.BL);
-
-        if (lastCall.Mnemonic == Arm64Mnemonic.INVALID)
+        if (!TryGetObjectIsInstCallTarget(instructions, out var target))
         {
-            Logger.VerboseNewline("Method does not match expected signature. Aborting.");
+            Logger.VerboseNewline("Method uses managed GetType/IsAssignableFrom dispatch or lacks a direct IsInst call. Aborting.");
             return 0;
         }
 
-        Logger.VerboseNewline($"Success. IsInst found at 0x{lastCall.BranchTarget:X}");
-        return lastCall.BranchTarget;
+        Logger.VerboseNewline($"Success. IsInst found at 0x{target:X}");
+        return target;
+    }
+
+    /// <summary>
+    /// 仅把以普通返回结束的直接调用识别为 Object::IsInst。
+    /// 新版运行时会先调用 Object.GetType，再经 BR 尾调 Type.IsAssignableFrom；该 BL 绝不能登记为键函数。
+    /// </summary>
+    internal static bool TryGetObjectIsInstCallTarget(
+        IReadOnlyList<Arm64Instruction> instructions,
+        out ulong target)
+    {
+        for (var index = instructions.Count - 1; index >= 0; index--)
+        {
+            var instruction = instructions[index];
+            if (instruction.Mnemonic != Arm64Mnemonic.BL || instruction.BranchTarget == 0)
+                continue;
+
+            for (var suffix = index + 1; suffix < instructions.Count; suffix++)
+            {
+                // 间接尾调用证明此前 BL 只是为后续托管虚调用准备接收者，不是 IsInst 本体。
+                if (instructions[suffix].Mnemonic == Arm64Mnemonic.BR)
+                {
+                    target = 0;
+                    return false;
+                }
+            }
+
+            target = instruction.BranchTarget;
+            return true;
+        }
+
+        target = 0;
+        return false;
     }
 
     protected override ulong FindFunctionThisIsAThunkOf(ulong thunkPtr, bool prioritiseCall = false)
