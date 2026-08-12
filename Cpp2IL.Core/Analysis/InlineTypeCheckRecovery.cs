@@ -251,7 +251,7 @@ public static class InlineTypeCheckRecovery
         block.CalculateBlockType();
     }
 
-    private static void ReplaceSuccessRegionUses(
+    internal static void ReplaceSuccessRegionUses(
         Block start,
         Block failure,
         LocalVariable source,
@@ -270,9 +270,13 @@ public static class InlineTypeCheckRecovery
             {
                 for (var index = 0; index < instruction.Operands.Count; index++)
                 {
-                    if (ReferenceEquals(instruction.Operands[index], source))
+                    // 环形控制流可能从当前成功区重新到达更早的CastClass定义。定义目标不是
+                    // 对旧值的读取；改写它会让两个不同目标类型共用一个局部量并永久振荡。
+                    var operand = instruction.Operands[index];
+                    if (ReferenceEquals(operand, source)
+                        && !ReferenceEquals(instruction.Destination, operand))
                         instruction.SetOperand(index, replacement);
-                    else if (instruction.Operands[index] is MemoryOperand memory
+                    else if (operand is MemoryOperand memory
                         && ReferenceEquals(memory.Base, source))
                     {
                         memory.Base = replacement;

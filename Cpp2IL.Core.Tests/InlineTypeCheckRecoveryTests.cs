@@ -55,6 +55,84 @@ public class InlineTypeCheckRecoveryTests
 
     [Test]
     [Category("边界值")]
+    public void 环形成功区不得改写既有强制转换的定义目标()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemStringType);
+        var replacement = Local("replacement", app.SystemTypes.SystemObjectType);
+        var originalInput = Local("originalInput", app.SystemTypes.SystemObjectType);
+        var returned = Local("returned", app.SystemTypes.SystemObjectType);
+        var definition = new Instruction(
+            0,
+            OpCode.CastClass,
+            source,
+            originalInput,
+            app.SystemTypes.SystemStringType);
+        var read = new Instruction(1, OpCode.Move, returned, source);
+        var successReturn = new Instruction(2, OpCode.Return, returned);
+        var failureReturn = new Instruction(3, OpCode.Return);
+        var graph = new ISILControlFlowGraph([
+            definition,
+            read,
+            successReturn,
+            failureReturn,
+        ]);
+        var start = graph.FindBlockByInstruction(definition)!;
+        var failure = graph.FindBlockByInstruction(failureReturn)!;
+
+        InlineTypeCheckRecovery.ReplaceSuccessRegionUses(
+            start,
+            failure,
+            source,
+            replacement);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(definition.Destination, Is.SameAs(source));
+            Assert.That(definition.Operands[1], Is.SameAs(originalInput));
+            Assert.That(read.Operands[1], Is.SameAs(replacement));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 只有定义没有读取时不得产生替换()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemStringType);
+        var replacement = Local("replacement", app.SystemTypes.SystemObjectType);
+        var originalInput = Local("originalInput", app.SystemTypes.SystemObjectType);
+        var definition = new Instruction(
+            0,
+            OpCode.CastClass,
+            source,
+            originalInput,
+            app.SystemTypes.SystemStringType);
+        var successReturn = new Instruction(1, OpCode.Return);
+        var failureReturn = new Instruction(2, OpCode.Return);
+        var graph = new ISILControlFlowGraph([
+            definition,
+            successReturn,
+            failureReturn,
+        ]);
+
+        InlineTypeCheckRecovery.ReplaceSuccessRegionUses(
+            graph.FindBlockByInstruction(definition)!,
+            graph.FindBlockByInstruction(failureReturn)!,
+            source,
+            replacement);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(definition.Destination, Is.SameAs(source));
+            Assert.That(definition.Operands[1], Is.SameAs(originalInput));
+            Assert.That(graph.Instructions.Any(instruction =>
+                instruction.Operands.Any(operand => ReferenceEquals(operand, replacement))), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
     public void 类层级表偏移不精确时保持原始控制流()
     {
         var fixture = CreateFixture(hierarchyOffset: 0xC0);
