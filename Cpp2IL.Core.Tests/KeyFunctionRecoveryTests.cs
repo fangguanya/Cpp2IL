@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
@@ -287,6 +289,367 @@ public class KeyFunctionRecoveryTests
         Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 同一类型句柄把已证明值类型传播到未知装箱槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var firstTypeClass = Local("firstTypeClass", app.SystemTypes.SystemIntPtrType);
+        var secondTypeClass = Local("secondTypeClass", app.SystemTypes.SystemIntPtrType);
+        const int knownStackNumber = 240;
+        var oldKnownSlot = new LocalVariable("oldKnownSlot", new Register(knownStackNumber, "stack_-24", 1));
+        var knownValue = new LocalVariable(
+            "knownValue",
+            new Register(knownStackNumber, "stack_-24", 2),
+            app.SystemTypes.SystemBooleanType);
+        var knownSource = Local("knownSource", app.SystemTypes.SystemBooleanType);
+        var unknownValue = Local("unknownValue", null);
+        var firstResult = Local("firstResult", app.SystemTypes.SystemObjectType);
+        var secondResult = Local("secondResult", app.SystemTypes.SystemObjectType);
+        var firstTypeLoad = new Instruction(0, OpCode.Move, firstTypeClass, new MemoryOperand(addend: 0x1000));
+        var secondTypeLoad = new Instruction(1, OpCode.Move, secondTypeClass, new MemoryOperand(addend: 0x1000));
+        var knownWrite = new Instruction(2, OpCode.Move, knownValue, knownSource);
+        var firstCall = new Instruction(
+            3,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            firstResult,
+            new MemoryOperand(firstTypeClass, addend: 0x28),
+            new AddressOf(oldKnownSlot));
+        var secondCall = new Instruction(
+            4,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            secondResult,
+            new MemoryOperand(secondTypeClass, addend: 0x28),
+            new AddressOf(unknownValue));
+        var method = CreateMethod(firstTypeLoad, secondTypeLoad, knownWrite, firstCall, secondCall);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstCall.OpCode, Is.EqualTo(OpCode.Box));
+            Assert.That(secondCall.OpCode, Is.EqualTo(OpCode.Box));
+            Assert.That(unknownValue.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+            Assert.That(secondCall.Operands[2], Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一类型句柄出现互斥证明时未知装箱槽保持原始调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var typeClass = Local("typeClass", app.SystemTypes.SystemIntPtrType);
+        var booleanValue = Local("booleanValue", app.SystemTypes.SystemBooleanType);
+        var integerValue = Local("integerValue", app.SystemTypes.SystemInt32Type);
+        var unknownValue = Local("unknownValue", null);
+        var typeLoad = new Instruction(0, OpCode.Move, typeClass, new MemoryOperand(addend: 0x2000));
+        var booleanCall = BoxCall(1, "booleanResult", typeClass, booleanValue, app);
+        var integerCall = BoxCall(2, "integerResult", typeClass, integerValue, app);
+        var unknownCall = BoxCall(3, "unknownResult", typeClass, unknownValue, app);
+        var method = CreateMethod(typeLoad, booleanCall, integerCall, unknownCall);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(booleanCall.OpCode, Is.EqualTo(OpCode.Box));
+            Assert.That(integerCall.OpCode, Is.EqualTo(OpCode.Box));
+            Assert.That(unknownCall.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(unknownValue.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同类型句柄不得向未知装箱槽串播类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var provenTypeClass = Local("provenTypeClass", app.SystemTypes.SystemIntPtrType);
+        var unknownTypeClass = Local("unknownTypeClass", app.SystemTypes.SystemIntPtrType);
+        var knownValue = Local("knownValue", app.SystemTypes.SystemBooleanType);
+        var unknownValue = Local("unknownValue", null);
+        var firstTypeLoad = new Instruction(0, OpCode.Move, provenTypeClass, new MemoryOperand(addend: 0x3000));
+        var secondTypeLoad = new Instruction(1, OpCode.Move, unknownTypeClass, new MemoryOperand(addend: 0x4000));
+        var knownCall = BoxCall(2, "knownResult", provenTypeClass, knownValue, app);
+        var unknownCall = BoxCall(3, "unknownResult", unknownTypeClass, unknownValue, app);
+        var method = CreateMethod(firstTypeLoad, secondTypeLoad, knownCall, unknownCall);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(knownCall.OpCode, Is.EqualTo(OpCode.Box));
+            Assert.That(unknownCall.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(unknownValue.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void ARM64取址定义清理后从紧邻X1栈写恢复装箱值()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var typeClass = Local("typeClass", app.SystemTypes.SystemIntPtrType);
+        var knownValue = Local("knownValue", app.SystemTypes.SystemBooleanType);
+        var opaqueX1 = new LocalVariable("opaqueX1", new Register(1, "X1"));
+        var stackValue = new LocalVariable("stackValue", new Register(240, "stack_-3C", 1));
+        var typeLoad = new Instruction(0, OpCode.Move, typeClass, new MemoryOperand(addend: 0x5000));
+        var knownCall = BoxCall(1, "knownResult", typeClass, knownValue, app);
+        var stackWrite = new Instruction(2, OpCode.Move, stackValue, new Immediate(0));
+        var removedAddressDefinition = new Instruction(3, OpCode.Nop);
+        var finalCall = new Instruction(
+            4,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            Local("finalResult", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(typeClass, addend: 0x28),
+            opaqueX1);
+        var method = CreateMethod(typeLoad, knownCall, stackWrite, removedAddressDefinition, finalCall);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(finalCall.OpCode, Is.EqualTo(OpCode.Box));
+            Assert.That(finalCall.Operands[1], Is.SameAs(stackValue));
+            Assert.That(stackValue.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void X1栈写与装箱之间存在调用时禁止跨调用取值()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var typeClass = Local("typeClass", app.SystemTypes.SystemIntPtrType);
+        var knownValue = Local("knownValue", app.SystemTypes.SystemBooleanType);
+        var opaqueX1 = new LocalVariable("opaqueX1", new Register(1, "X1"));
+        var stackValue = new LocalVariable("stackValue", new Register(240, "stack_-40", 1));
+        var typeLoad = new Instruction(0, OpCode.Move, typeClass, new MemoryOperand(addend: 0x6000));
+        var knownCall = BoxCall(1, "knownResult", typeClass, knownValue, app);
+        var stackWrite = new Instruction(2, OpCode.Move, stackValue, new Immediate(0));
+        var interveningCall = new Instruction(3, OpCode.CallVoid, new StringLiteral("intervening"));
+        var finalCall = new Instruction(
+            4,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            Local("finalResult", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(typeClass, addend: 0x28),
+            opaqueX1);
+        var method = CreateMethod(typeLoad, knownCall, stackWrite, interveningCall, finalCall);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.That(finalCall.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非X1未知载体不得绑定临近栈写()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var typeClass = Local("typeClass", app.SystemTypes.SystemIntPtrType);
+        var knownValue = Local("knownValue", app.SystemTypes.SystemBooleanType);
+        var opaqueX2 = new LocalVariable("opaqueX2", new Register(2, "X2"));
+        var stackValue = new LocalVariable("stackValue", new Register(240, "stack_-44", 1));
+        var typeLoad = new Instruction(0, OpCode.Move, typeClass, new MemoryOperand(addend: 0x7000));
+        var knownCall = BoxCall(1, "knownResult", typeClass, knownValue, app);
+        var stackWrite = new Instruction(2, OpCode.Move, stackValue, new Immediate(0));
+        var finalCall = new Instruction(
+            3,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            Local("finalResult", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(typeClass, addend: 0x28),
+            opaqueX2);
+        var method = CreateMethod(typeLoad, knownCall, stackWrite, finalCall);
+
+        KeyFunctionRecovery.RewriteBoxing(method);
+
+        Assert.That(finalCall.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 两前驱地址Phi转换为值Phi并由SSA销毁为边复制()
+    {
+        var fixture = CreateAddressPhiFixture(AddressPhiFixtureMode.Valid);
+
+        KeyFunctionRecovery.RewriteBoxing(fixture.Method);
+
+        Assert.That(fixture.FinalCall.OpCode, Is.EqualTo(OpCode.Box));
+        var mergedValue = (LocalVariable)fixture.FinalCall.Operands[1];
+        var valuePhi = fixture.Join.Instructions.Single(instruction =>
+            instruction.OpCode == OpCode.Phi
+            && ReferenceEquals(instruction.Destination, mergedValue));
+        Assert.That(valuePhi.Operands.Skip(1), Is.EqualTo(new[] { fixture.FirstStackValue, fixture.SecondStackValue }));
+
+        SsaForm.Remove(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fixture.Method.ControlFlowGraph!.Instructions.Any(instruction => instruction.OpCode == OpCode.Phi), Is.False);
+            Assert.That(fixture.FirstPredecessor.Instructions.Any(instruction =>
+                instruction.OpCode == OpCode.Move
+                && ReferenceEquals(instruction.Destination, mergedValue)
+                && ReferenceEquals(instruction.Operands[1], fixture.FirstStackValue)), Is.True);
+            Assert.That(fixture.SecondPredecessor.Instructions.Any(instruction =>
+                instruction.OpCode == OpCode.Move
+                && ReferenceEquals(instruction.Destination, mergedValue)
+                && ReferenceEquals(instruction.Operands[1], fixture.SecondStackValue)), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 地址Phi输入数与前驱数不一致时保持原始调用()
+    {
+        var fixture = CreateAddressPhiFixture(AddressPhiFixtureMode.MissingInput);
+
+        KeyFunctionRecovery.RewriteBoxing(fixture.Method);
+
+        Assert.That(fixture.FinalCall.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 地址Phi任一来源缺少取址证明时保持原始调用()
+    {
+        var fixture = CreateAddressPhiFixture(AddressPhiFixtureMode.UnresolvedInput);
+
+        KeyFunctionRecovery.RewriteBoxing(fixture.Method);
+
+        Assert.That(fixture.FinalCall.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 类型句柄Phi来源不一致时保持原始调用()
+    {
+        var fixture = CreateAddressPhiFixture(AddressPhiFixtureMode.ConflictingTypeHandle);
+
+        KeyFunctionRecovery.RewriteBoxing(fixture.Method);
+
+        Assert.That(fixture.FinalCall.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    private static AddressPhiFixture CreateAddressPhiFixture(AddressPhiFixtureMode mode)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var booleanType = app.SystemTypes.SystemBooleanType;
+        var knownValue = Local("knownValue", booleanType);
+        var knownResult = Local("knownResult", app.SystemTypes.SystemObjectType);
+        var firstTypeClass = Local("firstTypeClass", app.SystemTypes.SystemIntPtrType);
+        var secondTypeClass = Local("secondTypeClass", app.SystemTypes.SystemIntPtrType);
+        var mergedTypeClass = Local("mergedTypeClass", app.SystemTypes.SystemIntPtrType);
+        var firstSource = Local("firstSource", booleanType);
+        var firstStackValue = new LocalVariable("firstStackValue", new Register(240, "stack_-50", 1));
+        var secondStackValue = new LocalVariable("secondStackValue", new Register(241, "stack_-54", 1));
+        var firstCarrier = new LocalVariable("firstCarrier", new Register(1, "X1", 1));
+        var secondCarrier = new LocalVariable("secondCarrier", new Register(1, "X1", 2));
+        var mergedCarrier = new LocalVariable("mergedCarrier", new Register(1, "X1", 3));
+        var unresolvedCarrier = new LocalVariable("unresolvedCarrier", new Register(1, "X1", 4));
+
+        var firstTypeLoad = new Instruction(0, OpCode.Move, firstTypeClass, new MemoryOperand(addend: 0x8000));
+        var secondTypeLoad = new Instruction(
+            1,
+            OpCode.Move,
+            secondTypeClass,
+            new MemoryOperand(addend: mode == AddressPhiFixtureMode.ConflictingTypeHandle ? 0x9000 : 0x8000));
+        var knownCall = new Instruction(
+            2,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            knownResult,
+            firstTypeClass,
+            new AddressOf(knownValue));
+        var firstStackWrite = new Instruction(3, OpCode.Move, firstStackValue, firstSource);
+        var firstAddress = new Instruction(4, OpCode.Move, firstCarrier, new AddressOf(firstStackValue));
+        var secondStackWrite = new Instruction(5, OpCode.Move, secondStackValue, new Immediate(0));
+        var secondAddress = mode == AddressPhiFixtureMode.UnresolvedInput
+            ? new Instruction(6, OpCode.Move, secondCarrier, unresolvedCarrier)
+            : new Instruction(6, OpCode.Move, secondCarrier, new AddressOf(secondStackValue));
+        var phiOperands = mode == AddressPhiFixtureMode.MissingInput
+            ? new List<IOperand> { mergedCarrier, firstCarrier }
+            : new List<IOperand> { mergedCarrier, firstCarrier, secondCarrier };
+        var addressPhi = new Instruction(7, OpCode.Phi, phiOperands);
+        var typePhi = new Instruction(8, OpCode.Phi, mergedTypeClass, firstTypeClass, secondTypeClass);
+        var finalCall = new Instruction(
+            9,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            Local("finalResult", app.SystemTypes.SystemObjectType),
+            mergedTypeClass,
+            mergedCarrier);
+        var returnInstruction = new Instruction(10, OpCode.Return);
+
+        var graph = new ISILControlFlowGraph([new Instruction(100, OpCode.Return)]);
+        foreach (var block in graph.Blocks)
+        {
+            block.Predecessors.Clear();
+            block.Successors.Clear();
+            block.Instructions.Clear();
+        }
+
+        var firstPredecessor = new Block { ID = 2, Instructions = [firstTypeLoad, knownCall, firstStackWrite, firstAddress] };
+        var secondPredecessor = new Block { ID = 3, Instructions = [secondTypeLoad, secondStackWrite, secondAddress] };
+        var join = new Block { ID = 4, Instructions = [addressPhi, typePhi, finalCall, returnInstruction] };
+        graph.EntryBlock.Successors.AddRange([firstPredecessor, secondPredecessor]);
+        firstPredecessor.Predecessors.Add(graph.EntryBlock);
+        secondPredecessor.Predecessors.Add(graph.EntryBlock);
+        firstPredecessor.Successors.Add(join);
+        secondPredecessor.Successors.Add(join);
+        join.Predecessors.AddRange([firstPredecessor, secondPredecessor]);
+        join.Successors.Add(graph.ExitBlock);
+        graph.ExitBlock.Predecessors.Add(join);
+        graph.Blocks = [graph.EntryBlock, firstPredecessor, secondPredecessor, join, graph.ExitBlock];
+
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new AddressPhiFixture(
+            method,
+            finalCall,
+            firstPredecessor,
+            secondPredecessor,
+            join,
+            firstStackValue,
+            secondStackValue);
+    }
+
+    private enum AddressPhiFixtureMode
+    {
+        Valid,
+        MissingInput,
+        UnresolvedInput,
+        ConflictingTypeHandle,
+    }
+
+    private sealed record AddressPhiFixture(
+        MethodAnalysisContext Method,
+        Instruction FinalCall,
+        Block FirstPredecessor,
+        Block SecondPredecessor,
+        Block Join,
+        LocalVariable FirstStackValue,
+        LocalVariable SecondStackValue);
+
+    private static Instruction BoxCall(
+        int index,
+        string resultName,
+        LocalVariable typeClass,
+        LocalVariable value,
+        ApplicationAnalysisContext app)
+        => new(
+            index,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_box"),
+            Local(resultName, app.SystemTypes.SystemObjectType),
+            new MemoryOperand(typeClass, addend: 0x28),
+            new AddressOf(value));
+
     private static MethodAnalysisContext CreateMethod(params Instruction[] instructions)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
@@ -297,6 +660,6 @@ public class KeyFunctionRecoveryTests
         return method;
     }
 
-    private static LocalVariable Local(string name, TypeAnalysisContext type)
+    private static LocalVariable Local(string name, TypeAnalysisContext? type)
         => new(name, new Register(null, name), type);
 }

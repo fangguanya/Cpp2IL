@@ -53,6 +53,10 @@ public static class KeyFunctionRecovery
             return;
 
         var definitions = BuildUniqueDefinitions(instructions);
+        var boxTypesByHandle = BuildProvenBoxTypesByHandle(
+            method.ControlFlowGraph.Blocks,
+            definitions,
+            method.DominatorInfo);
 
         foreach (var block in method.ControlFlowGraph.Blocks)
         {
@@ -69,9 +73,54 @@ public static class KeyFunctionRecovery
                     method.ControlFlowGraph.Blocks,
                     block,
                     instructionIndex,
-                    method.DominatorInfo);
+                    method.DominatorInfo,
+                    boxTypesByHandle);
             }
         }
+    }
+
+    private static IReadOnlyDictionary<string, TypeAnalysisContext> BuildProvenBoxTypesByHandle(
+        IReadOnlyList<Block> blocks,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        DominatorInfo? dominance)
+    {
+        var proven = new Dictionary<string, TypeAnalysisContext>();
+        var ambiguous = new HashSet<string>();
+
+        foreach (var block in blocks)
+        {
+            for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
+            {
+                var instruction = block.Instructions[instructionIndex];
+                if (instruction.OpCode != OpCode.Call
+                    || instruction.Operands is not [StringLiteral { Value: var keyFunction }, _, { } typeHandle, { } dataAddress, ..]
+                    || !ObjectBoxFunctions.Contains(keyFunction)
+                    || ResolveAddressedValue(dataAddress, definitions) is not { } addressed
+                    || ResolveLatestStackValue(
+                        addressed,
+                        blocks,
+                        block,
+                        instructionIndex,
+                        instruction.Index,
+                        dominance) is not { Type: { IsValueType: true } boxedType }
+                    || !TryCanonicalizeBoxTypeHandle(typeHandle, definitions, out var handleKey)
+                    || ambiguous.Contains(handleKey))
+                    continue;
+
+                if (proven.TryGetValue(handleKey, out var existing)
+                    && !GenericCallRebinder.TypesEquivalent(existing, boxedType))
+                {
+                    // 同一句柄出现互斥值类型时证据不再唯一，禁止向未知栈槽传播任一猜测。
+                    proven.Remove(handleKey);
+                    ambiguous.Add(handleKey);
+                    continue;
+                }
+
+                proven[handleKey] = boxedType;
+            }
+        }
+
+        return proven;
     }
 
     internal static IReadOnlyCollection<Instruction> FindBoxDataWriteRoots(MethodAnalysisContext method)
@@ -169,7 +218,8 @@ public static class KeyFunctionRecovery
         IReadOnlyList<Block> allBlocks,
         Block callBlock,
         int instructionIndex,
-        DominatorInfo? dominance)
+        DominatorInfo? dominance,
+        IReadOnlyDictionary<string, TypeAnalysisContext> boxTypesByHandle)
     {
         // 原生Object::Box接收类型句柄和数据地址；地址可能先经寄存器局部传递。
         if (instruction.OpCode != OpCode.Call
@@ -177,20 +227,204 @@ public static class KeyFunctionRecovery
             return;
 
         var addressed = ResolveAddressedValue(dataAddress, definitions);
-        var value = addressed == null
-            ? null
-            : ResolveLatestStackValue(
+        var resolution = addressed != null
+            ? BoxValueResolution.Direct(ResolveLatestStackValue(
                 addressed,
                 allBlocks,
                 callBlock,
                 instructionIndex,
                 instruction.Index,
-                dominance);
-        if (value is not { Type: { IsValueType: true } boxedType })
+                dominance))
+            : ResolveAddressPhiBoxValue(dataAddress, definitions, callBlock)
+                ?? BoxValueResolution.Direct(
+                    ResolveAdjacentArm64BoxStackWrite(dataAddress, callBlock, instructionIndex));
+        var value = resolution?.Value;
+        var directlyProvenTypes = resolution?.Sources
+            .Select(source => source.Type)
+            .Where(type => type is { IsValueType: true })
+            .Cast<TypeAnalysisContext>()
+            .ToList() ?? [];
+        var boxedType = directlyProvenTypes.Count > 0
+            && directlyProvenTypes.All(type => GenericCallRebinder.TypesEquivalent(type, directlyProvenTypes[0]))
+                ? directlyProvenTypes[0]
+                : TryCanonicalizeBoxTypeHandle(instruction.Operands[2], definitions, out var handleKey)
+                    && boxTypesByHandle.TryGetValue(handleKey, out var provenType)
+                        ? provenType
+                        : null;
+        if (value == null || boxedType == null || resolution == null)
             return;
+
+        // 类型句柄只在同方法内、同一规范链且类型唯一时补全未知栈槽，随后由Box参与主类型不动点。
+        foreach (var source in resolution.Sources)
+            source.Type ??= boxedType;
+        value.Type ??= boxedType;
+        if (resolution.PendingPhi != null)
+            callBlock.Instructions.Insert(0, resolution.PendingPhi);
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, value, boxedType);
+    }
+
+    private static BoxValueResolution? ResolveAddressPhiBoxValue(
+        IOperand dataAddress,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        Block callBlock)
+    {
+        if (dataAddress is not LocalVariable carrier
+            || !definitions.TryGetValue(carrier, out var definition)
+            || definition.OpCode != OpCode.Phi
+            || definition.Operands.Count != callBlock.Predecessors.Count + 1)
+            return null;
+
+        var sources = new List<LocalVariable>(callBlock.Predecessors.Count);
+        for (var predecessorIndex = 0; predecessorIndex < callBlock.Predecessors.Count; predecessorIndex++)
+        {
+            if (ResolveAddressedValue(definition.Operands[predecessorIndex + 1], definitions) is not { } addressed
+                || ResolveIncomingStackValue(addressed, callBlock.Predecessors[predecessorIndex]) is not { } source)
+                return null;
+
+            sources.Add(source);
+        }
+
+        var merged = new LocalVariable(
+            $"boxPhi_{definition.Index}",
+            new Register(null, $"BOX_PHI_{definition.Index}"));
+        var phiOperands = new List<IOperand>(sources.Count + 1) { merged };
+        phiOperands.AddRange(sources);
+        var phi = new Instruction(-1, OpCode.Phi, phiOperands);
+        return new BoxValueResolution(merged, sources, phi);
+    }
+
+    private static LocalVariable ResolveIncomingStackValue(AddressedValue addressed, Block predecessor)
+    {
+        for (var index = predecessor.Instructions.Count - 1; index >= 0; index--)
+        {
+            if (predecessor.Instructions[index].Destination is LocalVariable candidate
+                && candidate.Register.Number == addressed.Slot.Register.Number)
+                return candidate;
+        }
+
+        return addressed.Slot;
+    }
+
+    private static LocalVariable? ResolveAdjacentArm64BoxStackWrite(
+        IOperand dataAddress,
+        Block callBlock,
+        int instructionIndex)
+    {
+        // AArch64 Object::Box的第二个原生实参固定走X1。若取址Move已被早期清理，
+        // 只接受同基本块内紧邻（中间仅Nop）的栈槽写入，绝不跨调用或控制转移猜测。
+        if (dataAddress is not LocalVariable { Register.Name: "X1" })
+            return null;
+
+        for (var index = instructionIndex - 1; index >= 0; index--)
+        {
+            var candidate = callBlock.Instructions[index];
+            if (candidate.OpCode == OpCode.Nop)
+                continue;
+
+            return candidate is
+            {
+                OpCode: OpCode.Move,
+                Destination: LocalVariable { Register.Name: var registerName } destination,
+            } && registerName.StartsWith("stack_", System.StringComparison.Ordinal)
+                ? destination
+                : null;
+        }
+
+        return null;
+    }
+
+    private static bool TryCanonicalizeBoxTypeHandle(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        out string key)
+    {
+        var visited = new HashSet<LocalVariable>();
+        return TryCanonicalizeBoxTypeHandle(operand, definitions, visited, out key);
+    }
+
+    private static bool TryCanonicalizeBoxTypeHandle(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        ISet<LocalVariable> visited,
+        out string key)
+    {
+        if (operand is LocalVariable local)
+        {
+            if (!visited.Add(local)
+                || !definitions.TryGetValue(local, out var definition))
+            {
+                key = string.Empty;
+                return false;
+            }
+
+            if (definition.OpCode == OpCode.Move && definition.Operands.Count >= 2)
+                return TryCanonicalizeBoxTypeHandle(definition.Operands[1], definitions, visited, out key);
+
+            if (definition.OpCode == OpCode.Phi && definition.Operands.Count >= 2)
+            {
+                string? commonKey = null;
+                for (var index = 1; index < definition.Operands.Count; index++)
+                {
+                    if (!TryCanonicalizeBoxTypeHandle(
+                            definition.Operands[index],
+                            definitions,
+                            new HashSet<LocalVariable>(visited),
+                            out var sourceKey)
+                        || commonKey != null && commonKey != sourceKey)
+                    {
+                        key = string.Empty;
+                        return false;
+                    }
+
+                    commonKey ??= sourceKey;
+                }
+
+                key = commonKey ?? string.Empty;
+                return commonKey != null;
+            }
+
+            key = string.Empty;
+            return false;
+        }
+
+        if (operand is MemoryOperand memory)
+        {
+            var baseKey = "null";
+            if (memory.Base != null
+                && !TryCanonicalizeBoxTypeHandle(memory.Base, definitions, visited, out baseKey))
+            {
+                key = string.Empty;
+                return false;
+            }
+
+            var indexKey = "null";
+            if (memory.Index != null
+                && !TryCanonicalizeBoxTypeHandle(memory.Index, definitions, visited, out indexKey))
+            {
+                key = string.Empty;
+                return false;
+            }
+
+            key = $"memory({baseKey},{memory.Addend},{indexKey},{memory.Scale})";
+            return true;
+        }
+
+        if (operand is Immediate immediate)
+        {
+            key = $"immediate({immediate.Value})";
+            return true;
+        }
+
+        if (operand is TypeAnalysisContext type)
+        {
+            key = $"type({type.FullName})";
+            return true;
+        }
+
+        key = string.Empty;
+        return false;
     }
 
     private static LocalVariable ResolveLatestStackValue(
@@ -290,4 +524,13 @@ public static class KeyFunctionRecovery
     }
 
     private sealed record AddressedValue(LocalVariable Slot, int AddressTakenIndex);
+
+    private sealed record BoxValueResolution(
+        LocalVariable Value,
+        IReadOnlyList<LocalVariable> Sources,
+        Instruction? PendingPhi)
+    {
+        public static BoxValueResolution? Direct(LocalVariable? value)
+            => value == null ? null : new BoxValueResolution(value, [value], null);
+    }
 }
