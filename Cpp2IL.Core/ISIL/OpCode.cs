@@ -50,6 +50,9 @@ public enum OpCode
     /// <summary><c>If op 2 is true, jumps to op 1</summary>
     ConditionalJump,
 
+    /// <summary>op 2 为真时选 op 3，否则选 op 4，并把结果写入 op 1</summary>
+    ConditionalSelect,
+
     /// <summary>Adds op 1 to stack pointer</summary>
     ShiftStack,
 

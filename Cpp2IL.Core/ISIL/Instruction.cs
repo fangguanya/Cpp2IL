@@ -90,6 +90,7 @@ public class Instruction : IOperand
         {
             case OpCode.Move:
             case OpCode.Phi:
+            case OpCode.ConditionalSelect:
             case OpCode.Add:
             case OpCode.Subtract:
             case OpCode.Multiply:
@@ -177,6 +178,9 @@ public class Instruction : IOperand
                 => [_operands[1]],
 
             OpCode.VectorBitwiseSelect
+                => [_operands[1], _operands[2], _operands[3]],
+
+            OpCode.ConditionalSelect
                 => [_operands[1], _operands[2], _operands[3]],
 
             OpCode.VectorMultiplyByElement

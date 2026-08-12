@@ -715,6 +715,9 @@ public static class LocalVariables
                 case OpCode.Phi:
                     instructionChanged = PropagatePhi(instruction);
                     break;
+                case OpCode.ConditionalSelect:
+                    instructionChanged = PropagateConditionalSelect(instruction);
+                    break;
                 case OpCode.Box:
                     instructionChanged = PropagateBox(instruction, method);
                     break;
@@ -874,6 +877,22 @@ public static class LocalVariables
 
         var changed = SetTypeIfUnknown(destination, destinationType);
         changed |= SetTypeIfUnknown(source, sourceType);
+        return changed;
+    }
+
+    private static bool PropagateConditionalSelect(Instruction select)
+    {
+        if (select.Operands is not
+            [LocalVariable destination, _, LocalVariable whenTrue, LocalVariable whenFalse])
+            return false;
+
+        var changed = SetTypeIfUnknown(destination, whenTrue.Type ?? whenFalse.Type);
+        if (destination.Type != null)
+        {
+            changed |= SetTypeIfUnknown(whenTrue, destination.Type);
+            changed |= SetTypeIfUnknown(whenFalse, destination.Type);
+        }
+
         return changed;
     }
 

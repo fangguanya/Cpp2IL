@@ -154,7 +154,7 @@ public static class DeadCodeEliminator
     private static bool IsRemovable(OpCode opCode) =>
         opCode switch
         {
-            OpCode.Move or OpCode.Phi
+            OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor

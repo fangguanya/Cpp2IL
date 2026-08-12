@@ -532,6 +532,15 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel());
                 break;
 
+            case OpCode.ConditionalSelect:
+                EmitConditionalSelect(
+                    instruction,
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor);
+                break;
+
             case OpCode.IndirectJump:
                 instructions.Add(CilOpCodes.Ldstr, $"Indirect jump: {instruction} (should have been resolved before IL gen)");
                 instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
@@ -1096,6 +1105,32 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+    }
+
+    private static void EmitConditionalSelect(
+        Instruction instruction,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals,
+        MemberReference writeLine,
+        MemberReference stringCtor)
+    {
+        if (instruction.Operands.Count != 4)
+            throw new DecompilerException($"条件选择操作数数量无效：{instruction}");
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var falseLabel = new CilInstruction(CilOpCodes.Nop);
+        var endLabel = new CilInstruction(CilOpCodes.Nop);
+        var destinationType = DestinationType(instruction.Operands[0]);
+
+        LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
+        instructions.Add(CilOpCodes.Brfalse, new CilInstructionLabel(falseLabel));
+        LoadOperand(instruction.Operands[2], method, locals, writeLine, stringCtor, destinationType);
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+        instructions.Add(CilOpCodes.Br, new CilInstructionLabel(endLabel));
+        instructions.Add(falseLabel);
+        LoadOperand(instruction.Operands[3], method, locals, writeLine, stringCtor, destinationType);
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+        instructions.Add(endLabel);
     }
 
     private static void EmitHomogeneousFloatingAggregateArgument(

@@ -85,6 +85,50 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void 后索引Ldp释放栈帧形成正向栈增量()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodePostIndexedStackAdjustment(
+            Arm64MemoryIndexMode.PostIndex,
+            Arm64Register.X31,
+            0x20,
+            out var stackDelta);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(stackDelta, Is.EqualTo(0x20));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 后索引栈访问接受零增量()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodePostIndexedStackAdjustment(
+                Arm64MemoryIndexMode.PostIndex,
+                Arm64Register.X31,
+                0,
+                out var stackDelta),
+            Is.True);
+        Assert.That(stackDelta, Is.Zero);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通基址的后索引不得修改托管栈状态()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodePostIndexedStackAdjustment(
+                Arm64MemoryIndexMode.PostIndex,
+                Arm64Register.X19,
+                0x20,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void AdrpRelativePageBecomesAbsolutePage()
     {
         Assert.That(

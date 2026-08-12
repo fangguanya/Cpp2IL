@@ -138,6 +138,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    /// <summary>
+    /// LDP/STR 等后索引内存操作先访问旧 SP，再按立即数更新 SP；因此内存槽使用零偏移，
+    /// 栈状态增量则取 MemOffset。普通偏移和前索引不得进入该路径。
+    /// </summary>
+    internal static bool TryDecodePostIndexedStackAdjustment(
+        Arm64MemoryIndexMode indexMode,
+        Arm64Register memoryBase,
+        long byteOffset,
+        out int stackDelta)
+    {
+        if (indexMode != Arm64MemoryIndexMode.PostIndex
+            || memoryBase != Arm64Register.X31
+            || byteOffset is < int.MinValue or > int.MaxValue)
+        {
+            stackDelta = 0;
+            return false;
+        }
+
+        stackDelta = checked((int)byteOffset);
+        return true;
+    }
+
     internal static bool TryCreateStackOffset(
         Arm64Register baseRegister,
         Arm64Register addendRegister,
@@ -1375,10 +1397,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var preservedFalse = new Register(null, registerPrefix + "_FALSE");
             Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
             Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
-            // 先保存两个源值，避免目标寄存器与任一源寄存器重叠时破坏假分支。
-            Add(address, OpCode.Move, destination, preservedTrue);
-            Add(address, OpCode.ConditionalJump, Imm(address + sizeof(uint)), condition);
-            Add(address, OpCode.Move, destination, preservedFalse);
+            // 条件选择是单条值指令，不是原生控制流。把它提升成跨地址跳转会制造伪基本块，
+            // 特别是在同一地址连续生成多条 ISIL 时形成自环；保留为原子值选择供 CIL 内部展开。
+            Add(address, OpCode.ConditionalSelect, destination, condition, preservedTrue, preservedFalse);
             return true;
         }
 
@@ -1811,6 +1832,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                 Add(address, OpCode.Move, dest1, mem);
                 Add(address, OpCode.Move, dest2, mem2);
+                if (TryDecodePostIndexedStackAdjustment(
+                        instruction.MemIndexMode,
+                        instruction.MemBase,
+                        instruction.MemOffset,
+                        out var postIndexedStackDelta))
+                    Add(address, OpCode.ShiftStack, Imm(postIndexedStackDelta));
                 break;
             case Arm64Mnemonic.BL:
                 AddCall(context, address, instruction.BranchTarget);
