@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
@@ -19,6 +20,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 {
     private HashSet<TypeAnalysisContext>? selectedRecoveryTypes;
     private HashSet<MethodAnalysisContext>? selectedRecoveryMethods;
+    private int validatedMethodCount;
 
     public override string OutputFormatId => "dll_il_recovery";
 
@@ -30,37 +32,44 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
         var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
         var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
-        if (assemblyFilters.Count == 0 && typeFilters.Count == 0 && methodFilters.Count == 0)
-            return base.BuildAssemblies(context);
+        var hasSelection = assemblyFilters.Count != 0 || typeFilters.Count != 0 || methodFilters.Count != 0;
+        if (hasSelection)
+        {
+            var assemblies = IsilDumpSelectionHelper.SelectExact(
+                context.Assemblies,
+                assemblyFilters,
+                assembly => assembly.Name,
+                "IL恢复程序集");
+            var types = IsilDumpSelectionHelper.SelectExact(
+                assemblies.SelectMany(assembly => assembly.Types),
+                typeFilters,
+                type => type.Definition?.FullName ?? string.Empty,
+                "IL恢复类型");
+            if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
+                throw new InvalidOperationException("IL恢复类型筛选命中了注入类型或没有方法的类型。");
 
-        var assemblies = IsilDumpSelectionHelper.SelectExact(
-            context.Assemblies,
-            assemblyFilters,
-            assembly => assembly.Name,
-            "IL恢复程序集");
-        var types = IsilDumpSelectionHelper.SelectExact(
-            assemblies.SelectMany(assembly => assembly.Types),
-            typeFilters,
-            type => type.Definition?.FullName ?? string.Empty,
-            "IL恢复类型");
-        if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
-            throw new InvalidOperationException("IL恢复类型筛选命中了注入类型或没有方法的类型。");
+            var methods = IsilDumpSelectionHelper.SelectExact(
+                types.SelectMany(type => type.Methods)
+                    .Where(method => method is not InjectedMethodAnalysisContext),
+                methodFilters,
+                method => method.Definition?.HumanReadableSignature ?? string.Empty,
+                "IL恢复方法");
 
-        var methods = IsilDumpSelectionHelper.SelectExact(
-            types.SelectMany(type => type.Methods)
-                .Where(method => method is not InjectedMethodAnalysisContext),
-            methodFilters,
-            method => method.Definition?.HumanReadableSignature ?? string.Empty,
-            "IL恢复方法");
+            selectedRecoveryTypes = new HashSet<TypeAnalysisContext>(types);
+            selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(methods);
+            Logger.InfoNewline(
+                $"IL恢复已精确选择 {assemblies.Count} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法；其他成员只保留声明。",
+                "DllOutput");
+        }
 
-        selectedRecoveryTypes = new HashSet<TypeAnalysisContext>(types);
-        selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(methods);
-        Logger.InfoNewline(
-            $"IL恢复已精确选择 {assemblies.Count} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法；其他成员只保留声明。",
-            "DllOutput");
+        Volatile.Write(ref validatedMethodCount, 0);
         try
         {
-            return base.BuildAssemblies(context);
+            var builtAssemblies = base.BuildAssemblies(context);
+            Logger.InfoNewline(
+                $"CIL 栈验证通过 {Volatile.Read(ref validatedMethodCount)} 个已选择方法。",
+                "DllOutput");
+            return builtAssemblies;
         }
         finally
         {
@@ -113,6 +122,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
+
+            CilStackValidator.Validate(methodDefinition.CilMethodBody!, methodContext.FullName);
+            Interlocked.Increment(ref validatedMethodCount);
 
             //WriteControlFlowGraph(methodContext, Path.Combine(Environment.CurrentDirectory, "Cpp2IL", "bin", "Debug", "net9.0", "cpp2il_out", "cfg"));
 
