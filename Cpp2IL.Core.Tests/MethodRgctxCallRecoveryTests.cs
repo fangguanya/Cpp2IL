@@ -94,6 +94,33 @@ public class MethodRgctxCallRecoveryTests
         });
     }
 
+    [Test]
+    [Category("异常输入")]
+    public void 同一目标局部存在多条定义时保持间接转移()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemVoidType);
+        var target = CreateMethod("Target", app.SystemTypes.SystemVoidType);
+        var firstMethodInfo = new LocalVariable(
+            "firstMethodInfo",
+            new Register(null, "X3"),
+            new RuntimeMethodInfoAnalysisContext(target, target.DeclaringType!.DeclaringAssembly));
+        var secondMethodInfo = new LocalVariable("secondMethodInfo", new Register(null, "X4"));
+        var pointer = new LocalVariable("methodPointer", new Register(null, "X9"));
+        var firstDefinition = new Instruction(0, OpCode.Move, pointer, new MemoryOperand(firstMethodInfo));
+        var secondDefinition = new Instruction(1, OpCode.Move, pointer, new MemoryOperand(secondMethodInfo));
+        var transfer = CreateRawTransfer(OpCode.IndirectJump, pointer);
+        owner.ControlFlowGraph = new ISILControlFlowGraph([firstDefinition, secondDefinition, transfer]);
+
+        var changed = MetadataResolver.ResolveMethodRgctxCalls(owner);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(transfer.OpCode, Is.EqualTo(OpCode.IndirectJump));
+        });
+    }
+
     private static InjectedMethodAnalysisContext CreateMethod(string name, TypeAnalysisContext returnType) =>
         new(
             Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType,

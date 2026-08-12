@@ -546,9 +546,7 @@ public static class MetadataResolver
         var changed = false;
         var definitions = method.ControlFlowGraph!.Instructions
             .Where(instruction => instruction.Destination is LocalVariable)
-            .ToDictionary(
-                instruction => (LocalVariable)instruction.Destination!,
-                instruction => instruction);
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
 
         foreach (var block in method.ControlFlowGraph.Blocks)
         {
@@ -571,7 +569,7 @@ public static class MetadataResolver
 
     private static RuntimeMethodInfoAnalysisContext? ResolveTargetMethodInfo(
         IOperand operand,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+        ILookup<LocalVariable, Instruction> definitions)
     {
         var visited = new HashSet<LocalVariable>();
         while (true)
@@ -589,7 +587,7 @@ public static class MetadataResolver
                 case LocalVariable { Type: RuntimeMethodInfoAnalysisContext typed }:
                     return typed;
                 case LocalVariable local when visited.Add(local)
-                                                  && definitions.TryGetValue(local, out var definition)
+                                                  && definitions[local].Take(2).ToArray() is [var definition]
                                                   && definition.OpCode == OpCode.Move
                                                   && definition.Operands.Count >= 2:
                     operand = definition.Operands[1];
