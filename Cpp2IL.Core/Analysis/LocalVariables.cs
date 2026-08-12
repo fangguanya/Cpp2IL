@@ -259,33 +259,82 @@ public static class LocalVariables
         var changed = true;
         var loopCount = 0;
         var lastChangingPasses = new List<string>();
+        var lastChangingTypeDetails = new List<string>();
 
         while (changed)
         {
             if (MaxTypePropagationLoopCount != -1 && ++loopCount > MaxTypePropagationLoopCount)
                 throw new DecompilerException(
                     $"Type and field resolution not settling! (looped {MaxTypePropagationLoopCount} times; "
-                    + $"last changing passes: {string.Join(", ", lastChangingPasses)})");
+                    + $"last changing passes: {string.Join(", ", lastChangingPasses)}; "
+                    + $"type changes: {string.Join(" | ", lastChangingTypeDetails)})");
 
             changed = false;
             lastChangingPasses.Clear();
+            lastChangingTypeDetails.Clear();
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveCallsViaMethodInfo), MetadataResolver.ResolveCallsViaMethodInfo(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveAmbiguousCalls), MetadataResolver.ResolveAmbiguousCalls(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveVirtualCalls), MetadataResolver.ResolveVirtualCalls(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(GenericCallRebinder), GenericCallRebinder.Run(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), PropagateFromCallParameters(method));
-            changed |= RecordChangingPass(
-                lastChangingPasses,
-                nameof(BindAddressCarrierTypes),
-                BindAddressCarrierTypes(method.ControlFlowGraph!.Instructions));
+            var captureFinalIteration = MaxTypePropagationLoopCount != -1
+                && loopCount == MaxTypePropagationLoopCount;
+            var typesBeforeAddressBinding = captureFinalIteration ? CaptureLocalTypes(method) : null;
+            var addressBindingChanges = captureFinalIteration ? new List<string>() : null;
+            var addressBindingChanged = BindAddressCarrierTypes(
+                method.ControlFlowGraph!.Instructions,
+                addressBindingChanges);
+            changed |= RecordChangingPass(lastChangingPasses, nameof(BindAddressCarrierTypes), addressBindingChanged);
+            if (addressBindingChanged && typesBeforeAddressBinding != null)
+                lastChangingTypeDetails.AddRange(DescribeTypeChanges(
+                    nameof(BindAddressCarrierTypes), typesBeforeAddressBinding, method));
+            if (addressBindingChanges != null)
+                lastChangingTypeDetails.AddRange(addressBindingChanges);
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveFieldOffsets), MetadataResolver.ResolveFieldOffsets(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(RgctxResolver), RgctxResolver.Run(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateStaticFieldStorage), PropagateStaticFieldStorage(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateBooleanBitTestTypes), PropagateBooleanBitTestTypes(method));
-            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateTypesOnce), PropagateTypesOnce(method));
+            var typesBeforePropagation = captureFinalIteration ? CaptureLocalTypes(method) : null;
+            var propagationChanges = captureFinalIteration ? new List<string>() : null;
+            var propagationChanged = PropagateTypesOnce(method, propagationChanges);
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateTypesOnce), propagationChanged);
+            if (propagationChanged && typesBeforePropagation != null)
+                lastChangingTypeDetails.AddRange(DescribeTypeChanges(
+                    nameof(PropagateTypesOnce), typesBeforePropagation, method));
+            if (propagationChanges != null)
+                lastChangingTypeDetails.AddRange(propagationChanges);
             changed |= RecordChangingPass(lastChangingPasses, nameof(AggregateStackCopyRecovery), AggregateStackCopyRecovery.Run(method));
         }
     }
+
+    private static Dictionary<LocalVariable, TypeAnalysisContext?> CaptureLocalTypes(MethodAnalysisContext method) =>
+        method.Locals.ToDictionary(local => local, local => local.Type);
+
+    /// <summary>
+    /// 仅在不动点达到硬上限的最后一轮生成确定性差异，避免正常方法承担诊断开销。
+    /// </summary>
+    private static IEnumerable<string> DescribeTypeChanges(
+        string pass,
+        IReadOnlyDictionary<LocalVariable, TypeAnalysisContext?> before,
+        MethodAnalysisContext method)
+    {
+        return method.Locals
+            .Select(local => new
+            {
+                Local = local,
+                Before = before.TryGetValue(local, out var oldType) ? oldType : null,
+                After = local.Type,
+            })
+            .Where(change => !ReferenceEquals(change.Before, change.After))
+            .OrderBy(change => change.Local.Name, StringComparer.Ordinal)
+            .ThenBy(change => change.Local.Register.Number)
+            .Select(change => $"{pass}:{change.Local.Name}@{change.Local.Register}:"
+                + $"{DescribeType(change.Before)}->{DescribeType(change.After)}");
+    }
+
+    private static string DescribeType(TypeAnalysisContext? type) => type == null
+        ? "<null>"
+        : $"{type.GetType().Name}[{type.FullName}]";
 
     /// <summary>
     /// 接口与委托分派在主类型不动点之后才把间接调用改写成真实方法。这里重放调用签名、
@@ -601,28 +650,34 @@ public static class LocalVariables
     }
 
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
-    private static bool PropagateTypesOnce(MethodAnalysisContext method)
+    private static bool PropagateTypesOnce(MethodAnalysisContext method, List<string>? changeDetails = null)
     {
         var changed = false;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
+            var operandTypesBefore = changeDetails == null
+                ? null
+                : instruction.Operands.OfType<LocalVariable>()
+                    .Distinct()
+                    .ToDictionary(local => local, local => local.Type);
+            var instructionChanged = false;
             switch (instruction.OpCode)
             {
                 case OpCode.Move:
-                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
+                    instructionChanged = PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
                     break;
                 case OpCode.Phi:
-                    changed |= PropagatePhi(instruction);
+                    instructionChanged = PropagatePhi(instruction);
                     break;
                 case OpCode.Box:
-                    changed |= PropagateBox(instruction, method);
+                    instructionChanged = PropagateBox(instruction, method);
                     break;
                 case OpCode.CastClass:
-                    changed |= PropagateCastClass(instruction);
+                    instructionChanged = PropagateCastClass(instruction);
                     break;
                 case OpCode.Not:
-                    changed |= BindBooleanNotResult(
+                    instructionChanged = BindBooleanNotResult(
                         instruction,
                         method.AppContext.SystemTypes.SystemBooleanType);
                     break;
@@ -633,8 +688,21 @@ public static class LocalVariables
                 case OpCode.ReinterpretFloatBitsAsInteger:
                 case OpCode.RoundFloatTowardPositiveInfinity:
                 case OpCode.RoundFloatTowardNegativeInfinity:
-                    changed |= PropagateNumericConversion(instruction, method);
+                    instructionChanged = PropagateNumericConversion(instruction, method);
                     break;
+            }
+
+            changed |= instructionChanged;
+            if (!instructionChanged || operandTypesBefore == null)
+                continue;
+
+            foreach (var pair in operandTypesBefore)
+            {
+                if (ReferenceEquals(pair.Value, pair.Key.Type))
+                    continue;
+                changeDetails!.Add($"PropagateTypesOnce:IL_{instruction.Index}:"
+                    + $"{instruction.OpCode}:{pair.Key.Name}@{pair.Key.Register}:"
+                    + $"{DescribeType(pair.Value)}->{DescribeType(pair.Key.Type)}");
             }
         }
 
@@ -803,11 +871,22 @@ public static class LocalVariables
     /// 栈槽元素类型双向收敛。地址载体本身必须是<c>T&amp;</c>，而不是槽内的<c>T</c>；否则
     /// IL生成阶段会把<c>ldloca</c>写入对象局部，反编译后形成<c>object* -&gt; object</c>非法转换。
     /// </summary>
-    internal static bool BindAddressCarrierTypes(IReadOnlyList<Instruction> instructions)
+    internal static bool BindAddressCarrierTypes(
+        IReadOnlyList<Instruction> instructions,
+        List<string>? changeDetails = null)
     {
         var addressedSlots = new Dictionary<LocalVariable, LocalVariable>();
         var forwardCopies = new Dictionary<LocalVariable, List<LocalVariable>>();
         var pendingCarriers = new Queue<LocalVariable>();
+
+        // SSA局部量通常只有一个定义，但内联类型检查恢复会在原复制局部量上追加CastClass等
+        // 语义定义。此类定义会结束原来的地址别名；若仍沿旧Move边传播，地址绑定与强制转换
+        // 会在每轮类型分析中互相覆盖，最终使大型方法无法达到不动点。
+        var semanticallyDefinedLocals = instructions
+            .Where(instruction => instruction.OpCode != OpCode.Move
+                && instruction.Destination is LocalVariable)
+            .Select(instruction => (LocalVariable)instruction.Destination!)
+            .ToHashSet();
 
         // 一次扫描同时建立直接取址根和局部量复制邻接表，后续用队列沿源到目标方向传播。
         foreach (var instruction in instructions)
@@ -815,6 +894,10 @@ public static class LocalVariables
             if (instruction.OpCode != OpCode.Move
                 || instruction.Operands.Count < 2
                 || instruction.Operands[0] is not LocalVariable destination)
+                continue;
+
+            // 非复制指令已经为该局部量建立了新的值语义，旧Move不得再把它归入地址链。
+            if (semanticallyDefinedLocals.Contains(destination))
                 continue;
 
             if (instruction.Operands[1] is AddressOf { Target: LocalVariable slot })
@@ -913,6 +996,9 @@ public static class LocalVariables
             var expectedCarrierType = slot.Type.MakeByReferenceType();
             if (!GenericCallRebinder.TypesEquivalent(carrier.Type, expectedCarrierType))
             {
+                changeDetails?.Add($"BindAddressCarrierTypes:{carrier.Name}@{carrier.Register}:"
+                    + $"{DescribeType(carrier.Type)}->{DescribeType(expectedCarrierType)}:"
+                    + $"slot={slot.Name}@{slot.Register}");
                 carrier.Type = expectedCarrierType;
                 changed = true;
             }

@@ -446,6 +446,81 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 强制转换语义定义必须截断旧地址别名()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var assembly = appContext.Assemblies[0];
+        var castType = new InjectedTypeAnalysisContext(
+            assembly,
+            "Cpp2IL.Core.Tests",
+            "RecoveredCastTarget",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var slot = new LocalVariable(
+            "slot",
+            new Register(null, "stack_-D0", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var carrier = new LocalVariable("carrier", new Register(null, "X22", 2));
+        var castLocal = new LocalVariable(
+            "castLocal",
+            new Register(null, "CAST_X22", 3),
+            castType);
+        var loadedValue = new LocalVariable("loadedValue", new Register(null, "X0", 4));
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, new AddressOf(slot)),
+            new(1, OpCode.Move, castLocal, carrier),
+            new(2, OpCode.CastClass, castLocal, castLocal, castType),
+            new(3, OpCode.Move, loadedValue, new MemoryOperand(carrier)),
+        };
+
+        var changed = LocalVariables.BindAddressCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(carrier.Type, Is.TypeOf<ByRefTypeAnalysisContext>());
+            Assert.That(castLocal.Type, Is.SameAs(castType));
+            Assert.That(loadedValue.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 算术语义定义不得继承旧地址别名()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var slot = new LocalVariable(
+            "slot",
+            new Register(null, "stack_-20", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var carrier = new LocalVariable("carrier", new Register(null, "X20", 2));
+        var redefined = new LocalVariable(
+            "redefined",
+            new Register(null, "X21", 3),
+            appContext.SystemTypes.SystemInt64Type);
+        var loadedValue = new LocalVariable("loadedValue", new Register(null, "W0", 4));
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, new AddressOf(slot)),
+            new(1, OpCode.Move, redefined, carrier),
+            new(2, OpCode.Add, redefined, redefined, new Immediate(8)),
+            new(3, OpCode.Move, loadedValue, new MemoryOperand(carrier)),
+        };
+
+        var changed = LocalVariables.BindAddressCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(carrier.Type, Is.TypeOf<ByRefTypeAnalysisContext>());
+            Assert.That(redefined.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+            Assert.That(loadedValue.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 普通局部量复制不得建立地址载体关系()
     {
