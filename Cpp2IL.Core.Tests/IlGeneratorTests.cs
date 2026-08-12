@@ -92,6 +92,69 @@ public class IlGeneratorTests
         Assert.That(box.Operand!.ToString(), Does.Contain("System.Boolean"));
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void CastClass生成取参强转存储与返回的平衡CIL栈()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = app.SystemTypes.SystemObjectType;
+        var systemString = app.SystemTypes.SystemStringType;
+        var source = new LocalVariable("source", new Register(null, "source"), systemObject);
+        var result = new LocalVariable("result", new Register(null, "result"), systemString);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "CastString",
+            systemString,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [systemObject],
+            ["source"]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CastClass, result, source, systemString),
+            new Instruction(1, OpCode.Return, result),
+        ]);
+        context.Locals = [result];
+        context.ParameterLocals = [source];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "CastClassTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        绑定AsmResolver系统类型(module, systemString, "String", TypeAttributes.Class | TypeAttributes.Public | TypeAttributes.Sealed);
+        var type = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "CastClassTestType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition(
+            "CastString",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(
+                systemString.ToTypeSignature(module),
+                [systemObject.ToTypeSignature(module)]));
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "source", (ParameterAttributes)0));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var opCodes = method.CilMethodBody!.Instructions.Select(instruction => instruction.OpCode).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(opCodes.Count(opCode => opCode == CilOpCodes.Castclass), Is.EqualTo(1));
+            Assert.That(opCodes.Count(opCode => opCode == CilOpCodes.Stloc), Is.EqualTo(1));
+            Assert.That(
+                opCodes,
+                Is.EqualTo(new[]
+                {
+                    CilOpCodes.Ldarg,
+                    CilOpCodes.Castclass,
+                    CilOpCodes.Stloc,
+                    CilOpCodes.Ldloc,
+                    CilOpCodes.Ret,
+                }));
+        });
+    }
+
     [TestCaseSource(nameof(不可顺序落出的终结指令))]
     public void Void方法已有控制流终结点时不重复补返回(CilOpCode opCode)
     {

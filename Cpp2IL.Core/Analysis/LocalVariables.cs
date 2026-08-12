@@ -618,6 +618,9 @@ public static class LocalVariables
                 case OpCode.Box:
                     changed |= PropagateBox(instruction, method);
                     break;
+                case OpCode.CastClass:
+                    changed |= PropagateCastClass(instruction);
+                    break;
                 case OpCode.Not:
                     changed |= BindBooleanNotResult(
                         instruction,
@@ -659,6 +662,19 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    private static bool PropagateCastClass(Instruction instruction)
+    {
+        if (instruction.Operands is not
+            [LocalVariable destination, _, TypeAnalysisContext { IsValueType: false } castType])
+            return false;
+
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, castType))
+            return false;
+
+        destination.Type = castType;
+        return true;
     }
 
     internal static bool BindBooleanNotResult(

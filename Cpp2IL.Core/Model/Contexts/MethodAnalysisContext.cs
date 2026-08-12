@@ -412,6 +412,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ErasedInstanceReceiverRecovery.Run(this);
         // 值类型通过主不动点到达取址栈槽后，再把Object::Box唯一恢复为托管box。
         KeyFunctionRecovery.RewriteBoxing(this);
+        // IL2CPP把castclass展开成类深度与继承表比较；在字段解析前折回托管转换，
+        // 让成功路径以派生类型进入同一个类型不动点，同时保留InvalidCastException语义。
+        InlineTypeCheckRecovery.Run(this);
         AggregateStackCopyRecovery.RewriteResolvedCopies(this);
 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
