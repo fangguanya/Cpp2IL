@@ -77,8 +77,9 @@ internal static class CilStackValidator
             }
         }
 
-        var first = Math.Max(0, failureIndex - 3);
-        var last = Math.Min(instructions.Count - 1, failureIndex + 3);
+        // 短方法完整输出，避免分支目标位于三条窗口之外；大型方法仍保持固定邻接窗口。
+        var first = instructions.Count <= 128 ? 0 : Math.Max(0, failureIndex - 3);
+        var last = instructions.Count <= 128 ? instructions.Count - 1 : Math.Min(instructions.Count - 1, failureIndex + 3);
         var window = new List<string>(last - first + 1);
         for (var index = first; index <= last; index++)
         {

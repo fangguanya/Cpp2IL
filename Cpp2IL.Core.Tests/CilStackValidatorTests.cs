@@ -61,6 +61,8 @@ public class CilStackValidatorTests
             Assert.That(exception!.Message, Does.Contain("CIL 栈验证失败"));
             Assert.That(exception.Message, Does.Contain("Fixture.Invalid"));
             Assert.That(exception.Message, Does.Contain("IL_0000"));
+            Assert.That(exception.Message, Does.Contain("window=>IL_0000:Pop"));
+            Assert.That(exception.Message, Does.Contain("IL_0001:Ret"));
         });
     }
 }

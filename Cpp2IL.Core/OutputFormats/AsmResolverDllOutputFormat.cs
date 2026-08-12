@@ -55,6 +55,9 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             fileBuilder.CreateFile(image).Write(dllPath);
         }
 
+        // DLL 已全部持久化后，由具体输出器在同一目录写入方法级恢复收据。
+        WriteOutputReceipts(outputRoot);
+
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
 
         if (TotalMethodCount != 0)
@@ -123,6 +126,13 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         TypeDefinitionsAsmResolver.Reset();
 
         return ret;
+    }
+
+    /// <summary>
+    /// 允许具体 DLL 输出器在所有程序集写盘后发布结构化收据。
+    /// </summary>
+    protected virtual void WriteOutputReceipts(string outputRoot)
+    {
     }
 
     protected abstract void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext);
