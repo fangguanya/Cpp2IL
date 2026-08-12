@@ -498,7 +498,7 @@ public static class InterfaceDispatchRecovery
         return slots.Count == 0 ? null : new VTableMatch(klassCandidate, slots);
     }
 
-    private static bool IsKlassLoad(
+    internal static bool IsKlassLoad(
         Dictionary<LocalVariable, Instruction> definitions,
         LocalVariable candidate,
         HashSet<LocalVariable> visited)
@@ -507,7 +507,8 @@ public static class InterfaceDispatchRecovery
             return false;
 
         var definition = ChaseCopies(definitions, candidate);
-        if (definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
+        if (definition is { OpCode: OpCode.Move, Operands: [_, IOperand loadedSource] }
+            && IsObjectHeaderClassLoad(loadedSource))
             return true;
 
         if (definition is not { OpCode: OpCode.Phi, Operands.Count: >= 3 } phi)
@@ -519,6 +520,15 @@ public static class InterfaceDispatchRecovery
 
         return true;
     }
+
+    /// <summary>
+    /// 判断操作数是否为对象头首指针（Il2CppObject::klass）的精确零偏移读取。
+    /// 当共享原生地址把接收者错误标成布尔等值类型时，字段解析会把同一条 <c>[receiver]</c>
+    /// 写成零偏移 <see cref="FieldReference"/>；两种表示都必须归一为同一个对象头证据。
+    /// </summary>
+    internal static bool IsObjectHeaderClassLoad(IOperand source)
+        => source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }
+           or FieldReference { Offset: 0 };
 
     internal static bool TryMatchEntryIndex(
         Dictionary<LocalVariable, Instruction> definitions,
