@@ -1,11 +1,19 @@
 using System.Collections.Generic;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
 public class InterfaceDispatchRecoveryTests
 {
+    [SetUp]
+    public void Setup()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+    }
+
     [Test]
     [Category("基本功能")]
     public void EntryOffsetPlusSlotIsRecovered()
@@ -120,6 +128,53 @@ public class InterfaceDispatchRecoveryTests
             Assert.That(InterfaceDispatchRecovery.IsObjectHeaderClassLoad(new FieldReference(null!, receiver, 1)), Is.False);
             Assert.That(InterfaceDispatchRecovery.IsKlassLoad(definitions, klass, []), Is.False);
         });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 共享地址慢路径的类型信息与槽位实参可被识别()
+    {
+        var interfaceDefinition = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            interfaceDefinition,
+            interfaceDefinition.DeclaringAssembly);
+        var interfaceTypeInfo = new LocalVariable("interfaceTypeInfo", new Register(null, "X1"), runtimeClassType);
+        var slot = Local("slot");
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [slot] = new Instruction(0, OpCode.Move, slot, new Immediate(1)),
+        };
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(InterfaceDispatchRecovery.IsRuntimeClassOperand(definitions, interfaceTypeInfo), Is.True);
+            Assert.That(InterfaceDispatchRecovery.ResolveConstant(definitions, slot), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零号接口槽位保持有效()
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+
+        Assert.That(
+            InterfaceDispatchRecovery.ResolveConstant(definitions, new Immediate(0)),
+            Is.Zero);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通业务对象不冒充接口类型信息()
+    {
+        var ordinary = Local("ordinary");
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [ordinary] = new Instruction(0, OpCode.Move, ordinary, new Immediate(7)),
+        };
+
+        Assert.That(InterfaceDispatchRecovery.IsRuntimeClassOperand(definitions, ordinary), Is.False);
     }
 
     private static LocalVariable Local(string name)

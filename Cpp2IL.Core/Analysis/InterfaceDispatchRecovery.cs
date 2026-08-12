@@ -140,10 +140,20 @@ public static class InterfaceDispatchRecovery
         IOperand interfaceArg;
         IOperand slotArg;
 
-        if (TryMatchSlowPathCall(firstDefinition, out receiverArg, out interfaceArg, out slotArg))
+        if (TryMatchSlowPathCall(definitions, firstDefinition, out receiverArg, out interfaceArg, out slotArg))
             slowCall = firstDefinition;
-        else if (TryMatchSlowPathCall(secondDefinition, out receiverArg, out interfaceArg, out slotArg))
+        else if (TryMatchSlowPathCall(definitions, secondDefinition, out receiverArg, out interfaceArg, out slotArg))
             slowCall = secondDefinition;
+        else if (homeBlock.TryGetValue(phi, out var slowMerge)
+                 && TryFindSlowPathCall(
+                     definitions,
+                     slowMerge,
+                     out slowCall,
+                     out receiverArg,
+                     out interfaceArg,
+                     out slotArg))
+        {
+        }
         else
         {
             receiverArg = null!;
@@ -230,27 +240,103 @@ public static class InterfaceDispatchRecovery
     /// 目标可能仍是数值地址，也可能因共享原生地址而被提前标成托管方法；接收者、接口 TypeInfo 与槽位证据保持不变。
     /// </summary>
     private static bool TryMatchSlowPathCall(
+        Dictionary<LocalVariable, Instruction> definitions,
         Instruction? candidate,
         out LocalVariable receiver,
         out IOperand interfaceType,
         out IOperand slot)
     {
-        if (candidate is { OpCode: OpCode.Call, Operands.Count: >= 5 }
-            && candidate.Operands[2] is LocalVariable receiverOperand)
+        if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands.Count: >= 4 }
+            || candidate.Operands[1] is not LocalVariable receiverOperand)
         {
-            receiver = receiverOperand;
-            interfaceType = candidate.Operands[3];
-            slot = candidate.Operands[4];
+            receiver = null!;
+            interfaceType = null!;
+            slot = null!;
+            return false;
+        }
+
+        var interfaceOperand = candidate.Operands[2];
+        var slotOperand = candidate.Operands[3];
+        if (!IsRuntimeClassOperand(definitions, interfaceOperand)
+            || ResolveConstant(definitions, slotOperand) is not { } resolvedSlot
+            || resolvedSlot is < 0 or > ushort.MaxValue)
+        {
+            receiver = null!;
+            interfaceType = null!;
+            slot = null!;
+            return false;
+        }
+
+        receiver = receiverOperand;
+        interfaceType = interfaceOperand;
+        slot = slotOperand;
+        return true;
+    }
+
+    /// <summary>
+    /// Phi 边复制会把慢路径结果直接写入 Phi 输入局部，使该输入不再有 SSA 定义。
+    /// 此时仅沿对应前驱块反查唯一调用，并要求调用参数同时满足接收者、接口 TypeInfo 与常量槽位证据。
+    /// </summary>
+    private static bool TryFindSlowPathCall(
+        Dictionary<LocalVariable, Instruction> definitions,
+        Block merge,
+        out Instruction call,
+        out LocalVariable receiver,
+        out IOperand interfaceType,
+        out IOperand slot)
+    {
+        var matches = merge.Predecessors
+            .SelectMany(predecessor => predecessor.Instructions)
+            .Where(instruction => TryMatchSlowPathCall(
+                definitions,
+                instruction,
+                out _,
+                out _,
+                out _))
+            .ToList();
+        if (matches.Count == 1
+            && TryMatchSlowPathCall(
+                definitions,
+                matches[0],
+                out receiver,
+                out interfaceType,
+                out slot))
+        {
+            call = matches[0];
             return true;
         }
 
+        call = null!;
         receiver = null!;
         interfaceType = null!;
         slot = null!;
         return false;
     }
 
-    private static long? ResolveConstant(Dictionary<LocalVariable, Instruction> definitions, IOperand operand)
+    /// <summary>
+    /// 判断操作数是否是接口 TypeInfo 指针。共享原生地址会把慢路径助手错标成泛型方法，
+    /// 因此只能从实参定义的运行时类类型恢复其真实角色。
+    /// </summary>
+    internal static bool IsRuntimeClassOperand(
+        Dictionary<LocalVariable, Instruction> definitions,
+        IOperand operand)
+    {
+        if (operand is RuntimeClassTypeAnalysisContext)
+            return true;
+        if (operand is not LocalVariable local)
+            return false;
+
+        if (local.Type is RuntimeClassTypeAnalysisContext)
+            return true;
+
+        return ChaseCopies(definitions, local) is
+        {
+            OpCode: OpCode.Move,
+            Operands: [_, RuntimeClassTypeAnalysisContext],
+        };
+    }
+
+    internal static long? ResolveConstant(Dictionary<LocalVariable, Instruction> definitions, IOperand operand)
     {
         if (operand is Immediate immediate)
             return immediate.Value;
@@ -382,6 +468,15 @@ public static class InterfaceDispatchRecovery
             }
             && IsInterface(metadataType))
             return metadataType;
+
+        if (interfaceArg is LocalVariable typedInterface
+            && typedInterface.Type is RuntimeClassTypeAnalysisContext { RepresentedType: { } representedInterface }
+            && IsInterface(representedInterface))
+            return representedInterface;
+
+        if (interfaceArg is RuntimeClassTypeAnalysisContext { RepresentedType: { } directInterface }
+            && IsInterface(directInterface))
+            return directInterface;
 
         if (receiverArg.Type is { } receiverType && IsInterface(receiverType))
             return receiverType;
