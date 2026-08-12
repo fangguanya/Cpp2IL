@@ -34,6 +34,54 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 空分支块解析到直接后继的首条CIL指令()
+    {
+        var empty = new Block { ID = 10 };
+        var targetBlock = new Block { ID = 11 };
+        var targetInstruction = new CilInstruction(CilOpCodes.Ret);
+        empty.Successors.Add(targetBlock);
+
+        var result = IlGenerator.ResolveBlockEntryInstruction(
+            empty,
+            new Dictionary<Block, CilInstruction> { [targetBlock] = targetInstruction });
+
+        Assert.That(result, Is.SameAs(targetInstruction));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 连续空分支块解析到末端首条CIL指令()
+    {
+        var first = new Block { ID = 20 };
+        var second = new Block { ID = 21 };
+        var targetBlock = new Block { ID = 22 };
+        var targetInstruction = new CilInstruction(CilOpCodes.Nop);
+        first.Successors.Add(second);
+        second.Successors.Add(targetBlock);
+
+        var result = IlGenerator.ResolveBlockEntryInstruction(
+            first,
+            new Dictionary<Block, CilInstruction> { [targetBlock] = targetInstruction });
+
+        Assert.That(result, Is.SameAs(targetInstruction));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 循环空分支块确定性返回未解析()
+    {
+        var first = new Block { ID = 30 };
+        var second = new Block { ID = 31 };
+        first.Successors.Add(second);
+        second.Successors.Add(first);
+
+        var result = IlGenerator.ResolveBlockEntryInstruction(first, new Dictionary<Block, CilInstruction>());
+
+        Assert.That(result, Is.Null);
+    }
+
+    [Test]
     public void Void方法尾部为普通调用时需要返回终结点()
     {
         var finalInstruction = new CilInstruction(CilOpCodes.Call, null);

@@ -175,21 +175,19 @@ public static class IlGenerator
 
                 if (instruction.Operands[0] is Block targetBlock)
                 {
-                    context.AddWarning($"Branch target block not in cfg: {instruction} ({targetBlock})");
-                    ilBranch.OpCode = CilOpCodes.Nop;
-                    ilBranch.Operand = null;
+                    // SSA 临界边可把原始目标改写为空块；必须穿透空块，不能把条件分支降为 nop 而泄漏栈值。
+                    var targetInstruction = ResolveBlockEntryInstruction(targetBlock, blockEntryMap);
+                    if (targetInstruction == null)
+                        throw new DecompilerException($"无法解析分支目标块：{instruction} ({targetBlock})");
+
+                    ilBranch.Operand = new CilInstructionLabel(targetInstruction);
                     continue;
                 }
 
                 var target = (Instruction)instruction.Operands[0];
 
                 if (!instructionMap.ContainsKey(target))
-                {
-                    context.AddWarning($"Branch target not in ISIL to IL map: {instruction} --- {target}");
-                    ilBranch.OpCode = CilOpCodes.Nop;
-                    ilBranch.Operand = null;
-                    continue;
-                }
+                    throw new DecompilerException($"分支目标不在 ISIL 到 CIL 映射中：{instruction} --- {target}");
 
                 ilBranch.Operand = new CilInstructionLabel(instructionMap[target][0]);
             }
@@ -258,7 +256,7 @@ public static class IlGenerator
         return null;
     }
 
-    private static CilInstruction? ResolveBlockEntryInstruction(Block block,
+    internal static CilInstruction? ResolveBlockEntryInstruction(Block block,
         Dictionary<Block, CilInstruction> blockEntryMap, HashSet<Block>? visited = null)
     {
         if (blockEntryMap.TryGetValue(block, out var target))

@@ -63,6 +63,31 @@ public class CilStackValidatorTests
             Assert.That(exception.Message, Does.Contain("IL_0000"));
             Assert.That(exception.Message, Does.Contain("window=>IL_0000:Pop"));
             Assert.That(exception.Message, Does.Contain("IL_0001:Ret"));
+            Assert.That(exception.Message, Does.Contain("incoming=NONE"));
+            Assert.That(exception.Message, Does.Contain("sequenceEntry=IL_0000:Pop;edges=NONE"));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 分支携带多余栈值时报告远距离入边()
+    {
+        var body = new CilMethodBody();
+        var target = new CilInstruction(CilOpCodes.Ret);
+        body.Instructions.Add(CilOpCodes.Ldc_I4_1);
+        body.Instructions.Add(CilOpCodes.Br, new CilInstructionLabel(target));
+        body.Instructions.Add(target);
+
+        var exception = Assert.Throws<DecompilerException>(() =>
+            CilStackValidator.Validate(body, "Fixture.InvalidBranch"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exception!.Message, Does.Contain("Fixture.InvalidBranch"));
+            Assert.That(exception.Message, Does.Contain("incoming=IL_0001:Br:IL_0006"));
+            Assert.That(exception.Message, Does.Contain("sequenceEntry=IL_0006:Ret;edges=IL_0001:Br:IL_0006"));
+            Assert.That(exception.Message, Does.Contain("entryDepths=1"));
+            Assert.That(exception.Message, Does.Contain("entryEdgeDepths=IL_0001:1"));
         });
     }
 }
