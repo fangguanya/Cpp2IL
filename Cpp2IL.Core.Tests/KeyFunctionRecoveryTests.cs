@@ -188,6 +188,121 @@ public class KeyFunctionRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void ObjectIsInst键函数恢复为独立托管类型测试()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var testedType = app.SystemTypes.SystemStringType;
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            source,
+            testedType,
+            new Immediate(0xBAD));
+        var method = CreateMethod(call);
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+            Assert.That(call.Operands, Is.EqualTo(new IOperand[] { result, source, testedType }));
+            Assert.That(result.Type, Is.SameAs(testedType));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 运行时类局部可恢复其表示的接口类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var testedType = app.SystemTypes.SystemStringType;
+        var typeHandle = Local(
+            "typeHandle",
+            new RuntimeClassTypeAnalysisContext(testedType, testedType.DeclaringAssembly));
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            typeHandle);
+        var method = CreateMethod(call);
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+        Assert.That(call.Operands[2], Is.SameAs(testedType));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 取址解引用接收者保持为IsInst源操作数()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var addressed = Local("addressed", app.SystemTypes.SystemObjectType);
+        var carrier = Local("carrier", app.SystemTypes.SystemIntPtrType);
+        var source = new MemoryOperand(carrier);
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var testedType = app.SystemTypes.SystemStringType;
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            source,
+            testedType);
+        var method = CreateMethod(new Instruction(0, OpCode.Move, carrier, new AddressOf(addressed)), call);
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+        Assert.That(call.Operands[1], Is.EqualTo(source));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 值类型目标不得恢复为引用类型IsInst()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            app.SystemTypes.SystemInt32Type);
+        var method = CreateMethod(call);
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通引用局部不得冒充运行时类句柄()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            Local("ordinary", app.SystemTypes.SystemStringType));
+        var method = CreateMethod(call);
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 死代码清理保留Box数据槽的调用前写入链()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

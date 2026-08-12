@@ -67,12 +67,99 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
         if (!TryGetObjectIsInstCallTarget(instructions, out var target))
         {
-            Logger.VerboseNewline("Method uses managed GetType/IsAssignableFrom dispatch or lacks a direct IsInst call. Aborting.");
-            return 0;
+            Logger.VerboseNewline("Method uses managed GetType/IsAssignableFrom dispatch; trying the ARM64 assignability-tail-thunk route...");
+            var assignabilityExport = _appContext.Binary.GetVirtualAddressOfExportedFunctionByName(
+                "il2cpp_class_is_assignable_from");
+            var assignabilityCore = assignabilityExport == 0
+                ? 0
+                : FindFunctionThisIsAThunkOf(assignabilityExport);
+            if (assignabilityCore == 0
+                || !TryFindObjectIsInstTailThunk(
+                    DisassembleTextSection(),
+                    assignabilityCore,
+                    out target))
+            {
+                Logger.VerboseNewline("No unique Object::IsInst tail thunk was proven.");
+                return 0;
+            }
+
+            Logger.VerboseNewline($"Success. IsInst tail thunk found at 0x{target:X}");
+            return target;
         }
 
         Logger.VerboseNewline($"Success. IsInst found at 0x{target:X}");
         return target;
+    }
+
+    /// <summary>
+    /// 新版运行时的 Object::IsInst 不是导出函数；代码生成入口以单条 B 尾跳到其实现，
+    /// 实现内部调用 class-assignability 核心。只接受调用者数量唯一最大的尾跳板，
+    /// 避免把同一核心中的内部标签或低频辅助函数误登记为全局键函数。
+    /// </summary>
+    internal static bool TryFindObjectIsInstTailThunk(
+        IReadOnlyList<Arm64Instruction> instructions,
+        ulong assignabilityCore,
+        out ulong thunk)
+    {
+        thunk = 0;
+        if (assignabilityCore == 0 || instructions.Count == 0)
+            return false;
+
+        var ordered = instructions.OrderBy(instruction => instruction.Address).ToArray();
+        var indexByAddress = ordered
+            .Select((instruction, index) => (instruction.Address, index))
+            .GroupBy(pair => pair.Address)
+            .ToDictionary(group => group.Key, group => group.First().index);
+
+        var candidates = new List<(ulong Thunk, int Callers)>();
+        foreach (var branch in ordered.Where(instruction =>
+                     instruction.Mnemonic == Arm64Mnemonic.B
+                     && instruction.BranchTarget != 0))
+        {
+            if (!indexByAddress.TryGetValue(branch.BranchTarget, out var targetIndex)
+                || !BodyCallsAssignabilityCore(ordered, targetIndex, assignabilityCore))
+                continue;
+
+            var callers = ordered.Count(instruction =>
+                instruction.Mnemonic == Arm64Mnemonic.BL
+                && instruction.BranchTarget == branch.Address);
+            if (callers > 0)
+                candidates.Add((branch.Address, callers));
+        }
+
+        if (candidates.Count == 0)
+            return false;
+
+        var maximumCallers = candidates.Max(candidate => candidate.Callers);
+        var strongest = candidates
+            .Where(candidate => candidate.Callers == maximumCallers)
+            .Select(candidate => candidate.Thunk)
+            .Distinct()
+            .ToArray();
+        if (strongest.Length != 1)
+            return false;
+
+        thunk = strongest[0];
+        return true;
+    }
+
+    private static bool BodyCallsAssignabilityCore(
+        IReadOnlyList<Arm64Instruction> ordered,
+        int startIndex,
+        ulong assignabilityCore)
+    {
+        const int MaximumBodyInstructions = 192;
+        for (var offset = 0; offset < MaximumBodyInstructions && startIndex + offset < ordered.Count; offset++)
+        {
+            var instruction = ordered[startIndex + offset];
+            if (instruction.Mnemonic == Arm64Mnemonic.BL
+                && instruction.BranchTarget == assignabilityCore)
+                return true;
+            if (instruction.Mnemonic == Arm64Mnemonic.RET)
+                return false;
+        }
+
+        return false;
     }
 
     /// <summary>

@@ -398,6 +398,18 @@ public static class IlGenerator
                 StoreToOperand(castDestination, method, locals, writeLine);
                 break;
 
+            case OpCode.IsInst:
+                if (instruction.Operands is not
+                    [{ } isInstDestination, { } isInstSource, TypeAnalysisContext { IsValueType: false } isInstType])
+                    throw new InvalidOperationException($"IsInst指令操作数不完整: {instruction}");
+
+                LoadOperand(isInstSource, method, locals, writeLine, stringCtor);
+                instructions.Add(
+                    CilOpCodes.Isinst,
+                    importer.ImportTypeSignature(isInstType.ToTypeSignature(module)).ToTypeDefOrRef());
+                StoreToOperand(isInstDestination, method, locals, writeLine);
+                break;
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)

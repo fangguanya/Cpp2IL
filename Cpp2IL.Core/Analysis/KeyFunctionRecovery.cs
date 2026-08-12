@@ -28,6 +28,8 @@ public static class KeyFunctionRecovery
         "il2cpp_codegen_object_box",
     ];
 
+    private const string ObjectIsInstFunction = nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst);
+
     public static void RewriteAllocationsAndBarriers(MethodAnalysisContext method)
     {
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
@@ -77,6 +79,59 @@ public static class KeyFunctionRecovery
                     boxTypesByHandle);
             }
         }
+    }
+
+    /// <summary>
+    /// 把运行时 Object::IsInst 调用恢复为托管 isinst。原生帮助器返回原对象或 null，
+    /// 与强制转换的异常语义不同，因此必须保留独立操作码。
+    /// </summary>
+    public static void RewriteTypeTests(MethodAnalysisContext method)
+    {
+        var definitions = BuildUniqueDefinitions(method.ControlFlowGraph!.Instructions);
+        foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
+        {
+            if (instruction is not
+                {
+                    OpCode: OpCode.Call,
+                    Operands: [StringLiteral { Value: ObjectIsInstFunction }, LocalVariable result, { } source,
+                        { } typeHandle, ..],
+                })
+                continue;
+
+            var testedType = ResolveRuntimeClassType(typeHandle, definitions);
+            if (testedType is not { IsValueType: false })
+                continue;
+
+            result.Type = testedType;
+            instruction.OpCode = OpCode.IsInst;
+            instruction.SetOperands(result, source, testedType);
+        }
+    }
+
+    private static TypeAnalysisContext? ResolveRuntimeClassType(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (operand is LocalVariable local && visited.Add(local))
+        {
+            if (local.Type is RuntimeClassTypeAnalysisContext runtimeClass)
+                return runtimeClass.RepresentedType;
+            if (!definitions.TryGetValue(local, out var definition)
+                || definition is not { OpCode: OpCode.Move, Operands.Count: 2 })
+                return null;
+
+            operand = definition.Operands[1];
+        }
+
+        return operand switch
+        {
+            RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+            // 元数据解析器会把直接 TypeInfo 常量表示为被描述的托管类型；普通局部的
+            // Type 只描述局部自身，已在上方排除，二者不可混用。
+            TypeAnalysisContext type when type is not RuntimeClassTypeAnalysisContext => type,
+            _ => null,
+        };
     }
 
     private static IReadOnlyDictionary<string, TypeAnalysisContext> BuildProvenBoxTypesByHandle(

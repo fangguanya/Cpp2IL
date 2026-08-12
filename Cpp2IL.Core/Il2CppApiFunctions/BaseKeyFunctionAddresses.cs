@@ -48,7 +48,7 @@ public abstract class BaseKeyFunctionAddresses
     public ulong il2cpp_vm_exception_raise; //Thunked from above
     public ulong il2cpp_codegen_raise_exception; //Thunked TO above. don't know real name.
 
-    public ulong il2cpp_vm_object_is_inst; //Not exported, not thunked. Can be located via the Type#IsInstanceOfType icall.
+    public ulong il2cpp_vm_object_is_inst; // 可由旧版 Type.IsInstanceOfType 或新版 assignability 核心的高频尾跳板定位。
 
     public ulong il2cpp_codegen_write_barrier; //Not exported, not thunked. Located via corlib methods which store a reference into a field. Zero if the build has write barriers disabled.
 

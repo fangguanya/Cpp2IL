@@ -130,6 +130,7 @@ public class Instruction : IOperand
             case OpCode.Newobj:
             case OpCode.Box:
             case OpCode.CastClass:
+            case OpCode.IsInst:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -174,7 +175,7 @@ public class Instruction : IOperand
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
                 or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
-                or OpCode.Newobj or OpCode.Box or OpCode.CastClass
+                or OpCode.Newobj or OpCode.Box or OpCode.CastClass or OpCode.IsInst
                 => [_operands[1]],
 
             OpCode.VectorBitwiseSelect

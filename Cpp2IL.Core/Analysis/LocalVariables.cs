@@ -724,6 +724,9 @@ public static class LocalVariables
                 case OpCode.CastClass:
                     instructionChanged = PropagateCastClass(instruction);
                     break;
+                case OpCode.IsInst:
+                    instructionChanged = PropagateIsInst(instruction);
+                    break;
                 case OpCode.Not:
                     instructionChanged = BindBooleanNotResult(
                         instruction,
@@ -790,6 +793,19 @@ public static class LocalVariables
             return false;
 
         destination.Type = castType;
+        return true;
+    }
+
+    private static bool PropagateIsInst(Instruction instruction)
+    {
+        if (instruction.Operands is not
+            [LocalVariable destination, _, TypeAnalysisContext { IsValueType: false } testedType])
+            return false;
+
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, testedType))
+            return false;
+
+        destination.Type = testedType;
         return true;
     }
 

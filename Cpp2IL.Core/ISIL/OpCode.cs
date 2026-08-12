@@ -178,6 +178,9 @@ public enum OpCode
     /// <summary>把 op 2 的对象强制转换为 op 3 指定的引用类型，并把结果写入 op 1。</summary>
     CastClass,
 
+    /// <summary>测试 op 2 是否兼容 op 3 指定的引用类型；成功时写入原对象，失败时写入 null。</summary>
+    IsInst,
+
     /// <summary>
     /// Allocates a new array of the type described by op 2, with the length in op 3, into op 1.
     /// </summary>
