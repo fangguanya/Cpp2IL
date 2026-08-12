@@ -167,6 +167,50 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 集合状态更新前夹有业务赋值时保留赋值并闭合Add()
+    {
+        var fixture = CreateInterleavedHeadFixture(touchesReceiver: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Graph.Instructions.ToList();
+        var carrierMoveIndex = instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [var destination, var source] }
+            && ReferenceEquals(destination, fixture.Carrier)
+            && ReferenceEquals(source, fixture.Value));
+        var publicAddIndex = instructions.FindIndex(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(carrierMoveIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(publicAddIndex, Is.GreaterThan(carrierMoveIndex));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 夹入指令读取集合接收者时保持原容量控制流()
+    {
+        var fixture = CreateInterleavedHeadFixture(touchesReceiver: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 连续添加索引掩码漂移时保持原控制流()
     {
@@ -475,6 +519,23 @@ public class ListAddRecoveryTests
             unusedCarrier,
             graph.FindBlockByInstruction(instructions[7])!,
             slowBlock);
+    }
+
+    private static Fixture CreateInterleavedHeadFixture(bool touchesReceiver)
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var head = fixture.Graph.Blocks.Single(block => block.Instructions.Any(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] }));
+        var itemsLoadIndex = head.Instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] });
+        head.Instructions.Insert(
+            itemsLoadIndex + 1,
+            new Instruction(
+                -1,
+                OpCode.Move,
+                fixture.Carrier,
+                touchesReceiver ? fixture.Receiver : fixture.Value));
+        return fixture;
     }
 
     private static LocalVariable Local(string name, TypeAnalysisContext type)

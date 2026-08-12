@@ -46,7 +46,8 @@ public static class ListAddRecovery
                     out var rewriteStart,
                     out var items,
                     out var sizeState,
-                    out var versionResult))
+                    out var versionResult,
+                    out var preservedHeadBusiness))
                 continue;
             if (!TryGetFastBlock(head, slowBlock, merge, out var fastBlock))
                 continue;
@@ -73,6 +74,7 @@ public static class ListAddRecovery
                 rewriteStart,
                 slowCall,
                 slowTail,
+                preservedHeadBusiness,
                 addTarget,
                 receiver,
                 value);
@@ -134,7 +136,8 @@ public static class ListAddRecovery
         out Instruction rewriteStart,
         out LocalVariable items,
         out IOperand sizeState,
-        out LocalVariable versionResult)
+        out LocalVariable versionResult,
+        out List<Instruction> preservedHeadBusiness)
     {
         rewriteHead = null!;
         headPath = [];
@@ -142,11 +145,12 @@ public static class ListAddRecovery
         items = null!;
         sizeState = null!;
         versionResult = null!;
+        preservedHeadBusiness = [];
 
         // 首个 Add 直接读取字段，连续 Add 则会复用上一容量菱形在汇合边写入的
         // size/version 局部载体；ARM64 还允许把 items 读取排在版本加法之后。
         // 逐个扩大后缀窗口，只在全部指令都属于该标准状态机时接受。
-        for (var instructionCount = 5; instructionCount <= 9; instructionCount++)
+        for (var instructionCount = 5; instructionCount <= 32; instructionCount++)
         {
             if (!TryCollectHeadSuffix(head, instructionCount, out var suffix, out var candidatePath))
                 continue;
@@ -157,7 +161,8 @@ public static class ListAddRecovery
                     out _,
                     out var loadedItems,
                     out var candidateSizeState,
-                    out var candidateVersionResult))
+                    out var candidateVersionResult,
+                    out var candidateBusiness))
                 continue;
 
             rewriteHead = suffix[0].Block;
@@ -169,6 +174,7 @@ public static class ListAddRecovery
             items = loadedItems;
             sizeState = candidateSizeState;
             versionResult = candidateVersionResult;
+            preservedHeadBusiness = candidateBusiness;
             return true;
         }
 
@@ -182,12 +188,14 @@ public static class ListAddRecovery
         out Instruction itemsLoad,
         out LocalVariable items,
         out IOperand sizeState,
-        out LocalVariable versionResult)
+        out LocalVariable versionResult,
+        out List<Instruction> preservedHeadBusiness)
     {
         itemsLoad = null!;
         items = null!;
         sizeState = null!;
         versionResult = null!;
+        preservedHeadBusiness = [];
 
         if (suffix.Count < 5
             || suffix[^1].Instruction is not
@@ -235,15 +243,66 @@ public static class ListAddRecovery
         var allowed = new List<Instruction> { itemLoads[0], versionAdds[0], versionWrites[0] };
         if (!CollectStateLoad(prefix, versionAdds[0], versionSource, receiver, "_version", allowed)
             || !CollectStateLoad(prefix, suffix[^2].Instruction, checkedSize, receiver, "_size", allowed)
-            || prefix.Any(instruction => !allowed.Contains(instruction)))
+            )
+            return false;
+
+        var itemsLoadIndex = prefix.IndexOf(itemLoads[0]);
+        var versionAddIndex = prefix.IndexOf(versionAdds[0]);
+        var business = prefix.Where(instruction => !allowed.Contains(instruction)).ToList();
+        if (business.Any(instruction =>
+                prefix.IndexOf(instruction) <= itemsLoadIndex
+                || prefix.IndexOf(instruction) >= versionAddIndex
+                || !IsPreservableHeadBusinessInstruction(
+                    instruction,
+                    receiver,
+                    loadedItems,
+                    version,
+                    condition)))
             return false;
 
         itemsLoad = itemLoads[0];
         items = loadedItems;
         sizeState = checkedSize;
         versionResult = version;
+        preservedHeadBusiness = business;
         return true;
     }
+
+    /// <summary>
+    /// 只搬运发生在 List 状态变更之前的业务计算；它不得读取或写入集合接收者、
+    /// 容量载体和分支条件，也不得包含调用或控制流。这样公开 Add 仍位于原业务指令之后，
+    /// 同时不会把可能观察集合状态的操作跨过版本与大小更新。
+    /// </summary>
+    private static bool IsPreservableHeadBusinessInstruction(
+        Instruction instruction,
+        LocalVariable receiver,
+        LocalVariable items,
+        LocalVariable version,
+        LocalVariable condition)
+    {
+        if (instruction.IsCall
+            || instruction.OpCode is OpCode.Return
+                or OpCode.Jump
+                or OpCode.IndirectJump
+                or OpCode.ConditionalJump
+                or OpCode.Throw)
+            return false;
+
+        return instruction.Operands.All(operand =>
+            !ReferencesLocal(operand, receiver)
+            && !ReferencesLocal(operand, items)
+            && !ReferencesLocal(operand, version)
+            && !ReferencesLocal(operand, condition));
+    }
+
+    private static bool ReferencesLocal(IOperand operand, LocalVariable local)
+        => ReferenceEquals(operand, local)
+           || operand is FieldReference field && ReferenceEquals(field.Local, local)
+           || operand is MemoryOperand memory
+           && (memory.Base is not null && ReferencesLocal(memory.Base, local)
+               || memory.Index is not null && ReferencesLocal(memory.Index, local))
+           || operand is ArrayLength length && ReferencesLocal(length.Array, local)
+           || operand is ArrayAccess access && ReferencesLocal(access.Array, local);
 
     private static bool IsStateSource(
         IReadOnlyList<Instruction> instructions,
@@ -538,12 +597,14 @@ public static class ListAddRecovery
         Instruction rewriteStart,
         Instruction slowCall,
         IReadOnlyList<Instruction> slowTail,
+        IReadOnlyList<Instruction> preservedHeadBusiness,
         ConcreteGenericMethodAnalysisContext addTarget,
         LocalVariable receiver,
         IOperand value)
     {
         var firstRemovedIndex = rewriteHead.Instructions.IndexOf(rewriteStart);
         rewriteHead.Instructions.RemoveRange(firstRemovedIndex, rewriteHead.Instructions.Count - firstRemovedIndex);
+        rewriteHead.Instructions.AddRange(preservedHeadBusiness);
         rewriteHead.Instructions.Add(new Instruction(slowCall.Index, OpCode.CallVoid, addTarget, receiver, value));
         rewriteHead.Instructions.AddRange(slowTail);
 
