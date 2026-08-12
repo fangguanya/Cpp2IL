@@ -177,6 +177,53 @@ public class InterfaceDispatchRecoveryTests
         Assert.That(InterfaceDispatchRecovery.IsRuntimeClassOperand(definitions, ordinary), Is.False);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 值类型枚举器地址可恢复为接口接收者()
+    {
+        var enumerator = Local("enumerator");
+
+        var matched = InterfaceDispatchRecovery.TryResolveReceiverOperand(
+            new AddressOf(enumerator),
+            out var receiver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(receiver, Is.SameAs(enumerator));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零偏移地址解引用可恢复为接口接收者()
+    {
+        var enumeratorAddress = Local("enumeratorAddress");
+
+        var matched = InterfaceDispatchRecovery.TryResolveReceiverOperand(
+            new MemoryOperand(enumeratorAddress),
+            out var receiver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(receiver, Is.SameAs(enumeratorAddress));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 带偏移的原生地址不冒充接口接收者()
+    {
+        var nativeAddress = Local("nativeAddress");
+
+        var matched = InterfaceDispatchRecovery.TryResolveReceiverOperand(
+            new MemoryOperand(nativeAddress, addend: 8),
+            out _);
+
+        Assert.That(matched, Is.False);
+    }
+
     private static LocalVariable Local(string name)
         => new(name, new Register(null, name));
 }

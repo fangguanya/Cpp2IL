@@ -246,8 +246,8 @@ public static class InterfaceDispatchRecovery
         out IOperand interfaceType,
         out IOperand slot)
     {
-        if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands.Count: >= 4 }
-            || candidate.Operands[1] is not LocalVariable receiverOperand)
+        if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands.Count: >= 3 }
+            || !TryResolveReceiverOperand(candidate.Operands[1], out var receiverOperand))
         {
             receiver = null!;
             interfaceType = null!;
@@ -256,7 +256,11 @@ public static class InterfaceDispatchRecovery
         }
 
         var interfaceOperand = candidate.Operands[2];
-        var slotOperand = candidate.Operands[3];
+        // ARM64 会省略作为零号槽位实参的 W2 写入，因此仅在慢路径调用确实只有
+        // 接收者与接口类型两个显式实参时补零；已有第三个实参但无法解析时必须拒绝。
+        var slotOperand = candidate.Operands.Count == 3
+            ? new Immediate(0)
+            : candidate.Operands[3];
         if (!IsRuntimeClassOperand(definitions, interfaceOperand)
             || ResolveConstant(definitions, slotOperand) is not { } resolvedSlot
             || resolvedSlot is < 0 or > ushort.MaxValue)
@@ -271,6 +275,29 @@ public static class InterfaceDispatchRecovery
         interfaceType = interfaceOperand;
         slot = slotOperand;
         return true;
+    }
+
+    /// <summary>
+    /// 接口慢路径的接收者既可能直接位于 X0，也可能是值类型枚举器的地址。
+    /// 地址只接受已经类型化的局部目标，避免把任意原生指针提升为托管接口接收者。
+    /// </summary>
+    internal static bool TryResolveReceiverOperand(IOperand operand, out LocalVariable receiver)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                receiver = local;
+                return true;
+            case AddressOf { Target: LocalVariable addressed }:
+                receiver = addressed;
+                return true;
+            case MemoryOperand { Base: LocalVariable memoryBase, Index: null, Scale: 0, Addend: 0 }:
+                receiver = memoryBase;
+                return true;
+            default:
+                receiver = null!;
+                return false;
+        }
     }
 
     /// <summary>
