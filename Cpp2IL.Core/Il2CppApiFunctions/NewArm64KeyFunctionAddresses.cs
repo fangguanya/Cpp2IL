@@ -26,10 +26,76 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
     {
         // ARM64没有x86的0xCC函数填充。无条件B会完整转发参数与返回值，正是可安全识别的尾调用thunk；
         // BL只是普通子调用，纳入会把包含目标调用的大函数误判成运行时helper。
-        _ = maxBytesBack;
-        foreach (var address in FindDirectTailThunkAddresses(DisassembleTextSection(), addr, addressesToIgnore))
+        // 部分Unity ARM64运行时把实际可调用入口放在尾跳前一条无副作用的自移动指令上。
+        // 只有调用者计数能唯一证明此前入口时才回溯，避免把相邻函数末尾误并入thunk。
+        foreach (var address in FindDirectTailThunkEntryAddresses(
+                     DisassembleTextSection(),
+                     addr,
+                     maxBytesBack,
+                     addressesToIgnore))
             yield return address;
     }
+
+    internal static IReadOnlyList<ulong> FindDirectTailThunkEntryAddresses(
+        IReadOnlyList<Arm64Instruction> instructions,
+        ulong target,
+        uint maxBytesBack = 0,
+        IEnumerable<ulong>? addressesToIgnore = null)
+    {
+        var ignored = new HashSet<ulong>(addressesToIgnore ?? Enumerable.Empty<ulong>());
+        var ordered = instructions.OrderBy(instruction => instruction.Address).ToArray();
+        var indexByAddress = ordered
+            .Select((instruction, index) => (instruction.Address, index))
+            .GroupBy(pair => pair.Address)
+            .ToDictionary(group => group.Key, group => group.First().index);
+        var callerCounts = ordered
+            .Where(instruction => instruction.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BL
+                && instruction.BranchTarget != 0)
+            .GroupBy(instruction => instruction.BranchTarget)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var maximumInstructionsBack = checked((int)(maxBytesBack / sizeof(uint)));
+        var entries = new List<ulong>();
+
+        foreach (var branchAddress in FindDirectTailThunkAddresses(ordered, target, ignored))
+        {
+            if (maximumInstructionsBack == 0 || !indexByAddress.TryGetValue(branchAddress, out var branchIndex))
+            {
+                entries.Add(branchAddress);
+                continue;
+            }
+
+            var candidates = new List<ulong> { branchAddress };
+            var currentAddress = branchAddress;
+            for (var offset = 1; offset <= maximumInstructionsBack && branchIndex - offset >= 0; offset++)
+            {
+                var previous = ordered[branchIndex - offset];
+                if (previous.Address + sizeof(uint) != currentAddress
+                    || !IsNoOpSelfMove(previous)
+                    || ignored.Contains(previous.Address))
+                    break;
+
+                candidates.Add(previous.Address);
+                currentAddress = previous.Address;
+            }
+
+            var strongestCallerCount = candidates.Max(candidate =>
+                callerCounts.GetValueOrDefault(candidate));
+            var strongest = candidates
+                .Where(candidate => callerCounts.GetValueOrDefault(candidate) == strongestCallerCount)
+                .ToArray();
+
+            // 零调用者或并列强度都不能证明入口边界，保持精确尾跳地址。
+            entries.Add(strongestCallerCount > 0 && strongest.Length == 1
+                ? strongest[0]
+                : branchAddress);
+        }
+
+        return entries.Distinct().ToArray();
+    }
+
+    private static bool IsNoOpSelfMove(Arm64Instruction instruction) =>
+        instruction.Mnemonic == Arm64Mnemonic.MOV
+        && instruction.Op0Reg == instruction.Op1Reg;
 
     internal static IReadOnlyList<ulong> FindDirectTailThunkAddresses(
         IEnumerable<Arm64Instruction> instructions,

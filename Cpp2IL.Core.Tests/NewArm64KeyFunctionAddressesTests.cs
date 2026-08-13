@@ -97,6 +97,65 @@ public class NewArm64KeyFunctionAddressesTests
 
     [Test]
     [Category("基本功能")]
+    public void 高频调用者证明尾跳前自移动是真实Thunk入口()
+    {
+        var instructions = Decode(
+            0xE1, 0x03, 0x01, 0x2A, // 0x1000: MOV W1, W1，无副作用入口前缀
+            0x05, 0x00, 0x00, 0x14, // 0x1004: B 0x1018
+            0xFE, 0xFF, 0xFF, 0x97, // 0x1008: BL 0x1000，调用者一
+            0xFD, 0xFF, 0xFF, 0x97, // 0x100C: BL 0x1000，调用者二
+            0xC0, 0x03, 0x5F, 0xD6, // 0x1010: RET
+            0xC0, 0x03, 0x5F, 0xD6, // 0x1014: RET
+            0xC0, 0x03, 0x5F, 0xD6); // 0x1018: RET
+
+        var thunks = NewArm64KeyFunctionAddresses.FindDirectTailThunkEntryAddresses(
+            instructions,
+            0x1018,
+            sizeof(uint));
+
+        Assert.That(thunks, Is.EqualTo(new[] { 0x1000UL }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 禁止回溯时保持尾跳指令地址()
+    {
+        var instructions = Decode(
+            0xE1, 0x03, 0x01, 0x2A, // 0x1000: MOV W1, W1
+            0x03, 0x00, 0x00, 0x14, // 0x1004: B 0x1010
+            0xFE, 0xFF, 0xFF, 0x97, // 0x1008: BL 0x1000
+            0xC0, 0x03, 0x5F, 0xD6, // 0x100C: RET
+            0xC0, 0x03, 0x5F, 0xD6); // 0x1010: RET
+
+        var thunks = NewArm64KeyFunctionAddresses.FindDirectTailThunkEntryAddresses(
+            instructions,
+            0x1010,
+            0);
+
+        Assert.That(thunks, Is.EqualTo(new[] { 0x1004UL }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 改变实参的移动指令不得并入Thunk入口()
+    {
+        var instructions = Decode(
+            0xE1, 0x03, 0x02, 0x2A, // 0x1000: MOV W1, W2，会改变数组长度实参
+            0x03, 0x00, 0x00, 0x14, // 0x1004: B 0x1010
+            0xFE, 0xFF, 0xFF, 0x97, // 0x1008: BL 0x1000
+            0xC0, 0x03, 0x5F, 0xD6, // 0x100C: RET
+            0xC0, 0x03, 0x5F, 0xD6); // 0x1010: RET
+
+        var thunks = NewArm64KeyFunctionAddresses.FindDirectTailThunkEntryAddresses(
+            instructions,
+            0x1010,
+            sizeof(uint));
+
+        Assert.That(thunks, Is.EqualTo(new[] { 0x1004UL }));
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 普通返回前最后一个直接调用可定位IsInst()
     {
         var instructions = Decode(
