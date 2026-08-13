@@ -92,6 +92,77 @@ public class MetadataInitGuardRemoverTests
         }
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void AddressAddThenLoadRecognizesInitializedFlag()
+    {
+        var classAddress = new LocalVariable("classAddress", new Register(null, "X8"));
+        var flagAddress = new LocalVariable("flagAddress", new Register(null, "X9"));
+        var testedBit = new LocalVariable("testedBit", new Register(null, "TEST_BIT_VALUE"));
+        var address = new Instruction(0, OpCode.Add, flagAddress, classAddress, new Immediate(0x135));
+        var test = new Instruction(
+            1,
+            OpCode.And,
+            testedBit,
+            new MemoryOperand(baseRegister: flagAddress),
+            new Immediate(1));
+        var guard = new Block { Instructions = [address, test] };
+
+        Assert.That(MetadataInitGuardRemover.HasInitialisedFlagTest(guard, 0x135), Is.True);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void LoadedFlagThenBitTestRecognizesInitializedFlag()
+    {
+        var classAddress = new LocalVariable("classAddress", new Register(null, "X8"));
+        var flagAddress = new LocalVariable("flagAddress", new Register(null, "X9"));
+        var loadedFlag = new LocalVariable("loadedFlag", new Register(null, "X10"));
+        var testedBit = new LocalVariable("testedBit", new Register(null, "TEST_BIT_VALUE"));
+        var address = new Instruction(0, OpCode.Add, flagAddress, classAddress, new Immediate(0x135));
+        var load = new Instruction(1, OpCode.Move, loadedFlag, new MemoryOperand(baseRegister: flagAddress));
+        var test = new Instruction(2, OpCode.And, testedBit, loadedFlag, new Immediate(1));
+        var guard = new Block { Instructions = [address, load, test] };
+
+        Assert.That(MetadataInitGuardRemover.HasInitialisedFlagTest(guard, 0x135), Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void DirectInitializedFlagOffsetRemainsRecognized()
+    {
+        var classAddress = new LocalVariable("classAddress", new Register(null, "X8"));
+        var testedBit = new LocalVariable("testedBit", new Register(null, "TEST_BIT_VALUE"));
+        var test = new Instruction(
+            0,
+            OpCode.And,
+            testedBit,
+            new MemoryOperand(baseRegister: classAddress, addend: 0x135),
+            new Immediate(1));
+        var guard = new Block { Instructions = [test] };
+
+        Assert.That(MetadataInitGuardRemover.HasInitialisedFlagTest(guard, 0x135), Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void DifferentAddressAddIsNotClassifiedAsInitializedFlag()
+    {
+        var classAddress = new LocalVariable("classAddress", new Register(null, "X8"));
+        var flagAddress = new LocalVariable("flagAddress", new Register(null, "X9"));
+        var testedBit = new LocalVariable("testedBit", new Register(null, "TEST_BIT_VALUE"));
+        var address = new Instruction(0, OpCode.Add, flagAddress, classAddress, new Immediate(0x134));
+        var test = new Instruction(
+            1,
+            OpCode.And,
+            testedBit,
+            new MemoryOperand(baseRegister: flagAddress),
+            new Immediate(1));
+        var guard = new Block { Instructions = [address, test] };
+
+        Assert.That(MetadataInitGuardRemover.HasInitialisedFlagTest(guard, 0x135), Is.False);
+    }
+
     private static Instruction CreateFlagTest(long address, long mask) =>
         new(
             0,

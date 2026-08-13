@@ -54,9 +54,7 @@ public static class MetadataInitGuardRemover
 
         // see if we're checking Il2CppClass::initialized_and_no_error
         // that means this is runtime_init boilerplate and we can drop the block
-        var initialisedFlagTest = guard.Instructions.Any(i => i.OpCode == OpCode.And
-            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask]
-            && flag.Addend == initialisedFlagOffset && IsOne(mask));
+        var initialisedFlagTest = HasInitialisedFlagTest(guard, initialisedFlagOffset);
         var constantMetadataFlagTest = GuardPrefixBlocks(guard)
             .Any(HasConstantMetadataFlagTest);
 
@@ -69,6 +67,65 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
+
+    /// <summary>
+    /// 判断保护块是否读取 <c>Il2CppClass::initialized_and_no_error</c>。
+    /// ARM64 既会直接读取 <c>[class+0x135]</c>，也会先用 ADD 生成字段地址再读取
+    /// <c>[address]</c>；两种严格等价的形态必须由同一处判定，避免把类初始化调用
+    /// 错认成共享原生地址上的托管方法。
+    /// </summary>
+    internal static bool HasInitialisedFlagTest(Block guard, long initialisedFlagOffset)
+    {
+        var prefixInstructions = GuardPrefixBlocks(guard)
+            .SelectMany(block => block.Instructions)
+            .ToList();
+        var definitions = guard.Instructions
+            .Select(instruction => (instruction, destination: instruction.Destination as LocalVariable))
+            .Where(pair => pair.destination != null)
+            .GroupBy(pair => pair.destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single().instruction);
+
+        foreach (var instruction in prefixInstructions)
+        {
+            if (instruction.OpCode != OpCode.And
+                || instruction.Operands is not [_, { } flagOperand, { } mask]
+                || !IsOne(mask))
+                continue;
+
+            var resolvedFlag = ResolveMemoryOperand(flagOperand, definitions);
+            if (resolvedFlag is not { Index: null, Scale: 0 } flag)
+                continue;
+
+            if (flag.Base is LocalVariable && flag.Addend == initialisedFlagOffset)
+                return true;
+
+            if (flag is not { Base: LocalVariable address, Addend: 0 })
+                continue;
+
+            definitions.TryGetValue(address, out var addressDefinition);
+            if (addressDefinition?.Operands is [_, _, Immediate offset]
+                && offset.Value == initialisedFlagOffset)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static MemoryOperand? ResolveMemoryOperand(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        for (var depth = 0; depth < 8 && operand is LocalVariable local; depth++)
+        {
+            if (!definitions.TryGetValue(local, out var definition)
+                || definition is not { OpCode: OpCode.Move, Operands: [_, { } source] })
+                return null;
+            operand = source;
+        }
+
+        return operand is MemoryOperand memory ? memory : null;
+    }
 
     internal static bool IsConstantMetadataFlagTest(Instruction instruction) =>
         instruction.OpCode == OpCode.And
