@@ -119,6 +119,105 @@ public static class InterfaceDispatchRecovery
 
     private readonly record struct SlotSelection(IOperand Condition, int TrueSlot, int FalseSlot);
 
+    /// <summary>
+    /// 判断单地址表中的 <c>List&lt;T&gt;.AddWithResize</c> 候选是否实际承载接口慢查表结果。
+    /// 该助手返回 <c>VirtualInvokeData*</c>，所以原始 Call 的 X0 结果必然进入 Phi，并由合并结果
+    /// 零偏移读取 methodPtr。真正的 void AddWithResize 没有可被托管代码消费的返回值，不满足此形状。
+    /// </summary>
+    internal static bool ShouldDeferSharedAddWithResizeBinding(
+        Instruction call,
+        MethodAnalysisContext candidate,
+        IEnumerable<Instruction> instructions)
+    {
+        if (!IsSharedAddWithResizeCandidate(candidate))
+            return false;
+
+        if (call.OpCode != OpCode.Call || call.Destination is not LocalVariable callResult)
+        {
+            Logger.VerboseNewline(
+                $"共享 AddWithResize 返回槽检查：调用 {call.Index} 已无 X0 返回槽，无法延迟绑定；{call}",
+                nameof(InterfaceDispatchRecovery));
+            return false;
+        }
+
+        var allInstructions = instructions as IReadOnlyCollection<Instruction> ?? instructions.ToList();
+        var resultAliases = new HashSet<LocalVariable> { callResult };
+
+        // SSA 边复制可能在进入 Phi 前增加一层或多层纯 Move；只扩展从返回值出发的正向别名，
+        // 不跨算术、字段或内存载荷，避免把普通 X0 寄存器复用误认为接口查表结果。
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var instruction in allInstructions)
+            {
+                if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, LocalVariable source] }
+                    || !resultAliases.Contains(source))
+                    continue;
+
+                changed |= resultAliases.Add(destination);
+            }
+        }
+
+        var consumingPhiCount = 0;
+        foreach (var phi in allInstructions)
+        {
+            if (phi is not { OpCode: OpCode.Phi, Operands.Count: >= 3 }
+                || phi.Destination is not LocalVariable invokeData
+                || !phi.Operands.Skip(1).OfType<LocalVariable>().Any(resultAliases.Contains))
+                continue;
+
+            consumingPhiCount++;
+
+            if (allInstructions.Any(instruction => IsMethodPointerLoad(instruction, invokeData)))
+            {
+                Logger.VerboseNewline(
+                    $"共享 AddWithResize 返回槽检查：调用 {call.Index} 命中 VirtualInvokeData Phi {phi.Index}，延迟绑定。",
+                    nameof(InterfaceDispatchRecovery));
+                return true;
+            }
+        }
+
+        Logger.VerboseNewline(
+            $"共享 AddWithResize 返回槽检查：调用 {call.Index} 的返回别名={resultAliases.Count}、消费 Phi={consumingPhiCount}，未命中零偏移 methodPtr。",
+            nameof(InterfaceDispatchRecovery));
+
+        return false;
+    }
+
+    internal static bool IsSharedAddWithResizeCandidate(MethodAnalysisContext candidate)
+    {
+        if (candidate.Name != "AddWithResize" || !candidate.IsVoid || candidate.DeclaringType == null)
+            return false;
+
+        var declaringType = candidate.DeclaringType is GenericInstanceTypeAnalysisContext instance
+            ? instance.GenericType
+            : candidate.DeclaringType;
+        return declaringType.FullName == "System.Collections.Generic.List`1";
+    }
+
+    private static bool IsMethodPointerLoad(Instruction instruction, LocalVariable invokeData)
+        => instruction is
+        {
+            OpCode: OpCode.Move,
+            Operands: [LocalVariable, MemoryOperand
+            {
+                Base: LocalVariable memoryBase,
+                Index: null,
+                Scale: 0,
+                Addend: 0,
+            }],
+        } && ReferenceEquals(memoryBase, invokeData)
+        || instruction is
+        {
+            OpCode: OpCode.Move,
+            Operands: [LocalVariable, FieldReference
+            {
+                Local: LocalVariable fieldBase,
+                Offset: 0,
+            }],
+        } && ReferenceEquals(fieldBase, invokeData);
+
     private static Match? MatchDispatch(
         MethodAnalysisContext method,
         Instruction dispatch,
@@ -258,8 +357,7 @@ public static class InterfaceDispatchRecovery
         out IOperand interfaceType,
         out IOperand slot)
     {
-        if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands.Count: >= 3 }
-            || !TryResolveReceiverOperand(candidate.Operands[1], out var receiverOperand))
+        if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid })
         {
             receiver = null!;
             interfaceType = null!;
@@ -267,12 +365,24 @@ public static class InterfaceDispatchRecovery
             return false;
         }
 
-        var interfaceOperand = candidate.Operands[2];
+        // 未解析 Call 包含目标、返回槽、X0..Xn；已解析 void 调用只有目标、X0..Xn。
+        // 统一从首个实参计算索引，避免把保留下来的 VirtualInvokeData 返回局部误当接收者。
+        var firstArgument = candidate.OpCode == OpCode.Call ? 2 : 1;
+        if (candidate.Operands.Count < firstArgument + 2
+            || !TryResolveReceiverOperand(candidate.Operands[firstArgument], out var receiverOperand))
+        {
+            receiver = null!;
+            interfaceType = null!;
+            slot = null!;
+            return false;
+        }
+
+        var interfaceOperand = candidate.Operands[firstArgument + 1];
         // ARM64 会省略作为零号槽位实参的 W2 写入，因此仅在慢路径调用确实只有
         // 接收者与接口类型两个显式实参时补零；已有第三个实参但无法解析时必须拒绝。
-        var slotOperand = candidate.Operands.Count == 3
+        var slotOperand = candidate.Operands.Count == firstArgument + 2
             ? new Immediate(0)
-            : candidate.Operands[3];
+            : candidate.Operands[firstArgument + 2];
         if (!IsRuntimeClassOperand(definitions, interfaceOperand)
             || ResolveConstant(definitions, slotOperand) is not { } resolvedSlot
             || resolvedSlot is < 0 or > ushort.MaxValue)
@@ -360,20 +470,66 @@ public static class InterfaceDispatchRecovery
         Dictionary<LocalVariable, Instruction> definitions,
         IOperand operand)
     {
-        if (operand is RuntimeClassTypeAnalysisContext)
+        if (ResolveRuntimeClassOperand(definitions, operand) != null)
             return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// 将接口 TypeInfo 的直接值、强类型局部和零偏移槽读取归一为同一运行时类身份。
+    /// ARM64 可把 <c>LDR X1,[slot]</c> 直接保留为调用实参；只有同一内存源还生成了唯一
+    /// <c>RuntimeClassTypeAnalysisContext</c> 局部时才接受，避免把普通对象或 MethodInfo 槽误判为接口类。
+    /// </summary>
+    private static RuntimeClassTypeAnalysisContext? ResolveRuntimeClassOperand(
+        Dictionary<LocalVariable, Instruction> definitions,
+        IOperand operand)
+    {
+        if (operand is RuntimeClassTypeAnalysisContext direct)
+            return direct;
         if (operand is not LocalVariable local)
-            return false;
+        {
+            var matchingTypes = definitions.Values
+                .Where(definition => definition is
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [LocalVariable { Type: RuntimeClassTypeAnalysisContext }, IOperand],
+                })
+                .Where(definition => SameMemorySource(definition.Operands[1], operand))
+                .Select(definition => (RuntimeClassTypeAnalysisContext)((LocalVariable)definition.Operands[0]).Type!)
+                .Distinct()
+                .Take(2)
+                .ToList();
+            return matchingTypes.Count == 1 ? matchingTypes[0] : null;
+        }
 
-        if (local.Type is RuntimeClassTypeAnalysisContext)
-            return true;
+        if (local.Type is RuntimeClassTypeAnalysisContext typed)
+            return typed;
 
+        if (ChaseCopies(definitions, local) is
+        {
+            OpCode: OpCode.Move,
+            Operands: [_, RuntimeClassTypeAnalysisContext copied],
+        })
+            return copied;
+
+        // 调用实参可能是从 TypeInfo 槽新加载出的未类型化 SSA 版本；沿该唯一 Move 读取回到
+        // 内存源，再与同源的强类型加载核对。这里不沿任意算术或 Phi，保持元数据身份唯一。
         return ChaseCopies(definitions, local) is
         {
             OpCode: OpCode.Move,
-            Operands: [_, RuntimeClassTypeAnalysisContext],
-        };
+            Operands: [_, MemoryOperand source],
+        } ? ResolveRuntimeClassOperand(definitions, source) : null;
     }
+
+    private static bool SameMemorySource(IOperand left, IOperand right)
+        => ReferenceEquals(left, right)
+           || left is MemoryOperand leftMemory
+           && right is MemoryOperand rightMemory
+           && ReferenceEquals(leftMemory.Base, rightMemory.Base)
+           && ReferenceEquals(leftMemory.Index, rightMemory.Index)
+           && leftMemory.Scale == rightMemory.Scale
+           && leftMemory.Addend == rightMemory.Addend;
 
     internal static long? ResolveConstant(Dictionary<LocalVariable, Instruction> definitions, IOperand operand)
     {
@@ -508,14 +664,10 @@ public static class InterfaceDispatchRecovery
             && IsInterface(metadataType))
             return metadataType;
 
-        if (interfaceArg is LocalVariable typedInterface
-            && typedInterface.Type is RuntimeClassTypeAnalysisContext { RepresentedType: { } representedInterface }
+        if (ResolveRuntimeClassOperand(definitions, interfaceArg) is
+            { RepresentedType: { } representedInterface }
             && IsInterface(representedInterface))
             return representedInterface;
-
-        if (interfaceArg is RuntimeClassTypeAnalysisContext { RepresentedType: { } directInterface }
-            && IsInterface(directInterface))
-            return directInterface;
 
         if (receiverArg.Type is { } receiverType && IsInterface(receiverType))
             return receiverType;

@@ -224,7 +224,11 @@ public static class MetadataResolver
             if (targetMethods is not [{ } singleTargetMethod])
                 continue;
 
-            BindCallTarget(callInstruction, singleTargetMethod);
+            // IL2CPP 的接口慢查表助手可能与 List<T>.AddWithResize 共用同一原生地址。
+            // 当原始 X0 返回值已经进入 VirtualInvokeData 的双路 Phi 时，先绑定 void 方法会删除
+            // 这个真实返回槽，令后续接口分派只能看到快速路径。此处只延迟具有完整消费者形状的
+            // 共享地址调用；接口、槽位和 vtable 证据仍由 InterfaceDispatchRecovery 统一验收。
+            TryBindCallTarget(method, callInstruction, singleTargetMethod);
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
@@ -286,8 +290,7 @@ public static class MetadataResolver
             if (AreInterchangeable(candidates))
             {
                 var preferred = PreferredOf(candidates);
-                BindCallTarget(instruction, preferred);
-                changed = true;
+                changed |= TryBindCallTarget(method, instruction, preferred);
                 continue;
             }
 
@@ -316,8 +319,7 @@ public static class MetadataResolver
             if (match == null)
                 continue;
 
-            BindCallTarget(instruction, match);
-            changed = true;
+            changed |= TryBindCallTarget(method, instruction, match);
         }
 
         return changed;
@@ -447,8 +449,7 @@ public static class MetadataResolver
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
                     continue;
 
-                BindCallTarget(instruction, representedMethod);
-                changed = true;
+                changed |= TryBindCallTarget(method, instruction, representedMethod);
                 continue;
             }
 
@@ -460,11 +461,29 @@ public static class MetadataResolver
             if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase)))
                 continue;
 
-            BindCallTarget(instruction, representedMethod);
-            changed = true;
+            changed |= TryBindCallTarget(method, instruction, representedMethod);
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 所有托管调用身份绑定共用同一共享地址保护门，防止直接地址、接收者推导和 MethodInfo
+    /// 三条解析路径出现不同语义。返回值精确表示本次是否完成绑定，供不动点统计使用。
+    /// </summary>
+    private static bool TryBindCallTarget(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        MethodAnalysisContext target)
+    {
+        if (InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
+                instruction,
+                target,
+                method.ControlFlowGraph!.Instructions))
+            return false;
+
+        BindCallTarget(instruction, target);
+        return true;
     }
 
     // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.

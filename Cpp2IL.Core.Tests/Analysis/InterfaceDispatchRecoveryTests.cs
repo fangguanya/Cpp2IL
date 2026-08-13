@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -179,6 +180,94 @@ public class InterfaceDispatchRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 同一零偏移槽的直接内存实参恢复接口类型信息()
+    {
+        var interfaceDefinition = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            interfaceDefinition,
+            interfaceDefinition.DeclaringAssembly);
+        var slot = Local("slot");
+        var loadedType = new LocalVariable("loadedType", new Register(null, "X1"), runtimeClassType);
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [loadedType] = new Instruction(0, OpCode.Move, loadedType, new MemoryOperand(slot)),
+        };
+
+        Assert.That(
+            InterfaceDispatchRecovery.IsRuntimeClassOperand(definitions, new MemoryOperand(slot)),
+            Is.True);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 同源未类型化实参局部恢复接口类型信息()
+    {
+        var interfaceDefinition = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            interfaceDefinition,
+            interfaceDefinition.DeclaringAssembly);
+        var slot = Local("slot");
+        var typedLoad = new LocalVariable("typedLoad", new Register(null, "X1"), runtimeClassType);
+        var argumentLoad = Local("argumentLoad");
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [typedLoad] = new Instruction(0, OpCode.Move, typedLoad, new MemoryOperand(slot)),
+            [argumentLoad] = new Instruction(1, OpCode.Move, argumentLoad, new MemoryOperand(slot)),
+        };
+
+        Assert.That(
+            InterfaceDispatchRecovery.IsRuntimeClassOperand(definitions, argumentLoad),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一最大正偏移槽仍恢复接口类型信息()
+    {
+        var interfaceDefinition = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            interfaceDefinition,
+            interfaceDefinition.DeclaringAssembly);
+        var slot = Local("slot");
+        var loadedType = new LocalVariable("loadedType", new Register(null, "X1"), runtimeClassType);
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [loadedType] = new Instruction(0, OpCode.Move, loadedType, new MemoryOperand(slot, addend: int.MaxValue)),
+        };
+
+        Assert.That(
+            InterfaceDispatchRecovery.IsRuntimeClassOperand(
+                definitions,
+                new MemoryOperand(slot, addend: int.MaxValue)),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同偏移内存槽不复用接口类型身份()
+    {
+        var interfaceDefinition = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            interfaceDefinition,
+            interfaceDefinition.DeclaringAssembly);
+        var slot = Local("slot");
+        var loadedType = new LocalVariable("loadedType", new Register(null, "X1"), runtimeClassType);
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [loadedType] = new Instruction(0, OpCode.Move, loadedType, new MemoryOperand(slot)),
+        };
+
+        Assert.That(
+            InterfaceDispatchRecovery.IsRuntimeClassOperand(definitions, new MemoryOperand(slot, addend: 8)),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 值类型枚举器地址可恢复为接口接收者()
     {
         var enumerator = Local("enumerator");
@@ -222,6 +311,92 @@ public class InterfaceDispatchRecoveryTests
             out _);
 
         Assert.That(matched, Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 共享AddWithResize地址的接口慢查表返回槽延迟绑定()
+    {
+        var callResult = Local("callResult");
+        var fastResult = Local("fastResult");
+        var invokeData = Local("invokeData");
+        var methodPointer = Local("methodPointer");
+        var call = new Instruction(0, OpCode.Call, new Immediate(0x219B070), callResult, Local("receiver"));
+        var phi = new Instruction(1, OpCode.Phi, invokeData, callResult, fastResult);
+        var load = new Instruction(2, OpCode.Move, methodPointer, new MemoryOperand(invokeData));
+
+        var deferred = InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
+            call,
+            CreateAddWithResizeCandidate(),
+            [call, phi, load]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(deferred, Is.True);
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(call.Destination, Is.SameAs(callResult));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 多层边复制与零偏移字段仍保留接口慢查表返回槽()
+    {
+        var callResult = Local("callResult");
+        var aliasA = Local("aliasA");
+        var aliasB = Local("aliasB");
+        var fastResult = Local("fastResult");
+        var invokeData = Local("invokeData");
+        var methodPointer = Local("methodPointer");
+        var call = new Instruction(0, OpCode.Call, new Immediate(0x219B070), callResult, Local("receiver"));
+        var copyA = new Instruction(1, OpCode.Move, aliasA, callResult);
+        var copyB = new Instruction(2, OpCode.Move, aliasB, aliasA);
+        var phi = new Instruction(3, OpCode.Phi, invokeData, aliasB, fastResult);
+        var load = new Instruction(4, OpCode.Move, methodPointer, new FieldReference(null!, invokeData, 0));
+
+        Assert.That(
+            InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
+                call,
+                CreateAddWithResizeCandidate(),
+                [call, copyA, copyB, phi, load]),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非零偏移消费者不延迟真实AddWithResize绑定()
+    {
+        var callResult = Local("callResult");
+        var fastResult = Local("fastResult");
+        var invokeData = Local("invokeData");
+        var loaded = Local("loaded");
+        var call = new Instruction(0, OpCode.Call, new Immediate(0x219B070), callResult, Local("receiver"));
+        var phi = new Instruction(1, OpCode.Phi, invokeData, callResult, fastResult);
+        var load = new Instruction(2, OpCode.Move, loaded, new MemoryOperand(invokeData, addend: 8));
+
+        Assert.That(
+            InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
+                call,
+                CreateAddWithResizeCandidate(),
+                [call, phi, load]),
+            Is.False);
+    }
+
+    private static MethodAnalysisContext CreateAddWithResizeCandidate()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [listDefinition.GenericParameters.Single()]);
+        return new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [app.SystemTypes.SystemStringType],
+            []);
     }
 
     private static LocalVariable Local(string name)

@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using Disarm;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
@@ -1523,9 +1524,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
 
             var calledMethod = methodsAtAddress.Count == 1 ? methodsAtAddress[0] : context;
-            Register? returnRegister = calledMethod.IsVoid
-                ? null
-                : Arm64CallingConventionResolver.ReturnRegister(calledMethod);
+            // 某些 Unity 6 构建会让接口慢查表助手与 List<T>.AddWithResize 共用原生地址。
+            // 前者真实返回 VirtualInvokeData*，后者为 void；在 CFG/SSA 消费关系建立前不能丢掉 X0。
+            // 仅对该已知共享身份保留原始返回槽，MetadataResolver 会删除普通 void 的伪返回值，
+            // InterfaceDispatchRecovery 则以 Phi、零偏移 methodPtr 和 vtable 链完成最终裁决。
+            var preservePotentialInterfaceLookupResult = calledMethod.IsVoid
+                && methodsAtAddress.Any(InterfaceDispatchRecovery.IsSharedAddWithResizeCandidate);
+            Register? returnRegister = preservePotentialInterfaceLookupResult
+                ? new Register(null, nameof(Arm64Register.X0))
+                : calledMethod.IsVoid
+                    ? null
+                    : Arm64CallingConventionResolver.ReturnRegister(calledMethod);
             var call = returnRegister == null
                 ? Add(address, OpCode.CallVoid, Imm(target))
                 : Add(address, OpCode.Call, Imm(target), returnRegister);
