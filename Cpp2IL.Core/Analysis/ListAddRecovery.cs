@@ -1,8 +1,10 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -52,6 +54,7 @@ public static class ListAddRecovery
             if (!TryGetFastBlock(head, slowBlock, merge, out var fastBlock))
                 continue;
             if (!TryMatchFastPath(
+                    graph,
                     fastBlock,
                     merge,
                     receiver,
@@ -59,7 +62,9 @@ public static class ListAddRecovery
                     sizeState,
                     versionResult,
                     value,
-                    slowTail))
+                    slowTail,
+                    addWithResize.AppContext,
+                    out var publicValue))
                 continue;
             if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
                 continue;
@@ -77,7 +82,7 @@ public static class ListAddRecovery
                 preservedHeadBusiness,
                 addTarget,
                 receiver,
-                value);
+                publicValue);
             recovered++;
         }
 
@@ -458,6 +463,7 @@ public static class ListAddRecovery
     }
 
     private static bool TryMatchFastPath(
+        ISILControlFlowGraph graph,
         Block block,
         Block merge,
         LocalVariable receiver,
@@ -465,8 +471,11 @@ public static class ListAddRecovery
         IOperand sizeState,
         LocalVariable versionResult,
         IOperand value,
-        IReadOnlyList<Instruction> slowTail)
+        IReadOnlyList<Instruction> slowTail,
+        ApplicationAnalysisContext appContext,
+        out IOperand publicValue)
     {
+        publicValue = null!;
         var instructions = PatternInstructions(block);
         if (instructions.Count < 6
             || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
@@ -474,8 +483,7 @@ public static class ListAddRecovery
             return false;
 
         var stores = instructions.Where(instruction =>
-            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, var storedValue] }
-            && ReferenceEquals(storedValue, value)).ToList();
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] }).ToList();
         var sizeAdds = instructions.Where(instruction =>
             instruction is { OpCode: OpCode.Add, Operands: [LocalVariable, var source, Immediate { Value: 1 }] }
             && IsSameStateOperand(source, sizeState, receiver, "_size")).ToList();
@@ -483,6 +491,13 @@ public static class ListAddRecovery
             || sizeAdds.Count != 1
             || stores[0].Operands[0] is not MemoryOperand memory
             || sizeAdds[0].Operands[0] is not LocalVariable newSize)
+            return false;
+        if (!TryReconcileElementValue(
+                graph,
+                stores[0].Operands[1],
+                value,
+                appContext,
+                out publicValue))
             return false;
 
         var sizeWrites = instructions.Where(instruction =>
@@ -543,6 +558,112 @@ public static class ListAddRecovery
         var fastTail = instructions.Where(instruction => !allowed.Contains(instruction)).ToList();
         var slowBusinessTail = slowTail.Where(instruction => !slowStateRefreshes.Contains(instruction)).ToList();
         return HaveIdenticalCarrierMoves(fastTail, slowBusinessTail);
+    }
+
+    /// <summary>
+    /// 统一快速路径的整元素常量写入与慢路径的 HFA 参数。
+    /// </summary>
+    /// <remarks>
+    /// ARM64 会把 <c>Vector2</c> 等 HFA 在快速路径打包成一次 D 寄存器常量写入，慢路径则按
+    /// V0/V1 分量调用 <c>AddWithResize</c>。后期死码清理可能只留下未定义的 ABI 分量局部变量；
+    /// 此时必须从同一快速路径的只读常量恢复完整值，不能把两个默认浮点数写入公开 Add。
+    /// </remarks>
+    private static bool TryReconcileElementValue(
+        ISILControlFlowGraph graph,
+        IOperand fastValue,
+        IOperand slowValue,
+        ApplicationAnalysisContext appContext,
+        out IOperand publicValue)
+    {
+        publicValue = null!;
+        if (ReferenceEquals(fastValue, slowValue))
+        {
+            publicValue = slowValue;
+            return true;
+        }
+
+        if (fastValue is not MemoryOperand { IsConstant: true, Addend: > 0 } packed
+            || slowValue is not HomogeneousFloatingAggregateArgument aggregate
+            || !TryDecodePackedHfaConstant(appContext, packed, aggregate, out var decoded))
+            return false;
+
+        var unresolvedAbiComponents = aggregate.Components.Select((component, index) => (component, index)).All(entry =>
+            entry.component is LocalVariable local
+            && local.Register.Name == $"V{entry.index}"
+            && graph.Instructions.All(instruction => !ReferenceEquals(instruction.Destination, local)));
+        if (!unresolvedAbiComponents && !HaveSameFloatingBits(aggregate.Components, decoded.Components))
+            return false;
+
+        publicValue = decoded;
+        return true;
+    }
+
+    private static bool TryDecodePackedHfaConstant(
+        ApplicationAnalysisContext appContext,
+        MemoryOperand packed,
+        HomogeneousFloatingAggregateArgument aggregate,
+        out HomogeneousFloatingAggregateArgument decoded)
+    {
+        decoded = null!;
+        if (!Arm64CallingConventionResolver.TryGetHomogeneousFloatingAggregateFields(
+                aggregate.AggregateType,
+                out var fields)
+            || fields.Count != aggregate.Components.Count
+            || fields.Count is < 1 or > 4)
+            return false;
+
+        var isSingle = fields.All(field => field.FieldType.FullName == "System.Single");
+        var isDouble = fields.All(field => field.FieldType.FullName == "System.Double");
+        if (!isSingle && !isDouble)
+            return false;
+
+        var elementSize = isSingle ? sizeof(float) : sizeof(double);
+        var byteCount = checked(fields.Count * elementSize);
+        try
+        {
+            if (!appContext.Binary.TryMapVirtualAddressToRaw(unchecked((ulong)packed.Addend), out var rawAddress))
+                return false;
+            var bytes = appContext.Binary.Reader.ReadByteArrayAtRawAddress(rawAddress, byteCount);
+            var components = new List<IOperand>(fields.Count);
+            for (var index = 0; index < fields.Count; index++)
+            {
+                var offset = index * elementSize;
+                components.Add(isSingle
+                    ? new FloatLiteral(BitConverter.ToSingle(bytes, offset))
+                    : new DoubleLiteral(BitConverter.ToDouble(bytes, offset)));
+            }
+
+            decoded = new HomogeneousFloatingAggregateArgument(aggregate.AggregateType, components);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool HaveSameFloatingBits(
+        IReadOnlyList<IOperand> left,
+        IReadOnlyList<IOperand> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            var same = left[index] switch
+            {
+                FloatLiteral leftFloat when right[index] is FloatLiteral rightFloat =>
+                    BitConverter.SingleToInt32Bits(leftFloat.Value) == BitConverter.SingleToInt32Bits(rightFloat.Value),
+                DoubleLiteral leftDouble when right[index] is DoubleLiteral rightDouble =>
+                    BitConverter.DoubleToInt64Bits(leftDouble.Value) == BitConverter.DoubleToInt64Bits(rightDouble.Value),
+                _ => false,
+            };
+            if (!same)
+                return false;
+        }
+
+        return true;
     }
 
     private static bool CollectUInt32IndexNormalization(

@@ -60,6 +60,80 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Hfa快速路径常量与慢路径分量统一为公开Add值()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = CreateHfaValueType("ListAddVector2");
+        var fixture = CreateFixture(vector);
+        var constantAddress = app.Binary.GetVirtualAddressOfPrimaryExecutableSection();
+        Assert.That(app.Binary.TryMapVirtualAddressToRaw(constantAddress, out _), Is.True);
+
+        var store = fixture.Graph.Instructions.Single(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] });
+        store.SetOperand(1, new MemoryOperand(addend: unchecked((long)constantAddress)));
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        slowCall.SetOperand(
+            2,
+            new HomogeneousFloatingAggregateArgument(
+                vector,
+                [
+                    Local("x", app.SystemTypes.SystemSingleType, "V0"),
+                    Local("y", app.SystemTypes.SystemSingleType, "V1"),
+                ]));
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var publicCall = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)publicCall.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(publicCall.Operands[2], Is.InstanceOf<HomogeneousFloatingAggregateArgument>());
+            var publicValue = (HomogeneousFloatingAggregateArgument)publicCall.Operands[2];
+            Assert.That(publicValue.Components, Has.All.InstanceOf<FloatLiteral>());
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Hfa快速路径常量地址无效时保持原容量控制流()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = CreateHfaValueType("ListAddInvalidVector2");
+        var fixture = CreateFixture(vector);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+        var store = fixture.Graph.Instructions.Single(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] });
+        store.SetOperand(1, new MemoryOperand(addend: long.MaxValue));
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        slowCall.SetOperand(
+            2,
+            new HomogeneousFloatingAggregateArgument(
+                vector,
+                [
+                    Local("x", app.SystemTypes.SystemSingleType, "V0"),
+                    Local("y", app.SystemTypes.SystemSingleType, "V1"),
+                ]));
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 快路径重新读取同一Items字段时仍闭合为Add()
     {
@@ -566,8 +640,26 @@ public class ListAddRecoveryTests
         return fixture;
     }
 
-    private static LocalVariable Local(string name, TypeAnalysisContext type)
-        => new(name, new Register(null, name), type);
+    private static InjectedTypeAnalysisContext CreateHfaValueType(string name)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var valueType = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.ValueType")!;
+        var aggregate = app.InjectTypeIntoAllAssemblies(
+                "Cpp2IL.Core.Tests",
+                name,
+                valueType,
+                System.Reflection.TypeAttributes.Public
+                | System.Reflection.TypeAttributes.Sealed
+                | System.Reflection.TypeAttributes.SequentialLayout)
+            .InjectedTypes[0];
+        aggregate.InjectFieldContext("x", app.SystemTypes.SystemSingleType, System.Reflection.FieldAttributes.Public);
+        aggregate.InjectFieldContext("y", app.SystemTypes.SystemSingleType, System.Reflection.FieldAttributes.Public);
+        return aggregate;
+    }
+
+    private static LocalVariable Local(string name, TypeAnalysisContext type, string? registerName = null)
+        => new(name, new Register(null, registerName ?? name), type);
 
     private static bool ContainsListImplementationMember(ISILControlFlowGraph graph)
         => graph.Instructions.SelectMany(instruction => instruction.Operands).Any(operand =>
