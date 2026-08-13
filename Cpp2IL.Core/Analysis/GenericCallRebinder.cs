@@ -49,16 +49,41 @@ public static class GenericCallRebinder
         var changed = false;
         var firstArgument = call.OpCode == OpCode.CallVoid ? 1 : 2;
         GenericInstanceTypeAnalysisContext? concreteReceiver = null;
+        var receiverDefinesTypeArguments = false;
 
         if (!current.IsStatic
             && firstArgument < call.Operands.Count
             && OperandType(call.Operands[firstArgument], definitions) is GenericInstanceTypeAnalysisContext receiver
             && SameTypeDefinition(receiver.GenericType, current.BaseMethodContext.DeclaringType)
             && receiver.GenericArguments.Count == current.BaseMethodContext.DeclaringType!.GenericParameters.Count
-            && !TypeListsEquivalent(receiver.GenericArguments, typeArguments))
+            && !receiver.GenericArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter))
         {
-            typeArguments = receiver.GenericArguments.ToArray();
-            concreteReceiver = receiver;
+            // 封闭接收者是声明类型实参的最高优先级证据。即便它与当前目标一致，也要阻止
+            // List<object>.Add(string) 被普通实参错误收窄成 List<string>。
+            receiverDefinesTypeArguments = true;
+            if (!TypeListsEquivalent(receiver.GenericArguments, typeArguments))
+            {
+                typeArguments = receiver.GenericArguments.ToArray();
+                concreteReceiver = receiver;
+                changed = true;
+            }
+        }
+
+        if (!receiverDefinesTypeArguments
+            && current.BaseMethodContext.DeclaringType is { GenericParameters.Count: > 0 } declaringType
+            && typeArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter)
+            && TryInferTypeArguments(
+                call,
+                current.BaseMethodContext,
+                declaringType.GenericParameters.Count,
+                firstArgument,
+                definitions,
+                out var inferredTypeArguments)
+            && !TypeListsEquivalent(inferredTypeArguments, typeArguments))
+        {
+            // 共享泛型实例的接收者可能已经被寄存器复用污染；此时由成员参数中的 VAR
+            // 反推声明类型实参，例如 List<!0>.AddWithResize(string) -> List<string>。
+            typeArguments = inferredTypeArguments;
             changed = true;
         }
 
@@ -100,8 +125,41 @@ public static class GenericCallRebinder
         int firstArgument,
         IReadOnlyDictionary<LocalVariable, IOperand>? definitions,
         out TypeAnalysisContext[] inferred)
+        => TryInferGenericArguments(
+            call,
+            baseMethod,
+            baseMethod.GenericParameters.Count,
+            firstArgument,
+            definitions,
+            Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+            out inferred);
+
+    private static bool TryInferTypeArguments(
+        Instruction call,
+        MethodAnalysisContext baseMethod,
+        int genericParameterCount,
+        int firstArgument,
+        IReadOnlyDictionary<LocalVariable, IOperand>? definitions,
+        out TypeAnalysisContext[] inferred)
+        => TryInferGenericArguments(
+            call,
+            baseMethod,
+            genericParameterCount,
+            firstArgument,
+            definitions,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+            out inferred);
+
+    private static bool TryInferGenericArguments(
+        Instruction call,
+        MethodAnalysisContext baseMethod,
+        int genericParameterCount,
+        int firstArgument,
+        IReadOnlyDictionary<LocalVariable, IOperand>? definitions,
+        Il2CppTypeEnum genericParameterKind,
+        out TypeAnalysisContext[] inferred)
     {
-        inferred = new TypeAnalysisContext[baseMethod.GenericParameters.Count];
+        inferred = new TypeAnalysisContext[genericParameterCount];
         var parameterStart = firstArgument + (baseMethod.IsStatic ? 0 : 1);
         var matchedAny = false;
 
@@ -112,24 +170,31 @@ public static class GenericCallRebinder
                 || OperandType(call.Operands[operandIndex], definitions) is not { } actual)
                 continue;
 
-            if (!TryUnifyMethodParameters(baseMethod.Parameters[parameterIndex].ParameterType, actual, inferred, ref matchedAny))
+            if (!TryUnifyGenericParameters(
+                    baseMethod.Parameters[parameterIndex].ParameterType,
+                    actual,
+                    genericParameterKind,
+                    inferred,
+                    ref matchedAny))
                 return false;
         }
 
         return matchedAny && inferred.All(argument => argument != null);
     }
 
-    private static bool TryUnifyMethodParameters(
+    private static bool TryUnifyGenericParameters(
         TypeAnalysisContext pattern,
         TypeAnalysisContext actual,
+        Il2CppTypeEnum genericParameterKind,
         TypeAnalysisContext[] inferred,
         ref bool matchedAny)
     {
         if (pattern is GenericParameterTypeAnalysisContext
             {
-                Type: Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+                Type: var parameterKind,
                 Index: var index
-            })
+            }
+            && parameterKind == genericParameterKind)
         {
             if (index < 0 || index >= inferred.Length)
                 return false;
@@ -150,9 +215,10 @@ public static class GenericCallRebinder
 
             for (var argumentIndex = 0; argumentIndex < genericPattern.GenericArguments.Count; argumentIndex++)
             {
-                if (!TryUnifyMethodParameters(
+                if (!TryUnifyGenericParameters(
                         genericPattern.GenericArguments[argumentIndex],
                         projected.GenericArguments[argumentIndex],
+                        genericParameterKind,
                         inferred,
                         ref matchedAny))
                     return false;
@@ -163,11 +229,21 @@ public static class GenericCallRebinder
 
         if (pattern is SzArrayTypeAnalysisContext patternArray
             && actual is SzArrayTypeAnalysisContext actualArray)
-            return TryUnifyMethodParameters(patternArray.ElementType, actualArray.ElementType, inferred, ref matchedAny);
+            return TryUnifyGenericParameters(
+                patternArray.ElementType,
+                actualArray.ElementType,
+                genericParameterKind,
+                inferred,
+                ref matchedAny);
 
         if (pattern is ByRefTypeAnalysisContext patternByRef
             && actual is ByRefTypeAnalysisContext actualByRef)
-            return TryUnifyMethodParameters(patternByRef.ElementType, actualByRef.ElementType, inferred, ref matchedAny);
+            return TryUnifyGenericParameters(
+                patternByRef.ElementType,
+                actualByRef.ElementType,
+                genericParameterKind,
+                inferred,
+                ref matchedAny);
 
         return TypesEquivalent(pattern, actual);
     }

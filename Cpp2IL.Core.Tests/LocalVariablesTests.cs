@@ -804,6 +804,42 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 已闭合List调用目标闭合同定义开放接收者()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement]);
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var closedTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [stringType],
+            []);
+        var openReceiverType = listDefinition.MakeGenericInstanceType([genericElement]);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            openReceiverType);
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, closedTarget);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(
+                GenericCallRebinder.TypesEquivalent(receiver.Type, closedTarget.DeclaringType),
+                Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 已是目标接口的接收者保持精确类型()
     {

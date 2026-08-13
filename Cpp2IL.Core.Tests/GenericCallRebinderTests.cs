@@ -139,6 +139,114 @@ public class GenericCallRebinderTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 开放List成员从具体值参数闭合声明类型实参()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement]);
+        var openTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [genericElement],
+            []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            openTarget.DeclaringType);
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "X1"),
+            app.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, openTarget, receiver, value);
+
+        var changed = GenericCallRebinder.TryRebind(call);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(rebound.TypeGenericParameters, Is.EqualTo(new[] { app.SystemTypes.SystemStringType }));
+            Assert.That(rebound.DeclaringType!.FullName, Does.Contain("System.String"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 封闭ListObject接收者不得被String参数收窄()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement]);
+        var objectType = app.SystemTypes.SystemObjectType;
+        var target = new ConcreteGenericMethodAnalysisContext(addWithResize, [objectType], []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            listDefinition.MakeGenericInstanceType([objectType]));
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "X1"),
+            app.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, target, receiver, value);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
+            Assert.That(call.Operands[0], Is.SameAs(target));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 同一声明类型参数收到冲突实参时保持开放目标()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var pair = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "Pair",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement, genericElement]);
+        var openTarget = new ConcreteGenericMethodAnalysisContext(pair, [genericElement], []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            openTarget.DeclaringType);
+        var first = new LocalVariable(
+            "first",
+            new Register(null, "X1"),
+            app.SystemTypes.SystemStringType);
+        var second = new LocalVariable(
+            "second",
+            new Register(null, "X2"),
+            app.SystemTypes.SystemInt32Type);
+        var call = new Instruction(0, OpCode.CallVoid, openTarget, receiver, first, second);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
+            Assert.That(call.Operands[0], Is.SameAs(openTarget));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 非泛型目标不得冒充共享泛型调用()
     {

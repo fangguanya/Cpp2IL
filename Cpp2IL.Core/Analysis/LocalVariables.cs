@@ -1319,12 +1319,26 @@ public static class LocalVariables
         if (GenericCallRebinder.TypesEquivalent(receiver.Type, declaringType))
             return false;
 
-        var declaringInterface = declaringType is GenericInstanceTypeAnalysisContext genericInstance
-            ? genericInstance.GenericType.IsInterface
+        var declaringInterface = declaringType is GenericInstanceTypeAnalysisContext declaringGenericInstance
+            ? declaringGenericInstance.GenericType.IsInterface
             : declaringType.IsInterface;
-        if (!declaringInterface
-            || receiver.Type.IsAssignableTo(declaringType)
-            || !ContainsUninstantiatedGenericParameter(receiver.Type))
+        if (!ContainsUninstantiatedGenericParameter(receiver.Type))
+            return false;
+
+        // 同一个泛型定义的开放接收者可以由已经重绑定的封闭调用目标精确闭合；这覆盖
+        // List<!0>.AddWithResize(string) 等非接口实例成员，同时不跨类型改写 IDisposable。
+        if (receiver.Type is GenericInstanceTypeAnalysisContext receiverGenericInstance
+            && declaringType is GenericInstanceTypeAnalysisContext closedDeclaringInstance
+            && GenericCallRebinder.TypesEquivalent(
+                receiverGenericInstance.GenericType,
+                closedDeclaringInstance.GenericType)
+            && !ContainsUninstantiatedGenericParameter(closedDeclaringInstance))
+        {
+            receiver.Type = declaringType;
+            return true;
+        }
+
+        if (!declaringInterface || receiver.Type.IsAssignableTo(declaringType))
             return false;
 
         receiver.Type = declaringType;
