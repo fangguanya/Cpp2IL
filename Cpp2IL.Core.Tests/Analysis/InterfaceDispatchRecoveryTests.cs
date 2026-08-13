@@ -321,14 +321,24 @@ public class InterfaceDispatchRecoveryTests
         var fastResult = Local("fastResult");
         var invokeData = Local("invokeData");
         var methodPointer = Local("methodPointer");
-        var call = new Instruction(0, OpCode.Call, new Immediate(0x219B070), callResult, Local("receiver"));
+        var methodInfo = Local("methodInfo");
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x219B070),
+            callResult,
+            Local("receiver"),
+            Local("interfaceType"),
+            new Immediate(0));
         var phi = new Instruction(1, OpCode.Phi, invokeData, callResult, fastResult);
         var load = new Instruction(2, OpCode.Move, methodPointer, new MemoryOperand(invokeData));
+        var loadMethodInfo = new Instruction(3, OpCode.Move, methodInfo, new MemoryOperand(invokeData, addend: 8));
+        var dispatch = new Instruction(4, OpCode.IndirectCall, new MemoryOperand(invokeData), Local("result"));
 
         var deferred = InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
             call,
             CreateAddWithResizeCandidate(),
-            [call, phi, load]);
+            [call, phi, load, loadMethodInfo, dispatch]);
 
         Assert.Multiple(() =>
         {
@@ -348,17 +358,27 @@ public class InterfaceDispatchRecoveryTests
         var fastResult = Local("fastResult");
         var invokeData = Local("invokeData");
         var methodPointer = Local("methodPointer");
-        var call = new Instruction(0, OpCode.Call, new Immediate(0x219B070), callResult, Local("receiver"));
+        var methodInfo = Local("methodInfo");
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x219B070),
+            callResult,
+            Local("receiver"),
+            Local("interfaceType"),
+            new Immediate(ushort.MaxValue));
         var copyA = new Instruction(1, OpCode.Move, aliasA, callResult);
         var copyB = new Instruction(2, OpCode.Move, aliasB, aliasA);
         var phi = new Instruction(3, OpCode.Phi, invokeData, aliasB, fastResult);
         var load = new Instruction(4, OpCode.Move, methodPointer, new FieldReference(null!, invokeData, 0));
+        var loadMethodInfo = new Instruction(5, OpCode.Move, methodInfo, new MemoryOperand(invokeData, addend: 8));
+        var dispatch = new Instruction(6, OpCode.IndirectJump, new MemoryOperand(invokeData), Local("result"));
 
         Assert.That(
             InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
                 call,
                 CreateAddWithResizeCandidate(),
-                [call, copyA, copyB, phi, load]),
+                [call, copyA, copyB, phi, load, loadMethodInfo, dispatch]),
             Is.True);
     }
 
@@ -370,15 +390,25 @@ public class InterfaceDispatchRecoveryTests
         var fastResult = Local("fastResult");
         var invokeData = Local("invokeData");
         var loaded = Local("loaded");
-        var call = new Instruction(0, OpCode.Call, new Immediate(0x219B070), callResult, Local("receiver"));
+        var methodInfo = Local("methodInfo");
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x219B070),
+            callResult,
+            Local("receiver"),
+            Local("interfaceType"),
+            new Immediate(0));
         var phi = new Instruction(1, OpCode.Phi, invokeData, callResult, fastResult);
         var load = new Instruction(2, OpCode.Move, loaded, new MemoryOperand(invokeData, addend: 8));
+        var loadMethodInfo = new Instruction(3, OpCode.Move, methodInfo, new MemoryOperand(invokeData, addend: 8));
+        var dispatch = new Instruction(4, OpCode.IndirectCall, new MemoryOperand(invokeData), Local("result"));
 
         Assert.That(
             InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
                 call,
                 CreateAddWithResizeCandidate(),
-                [call, phi, load]),
+                [call, phi, load, loadMethodInfo, dispatch]),
             Is.False);
     }
 

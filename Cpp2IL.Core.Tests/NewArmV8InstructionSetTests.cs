@@ -9,6 +9,60 @@ namespace Cpp2IL.Core.Tests;
 
 public class NewArmV8InstructionSetTests
 {
+    [Test]
+    [Category("基本功能")]
+    public void InterfaceLookupSlotRecognizesRecentZeroImmediate()
+    {
+        Instruction[] instructions =
+        [
+            new(0, OpCode.Move, new Register(null, "X2"), new Immediate(0)),
+            new(1, OpCode.CheckEqual, new Register(null, "Z"), new Register(null, "X2"), new Immediate(0)),
+        ];
+
+        Assert.That(
+            NewArmV8InstructionSet.HasRecentSmallImmediateArgument(instructions, "X2", ushort.MaxValue),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void InterfaceLookupSlotAcceptsUnsignedShortMaximum()
+    {
+        Instruction[] instructions =
+        [
+            new(0, OpCode.Move, new Register(null, "X2"), new Immediate(ushort.MaxValue)),
+        ];
+
+        Assert.That(
+            NewArmV8InstructionSet.HasRecentSmallImmediateArgument(instructions, "X2", ushort.MaxValue),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void InterfaceLookupSlotRejectsMethodInfoPointerAndCallBoundary()
+    {
+        Instruction[] pointerInstructions =
+        [
+            new(0, OpCode.Move, new Register(null, "X2"), new Register(null, "X19")),
+        ];
+        Instruction[] crossedCallInstructions =
+        [
+            new(0, OpCode.Move, new Register(null, "X2"), new Immediate(1)),
+            new(1, OpCode.CallVoid, new Immediate(0x1234)),
+        ];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.HasRecentSmallImmediateArgument(pointerInstructions, "X2", ushort.MaxValue),
+                Is.False);
+            Assert.That(
+                NewArmV8InstructionSet.HasRecentSmallImmediateArgument(crossedCallInstructions, "X2", ushort.MaxValue),
+                Is.False);
+        });
+    }
+
     [TestCase(Arm64Mnemonic.SUB, 0x100L, -0x100, TestName = "基本_建立256字节ARM64栈帧")]
     [TestCase(Arm64Mnemonic.ADD, 0x100L, 0x100, TestName = "基本_释放256字节ARM64栈帧")]
     [Category("基本功能")]

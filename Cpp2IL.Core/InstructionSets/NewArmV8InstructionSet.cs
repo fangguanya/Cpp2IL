@@ -1529,7 +1529,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             // 仅对该已知共享身份保留原始返回槽，MetadataResolver 会删除普通 void 的伪返回值，
             // InterfaceDispatchRecovery 则以 Phi、零偏移 methodPtr 和 vtable 链完成最终裁决。
             var preservePotentialInterfaceLookupResult = calledMethod.IsVoid
-                && methodsAtAddress.Any(InterfaceDispatchRecovery.IsSharedAddWithResizeCandidate);
+                && methodsAtAddress.Any(InterfaceDispatchRecovery.IsSharedAddWithResizeCandidate)
+                && HasRecentSmallImmediateArgument(instructions, "X2", ushort.MaxValue);
             Register? returnRegister = preservePotentialInterfaceLookupResult
                 ? new Register(null, nameof(Arm64Register.X0))
                 : calledMethod.IsVoid
@@ -2722,6 +2723,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
                 break;
         }
+    }
+
+    /// <summary>
+    /// 在当前基本块内读取最近一次整数参数寄存器赋值。
+    /// 接口慢查表第三实参是较小的虚表槽号；真实 AddWithResize 的 X2 则承载 MethodInfo 指针。
+    /// 一旦跨越调用或控制流边界，AAPCS64 参数寄存器内容便不再属于当前调用点，因此立即停止追踪。
+    /// </summary>
+    internal static bool HasRecentSmallImmediateArgument(
+        IReadOnlyList<Instruction> instructions,
+        string registerName,
+        long maximumValue)
+    {
+        if (string.IsNullOrWhiteSpace(registerName) || maximumValue < 0)
+            return false;
+
+        for (var index = instructions.Count - 1; index >= 0; index--)
+        {
+            var instruction = instructions[index];
+            if (instruction.IsCall || !instruction.IsFallThrough)
+                return false;
+
+            if (instruction.Destination is not Register destination
+                || !string.Equals(destination.Name, registerName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return instruction.OpCode == OpCode.Move
+                   && instruction.Operands.Count >= 2
+                   && instruction.Operands[1] is Immediate { Value: >= 0 } immediate
+                   && immediate.Value <= maximumValue;
+        }
+
+        return false;
     }
 
     private IOperand ConvertOperand(Arm64Instruction instruction, int operand)

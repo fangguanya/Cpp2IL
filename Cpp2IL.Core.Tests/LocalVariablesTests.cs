@@ -841,6 +841,32 @@ public class LocalVariablesTests
 
     [Test]
     [Category("边界值")]
+    public void 开放接口接收者跨继承接口调用时保持原声明身份()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listInterfaceDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.IList`1")!;
+        var collectionInterfaceDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.ICollection`1")!;
+        var openListInterface = listInterfaceDefinition.MakeGenericInstanceType(
+            listInterfaceDefinition.GenericParameters);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            openListInterface);
+        var countGetter = collectionInterfaceDefinition.Methods.First(method => method.Name == "get_Count");
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, countGetter);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(openListInterface));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
     public void 已是目标接口的接收者保持精确类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

@@ -141,6 +141,17 @@ public static class InterfaceDispatchRecovery
         }
 
         var allInstructions = instructions as IReadOnlyCollection<Instruction> ?? instructions.ToList();
+        var definitions = allInstructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+        const int FirstArgument = 2;
+        if (call.Operands.Count <= FirstArgument + 2
+            || ResolveConstant(definitions, call.Operands[FirstArgument + 2]) is not { } slot
+            || slot is < 0 or > ushort.MaxValue)
+            return false;
+
         var resultAliases = new HashSet<LocalVariable> { callResult };
 
         // SSA 边复制可能在进入 Phi 前增加一层或多层纯 Move；只扩展从返回值出发的正向别名，
@@ -169,7 +180,7 @@ public static class InterfaceDispatchRecovery
 
             consumingPhiCount++;
 
-            if (allInstructions.Any(instruction => IsMethodPointerLoad(instruction, invokeData)))
+            if (HasCompleteVirtualInvokeDataConsumer(allInstructions, definitions, invokeData))
             {
                 Logger.VerboseNewline(
                     $"共享 AddWithResize 返回槽检查：调用 {call.Index} 命中 VirtualInvokeData Phi {phi.Index}，延迟绑定。",
@@ -217,6 +228,57 @@ public static class InterfaceDispatchRecovery
                 Offset: 0,
             }],
         } && ReferenceEquals(fieldBase, invokeData);
+
+    /// <summary>
+    /// 同一 Phi 必须同时提供 methodPtr、MethodInfo 和最终间接调用；只出现普通零偏移读取时，
+    /// 可能只是 void 调用后 X0 寄存器复用，不足以证明接口慢查表。
+    /// </summary>
+    private static bool HasCompleteVirtualInvokeDataConsumer(
+        IReadOnlyCollection<Instruction> instructions,
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable invokeData)
+    {
+        var hasMethodPointer = instructions.Any(instruction => IsMethodPointerLoad(instruction, invokeData));
+        var hasMethodInfo = instructions.Any(instruction => instruction is
+        {
+            OpCode: OpCode.Move,
+            Operands: [LocalVariable, MemoryOperand
+            {
+                Base: LocalVariable memoryBase,
+                Index: null,
+                Scale: 0,
+                Addend: 8,
+            }],
+        } && ReferenceEquals(memoryBase, invokeData));
+        var hasIndirectTransfer = instructions.Any(instruction =>
+            (instruction.OpCode is OpCode.IndirectCall or OpCode.IndirectJump)
+            && IsInvokeDataMethodPointer(instruction.Operands[0], definitions, invokeData));
+        return hasMethodPointer && hasMethodInfo && hasIndirectTransfer;
+    }
+
+    private static bool IsInvokeDataMethodPointer(
+        IOperand operand,
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable invokeData)
+        => operand is MemoryOperand
+           {
+               Base: LocalVariable memoryBase,
+               Index: null,
+               Scale: 0,
+               Addend: 0,
+           } && ReferenceEquals(memoryBase, invokeData)
+           || operand is LocalVariable target
+           && Definition(definitions, target) is
+           {
+               OpCode: OpCode.Move,
+               Operands: [_, MemoryOperand
+               {
+                   Base: LocalVariable loadedBase,
+                   Index: null,
+                   Scale: 0,
+                   Addend: 0,
+               }],
+           } && ReferenceEquals(loadedBase, invokeData);
 
     private static Match? MatchDispatch(
         MethodAnalysisContext method,

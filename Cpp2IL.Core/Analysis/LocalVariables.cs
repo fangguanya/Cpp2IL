@@ -384,18 +384,60 @@ public static class LocalVariables
     {
         var changed = true;
         var loopCount = 0;
+        var lastChangingPasses = new List<string>();
+        var lastChangingTypeDetails = new List<string>();
 
         while (changed)
         {
             if (MaxTypePropagationLoopCount != -1 && ++loopCount > MaxTypePropagationLoopCount)
                 throw new DecompilerException(
-                    $"Late call and address type resolution not settling! (looped {MaxTypePropagationLoopCount} times)");
+                    $"Late call and address type resolution not settling! (looped {MaxTypePropagationLoopCount} times; "
+                    + $"last changing passes: {string.Join(", ", lastChangingPasses)}; "
+                    + $"type changes: {string.Join(" | ", lastChangingTypeDetails)})");
 
-            changed = PropagateFromCallParameters(method);
-            changed |= BindAddressCarrierTypes(method.ControlFlowGraph!.Instructions);
-            changed |= MetadataResolver.ResolveFieldOffsets(method);
-            changed |= PropagateBooleanBitTestTypes(method);
-            changed |= PropagateTypesOnce(method);
+            changed = false;
+            lastChangingPasses.Clear();
+            lastChangingTypeDetails.Clear();
+            var captureFinalIteration = MaxTypePropagationLoopCount != -1
+                && loopCount == MaxTypePropagationLoopCount;
+
+            var typesBeforeCalls = captureFinalIteration ? CaptureLocalTypes(method) : null;
+            var callChanges = PropagateFromCallParameters(method);
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), callChanges);
+            if (callChanges && typesBeforeCalls != null)
+                lastChangingTypeDetails.AddRange(DescribeTypeChanges(
+                    nameof(PropagateFromCallParameters), typesBeforeCalls, method));
+
+            var typesBeforeAddressBinding = captureFinalIteration ? CaptureLocalTypes(method) : null;
+            var addressBindingChanges = captureFinalIteration ? new List<string>() : null;
+            var addressBindingChanged = BindAddressCarrierTypes(
+                method.ControlFlowGraph!.Instructions,
+                addressBindingChanges);
+            changed |= RecordChangingPass(lastChangingPasses, nameof(BindAddressCarrierTypes), addressBindingChanged);
+            if (addressBindingChanged && typesBeforeAddressBinding != null)
+                lastChangingTypeDetails.AddRange(DescribeTypeChanges(
+                    nameof(BindAddressCarrierTypes), typesBeforeAddressBinding, method));
+            if (addressBindingChanges != null)
+                lastChangingTypeDetails.AddRange(addressBindingChanges);
+
+            changed |= RecordChangingPass(
+                lastChangingPasses,
+                nameof(MetadataResolver.ResolveFieldOffsets),
+                MetadataResolver.ResolveFieldOffsets(method));
+            changed |= RecordChangingPass(
+                lastChangingPasses,
+                nameof(PropagateBooleanBitTestTypes),
+                PropagateBooleanBitTestTypes(method));
+
+            var typesBeforePropagation = captureFinalIteration ? CaptureLocalTypes(method) : null;
+            var propagationChanges = captureFinalIteration ? new List<string>() : null;
+            var propagationChanged = PropagateTypesOnce(method, propagationChanges);
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateTypesOnce), propagationChanged);
+            if (propagationChanged && typesBeforePropagation != null)
+                lastChangingTypeDetails.AddRange(DescribeTypeChanges(
+                    nameof(PropagateTypesOnce), typesBeforePropagation, method));
+            if (propagationChanges != null)
+                lastChangingTypeDetails.AddRange(propagationChanges);
         }
     }
 
@@ -1337,6 +1379,15 @@ public static class LocalVariables
             receiver.Type = declaringType;
             return true;
         }
+
+        // 一个长期局部可能以 IList<T>、ICollection<T> 等多个继承接口分别发起调用。
+        // 它已有接口身份时，调用目标只提供行为约束而非新的静态声明类型；继续覆盖会让
+        // 不同接口调用在每轮传播中来回改写同一局部，破坏单调不动点。
+        var receiverIsInterface = receiver.Type is GenericInstanceTypeAnalysisContext receiverInterfaceInstance
+            ? receiverInterfaceInstance.GenericType.IsInterface
+            : receiver.Type.IsInterface;
+        if (receiverIsInterface)
+            return false;
 
         if (!declaringInterface || receiver.Type.IsAssignableTo(declaringType))
             return false;
