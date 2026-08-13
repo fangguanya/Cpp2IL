@@ -1166,7 +1166,7 @@ public class LocalVariablesTests
         var receiver = new LocalVariable(
             "receiver",
             new Register(null, "X0", 1),
-            appContext.SystemTypes.SystemInt32Type);
+            new ByRefTypeAnalysisContext(appContext.SystemTypes.SystemInt32Type));
         var allocation = new Instruction(0, OpCode.Newobj, receiver, listType);
         var call = new Instruction(1, OpCode.CallVoid, constructor, receiver);
         var method = CreateConstructorFixture(listType, "RecoverConstructedReceiver", [allocation, call], [receiver]);
@@ -1184,8 +1184,14 @@ public class LocalVariablesTests
         var listType = appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.Collections.ArrayList")!;
         var constructor = listType.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
-        var allocated = new LocalVariable("allocated", new Register(null, "X0", 1), appContext.SystemTypes.SystemInt32Type);
-        var receiver = new LocalVariable("receiver", new Register(null, "X0", 2), appContext.SystemTypes.SystemInt32Type);
+        var allocated = new LocalVariable(
+            "allocated",
+            new Register(null, "X0", 1),
+            new ByRefTypeAnalysisContext(appContext.SystemTypes.SystemInt32Type));
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 2),
+            new ByRefTypeAnalysisContext(appContext.SystemTypes.SystemInt32Type));
         var allocation = new Instruction(0, OpCode.Newobj, allocated, listType);
         var copy = new Instruction(1, OpCode.Move, receiver, allocated);
         var call = new Instruction(2, OpCode.CallVoid, constructor, receiver);
@@ -1238,6 +1244,31 @@ public class LocalVariablesTests
             listType,
             "PreserveNonAllocationConstructorReceiver",
             [call],
+            [receiver]);
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 正常具体Newobj分配不得被构造器声明类型覆盖()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.ArrayList")!;
+        var constructor = listType.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemStringType);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, appContext.SystemTypes.SystemStringType);
+        var call = new Instruction(1, OpCode.CallVoid, constructor, receiver);
+        var method = CreateConstructorFixture(
+            listType,
+            "PreserveConcreteAllocationType",
+            [allocation, call],
             [receiver]);
 
         LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);

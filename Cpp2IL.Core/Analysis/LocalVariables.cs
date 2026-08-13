@@ -1351,6 +1351,12 @@ public static class LocalVariables
             || allocation.OpCode != OpCode.Newobj)
             return false;
 
+        // 正常 Object::New 已经给出封闭托管类型，构造器解析只负责消除原生地址载体
+        // 被误投影成 Newobj 结果的缺口。若分配链没有 ByRef/Pointer 证据，保留既有类型，
+        // 避免把共享构造器声明类型扩散到所有正常对象分配。
+        if (!allocationChain.Any(local => local.Type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
+            return false;
+
         var targetType = receiver.Type is { } receiverType
                          && HasClosedGenericProjection(receiverType, constructedType)
             ? receiverType
