@@ -303,6 +303,124 @@ public class KeyFunctionRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 未解析类型句柄可由IsInst结果的强类型栈槽恢复()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var testedType = app.SystemTypes.SystemStringType;
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var slot = Local("slot", testedType);
+        var carrier = Local("carrier", app.SystemTypes.SystemIntPtrType);
+        var call = new Instruction(
+            1,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            Local("source", app.SystemTypes.SystemObjectType),
+            Local("unresolvedTypeHandle", null));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, carrier, new AddressOf(slot)),
+            call,
+            new Instruction(2, OpCode.Move, new MemoryOperand(carrier), result));
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+            Assert.That(call.Operands[2], Is.SameAs(testedType));
+            Assert.That(result.Type, Is.SameAs(testedType));
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 多定义地址载体可由自身ByRef类型恢复IsInst目标()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var testedType = app.SystemTypes.SystemStringType;
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var carrier = Local("carrier", new ByRefTypeAnalysisContext(testedType));
+        var call = new Instruction(
+            2,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            Local("source", app.SystemTypes.SystemObjectType),
+            Local("unresolvedTypeHandle", null));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, carrier,
+                new AddressOf(Local("firstSlot", testedType))),
+            new Instruction(1, OpCode.Move, carrier,
+                new AddressOf(Local("secondSlot", testedType))),
+            call,
+            new Instruction(3, OpCode.Move, new MemoryOperand(carrier), result));
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+        Assert.That(call.Operands[2], Is.SameAs(testedType));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void IsInst结果写入多个等价强类型栈槽仍可恢复()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var testedType = app.SystemTypes.SystemStringType;
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var firstCarrier = Local("firstCarrier", app.SystemTypes.SystemIntPtrType);
+        var secondCarrier = Local("secondCarrier", app.SystemTypes.SystemIntPtrType);
+        var call = new Instruction(
+            2,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            Local("source", app.SystemTypes.SystemObjectType),
+            Local("unresolvedTypeHandle", null));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, firstCarrier, new AddressOf(Local("firstSlot", testedType))),
+            new Instruction(1, OpCode.Move, secondCarrier, new AddressOf(Local("secondSlot", testedType))),
+            call,
+            new Instruction(3, OpCode.Move, new MemoryOperand(firstCarrier), result),
+            new Instruction(4, OpCode.Move, new MemoryOperand(secondCarrier), result));
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+        Assert.That(call.Operands[2], Is.SameAs(testedType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void IsInst结果写入冲突类型栈槽时保持原始调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var firstCarrier = Local("firstCarrier", app.SystemTypes.SystemIntPtrType);
+        var secondCarrier = Local("secondCarrier", app.SystemTypes.SystemIntPtrType);
+        var call = new Instruction(
+            2,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            Local("source", app.SystemTypes.SystemObjectType),
+            Local("unresolvedTypeHandle", null));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, firstCarrier,
+                new AddressOf(Local("firstSlot", app.SystemTypes.SystemStringType))),
+            new Instruction(1, OpCode.Move, secondCarrier,
+                new AddressOf(Local("secondSlot", app.SystemTypes.SystemObjectType))),
+            call,
+            new Instruction(3, OpCode.Move, new MemoryOperand(firstCarrier), result),
+            new Instruction(4, OpCode.Move, new MemoryOperand(secondCarrier), result));
+
+        KeyFunctionRecovery.RewriteTypeTests(method);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 死代码清理保留Box数据槽的调用前写入链()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

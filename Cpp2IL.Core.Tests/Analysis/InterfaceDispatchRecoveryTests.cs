@@ -166,6 +166,50 @@ public class InterfaceDispatchRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 未写入W2时MethodInfo载体解析为零号接口槽位()
+    {
+        var carrier = new LocalVariable("methodInfoCarrier", new Register(null, "X2"))
+        {
+            IsMethodInfo = true,
+        };
+
+        var matched = InterfaceDispatchRecovery.TryResolveSlowPathSlotOperand([], carrier, out var slot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(slot, Is.TypeOf<Immediate>());
+            Assert.That(((Immediate)slot).Value, Is.Zero);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 接口慢查表接受显式最大槽位()
+    {
+        var matched = InterfaceDispatchRecovery.TryResolveSlowPathSlotOperand(
+            [],
+            new Immediate(ushort.MaxValue),
+            out var slot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(((Immediate)slot).Value, Is.EqualTo(ushort.MaxValue));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未类型化第三寄存器不冒充省略的零号槽位()
+    {
+        Assert.That(
+            InterfaceDispatchRecovery.TryResolveSlowPathSlotOperand([], Local("untypedX2"), out _),
+            Is.False);
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 普通业务对象不冒充接口类型信息()
     {
@@ -281,6 +325,68 @@ public class InterfaceDispatchRecoveryTests
             Assert.That(matched, Is.True);
             Assert.That(receiver, Is.SameAs(enumerator));
         });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 慢查表接收者经纯Move仍回溯到接口类型()
+    {
+        var disposable = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var source = new LocalVariable("source", new Register(null, "X0"), disposable);
+        var copied = Local("copied");
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [copied] = new Instruction(0, OpCode.Move, copied, source),
+        };
+
+        var matched = InterfaceDispatchRecovery.TryResolveTypedInterfaceReceiver(
+            definitions,
+            copied,
+            out var resolved);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(resolved, Is.SameAs(source));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 慢查表接收者多层纯Move保持接口类型()
+    {
+        var disposable = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var source = new LocalVariable("source", new Register(null, "X0"), disposable);
+        var first = Local("first");
+        var second = Local("second");
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [first] = new Instruction(0, OpCode.Move, first, source),
+            [second] = new Instruction(1, OpCode.Move, second, first),
+        };
+
+        Assert.That(
+            InterfaceDispatchRecovery.TryResolveTypedInterfaceReceiver(definitions, second, out var resolved)
+            && ReferenceEquals(resolved, source),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 内存读取接收者不跨边界推断接口类型()
+    {
+        var source = Local("source");
+        var loaded = Local("loaded");
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [loaded] = new Instruction(0, OpCode.Move, loaded, new MemoryOperand(source)),
+        };
+
+        Assert.That(
+            InterfaceDispatchRecovery.TryResolveTypedInterfaceReceiver(definitions, loaded, out _),
+            Is.False);
     }
 
     [Test]
@@ -410,6 +516,128 @@ public class InterfaceDispatchRecoveryTests
                 CreateAddWithResizeCandidate(),
                 [call, phi, load, loadMethodInfo, dispatch]),
             Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 共享慢查表与快速地址复用同一返回槽时解析Dispose()
+    {
+        var shape = CreateSharedInvokeDataShape(includeMethodInfo: true, slowSlot: 0);
+
+        var resolved = InterfaceDispatchRecovery.ResolveSharedInvokeDataTarget(
+            shape.Dispatch,
+            shape.Instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.Not.Null);
+            Assert.That(resolved!.Name, Is.EqualTo("Dispose"));
+            Assert.That(resolved.DeclaringType!.FullName, Is.EqualTo("System.IDisposable"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void MethodInfo经局部加载仍可闭合共享无Phi接口查表()
+    {
+        var shape = CreateSharedInvokeDataShape(
+            includeMethodInfo: true,
+            slowSlot: 0,
+            indirectMethodInfo: true,
+            separateConsumerBase: true);
+
+        var resolved = InterfaceDispatchRecovery.ResolveSharedInvokeDataTarget(
+            shape.Dispatch,
+            shape.Instructions);
+
+        Assert.That(resolved?.Name, Is.EqualTo("Dispose"));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 缺失MethodInfo消费者或槽位冲突时拒绝共享无Phi接口查表()
+    {
+        var missingMethodInfo = CreateSharedInvokeDataShape(includeMethodInfo: false, slowSlot: 0);
+        var conflictingSlot = CreateSharedInvokeDataShape(includeMethodInfo: true, slowSlot: 1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                InterfaceDispatchRecovery.ResolveSharedInvokeDataTarget(
+                    missingMethodInfo.Dispatch,
+                    missingMethodInfo.Instructions),
+                Is.Null);
+            Assert.That(
+                InterfaceDispatchRecovery.ResolveSharedInvokeDataTarget(
+                    conflictingSlot.Dispatch,
+                    conflictingSlot.Instructions),
+                Is.Null);
+        });
+    }
+
+    private static (Instruction Dispatch, IReadOnlyList<Instruction> Instructions) CreateSharedInvokeDataShape(
+        bool includeMethodInfo,
+        long slowSlot,
+        bool indirectMethodInfo = false,
+        bool separateConsumerBase = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var disposable = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            disposable);
+        // 生产形状中的TypeInfo仍是共享内存槽，接口身份来自同链isinst定型的接收者。
+        var interfaceTypeInfo = new MemoryOperand(Local("sharedTypeInfoSlot"));
+        var invokeDataRegister = new Register(0, "X0", 404);
+        var slowInvokeData = new LocalVariable("slowInvokeData", invokeDataRegister);
+        var invokeData = new LocalVariable("invokeData", invokeDataRegister);
+        // 真实转换结果会为两个内存消费者各建局部对象，但保留完全相同的SSA寄存器身份。
+        var consumerBase = separateConsumerBase
+            ? new LocalVariable("consumerInvokeData", invokeDataRegister)
+            : invokeData;
+        var klass = Local("klass");
+        var entryOffset = Local("entryOffset");
+        var shifted = Local("shifted");
+        var beforeVTable = Local("beforeVTable");
+        var methodInfo = Local("methodInfo");
+
+        var instructions = new List<Instruction>
+        {
+            // 两条原生路径具有同一SSA寄存器身份，但解析阶段可能保留为不同局部对象。
+            new(0, OpCode.Call, new Immediate(0x219B070), slowInvokeData, receiver, interfaceTypeInfo, new Immediate(slowSlot)),
+            new(1, OpCode.Move, klass, new MemoryOperand(receiver)),
+            new(2, OpCode.Move, entryOffset, new MemoryOperand(Local("interfaceOffsets"))),
+            new(3, OpCode.ShiftLeft, shifted, entryOffset, new Immediate(4)),
+            new(4, OpCode.Add, beforeVTable, shifted, klass),
+            new(5, OpCode.Add, invokeData, beforeVTable, new Immediate(0x138)),
+        };
+
+        IOperand methodInfoOperand = new MemoryOperand(consumerBase, addend: 8);
+        if (includeMethodInfo && indirectMethodInfo)
+        {
+            instructions.Add(new Instruction(6, OpCode.Move, methodInfo, methodInfoOperand));
+            methodInfoOperand = methodInfo;
+        }
+
+        var operands = includeMethodInfo
+            ? new IOperand[]
+            {
+                new MemoryOperand(consumerBase),
+                Local("result"),
+                receiver,
+                methodInfoOperand,
+            }
+            : new IOperand[]
+            {
+                new MemoryOperand(consumerBase),
+                Local("result"),
+                receiver,
+            };
+        var dispatch = new Instruction(7, OpCode.IndirectCall, operands.ToList());
+        instructions.Add(dispatch);
+        return (dispatch, instructions);
     }
 
     private static MethodAnalysisContext CreateAddWithResizeCandidate()

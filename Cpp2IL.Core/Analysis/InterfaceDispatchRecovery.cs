@@ -36,6 +36,7 @@ public static class InterfaceDispatchRecovery
 
         var changed = false;
         var directMatches = new List<Match>();
+        var allInstructions = cfg.Blocks.SelectMany(block => block.Instructions).ToList();
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -43,6 +44,24 @@ public static class InterfaceDispatchRecovery
             {
                 if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                     continue;
+
+                // 某些ARM64共享慢查表直接把返回值写回快速路径使用的同一X0 SSA局部，
+                // 未生成Phi。只有慢调用、完整快速vtable链、methodPtr/MethodInfo双消费者、
+                // 接口身份与槽位全部一致时才闭合这条形状。
+                if (MatchSharedInvokeDataResult(instruction, definitions, allInstructions) is { } shared)
+                {
+                    RewriteSharedInvokeDataDispatch(
+                        method,
+                        instruction,
+                        block,
+                        shared.Resolved,
+                        shared.InvokeData,
+                        definitions);
+                    shared.SlowCall.OpCode = OpCode.Nop;
+                    shared.SlowCall.SetOperands();
+                    changed = true;
+                    continue;
+                }
 
                 if (MatchDispatch(method, instruction, definitions, homeBlock, out var rejection) is not { } match)
                 {
@@ -118,6 +137,192 @@ public static class InterfaceDispatchRecovery
     private readonly record struct VTableMatch(LocalVariable KlassLocal, HashSet<int> Slots);
 
     private readonly record struct SlotSelection(IOperand Condition, int TrueSlot, int FalseSlot);
+
+    private sealed record SharedResultMatch(
+        MethodAnalysisContext Resolved,
+        Instruction SlowCall,
+        LocalVariable InvokeData);
+
+    /// <summary>
+    /// 匹配共享慢查表返回值与快速vtable地址复用同一个SSA局部、因而没有Phi的形状。
+    /// 两条生产路径必须各自唯一，并对同一接口槽位给出一致结论。
+    /// </summary>
+    private static SharedResultMatch? MatchSharedInvokeDataResult(
+        Instruction dispatch,
+        Dictionary<LocalVariable, Instruction> definitions,
+        IReadOnlyList<Instruction> instructions)
+    {
+        var targetLoad = dispatch.Operands[0] switch
+        {
+            MemoryOperand folded => folded,
+            LocalVariable target when Definition(definitions, target) is
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+            _ => default(MemoryOperand?),
+        };
+        if (targetLoad is not { Base: LocalVariable invokeData, Index: null, Scale: 0, Addend: 0 })
+            return null;
+        if (!HasInvokeDataMethodInfoConsumer(dispatch, definitions, invokeData))
+        {
+            Logger.VerboseNewline(
+                $"共享接口返回槽拒绝 {dispatch.Index}：MethodInfo消费者未绑定同一SSA寄存器 {invokeData.Register}",
+                nameof(InterfaceDispatchRecovery));
+            return null;
+        }
+
+        var producers = instructions
+            .Where(instruction => instruction.Destination is LocalVariable produced
+                                  && produced.Register == invokeData.Register)
+            .ToList();
+        var slowMatches = producers
+            .Select(candidate => TryMatchSharedSlowPathCall(
+                definitions,
+                candidate,
+                out var receiver,
+                out var interfaceType,
+                out var slot)
+                    ? (Call: candidate, Receiver: receiver, InterfaceType: interfaceType, Slot: slot)
+                    : default)
+            .Where(match => match.Call != null)
+            .ToList();
+        var fastMatches = producers
+            .Select(candidate => (Producer: candidate, Match: MatchVTableEntryChain(definitions, candidate)))
+            .Where(match => match.Match != null)
+            .ToList();
+        Logger.VerboseNewline(
+            $"共享接口返回槽 {dispatch.Index}：寄存器={invokeData.Register}，生产者={producers.Count}，慢路径={slowMatches.Count}，快速路径={fastMatches.Count}",
+            nameof(InterfaceDispatchRecovery));
+        if (slowMatches.Count != 1 || fastMatches.Count != 1)
+            return null;
+
+        var slow = slowMatches[0];
+        var fast = fastMatches[0].Match!.Value;
+        if (ResolveDeclaringInterface(
+                definitions,
+                slow.InterfaceType,
+                slow.Receiver,
+                fast.KlassLocal) is not { } declaringInterface
+            || ResolveConstant(definitions, slow.Slot) is not { } slot
+            || slot is < 0 or > ushort.MaxValue
+            || !fast.Slots.SetEquals([(int)slot])
+            || ResolveInterfaceSlot(declaringInterface, (int)slot) is not { } resolved)
+        {
+            Logger.VerboseNewline(
+                $"共享接口返回槽拒绝 {dispatch.Index}：接口、槽位或快速地址链结论不一致",
+                nameof(InterfaceDispatchRecovery));
+            return null;
+        }
+
+        return new SharedResultMatch(resolved, slow.Call, invokeData);
+    }
+
+    /// <summary>
+    /// 无Phi共享形状允许 TypeInfo 仍保留为内存槽，但此时接收者必须已经由同链 isinst
+    /// 精确定型为接口。该约束只供完整 VirtualInvokeData 共享返回槽闭包使用。
+    /// </summary>
+    private static bool TryMatchSharedSlowPathCall(
+        Dictionary<LocalVariable, Instruction> definitions,
+        Instruction candidate,
+        out LocalVariable receiver,
+        out IOperand interfaceType,
+        out IOperand slot)
+    {
+        if (TryMatchSlowPathCall(definitions, candidate, out receiver, out interfaceType, out slot))
+            return true;
+
+        if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid })
+            goto Reject;
+        var firstArgument = candidate.OpCode == OpCode.Call ? 2 : 1;
+        if (candidate.Operands.Count < firstArgument + 2
+            || !TryResolveReceiverOperand(candidate.Operands[firstArgument], out var receiverOperand)
+            || !TryResolveTypedInterfaceReceiver(definitions, receiverOperand, out var typedReceiver))
+            goto Reject;
+
+        var interfaceOperand = candidate.Operands[firstArgument + 1];
+        var rawSlotOperand = candidate.Operands.Count > firstArgument + 2
+            ? candidate.Operands[firstArgument + 2]
+            : null;
+        if (!TryResolveSlowPathSlotOperand(definitions, rawSlotOperand, out var slotOperand))
+            goto Reject;
+
+        receiver = typedReceiver;
+        interfaceType = interfaceOperand;
+        slot = slotOperand;
+        return true;
+
+        Reject:
+        receiver = null!;
+        interfaceType = null!;
+        slot = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// 接口慢查表前的寄存器搬运会产生新的未类型化 SSA 局部；只沿纯局部 Move 回溯，
+    /// 一旦遇到接口类型即返回该唯一来源，不跨 Phi、内存或算术边界。
+    /// </summary>
+    internal static bool TryResolveTypedInterfaceReceiver(
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable receiver,
+        out LocalVariable typedReceiver)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(receiver))
+        {
+            if (receiver.Type is { } receiverType && IsInterface(receiverType))
+            {
+                typedReceiver = receiver;
+                return true;
+            }
+
+            if (Definition(definitions, receiver) is not
+                { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                break;
+            receiver = source;
+        }
+
+        typedReceiver = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// 测试入口：返回共享无Phi接口查表最终解析到的托管目标。
+    /// </summary>
+    internal static MethodAnalysisContext? ResolveSharedInvokeDataTarget(
+        Instruction dispatch,
+        IReadOnlyList<Instruction> instructions)
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in instructions)
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+        return MatchSharedInvokeDataResult(dispatch, definitions, instructions)?.Resolved;
+    }
+
+    private static bool HasInvokeDataMethodInfoConsumer(
+        Instruction dispatch,
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable invokeData)
+        => dispatch.Operands.Skip(1).Any(operand => ResolveInvokeDataLoad(operand, definitions, invokeData) == 8);
+
+    private static long? ResolveInvokeDataLoad(
+        IOperand operand,
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable invokeData)
+    {
+        var load = operand switch
+        {
+            MemoryOperand direct => direct,
+            LocalVariable local when Definition(definitions, local) is
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand indirect] } => indirect,
+            _ => default(MemoryOperand?),
+        };
+        // ARM64 转换器会为同一个 SSA 地址寄存器在 methodPtr 与 MethodInfo 两个内存操作数中
+        // 创建不同 LocalVariable 对象；这里必须比较完整寄存器身份，不能依赖对象引用。
+        return load is { Base: LocalVariable loadBase, Index: null, Scale: 0 }
+               && loadBase.Register == invokeData.Register
+            ? load.Value.Addend
+            : null;
+    }
 
     /// <summary>
     /// 判断单地址表中的 <c>List&lt;T&gt;.AddWithResize</c> 候选是否实际承载接口慢查表结果。
@@ -313,9 +518,9 @@ public static class InterfaceDispatchRecovery
         IOperand interfaceArg;
         IOperand slotArg;
 
-        if (TryMatchSlowPathCall(definitions, firstDefinition, out receiverArg, out interfaceArg, out slotArg))
+        if (TryMatchSharedSlowPathCall(definitions, firstDefinition!, out receiverArg, out interfaceArg, out slotArg))
             slowCall = firstDefinition;
-        else if (TryMatchSlowPathCall(definitions, secondDefinition, out receiverArg, out interfaceArg, out slotArg))
+        else if (TryMatchSharedSlowPathCall(definitions, secondDefinition!, out receiverArg, out interfaceArg, out slotArg))
             slowCall = secondDefinition;
         else if (homeBlock.TryGetValue(phi, out var slowMerge)
                  && TryFindSlowPathCall(
@@ -440,14 +645,11 @@ public static class InterfaceDispatchRecovery
         }
 
         var interfaceOperand = candidate.Operands[firstArgument + 1];
-        // ARM64 会省略作为零号槽位实参的 W2 写入，因此仅在慢路径调用确实只有
-        // 接收者与接口类型两个显式实参时补零；已有第三个实参但无法解析时必须拒绝。
-        var slotOperand = candidate.Operands.Count == firstArgument + 2
-            ? new Immediate(0)
-            : candidate.Operands[firstArgument + 2];
+        var rawSlotOperand = candidate.Operands.Count > firstArgument + 2
+            ? candidate.Operands[firstArgument + 2]
+            : null;
         if (!IsRuntimeClassOperand(definitions, interfaceOperand)
-            || ResolveConstant(definitions, slotOperand) is not { } resolvedSlot
-            || resolvedSlot is < 0 or > ushort.MaxValue)
+            || !TryResolveSlowPathSlotOperand(definitions, rawSlotOperand, out var slotOperand))
         {
             receiver = null!;
             interfaceType = null!;
@@ -459,6 +661,31 @@ public static class InterfaceDispatchRecovery
         interfaceType = interfaceOperand;
         slot = slotOperand;
         return true;
+    }
+
+    /// <summary>
+    /// 解析接口慢查表的槽位实参。ARM64 对零号槽位可省略 W2 写入，此时 ISIL 会保留
+    /// 调用前原有的 MethodInfo 寄存器值；只有精确定型为 MethodInfo 的载体才等价于省略的零。
+    /// </summary>
+    internal static bool TryResolveSlowPathSlotOperand(
+        Dictionary<LocalVariable, Instruction> definitions,
+        IOperand? operand,
+        out IOperand slot)
+    {
+        if (operand == null || operand is LocalVariable { IsMethodInfo: true } or LocalVariable { Type: RuntimeMethodInfoAnalysisContext })
+        {
+            slot = new Immediate(0);
+            return true;
+        }
+
+        if (ResolveConstant(definitions, operand) is { } value && value is >= 0 and <= ushort.MaxValue)
+        {
+            slot = operand;
+            return true;
+        }
+
+        slot = null!;
+        return false;
     }
 
     /// <summary>
@@ -498,7 +725,7 @@ public static class InterfaceDispatchRecovery
     {
         var matches = merge.Predecessors
             .SelectMany(predecessor => predecessor.Instructions)
-            .Where(instruction => TryMatchSlowPathCall(
+            .Where(instruction => TryMatchSharedSlowPathCall(
                 definitions,
                 instruction,
                 out _,
@@ -506,7 +733,7 @@ public static class InterfaceDispatchRecovery
                 out _))
             .ToList();
         if (matches.Count == 1
-            && TryMatchSlowPathCall(
+            && TryMatchSharedSlowPathCall(
                 definitions,
                 matches[0],
                 out receiver,
@@ -984,19 +1211,38 @@ public static class InterfaceDispatchRecovery
         // 将 [phi+8] 标记为隐藏 MethodInfo 参数。尾调用的目标寄存器也可能兼作参数槽，
         // 因而陈旧的 [phi] 加载也可能进入参数列表；用零占位后，VirtualInvokeData 指针即可被删除。
         var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+        if (invokeDataPhi.Destination is not LocalVariable invokeData)
+            return;
         for (var i = 1; i < dispatch.Operands.Count; i++)
         {
-            if (dispatch.Operands[i] is not LocalVariable argument
-                || Definition(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
-                || !ReferenceEquals(Definition(definitions, loadBase), invokeDataPhi))
-                continue;
-
-            if (load.Addend == 8 && assembly != null)
+            var addend = ResolveInvokeDataLoad(dispatch.Operands[i], definitions, invokeData);
+            if (addend == 8 && assembly != null)
                 dispatch.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
-            else if (load.Addend == 0)
+            else if (addend == 0)
                 dispatch.SetOperand(i, new Immediate(0));
         }
 
+    }
+
+    private static void RewriteSharedInvokeDataDispatch(
+        MethodAnalysisContext method,
+        Instruction dispatch,
+        Block block,
+        MethodAnalysisContext resolved,
+        LocalVariable invokeData,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        IndirectTransferCallRewriter.Rewrite(method, dispatch, block, resolved);
+
+        var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+        for (var i = 1; i < dispatch.Operands.Count; i++)
+        {
+            var addend = ResolveInvokeDataLoad(dispatch.Operands[i], definitions, invokeData);
+            if (addend == 8 && assembly != null)
+                dispatch.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+            else if (addend == 0)
+                dispatch.SetOperand(i, new Immediate(0));
+        }
     }
 
     private static void RewriteConditionalDispatch(

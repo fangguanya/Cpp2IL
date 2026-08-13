@@ -87,8 +87,9 @@ public static class KeyFunctionRecovery
     /// </summary>
     public static void RewriteTypeTests(MethodAnalysisContext method)
     {
-        var definitions = BuildUniqueDefinitions(method.ControlFlowGraph!.Instructions);
-        foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
+        var instructions = method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions).ToList();
+        var definitions = BuildUniqueDefinitions(instructions);
+        foreach (var instruction in instructions)
         {
             if (instruction is not
                 {
@@ -98,7 +99,12 @@ public static class KeyFunctionRecovery
                 })
                 continue;
 
-            var testedType = ResolveRuntimeClassType(typeHandle, definitions);
+            var testedType = ResolveRuntimeClassType(typeHandle, definitions)
+                             ?? ResolveTypeTestResultStorageType(
+                                 instruction,
+                                 result,
+                                 instructions,
+                                 definitions);
             if (testedType is not { IsValueType: false })
                 continue;
 
@@ -106,6 +112,67 @@ public static class KeyFunctionRecovery
             instruction.OpCode = OpCode.IsInst;
             instruction.SetOperands(result, source, testedType);
         }
+    }
+
+    /// <summary>
+    /// 当ARM64共享代码只把类型句柄保留为泛型寄存器时，使用 isinst 结果随后写入的
+    /// 唯一强类型栈槽恢复目标类型。该证据来自同一个SSA结果的真实数据流，且多个
+    /// 消费者必须指向等价引用类型；类型冲突或值类型一律保持原始调用。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveTypeTestResultStorageType(
+        Instruction typeTest,
+        LocalVariable result,
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        TypeAnalysisContext? provenType = null;
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Index <= typeTest.Index
+                || instruction is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [MemoryOperand memory, LocalVariable source],
+                }
+                || !ReferenceEquals(source, result)
+                || ResolveExactAddressedSlotType(memory, definitions) is not { IsValueType: false } candidate)
+                continue;
+
+            if (provenType != null && !GenericCallRebinder.TypesEquivalent(provenType, candidate))
+                return null;
+
+            provenType ??= candidate;
+        }
+
+        return provenType;
+    }
+
+    /// <summary>
+    /// 只接受零偏移、无索引的精确栈槽地址，避免把对象字段或数组元素类型误当成
+    /// isinst 的目标类型。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveExactAddressedSlotType(
+        MemoryOperand memory,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        if (memory is not { Base: LocalVariable carrier, Index: null, Scale: 0, Addend: 0 })
+            return null;
+
+        // SSA重命名后的地址寄存器会直接携带 T&；这比同物理寄存器跨块出现的多个
+        // AddressOf定义更精确，因此先读取其元素类型，并继续由调用者限制为引用类型。
+        if (carrier.Type is ByRefTypeAnalysisContext { ElementType: { } elementType })
+            return elementType;
+
+        if (!definitions.TryGetValue(carrier, out var definition)
+            || definition is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable destination, AddressOf { Target: LocalVariable slot }],
+            }
+            || !ReferenceEquals(destination, carrier))
+            return null;
+
+        return slot.Type;
     }
 
     private static TypeAnalysisContext? ResolveRuntimeClassType(

@@ -426,6 +426,12 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DelegateInvokeRecovery.Run(this);
         // 间接调用刚刚获得真实签名；立即把接收者、ref/out栈槽及其地址载体收敛为可生成CIL的精确类型。
         LocalVariables.ResolveLateCallTypesAndAddressCarriers(this);
+        // 第一次接口分派会给原生取址载体补出 T&。仅在这一新证据出现后，才能恢复
+        // 共享泛型地址上的 Object::IsInst；恢复出的接口类型再驱动同一链的最终BLR绑定。
+        // 这是固定的第二阶段闭包，不进行次数不定的重算。
+        KeyFunctionRecovery.RewriteTypeTests(this);
+        InterfaceDispatchRecovery.Run(this);
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(this);
         RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
 
         // 所有可解析目标此时已经绑定。在SSA单一定义仍有效时裁掉原生猜测出的多余隐参，
