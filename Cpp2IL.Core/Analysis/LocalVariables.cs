@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
@@ -1145,6 +1146,14 @@ public static class LocalVariables
     {
         var changed = false;
 
+        // 后置接口恢复仍处于SSA，但个别语义重写可能为同一局部追加定义；只沿唯一Move/Phi
+        // 定义反向追踪，避免把一次调用的接口约束扩散到不确定的多定义值。
+        var uniqueDefinitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+
         // A lea and the call it's passed to are still separate here. The address only gets folded into the
         // call later, so an argument's address-of has to be found through the local carrying it.
         var addressesOf = new Dictionary<LocalVariable, LocalVariable>();
@@ -1195,7 +1204,10 @@ public static class LocalVariables
             if (!calledMethod.IsStatic
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
             {
-                changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
+                changed |= BindResolvedInstanceReceiverCopySources(
+                    thisParam,
+                    calledMethod,
+                    uniqueDefinitions);
             }
 
             // Value type instance method, first arg is address of value, but we need to type the value
@@ -1244,6 +1256,77 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 已解析接口调用的接收者可能只是X0参数副本，真实长期值保存在X19-X28或Phi输入中。
+    /// 若只修正调用点副本，SSA简化会再次以内联源值替换它。沿唯一Move/Phi定义反向绑定，
+    /// 让调用点及所有确切入边共享同一接口类型；遇到非复制定义立即停止。
+    /// </summary>
+    internal static bool BindResolvedInstanceReceiverCopySources(
+        LocalVariable receiver,
+        MethodAnalysisContext calledMethod,
+        IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
+    {
+        var changed = false;
+        var pending = new Queue<LocalVariable>();
+        var visited = new HashSet<LocalVariable>();
+        pending.Enqueue(receiver);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Dequeue();
+            if (!visited.Add(current))
+                continue;
+
+            changed |= BindResolvedInstanceReceiverType(current, calledMethod);
+            if (!uniqueDefinitions.TryGetValue(current, out var definition))
+                continue;
+
+            if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            {
+                pending.Enqueue(source);
+                continue;
+            }
+
+            if (definition.OpCode != OpCode.Phi)
+                continue;
+
+            for (var operandIndex = 1; operandIndex < definition.Operands.Count; operandIndex++)
+                if (definition.Operands[operandIndex] is LocalVariable input)
+                    pending.Enqueue(input);
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 已解析托管实例调用的声明类型是接收者的权威下界。普通具体类型仍沿用单调的“只填空值”
+    /// 传播；接口分派若与原生查表阶段留下的类型冲突，则接口槽位证据更精确，必须覆盖陈旧猜测。
+    /// 这样既保留实现接口的具体类型，也能修正共享泛型查表把IEnumerator误写成List&lt;T&gt;的情况。
+    /// </summary>
+    internal static bool BindResolvedInstanceReceiverType(
+        LocalVariable receiver,
+        MethodAnalysisContext calledMethod)
+    {
+        var declaringType = calledMethod.DeclaringType;
+        if (declaringType == null)
+            return false;
+
+        if (receiver.Type == null)
+            return SetTypeIfUnknown(receiver, declaringType);
+
+        if (GenericCallRebinder.TypesEquivalent(receiver.Type, declaringType))
+            return false;
+
+        var declaringInterface = declaringType is GenericInstanceTypeAnalysisContext genericInstance
+            ? genericInstance.GenericType.IsInterface
+            : declaringType.IsInterface;
+        if (!declaringInterface || receiver.Type.IsAssignableTo(declaringType))
+            return false;
+
+        receiver.Type = declaringType;
+        return true;
     }
 
     private static void PropagateFromParameters(MethodAnalysisContext method)

@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Linq;
+using System.Collections.Generic;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -736,6 +737,111 @@ public class LocalVariablesTests
         {
             Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>());
             Assert.That(loaded.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 已解析接口调用覆盖不兼容的共享泛型接收者类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var moveNext = enumerator.Methods.First(method => method.Name == "MoveNext");
+        var pollutedType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X20", 14),
+            pollutedType);
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, moveNext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(receiver.Type, Is.SameAs(enumerator));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 已解析接口接收者类型沿唯一复制链传播到长期局部()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var moveNext = enumerator.Methods.First(method => method.Name == "MoveNext");
+        var pollutedType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var longLived = new LocalVariable(
+            "longLived",
+            new Register(null, "X20", 14),
+            pollutedType);
+        var callReceiver = new LocalVariable(
+            "callReceiver",
+            new Register(null, "X0", 47),
+            pollutedType);
+        var copy = new Instruction(0, OpCode.Move, callReceiver, longLived);
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [callReceiver] = copy,
+        };
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverCopySources(
+            callReceiver,
+            moveNext,
+            definitions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(callReceiver.Type, Is.SameAs(enumerator));
+            Assert.That(longLived.Type, Is.SameAs(enumerator));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已是目标接口的接收者保持精确类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var moveNext = enumerator.Methods.First(method => method.Name == "MoveNext");
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X20", 14),
+            enumerator);
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, moveNext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(enumerator));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非接口调用不得覆盖已有接收者类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var toString = systemObject.Methods.First(method => method.Name == "ToString");
+        var existingType = appContext.SystemTypes.SystemStringType;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            existingType);
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, toString);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(existingType));
         });
     }
 }

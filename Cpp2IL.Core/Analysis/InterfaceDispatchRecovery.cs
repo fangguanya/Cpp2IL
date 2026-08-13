@@ -35,6 +35,7 @@ public static class InterfaceDispatchRecovery
         }
 
         var changed = false;
+        var directMatches = new List<Match>();
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -67,13 +68,24 @@ public static class InterfaceDispatchRecovery
                 match.SlowCall.SetOperands();
 
                 if (match is DirectMatch)
-                    TryExciseLookup(cfg, match, definitions, homeBlock);
+                    directMatches.Add(match);
                 changed = true;
             }
         }
 
         if (changed)
+        {
+            // 当前阶段同时包含此前已解析的GetEnumerator等直调与刚恢复的接口调用；统一裁参后，
+            // SSA死码删除才能精确清掉它们共同维持的隐藏MethodInfo Phi链。后续委托恢复会产生新的
+            // 调用集合，由流水线末端的同一裁参器处理，两个阶段各自只计算一次。
+            CallArgumentTrimmer.Run(method);
             DeadCodeEliminator.Run(method);
+
+            foreach (var match in directMatches)
+                TryExciseLookup(cfg, match, definitions, homeBlock);
+
+            DeadCodeEliminator.Run(method);
+        }
     }
 
     private const long VTableOffset = 0x138;
