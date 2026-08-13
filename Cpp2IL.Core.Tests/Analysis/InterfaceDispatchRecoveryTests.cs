@@ -575,6 +575,73 @@ public class InterfaceDispatchRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 已消费的MethodInfo局部载入被精确删除()
+    {
+        var invokeData = Local("invokeData");
+        var methodInfo = Local("methodInfo");
+        var load = new Instruction(0, OpCode.Move, methodInfo, new MemoryOperand(invokeData, addend: 8));
+        var definitions = new Dictionary<LocalVariable, Instruction> { [methodInfo] = load };
+
+        var changed = InterfaceDispatchRecovery.SuppressConsumedMethodInfoLoad(
+            methodInfo,
+            definitions,
+            invokeData);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(load.Operands, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同寄存器不同局部对象的MethodInfo载入仍被删除()
+    {
+        var producerBase = new LocalVariable("producerBase", new Register(null, "X8"));
+        var consumerBase = new LocalVariable("consumerBase", new Register(null, "X8"));
+        var methodInfo = Local("methodInfo");
+        var load = new Instruction(0, OpCode.Move, methodInfo, new MemoryOperand(producerBase, addend: 8));
+        var definitions = new Dictionary<LocalVariable, Instruction> { [methodInfo] = load };
+
+        var changed = InterfaceDispatchRecovery.SuppressConsumedMethodInfoLoad(
+            methodInfo,
+            definitions,
+            consumerBase);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Nop));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非MethodInfo载入保持原指令不变()
+    {
+        var invokeData = Local("invokeData");
+        var unrelatedBase = Local("unrelatedBase");
+        var value = Local("value");
+        var wrongBaseLoad = new Instruction(0, OpCode.Move, value, new MemoryOperand(unrelatedBase, addend: 8));
+        var definitions = new Dictionary<LocalVariable, Instruction> { [value] = wrongBaseLoad };
+
+        var changed = InterfaceDispatchRecovery.SuppressConsumedMethodInfoLoad(
+            value,
+            definitions,
+            invokeData);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(wrongBaseLoad.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(wrongBaseLoad.Operands, Has.Count.EqualTo(2));
+        });
+    }
+
     private static (Instruction Dispatch, IReadOnlyList<Instruction> Instructions) CreateSharedInvokeDataShape(
         bool includeMethodInfo,
         long slowSlot,

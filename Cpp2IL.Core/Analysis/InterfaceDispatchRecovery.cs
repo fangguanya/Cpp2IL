@@ -1209,19 +1209,12 @@ public static class InterfaceDispatchRecovery
         IndirectTransferCallRewriter.Rewrite(method, dispatch, block, resolved);
 
         // 将 [phi+8] 标记为隐藏 MethodInfo 参数。尾调用的目标寄存器也可能兼作参数槽，
-        // 因而陈旧的 [phi] 加载也可能进入参数列表；用零占位后，VirtualInvokeData 指针即可被删除。
+        // 因而陈旧的 [phi] 加载也可能进入参数列表；统一清理已消费的元数据载入，
+        // 再用零占位替换 methodPtr 载入，使 VirtualInvokeData 指针可以被死码删除。
         var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
         if (invokeDataPhi.Destination is not LocalVariable invokeData)
             return;
-        for (var i = 1; i < dispatch.Operands.Count; i++)
-        {
-            var addend = ResolveInvokeDataLoad(dispatch.Operands[i], definitions, invokeData);
-            if (addend == 8 && assembly != null)
-                dispatch.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
-            else if (addend == 0)
-                dispatch.SetOperand(i, new Immediate(0));
-        }
-
+        ReplaceInvokeDataOperands(dispatch, resolved, assembly, definitions, invokeData);
     }
 
     private static void RewriteSharedInvokeDataDispatch(
@@ -1235,14 +1228,55 @@ public static class InterfaceDispatchRecovery
         IndirectTransferCallRewriter.Rewrite(method, dispatch, block, resolved);
 
         var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+        ReplaceInvokeDataOperands(dispatch, resolved, assembly, definitions, invokeData);
+    }
+
+    /// <summary>
+    /// 替换已经闭合的 VirtualInvokeData 参数，并删除仅用于携带隐藏 MethodInfo 的原生载入。
+    /// ARM64 会让隐藏参数寄存器与后续托管值复用；如果只替换调用参数而保留该 Move，
+    /// CIL 会把原生 MethodInfo 指针错误写回托管局部，破坏后续泛型值的数据流。
+    /// </summary>
+    private static void ReplaceInvokeDataOperands(
+        Instruction dispatch,
+        MethodAnalysisContext resolved,
+        AssemblyAnalysisContext? assembly,
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable invokeData)
+    {
         for (var i = 1; i < dispatch.Operands.Count; i++)
         {
-            var addend = ResolveInvokeDataLoad(dispatch.Operands[i], definitions, invokeData);
+            var originalOperand = dispatch.Operands[i];
+            var addend = ResolveInvokeDataLoad(originalOperand, definitions, invokeData);
             if (addend == 8 && assembly != null)
+            {
+                SuppressConsumedMethodInfoLoad(originalOperand, definitions, invokeData);
                 dispatch.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+            }
             else if (addend == 0)
+            {
                 dispatch.SetOperand(i, new Immediate(0));
+            }
         }
+    }
+
+    /// <summary>
+    /// 删除已被接口调用语义取代的 <c>Move local, [invokeData+8]</c>。
+    /// 直接内存操作数没有独立定义；不同基址、不同偏移以及复制链均保持原样。
+    /// </summary>
+    internal static bool SuppressConsumedMethodInfoLoad(
+        IOperand operand,
+        Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable invokeData)
+    {
+        if (operand is not LocalVariable local
+            || Definition(definitions, local) is not
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand] } definition
+            || ResolveInvokeDataLoad(operand, definitions, invokeData) != 8)
+            return false;
+
+        definition.OpCode = OpCode.Nop;
+        definition.SetOperands();
+        return true;
     }
 
     private static void RewriteConditionalDispatch(
