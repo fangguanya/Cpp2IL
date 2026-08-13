@@ -1154,4 +1154,90 @@ public class LocalVariablesTests
             Assert.That(local.Type, Is.SameAs(genericElement));
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 构造器接收者必须覆盖分配结果的错误值类型猜测()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.ArrayList")!;
+        var constructor = listType.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, listType);
+        var call = new Instruction(1, OpCode.CallVoid, constructor, receiver);
+        var method = CreateConstructorFixture(listType, "RecoverConstructedReceiver", [allocation, call], [receiver]);
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.That(receiver.Type, Is.SameAs(listType));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 构造器接收者沿唯一Move闭合到分配结果()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.ArrayList")!;
+        var constructor = listType.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
+        var allocated = new LocalVariable("allocated", new Register(null, "X0", 1), appContext.SystemTypes.SystemInt32Type);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 2), appContext.SystemTypes.SystemInt32Type);
+        var allocation = new Instruction(0, OpCode.Newobj, allocated, listType);
+        var copy = new Instruction(1, OpCode.Move, receiver, allocated);
+        var call = new Instruction(2, OpCode.CallVoid, constructor, receiver);
+        var method = CreateConstructorFixture(
+            listType,
+            "RecoverCopiedConstructedReceiver",
+            [allocation, copy, call],
+            [allocated, receiver]);
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(receiver.Type, Is.SameAs(listType));
+            Assert.That(allocated.Type, Is.SameAs(listType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通实例调用不得覆盖接收者已有具体类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var objectType = appContext.SystemTypes.SystemObjectType;
+        var toString = objectType.Methods.First(method => method.Name == "ToString" && method.Parameters.Count == 0);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), appContext.SystemTypes.SystemStringType);
+        var result = new LocalVariable("result", new Register(null, "X0", 2));
+        var call = new Instruction(0, OpCode.Call, toString, result, receiver);
+        var method = CreateConstructorFixture(objectType, "PreserveNormalReceiver", [call], [receiver, result]);
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+    }
+
+    private static InjectedMethodAnalysisContext CreateConstructorFixture(
+        TypeAnalysisContext declaringType,
+        string name,
+        IReadOnlyList<Instruction> body,
+        IReadOnlyList<LocalVariable> locals)
+    {
+        var method = new InjectedMethodAnalysisContext(
+            declaringType,
+            name,
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            .. body,
+            new Instruction(body.Count, OpCode.Return),
+        ]);
+        method.Locals = [.. locals];
+        return method;
+    }
 }

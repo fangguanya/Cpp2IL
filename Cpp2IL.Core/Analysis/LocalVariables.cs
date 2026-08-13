@@ -1230,6 +1230,20 @@ public static class LocalVariables
             if (instruction.Operands[0] is not MethodAnalysisContext calledMethod)
                 continue;
 
+            // Object::New 已经把目标局部标记为 Newobj，但原生分配入口本身没有托管构造器
+            // 的返回值语义。真实实例类型以紧随其后的 .ctor 接收者为准；若此前因栈帧
+            // 寄存器复用留下了值类型猜测，这里必须用构造器声明类型覆盖，避免生成
+            // Unsafe.AsPointer(ref *(?*)new Dictionary(...)) 一类非法源码。
+            if (instruction.OpCode == OpCode.CallVoid
+                && calledMethod.Name == ".ctor"
+                && !calledMethod.IsStatic
+                && calledMethod.DeclaringType is { } constructedType
+                && instruction.Operands.Count > 1
+                && instruction.Operands[1] is LocalVariable constructedReceiver)
+            {
+                changed |= SetConstructedReceiverType(constructedReceiver, constructedType, uniqueDefinitions);
+            }
+
             // Return value: a constructor yields its declaring type, otherwise the declared return type.
             if (instruction.Destination is LocalVariable returnValue)
             {
@@ -1307,6 +1321,54 @@ public static class LocalVariables
 
         return changed;
     }
+
+    private static bool SetConstructedReceiverType(
+        LocalVariable receiver,
+        TypeAnalysisContext constructedType,
+        IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
+    {
+        var targetType = receiver.Type is { } receiverType
+                         && HasClosedGenericProjection(receiverType, constructedType)
+            ? receiverType
+            : constructedType;
+        var changed = false;
+        var current = receiver;
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(current))
+        {
+            if (!GenericCallRebinder.TypesEquivalent(current.Type, targetType))
+            {
+                current.Type = targetType;
+                changed = true;
+            }
+
+            if (!uniqueDefinitions.TryGetValue(current, out var definition))
+                break;
+
+            if (definition.OpCode == OpCode.Newobj
+                && definition.Destination is LocalVariable allocated)
+            {
+                if (!GenericCallRebinder.TypesEquivalent(allocated.Type, targetType))
+                {
+                    allocated.Type = targetType;
+                    changed = true;
+                }
+                break;
+            }
+
+            if (definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                break;
+            current = source;
+        }
+
+        return changed;
+    }
+
+    private static bool HasClosedGenericProjection(TypeAnalysisContext? actual, TypeAnalysisContext expected)
+        => actual is GenericInstanceTypeAnalysisContext actualGeneric
+           && expected is GenericInstanceTypeAnalysisContext expectedGeneric
+           && actualGeneric.GenericParameters.All(parameter => !ContainsUninstantiatedGenericParameter(parameter))
+           && GenericCallRebinder.TypesEquivalent(actualGeneric.GenericType, expectedGeneric.GenericType);
 
     /// <summary>
     /// 已重绑定调用的封闭参数签名可以取代局部变量上的开放泛型占位符。
