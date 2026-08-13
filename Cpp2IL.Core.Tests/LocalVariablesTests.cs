@@ -1221,6 +1221,30 @@ public class LocalVariablesTests
         Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
     }
 
+    [Test]
+    [Category("异常输入")]
+    public void 构造器接收者不来自Newobj时不得覆盖既有类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.ArrayList")!;
+        var constructor = listType.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, constructor, receiver);
+        var method = CreateConstructorFixture(
+            listType,
+            "PreserveNonAllocationConstructorReceiver",
+            [call],
+            [receiver]);
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+    }
+
     private static InjectedMethodAnalysisContext CreateConstructorFixture(
         TypeAnalysisContext declaringType,
         string name,

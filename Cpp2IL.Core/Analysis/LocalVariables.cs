@@ -1266,6 +1266,7 @@ public static class LocalVariables
 
             // 'this' param
             if (!calledMethod.IsStatic
+                && calledMethod.Name != ".ctor"
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
             {
                 changed |= BindResolvedInstanceReceiverCopySources(
@@ -1327,38 +1328,41 @@ public static class LocalVariables
         TypeAnalysisContext constructedType,
         IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
     {
+        // 先完整确认接收者确实来自 Object::New。构造器也会被显式调用在既有实例、
+        // 可空值与共享寄存器上；若边走边写类型，会与 IsInst/字段证据相互覆盖并振荡。
+        var allocationChain = new List<LocalVariable>();
+        var current = receiver;
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(current))
+        {
+            allocationChain.Add(current);
+            if (!uniqueDefinitions.TryGetValue(current, out var definition))
+                return false;
+
+            if (definition.OpCode == OpCode.Newobj)
+                break;
+
+            if (definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                return false;
+            current = source;
+        }
+
+        if (!uniqueDefinitions.TryGetValue(current, out var allocation)
+            || allocation.OpCode != OpCode.Newobj)
+            return false;
+
         var targetType = receiver.Type is { } receiverType
                          && HasClosedGenericProjection(receiverType, constructedType)
             ? receiverType
             : constructedType;
         var changed = false;
-        var current = receiver;
-        var visited = new HashSet<LocalVariable>();
-        while (visited.Add(current))
+        foreach (var allocated in allocationChain)
         {
-            if (!GenericCallRebinder.TypesEquivalent(current.Type, targetType))
+            if (!GenericCallRebinder.TypesEquivalent(allocated.Type, targetType))
             {
-                current.Type = targetType;
+                allocated.Type = targetType;
                 changed = true;
             }
-
-            if (!uniqueDefinitions.TryGetValue(current, out var definition))
-                break;
-
-            if (definition.OpCode == OpCode.Newobj
-                && definition.Destination is LocalVariable allocated)
-            {
-                if (!GenericCallRebinder.TypesEquivalent(allocated.Type, targetType))
-                {
-                    allocated.Type = targetType;
-                    changed = true;
-                }
-                break;
-            }
-
-            if (definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
-                break;
-            current = source;
         }
 
         return changed;
