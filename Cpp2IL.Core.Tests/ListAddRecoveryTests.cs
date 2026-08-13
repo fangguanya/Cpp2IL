@@ -106,6 +106,27 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("边界值")]
+    public void 慢路径直接返回而快路径跳到共享返回时仍闭合Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            slowPathReturnsDirectly: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }),
+                Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
     public void 慢路径含已解析运行时元数据读取时仍闭合Add()
     {
         var fixture = CreateFixture(
@@ -299,7 +320,8 @@ public class ListAddRecoveryTests
         bool includeMatchingCarrierMove = false,
         bool mismatchCarrierSource = false,
         bool includeRuntimeMetadataPrefix = false,
-        bool includeDivergentRuntimeMetadataCarrier = false)
+        bool includeDivergentRuntimeMetadataCarrier = false,
+        bool slowPathReturnsDirectly = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -393,16 +415,22 @@ public class ListAddRecoveryTests
         }
         var slowCallIndex = instructions.Count;
         instructions.Add(new Instruction(slowCallIndex, OpCode.CallVoid, addWithResizeTarget, receiver, value));
+        if (slowPathReturnsDirectly)
+            instructions.Add(new Instruction(instructions.Count, OpCode.Return));
         var mergeEntryIndex = instructions.Count;
         if (includeNops)
             instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
         var mergeIndex = instructions.Count;
-        instructions.Add(new Instruction(mergeIndex, OpCode.Return, receiver));
+        instructions.Add(slowPathReturnsDirectly
+            ? new Instruction(mergeIndex, OpCode.Return)
+            : new Instruction(mergeIndex, OpCode.Return, receiver));
 
         instructions[4].SetOperand(0, instructions[slowEntryIndex]);
         fastJump.SetOperand(0, instructions[mergeEntryIndex]);
 
         var graph = new ISILControlFlowGraph(instructions);
+        if (slowPathReturnsDirectly)
+            graph.MergeCallBlocks();
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
         method.ControlFlowGraph = graph;
         var slowBlock = graph.FindBlockByInstruction(instructions[slowCallIndex])!;

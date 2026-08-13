@@ -35,7 +35,7 @@ public static class ListAddRecovery
 
             if (slowBlock.Predecessors is not [var head])
                 continue;
-            if (slowBlock.Successors is not [var merge])
+            if (!TryGetMergeBlock(graph, slowBlock, out var merge))
                 continue;
             if (!TryMatchHead(
                     head,
@@ -84,6 +84,43 @@ public static class ListAddRecovery
         return recovered;
     }
 
+    /// <summary>
+    /// 容量不足分支有时会直接以AddWithResize结束方法，而快速分支跳到同一Return块。
+    /// 此时慢块的图后继是Exit，但它的唯一托管Return仍是公开Add应接回的汇合块。
+    /// </summary>
+    private static bool TryGetMergeBlock(
+        ISILControlFlowGraph graph,
+        Block slowBlock,
+        out Block merge)
+    {
+        merge = null!;
+        if (slowBlock.Successors is not [var successor])
+            return false;
+        if (!ReferenceEquals(successor, graph.ExitBlock))
+        {
+            merge = successor;
+            return true;
+        }
+
+        var slowInstructions = SemanticInstructions(slowBlock);
+        if (slowInstructions is not
+            [
+                { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "AddWithResize" }, ..] },
+                { OpCode: OpCode.Return, Operands.Count: 0 }
+            ])
+            return false;
+
+        var candidates = graph.ExitBlock.Predecessors.Where(block =>
+            !ReferenceEquals(block, slowBlock)
+            && SemanticInstructions(block) is
+            [{ OpCode: OpCode.Return, Operands.Count: 0 }]).ToList();
+        if (candidates.Count != 1)
+            return false;
+
+        merge = candidates[0];
+        return true;
+    }
+
     private static bool TryMatchSlowPath(
         Block block,
         out Instruction call,
@@ -102,6 +139,12 @@ public static class ListAddRecovery
         var callIndex = instructions.FindIndex(instruction =>
             instruction is { OpCode: OpCode.CallVoid, Operands.Count: 3 }
             && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var trailingInstructions = callIndex < 0
+            ? []
+            : instructions
+                .Skip(callIndex + 1)
+                .Where(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+                .ToList();
         if (callIndex < 0
             || instructions.Count(instruction =>
                 instruction.IsCall
@@ -113,18 +156,28 @@ public static class ListAddRecovery
             || method.Name != "AddWithResize"
             || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
             || instructions.Take(callIndex).Any(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
-            || instructions.Skip(callIndex + 1).Any(instruction => instruction.OpCode != OpCode.Move))
+            || !IsValidSlowTail(trailingInstructions))
             return false;
 
         call = candidate;
         target = method;
         receiver = list;
         value = candidate.Operands[2];
-        tail = instructions
-            .Skip(callIndex + 1)
-            .Where(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+        tail = trailingInstructions
+            .Where(instruction => instruction.OpCode != OpCode.Return)
             .ToList();
         return true;
+    }
+
+    private static bool IsValidSlowTail(IReadOnlyList<Instruction> instructions)
+    {
+        if (instructions.All(instruction => instruction.OpCode == OpCode.Move))
+            return true;
+
+        return instructions.Count > 0
+               && instructions[^1] is { OpCode: OpCode.Return, Operands.Count: 0 }
+               && instructions.Take(instructions.Count - 1)
+                   .All(instruction => instruction.OpCode == OpCode.Move);
     }
 
     private static bool TryMatchHead(

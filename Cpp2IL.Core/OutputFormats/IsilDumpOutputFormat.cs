@@ -96,6 +96,21 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
                             typeDump.Append('\t').Append(isilInsn).AppendLine();
                         }
 
+                        // 原始ConvertedIsil只反映CFG建立前的输入。恢复器会改写最终控制流，
+                        // 因此同时输出最终块关系和指令，才能逐方法核验List、接口与BLR闭包。
+                        typeDump.AppendLine().AppendLine("Final CFG:");
+                        foreach (var block in method.ControlFlowGraph!.Blocks)
+                        {
+                            typeDump.Append("\tBlock ").Append(block.ID)
+                                .Append(" predecessors=[")
+                                .Append(string.Join(",", block.Predecessors.Select(item => item.ID)))
+                                .Append("] successors=[")
+                                .Append(string.Join(",", block.Successors.Select(item => item.ID)))
+                                .AppendLine("]");
+                            foreach (var instruction in block.Instructions)
+                                typeDump.Append("\t\t").Append(instruction).AppendLine();
+                        }
+
                         method.ReleaseAnalysisData();
 
                         typeDump.AppendLine();
