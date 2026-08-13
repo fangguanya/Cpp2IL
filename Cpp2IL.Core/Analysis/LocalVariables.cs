@@ -1302,8 +1302,8 @@ public static class LocalVariables
 
     /// <summary>
     /// 已解析托管实例调用的声明类型是接收者的权威下界。普通具体类型仍沿用单调的“只填空值”
-    /// 传播；接口分派若与原生查表阶段留下的类型冲突，则接口槽位证据更精确，必须覆盖陈旧猜测。
-    /// 这样既保留实现接口的具体类型，也能修正共享泛型查表把IEnumerator误写成List&lt;T&gt;的情况。
+    /// 传播；接口分派只覆盖含未实例化泛型参数的占位类型。这样既保留object、IConvertible等
+    /// 运行时合法接收者，也能修正共享泛型查表把IEnumerator误写成List&lt;T&gt;的情况。
     /// </summary>
     internal static bool BindResolvedInstanceReceiverType(
         LocalVariable receiver,
@@ -1322,12 +1322,22 @@ public static class LocalVariables
         var declaringInterface = declaringType is GenericInstanceTypeAnalysisContext genericInstance
             ? genericInstance.GenericType.IsInterface
             : declaringType.IsInterface;
-        if (!declaringInterface || receiver.Type.IsAssignableTo(declaringType))
+        if (!declaringInterface
+            || receiver.Type.IsAssignableTo(declaringType)
+            || !ContainsUninstantiatedGenericParameter(receiver.Type))
             return false;
 
         receiver.Type = declaringType;
         return true;
     }
+
+    /// <summary>
+    /// 递归识别仍携带类型/方法泛型参数的开放实例；封闭泛型和普通引用类型均不属于占位类型。
+    /// </summary>
+    internal static bool ContainsUninstantiatedGenericParameter(TypeAnalysisContext type)
+        => type is GenericParameterTypeAnalysisContext
+           || type is GenericInstanceTypeAnalysisContext genericInstance
+           && genericInstance.GenericArguments.Any(ContainsUninstantiatedGenericParameter);
 
     private static void PropagateFromParameters(MethodAnalysisContext method)
     {

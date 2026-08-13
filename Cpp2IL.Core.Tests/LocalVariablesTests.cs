@@ -748,8 +748,9 @@ public class LocalVariablesTests
         var enumerator = appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.Collections.IEnumerator")!;
         var moveNext = enumerator.Methods.First(method => method.Name == "MoveNext");
-        var pollutedType = appContext.GetAssemblyByName("mscorlib")!
+        var pollutedDefinition = appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var pollutedType = pollutedDefinition.MakeGenericInstanceType(pollutedDefinition.GenericParameters);
         var receiver = new LocalVariable(
             "receiver",
             new Register(null, "X20", 14),
@@ -772,8 +773,9 @@ public class LocalVariablesTests
         var enumerator = appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.Collections.IEnumerator")!;
         var moveNext = enumerator.Methods.First(method => method.Name == "MoveNext");
-        var pollutedType = appContext.GetAssemblyByName("mscorlib")!
+        var pollutedDefinition = appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var pollutedType = pollutedDefinition.MakeGenericInstanceType(pollutedDefinition.GenericParameters);
         var longLived = new LocalVariable(
             "longLived",
             new Register(null, "X20", 14),
@@ -837,6 +839,30 @@ public class LocalVariablesTests
             existingType);
 
         var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, toString);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(existingType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不兼容但封闭的接口类型不得被覆盖()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var moveNext = enumerator.Methods.First(method => method.Name == "MoveNext");
+        var existingType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IConvertible")!;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            existingType);
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, moveNext);
 
         Assert.Multiple(() =>
         {
