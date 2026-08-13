@@ -932,4 +932,226 @@ public class LocalVariablesTests
             Assert.That(receiver.Type, Is.SameAs(existingType));
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 后置类型收敛必须按具体实参闭合开放List调用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement]);
+        var openTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [genericElement],
+            []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            openTarget.DeclaringType);
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, openTarget, receiver, value);
+        var method = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "CloseLateListCall",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            call,
+            new Instruction(1, OpCode.Return),
+        ]);
+        method.Locals = [receiver, value];
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                rebound.TypeGenericParameters,
+                Is.EqualTo(new[] { appContext.SystemTypes.SystemStringType }));
+            Assert.That(
+                GenericCallRebinder.TypesEquivalent(receiver.Type, rebound.DeclaringType),
+                Is.True);
+            Assert.That(value.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 后置类型收敛必须优先保持封闭List接收者实参()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement]);
+        var openTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [genericElement],
+            []);
+        var objectType = appContext.SystemTypes.SystemObjectType;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            listDefinition.MakeGenericInstanceType([objectType]));
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, openTarget, receiver, value);
+        var method = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "PreserveClosedListReceiver",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            call,
+            new Instruction(1, OpCode.Return),
+        ]);
+        method.Locals = [receiver, value];
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(rebound.TypeGenericParameters, Is.EqualTo(new[] { objectType }));
+            Assert.That(
+                GenericCallRebinder.TypesEquivalent(receiver.Type, rebound.DeclaringType),
+                Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 后置类型收敛遇到冲突实参必须保持开放调用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var pair = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "Pair",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement, genericElement]);
+        var openTarget = new ConcreteGenericMethodAnalysisContext(pair, [genericElement], []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            openTarget.DeclaringType);
+        var first = new LocalVariable(
+            "first",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemStringType);
+        var second = new LocalVariable(
+            "second",
+            new Register(null, "X2", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var call = new Instruction(0, OpCode.CallVoid, openTarget, receiver, first, second);
+        var method = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "RejectConflictingLateArguments",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            call,
+            new Instruction(1, OpCode.Return),
+        ]);
+        method.Locals = [receiver, first, second];
+
+        LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.Operands[0], Is.SameAs(openTarget));
+            Assert.That(first.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+            Assert.That(second.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 封闭调用参数必须替换局部的开放泛型占位符()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            listDefinition.GenericParameters.Single());
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(
+            local,
+            appContext.SystemTypes.SystemStringType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(local.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 封闭调用参数不得覆盖局部已有的具体类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemObjectType);
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(
+            local,
+            appContext.SystemTypes.SystemStringType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(local.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 开放调用参数不得改写开放局部类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            genericElement);
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(local, genericElement);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(local.Type, Is.SameAs(genericElement));
+        });
+    }
 }

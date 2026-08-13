@@ -401,6 +401,14 @@ public static class LocalVariables
             var captureFinalIteration = MaxTypePropagationLoopCount != -1
                 && loopCount == MaxTypePropagationLoopCount;
 
+            // 接口派发、字段偏移和聚合复制会在主类型循环之后提供新的具体类型证据。
+            // 必须先据此重绑定共享泛型调用，再让调用签名向局部变量传播，避免
+            // List<!0>.AddWithResize(T) 一直把开放 VAR 反向写回后续 SSA 局部。
+            changed |= RecordChangingPass(
+                lastChangingPasses,
+                nameof(GenericCallRebinder),
+                GenericCallRebinder.Run(method));
+
             var typesBeforeCalls = captureFinalIteration ? CaptureLocalTypes(method) : null;
             var callChanges = PropagateFromCallParameters(method);
             changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), callChanges);
@@ -1288,16 +1296,37 @@ public static class LocalVariables
                 if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType }
                     && Addressed(instruction.Operands[i]) is { } referenced)
                 {
-                    changed |= SetTypeIfUnknown(referenced, referencedType);
+                    changed |= SetTypeFromClosedCallParameter(referenced, referencedType);
                     continue;
                 }
 
                 if (instruction.Operands[i] is LocalVariable local)
-                    changed |= SetTypeIfUnknown(local, parameterType);
+                    changed |= SetTypeFromClosedCallParameter(local, parameterType);
             }
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 已重绑定调用的封闭参数签名可以取代局部变量上的开放泛型占位符。
+    /// 具体局部类型仍保持不变；参数自身仍开放时也不传播，从而维持单调收敛并拒绝冲突推断。
+    /// </summary>
+    internal static bool SetTypeFromClosedCallParameter(
+        LocalVariable local,
+        TypeAnalysisContext? parameterType)
+    {
+        if (parameterType == null || ContainsUninstantiatedGenericParameter(parameterType))
+            return false;
+
+        if (local.Type == null)
+            return SetTypeIfUnknown(local, parameterType);
+
+        if (!ContainsUninstantiatedGenericParameter(local.Type))
+            return false;
+
+        local.Type = parameterType;
+        return true;
     }
 
     /// <summary>
