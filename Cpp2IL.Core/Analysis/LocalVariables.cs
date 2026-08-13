@@ -1266,7 +1266,6 @@ public static class LocalVariables
 
             // 'this' param
             if (!calledMethod.IsStatic
-                && calledMethod.Name != ".ctor"
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
             {
                 changed |= BindResolvedInstanceReceiverCopySources(
