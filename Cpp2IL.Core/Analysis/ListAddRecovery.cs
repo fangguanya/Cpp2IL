@@ -559,11 +559,46 @@ public static class ListAddRecovery
             return false;
 
         var fastTail = instructions.Where(instruction => !allowed.Contains(instruction)).ToList();
-        preservedSlowTail = slowTail.Where(instruction => !slowStateRefreshes.Contains(instruction)).ToList();
+        // 连续内联 Add 会在汇合块继续消费上一菱形的 size/version 载体。公开 Add 已经完成
+        // 集合状态更新，因此只有在后续仍引用载体时，才把慢路径的字段回读搬到公开调用之后；
+        // 最后一项追加没有后续引用，仍删除全部私有状态刷新。
+        var requiredStateRefreshes = slowStateRefreshes.Where(instruction =>
+            instruction.Destination is LocalVariable destination
+            && IsReferencedFromMerge(merge, destination)).ToHashSet();
+        preservedSlowTail = slowTail.Where(instruction =>
+            !slowStateRefreshes.Contains(instruction)
+            || requiredStateRefreshes.Contains(instruction)).ToList();
         var callClobberRefreshes = preservedSlowTail.Where(instruction =>
             IsRedundantCallClobberRefresh(graph, instruction)).ToList();
-        var comparableSlowTail = preservedSlowTail.Where(instruction => !callClobberRefreshes.Contains(instruction)).ToList();
+        var comparableSlowTail = preservedSlowTail.Where(instruction =>
+            !requiredStateRefreshes.Contains(instruction)
+            && !callClobberRefreshes.Contains(instruction)).ToList();
         return HaveIdenticalCarrierMoves(fastTail, comparableSlowTail);
+    }
+
+    /// <summary>
+    /// 判断容量菱形的汇合点及其后继是否继续使用指定状态载体。
+    /// </summary>
+    private static bool IsReferencedFromMerge(Block merge, LocalVariable local)
+    {
+        var pending = new Stack<Block>();
+        var visited = new HashSet<Block>();
+        pending.Push(merge);
+
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (!visited.Add(block))
+                continue;
+            if (SemanticInstructions(block).Any(instruction =>
+                    instruction.Operands.Any(operand => ReferencesLocal(operand, local))))
+                return true;
+
+            foreach (var successor in block.Successors)
+                pending.Push(successor);
+        }
+
+        return false;
     }
 
     /// <summary>

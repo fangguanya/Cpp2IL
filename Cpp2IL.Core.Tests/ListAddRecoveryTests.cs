@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -351,6 +352,68 @@ public class ListAddRecoveryTests
             Assert.That(call.Operands[2], Is.SameAs(fixture.Value));
             Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.FastBlock));
             Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SlowBlock));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 两个连续容量菱形按状态载体逐项闭合为公开Add()
+    {
+        var fixture = CreateChainedFixture(2);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 三个连续容量菱形的末项不保留未使用状态刷新()
+    {
+        var fixture = CreateChainedFixture(3);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(3));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(3));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 连续容量菱形的后项值不一致时保留其控制流和已定义状态载体()
+    {
+        var fixture = CreateChainedFixture(2, mismatchStoredValueAt: 1);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [var destination, FieldReference] }
+                && ReferenceEquals(destination, fixture.SizeStates[0])), Is.True);
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [var destination, FieldReference] }
+                && ReferenceEquals(destination, fixture.VersionStates[0])), Is.True);
         });
     }
 
@@ -742,6 +805,129 @@ public class ListAddRecoveryTests
             slowBlock);
     }
 
+    private static ChainedFixture CreateChainedFixture(
+        int addCount,
+        int mismatchStoredValueAt = -1)
+    {
+        if (addCount < 2)
+            throw new ArgumentOutOfRangeException(nameof(addCount));
+
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var elementType = app.SystemTypes.SystemStringType;
+        var listType = listDefinition.MakeGenericInstanceType([elementType]);
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [genericElement]);
+        var addWithResizeTarget = new ConcreteGenericMethodAnalysisContext(addWithResize, [elementType], []);
+        var itemsField = new InjectedFieldAnalysisContext(
+            "_items",
+            genericElement.MakeSzArrayType(),
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var sizeField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var versionField = new InjectedFieldAnalysisContext(
+            "_version",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+
+        var receiver = Local("list", listType);
+        var values = Enumerable.Range(0, addCount)
+            .Select(index => Local($"value{index}", elementType)).ToList();
+        var otherValue = Local("otherValue", elementType);
+        var sizeStates = new List<LocalVariable>(addCount);
+        var versionStates = new List<LocalVariable>(addCount);
+        var instructions = new List<Instruction>();
+        var slowTargets = new List<(
+            Instruction Branch,
+            Instruction SlowCall,
+            LocalVariable SizeState,
+            LocalVariable VersionState)>();
+        var fastTargets = new List<(Instruction Jump, int NextHeadIndex)>();
+
+        FieldReference Field(FieldAnalysisContext field) => new(field, receiver, 0);
+        IOperand currentSize = Field(sizeField);
+        IOperand currentVersion = Field(versionField);
+        for (var index = 0; index < addCount; index++)
+        {
+            var items = Local($"items{index}", elementType.MakeSzArrayType());
+            var version = Local($"version{index}", app.SystemTypes.SystemInt32Type);
+            var condition = Local($"condition{index}", app.SystemTypes.SystemBooleanType);
+            var newSize = Local($"newSize{index}", app.SystemTypes.SystemInt32Type);
+            var elementOffset = Local($"elementOffset{index}", app.SystemTypes.SystemIntPtrType);
+            var elementAddress = Local($"elementAddress{index}", app.SystemTypes.SystemIntPtrType);
+            sizeStates.Add(newSize);
+            versionStates.Add(version);
+
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, items, Field(itemsField)));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Add, version, currentVersion, new Immediate(1)));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(versionField), version));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.CheckGreaterOrEqualUnsigned,
+                condition,
+                currentSize,
+                new ArrayLength(items)));
+            var branch = new Instruction(instructions.Count, OpCode.ConditionalJump, new Immediate(-1), condition);
+            instructions.Add(branch);
+            instructions.Add(new Instruction(instructions.Count, OpCode.Add, newSize, currentSize, new Immediate(1)));
+            instructions.Add(new Instruction(instructions.Count, OpCode.ShiftLeft, elementOffset, currentSize, new Immediate(3)));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Add, elementAddress, items, elementOffset));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(sizeField), newSize));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                new MemoryOperand(elementAddress, null, 0x20),
+                index == mismatchStoredValueAt ? otherValue : values[index]));
+            var fastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+            instructions.Add(fastJump);
+            var slowCall = new Instruction(
+                instructions.Count,
+                OpCode.CallVoid,
+                addWithResizeTarget,
+                receiver,
+                values[index]);
+            instructions.Add(slowCall);
+            slowTargets.Add((branch, slowCall, newSize, version));
+            fastTargets.Add((fastJump, instructions.Count));
+            currentSize = newSize;
+            currentVersion = version;
+        }
+
+        var returnInstruction = new Instruction(instructions.Count, OpCode.Return, receiver);
+        instructions.Add(returnInstruction);
+        for (var index = 0; index < addCount; index++)
+        {
+            slowTargets[index].Branch.SetOperand(0, slowTargets[index].SlowCall);
+            var nextHead = fastTargets[index].NextHeadIndex < instructions.Count
+                ? instructions[fastTargets[index].NextHeadIndex]
+                : returnInstruction;
+            fastTargets[index].Jump.SetOperand(0, nextHead);
+        }
+
+        var graph = new ISILControlFlowGraph(instructions);
+        foreach (var target in slowTargets)
+        {
+            var slowBlock = graph.FindBlockByInstruction(target.SlowCall)!;
+            // Phi 消除把容量和版本的慢边复制追加到扩容调用块，生产 CFG 不为它们另建块。
+            slowBlock.Instructions.Add(new Instruction(-1, OpCode.Move, target.SizeState, Field(sizeField)));
+            slowBlock.Instructions.Add(new Instruction(-1, OpCode.Move, target.VersionState, Field(versionField)));
+        }
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new ChainedFixture(method, graph, receiver, sizeStates, versionStates);
+    }
+
     private static Fixture CreateInterleavedHeadFixture(bool touchesReceiver)
     {
         var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
@@ -819,4 +1005,11 @@ public class ListAddRecoveryTests
         LocalVariable Carrier,
         Block FastBlock,
         Block SlowBlock);
+
+    private sealed record ChainedFixture(
+        MethodAnalysisContext Method,
+        ISILControlFlowGraph Graph,
+        LocalVariable Receiver,
+        IReadOnlyList<LocalVariable> SizeStates,
+        IReadOnlyList<LocalVariable> VersionStates);
 }
