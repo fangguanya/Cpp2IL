@@ -61,11 +61,19 @@ public static class ListAddRecovery
                     out var versionResult,
                     out var preservedHeadBusiness))
                 continue;
-            if (!TryGetFastBlock(head, slowBlock, merge, out var fastBlock))
+            if (!TryGetFastRoute(
+                    head,
+                    slowBlock,
+                    merge,
+                    originalSharedFastTails,
+                    out var fastEntry,
+                    out var fastBody,
+                    out var fastPrefix))
                 continue;
             if (!TryMatchFastPath(
                     graph,
-                    fastBlock,
+                    fastBody,
+                    fastPrefix,
                     merge,
                     receiver,
                     items,
@@ -84,7 +92,8 @@ public static class ListAddRecovery
                 graph,
                 rewriteHead,
                 headPath,
-                fastBlock,
+                fastEntry,
+                fastBody,
                 slowBlock,
                 merge,
                 rewriteStart,
@@ -692,7 +701,7 @@ public static class ListAddRecovery
             || method.Name != "AddWithResize"
             || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
             || instructions.Take(callIndex).Any(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
-            || !IsValidSlowTail(trailingInstructions))
+            || !IsValidSlowTail(block, trailingInstructions))
             return false;
 
         call = candidate;
@@ -700,20 +709,27 @@ public static class ListAddRecovery
         receiver = list;
         value = candidate.Operands[2];
         tail = trailingInstructions
-            .Where(instruction => instruction.OpCode != OpCode.Return)
+            .Where(instruction => instruction.OpCode is not (OpCode.Return or OpCode.Jump))
             .ToList();
         return true;
     }
 
-    private static bool IsValidSlowTail(IReadOnlyList<Instruction> instructions)
+    /// <summary>
+    /// 验证扩容调用后的载体尾部；显式跳转必须精确指向慢块唯一图后继。
+    /// </summary>
+    private static bool IsValidSlowTail(Block block, IReadOnlyList<Instruction> instructions)
     {
         if (instructions.All(IsPotentialSlowTailInstruction))
             return true;
 
-        return instructions.Count > 0
-               && instructions[^1] is { OpCode: OpCode.Return, Operands.Count: 0 }
-               && instructions.Take(instructions.Count - 1)
-                   .All(IsPotentialSlowTailInstruction);
+        if (instructions.Count == 0
+            || !instructions.Take(instructions.Count - 1).All(IsPotentialSlowTailInstruction))
+            return false;
+
+        return instructions[^1] is { OpCode: OpCode.Return, Operands.Count: 0 }
+               || instructions[^1] is { OpCode: OpCode.Jump, Operands: [Block target] }
+               && block.Successors is [var successor]
+               && ReferenceEquals(target, successor);
     }
 
     /// <summary>
@@ -810,11 +826,15 @@ public static class ListAddRecovery
             }
             || suffix[^2].Instruction is not
             {
-                OpCode: OpCode.CheckGreaterOrEqualUnsigned,
                 Operands: [LocalVariable condition, var checkedSize, ArrayLength length]
-            }
-            || !ReferenceEquals(target, slowBlock)
-            || !ReferenceEquals(condition, branchCondition))
+            } capacityCheck
+            || capacityCheck.OpCode is not (OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessUnsigned)
+            || !ReferenceEquals(condition, branchCondition)
+            || !IsCapacityBranchTarget(
+                suffix[^1].Block,
+                slowBlock,
+                target,
+                capacityCheck.OpCode))
             return false;
 
         var prefix = suffix.Take(suffix.Count - 2).Select(entry => entry.Instruction).ToList();
@@ -851,6 +871,26 @@ public static class ListAddRecovery
             )
             return false;
 
+        // 容量比较可以直接重读 _size/Count，而快路索引复用稍早读取的局部载体。
+        // 只有唯一、同接收者且位于容量比较前的读取才作为快路状态身份。
+        var parallelSizeLoads = prefix.Where(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var source] }
+            && IsDirectStateOperand(source, receiver, "_size")
+            && IsBefore(prefix, instruction, suffix[^2].Instruction)
+            && !allowed.Contains(instruction)).ToList();
+        if (parallelSizeLoads.Count > 1
+            || parallelSizeLoads.Count == 1
+            && parallelSizeLoads[0].Operands[0] is not LocalVariable)
+            return false;
+        var candidateSizeState = checkedSize;
+        if (parallelSizeLoads is [var parallelSizeLoad])
+        {
+            candidateSizeState = parallelSizeLoad.Operands[0];
+            allowed.Add(parallelSizeLoad);
+        }
+        if (!CollectItemsNullGuards(prefix, receiver, versionWrites[0], allowed))
+            return false;
+
         var itemsLoadIndex = prefix.IndexOf(itemLoads[0]);
         var versionAddIndex = prefix.IndexOf(versionAdds[0]);
         var business = prefix.Where(instruction => !allowed.Contains(instruction)).ToList();
@@ -867,10 +907,30 @@ public static class ListAddRecovery
 
         itemsLoad = itemLoads[0];
         items = loadedItems;
-        sizeState = checkedSize;
+        sizeState = candidateSizeState;
         versionResult = version;
         preservedHeadBusiness = business;
         return true;
+    }
+
+    /// <summary>
+    /// 验证容量分支方向：标准 <c>size &gt;= length</c> 跳向慢边，
+    /// 等价反向 <c>size &lt; length</c> 则跳向快边。
+    /// </summary>
+    private static bool IsCapacityBranchTarget(
+        Block head,
+        Block slowBlock,
+        Block target,
+        OpCode comparison)
+    {
+        if (head.Successors.Count != 2
+            || !head.Successors.Contains(slowBlock)
+            || !head.Successors.Contains(target))
+            return false;
+
+        return comparison == OpCode.CheckGreaterOrEqualUnsigned
+            ? ReferenceEquals(target, slowBlock)
+            : !ReferenceEquals(target, slowBlock);
     }
 
     /// <summary>
@@ -974,8 +1034,7 @@ public static class ListAddRecovery
                 break;
 
             if (current.Predecessors is not [var predecessor]
-                || predecessor.Successors is not [var successor]
-                || !ReferenceEquals(successor, current)
+                || !IsLinearOrStrictItemsNullGuardEdge(predecessor, current)
                 || predecessor.BlockType is BlockType.Entry or BlockType.Exit)
             {
                 suffix = [];
@@ -995,27 +1054,150 @@ public static class ListAddRecovery
         return true;
     }
 
-    private static bool TryGetFastBlock(
+    /// <summary>
+    /// 允许头部状态链跨过唯一线性边，或跨过失败边严格抛出空引用异常的
+    /// <c>_items == null</c> 守卫。
+    /// </summary>
+    private static bool IsLinearOrStrictItemsNullGuardEdge(Block predecessor, Block continuation)
+    {
+        if (predecessor.Successors is [var successor])
+            return ReferenceEquals(successor, continuation);
+        if (predecessor.Successors.Count != 2)
+            return false;
+
+        var instructions = PatternInstructions(predecessor);
+        if (instructions.Count < 2
+            || instructions[^2] is not
+            {
+                OpCode: OpCode.CheckEqual,
+                Operands:
+                [
+                    LocalVariable condition,
+                    FieldReference { Field.Name: "_items" },
+                    Immediate { Value: 0 },
+                ],
+            }
+            || instructions[^1] is not
+            {
+                OpCode: OpCode.ConditionalJump,
+                Operands: [Block failure, var branchCondition],
+            }
+            || !ReferenceEquals(condition, branchCondition)
+            || ReferenceEquals(failure, continuation)
+            || !predecessor.Successors.Contains(continuation)
+            || !predecessor.Successors.Contains(failure))
+            return false;
+
+        return IsStrictNullReferenceThrowBlock(failure);
+    }
+
+    /// <summary>
+    /// 将已由图路径证明的私有 items 空守卫纳入标准 List 状态前缀。
+    /// </summary>
+    private static bool CollectItemsNullGuards(
+        IReadOnlyList<Instruction> prefix,
+        LocalVariable receiver,
+        Instruction versionWrite,
+        ICollection<Instruction> allowed)
+    {
+        var versionWriteIndex = IndexOf(prefix, versionWrite);
+        for (var index = 0; index + 1 < prefix.Count; index++)
+        {
+            if (prefix[index] is not
+                {
+                    OpCode: OpCode.CheckEqual,
+                    Operands:
+                    [
+                        LocalVariable condition,
+                        FieldReference field,
+                        Immediate { Value: 0 },
+                    ],
+                }
+                || prefix[index + 1] is not
+                {
+                    OpCode: OpCode.ConditionalJump,
+                    Operands: [Block failure, var branchCondition],
+                }
+                || !ReferenceEquals(condition, branchCondition)
+                || !IsField(field, receiver, "_items")
+                || !IsStrictNullReferenceThrowBlock(failure))
+                continue;
+
+            if (index <= versionWriteIndex)
+                return false;
+            allowed.Add(prefix[index]);
+            allowed.Add(prefix[index + 1]);
+            index++;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 仅接受首条语义指令抛出 <c>NullReferenceException</c>、余下只含边载体与跳转的失败块。
+    /// </summary>
+    private static bool IsStrictNullReferenceThrowBlock(Block block)
+    {
+        var instructions = PatternInstructions(block);
+        return instructions.Count > 0
+               && instructions[0] is { OpCode: OpCode.Throw, Operands: [TypeAnalysisContext type] }
+               && string.Equals(type.FullName, "System.NullReferenceException", StringComparison.Ordinal)
+               && instructions.Skip(1).All(instruction => instruction.OpCode is OpCode.Move or OpCode.Jump);
+    }
+
+    /// <summary>
+    /// 获取标准快边，同时支持边载体 staging 块进入多前驱共享快尾。
+    /// </summary>
+    private static bool TryGetFastRoute(
         Block head,
         Block slowBlock,
         Block merge,
-        out Block fastBlock)
+        HashSet<Block> originalSharedFastTails,
+        out Block fastEntry,
+        out Block fastBody,
+        out List<Instruction> fastPrefix)
     {
-        fastBlock = null!;
+        fastEntry = null!;
+        fastBody = null!;
+        fastPrefix = [];
         if (head.Successors.Count != 2)
             return false;
 
-        fastBlock = head.Successors.SingleOrDefault(block => !ReferenceEquals(block, slowBlock))!;
-        return fastBlock != null
-               && fastBlock.Predecessors is [var predecessor]
-               && ReferenceEquals(predecessor, head)
-               && fastBlock.Successors is [var successor]
-               && ReferenceEquals(successor, merge);
+        fastEntry = head.Successors.SingleOrDefault(block => !ReferenceEquals(block, slowBlock))!;
+        if (fastEntry == null
+            || fastEntry.Predecessors is not [var predecessor]
+            || !ReferenceEquals(predecessor, head)
+            || fastEntry.Successors is not [var successor])
+            return false;
+
+        if (ReferenceEquals(successor, merge))
+        {
+            fastBody = fastEntry;
+            return true;
+        }
+
+        if (!originalSharedFastTails.Contains(successor)
+            || successor.Successors is not [var sharedMerge]
+            || !ReferenceEquals(sharedMerge, merge))
+            return false;
+
+        var stagingInstructions = PatternInstructions(fastEntry);
+        if (stagingInstructions.Count < 2
+            || stagingInstructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
+            || !ReferenceEquals(target, successor)
+            || stagingInstructions.Take(stagingInstructions.Count - 1).Any(instruction =>
+                instruction.OpCode != OpCode.Move))
+            return false;
+
+        fastBody = successor;
+        fastPrefix = stagingInstructions.Take(stagingInstructions.Count - 1).ToList();
+        return true;
     }
 
     private static bool TryMatchFastPath(
         ISILControlFlowGraph graph,
         Block block,
+        IReadOnlyList<Instruction> fastPrefix,
         Block merge,
         LocalVariable receiver,
         LocalVariable items,
@@ -1029,7 +1211,7 @@ public static class ListAddRecovery
     {
         publicValue = null!;
         preservedSlowTail = [];
-        var instructions = PatternInstructions(block);
+        var instructions = fastPrefix.Concat(PatternInstructions(block)).ToList();
         if (instructions.Count < 6
             || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
             || !ReferenceEquals(target, merge))
@@ -1514,7 +1696,8 @@ public static class ListAddRecovery
         ISILControlFlowGraph graph,
         Block rewriteHead,
         List<Block> headPath,
-        Block fastBlock,
+        Block fastEntry,
+        Block fastBody,
         Block slowBlock,
         Block merge,
         Instruction rewriteStart,
@@ -1533,9 +1716,13 @@ public static class ListAddRecovery
 
         foreach (var pathBlock in headPath.Skip(1).ToList())
             Detach(graph, pathBlock);
-        Detach(graph, fastBlock);
+        Detach(graph, fastEntry);
         Detach(graph, slowBlock);
+        if (!ReferenceEquals(fastBody, fastEntry) && fastBody.Predecessors.Count == 0)
+            Detach(graph, fastBody);
 
+        foreach (var successor in rewriteHead.Successors.ToList())
+            successor.Predecessors.Remove(rewriteHead);
         rewriteHead.Successors.Clear();
         rewriteHead.Successors.Add(merge);
         if (!merge.Predecessors.Contains(rewriteHead))
@@ -1580,6 +1767,7 @@ public static class ListAddRecovery
                or RuntimeMethodInfoAnalysisContext
                or RuntimeClassTypeAnalysisContext
                or RgctxTableTypeAnalysisContext
+               or TypeAnalysisContext
                or Immediate;
 
     private static bool HaveIdenticalCarrierMoves(
@@ -1594,7 +1782,7 @@ public static class ListAddRecovery
             if (fastTail[index] is not { OpCode: OpCode.Move, Operands: [var fastDestination, var fastSource] }
                 || slowTail[index] is not { OpCode: OpCode.Move, Operands: [var slowDestination, var slowSource] }
                 || !ReferenceEquals(fastDestination, slowDestination)
-                || !ReferenceEquals(fastSource, slowSource))
+                || !AreEquivalentValue(fastSource, slowSource))
                 return false;
         }
 
