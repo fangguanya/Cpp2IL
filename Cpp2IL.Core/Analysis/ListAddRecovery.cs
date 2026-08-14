@@ -23,9 +23,19 @@ public static class ListAddRecovery
     {
         var graph = method.ControlFlowGraph!;
         var recovered = 0;
+        // 共享快尾会在逐项改写后只剩一个前驱，因此必须在任何图修改之前冻结其身份。
+        var originalSharedFastTails = graph.Blocks
+            .Where(block => block.Predecessors.Count >= 2)
+            .ToHashSet();
 
         foreach (var slowBlock in graph.Blocks.ToList())
         {
+            if (TryRecoverSharedFastTail(graph, slowBlock, originalSharedFastTails))
+            {
+                recovered++;
+                continue;
+            }
+
             if (!TryMatchSlowPath(
                     slowBlock,
                     out var slowCall,
@@ -89,6 +99,526 @@ public static class ListAddRecovery
 
         return recovered;
     }
+
+    /// <summary>
+    /// 恢复多个容量分支把元素写入汇聚到同一个原生快速尾块的 ARM64 形态。
+    /// </summary>
+    /// <remarks>
+    /// 该形态先在每条快边写入元素载体，再由共享块统一执行数组地址计算、大小递增和元素写入；
+    /// 慢边则直接调用 <c>AddWithResize</c>。恢复必须同时证明公开接收者别名、两级空检查、
+    /// 版本递增、容量判断、共享尾的原生布局以及快慢值完全等价，任一条件漂移都保留原图。
+    /// </remarks>
+    private static bool TryRecoverSharedFastTail(
+        ISILControlFlowGraph graph,
+        Block slowBlock,
+        HashSet<Block> originalSharedFastTails)
+    {
+        if (!TryMatchSharedSlowPath(
+                slowBlock,
+                out var slowCall,
+                out var addWithResize,
+                out var publicReceiver,
+                out var slowValue,
+                out var slowCarrierTail))
+            return false;
+        if (slowBlock.Predecessors is not [var capacityHead])
+            return false;
+        if (!TryGetMergeBlock(graph, slowBlock, out var merge))
+            return false;
+        if (!TryGetSharedFastBlocks(
+                capacityHead,
+                slowBlock,
+                merge,
+                originalSharedFastTails,
+                out var stagingBlock,
+                out var sharedFastTail))
+            return false;
+        if (!TryMatchSharedFastTail(
+                sharedFastTail,
+                merge,
+                out var sharedPattern))
+            return false;
+        if (!TryMatchSharedCapacityHead(
+                capacityHead,
+                slowBlock,
+                publicReceiver,
+                sharedPattern))
+            return false;
+        if (!TryMatchSharedStatePrefix(
+                capacityHead,
+                publicReceiver,
+                sharedPattern.Items,
+                out var rewriteHead,
+                out var headPath,
+                out var rewriteStart))
+            return false;
+        if (!TryMatchSharedStagingPath(
+                graph,
+                stagingBlock,
+                sharedFastTail,
+                merge,
+                sharedPattern.StagedValue,
+                slowValue,
+                slowCarrierTail,
+                addWithResize.AppContext,
+                out var publicValue,
+                out var preservedCarrierTail))
+            return false;
+        if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
+            return false;
+
+        RewriteSharedFastTail(
+            graph,
+            rewriteHead,
+            headPath,
+            stagingBlock,
+            slowBlock,
+            sharedFastTail,
+            merge,
+            rewriteStart,
+            slowCall,
+            preservedCarrierTail,
+            addTarget,
+            publicReceiver,
+            publicValue);
+        return true;
+    }
+
+    private static bool TryMatchSharedSlowPath(
+        Block block,
+        out Instruction call,
+        out ConcreteGenericMethodAnalysisContext target,
+        out IOperand receiver,
+        out IOperand value,
+        out List<Instruction> carrierTail)
+    {
+        call = null!;
+        target = null!;
+        receiver = null!;
+        value = null!;
+        carrierTail = [];
+
+        var instructions = PatternInstructions(block);
+        if (instructions.Count < 2
+            || instructions[0] is not
+            {
+                OpCode: OpCode.CallVoid,
+                Operands:
+                [
+                    ConcreteGenericMethodAnalysisContext method,
+                    var candidateReceiver,
+                    var candidateValue,
+                ],
+            } candidateCall
+            || method.Name != "AddWithResize"
+            || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
+            || candidateReceiver is not (LocalVariable or FieldReference)
+            || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block] }
+            || instructions.Skip(1).Take(instructions.Count - 2).Any(instruction =>
+                instruction is not { OpCode: OpCode.Move }))
+            return false;
+
+        call = candidateCall;
+        target = method;
+        receiver = candidateReceiver;
+        value = candidateValue;
+        carrierTail = instructions.Skip(1).Take(instructions.Count - 2).ToList();
+        return true;
+    }
+
+    private static bool TryGetSharedFastBlocks(
+        Block capacityHead,
+        Block slowBlock,
+        Block merge,
+        HashSet<Block> originalSharedFastTails,
+        out Block stagingBlock,
+        out Block sharedFastTail)
+    {
+        stagingBlock = null!;
+        sharedFastTail = null!;
+        if (capacityHead.Successors.Count != 2)
+            return false;
+
+        stagingBlock = capacityHead.Successors.SingleOrDefault(block =>
+            !ReferenceEquals(block, slowBlock))!;
+        if (stagingBlock == null
+            || stagingBlock.Predecessors is not [var stagingPredecessor]
+            || !ReferenceEquals(stagingPredecessor, capacityHead)
+            || stagingBlock.Successors is not [var candidateTail]
+            || !originalSharedFastTails.Contains(candidateTail)
+            || candidateTail.Successors is not [var candidateMerge]
+            || !ReferenceEquals(candidateMerge, merge))
+            return false;
+
+        sharedFastTail = candidateTail;
+        return true;
+    }
+
+    private static bool TryMatchSharedFastTail(
+        Block block,
+        Block merge,
+        out SharedFastTailPattern pattern)
+    {
+        pattern = null!;
+        var instructions = PatternInstructions(block);
+        if (instructions.Count != 9
+            || instructions[0] is not
+            {
+                OpCode: OpCode.And,
+                Operands: [LocalVariable masked, var sizeState, Immediate { Value: 0xFFFFFFFFL }],
+            }
+            || instructions[1] is not
+            {
+                OpCode: OpCode.Xor,
+                Operands: [LocalVariable biased, var maskSource, Immediate { Value: 0x80000000L }],
+            }
+            || instructions[2] is not
+            {
+                OpCode: OpCode.Subtract,
+                Operands: [LocalVariable normalized, var biasedSource, Immediate { Value: 0x80000000L }],
+            }
+            || instructions[3] is not
+            {
+                OpCode: OpCode.ShiftLeft,
+                Operands: [LocalVariable elementOffset, var normalizedSource, Immediate scale],
+            }
+            || instructions[4] is not
+            {
+                OpCode: OpCode.Add,
+                Operands: [LocalVariable elementAddress, var addressLeft, var addressRight],
+            }
+            || instructions[5] is not
+            {
+                OpCode: OpCode.Add,
+                Operands: [LocalVariable newSize, var sizeAddSource, Immediate { Value: 1 }],
+            }
+            || instructions[6] is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [MemoryOperand sizeMemory, var sizeWriteSource],
+            }
+            || instructions[7] is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [MemoryOperand elementMemory, LocalVariable stagedValue],
+            }
+            || instructions[8] is not { OpCode: OpCode.Jump, Operands: [Block target] }
+            || !ReferenceEquals(maskSource, masked)
+            || !ReferenceEquals(biasedSource, biased)
+            || !ReferenceEquals(normalizedSource, normalized)
+            || scale.Value is not (1 or 2 or 3 or 4)
+            || !ReferenceEquals(sizeAddSource, sizeState)
+            || !ReferenceEquals(sizeWriteSource, newSize)
+            || sizeMemory is not { Base: LocalVariable sizeAddress, Index: null, Addend: 0 }
+            || elementMemory is not { Base: var storedElementAddress, Index: null, Addend: 0x20 }
+            || !ReferenceEquals(storedElementAddress, elementAddress)
+            || !ReferenceEquals(target, merge))
+            return false;
+
+        LocalVariable items;
+        if (ReferenceEquals(addressLeft, elementOffset) && addressRight is LocalVariable rightItems)
+            items = rightItems;
+        else if (ReferenceEquals(addressRight, elementOffset) && addressLeft is LocalVariable leftItems)
+            items = leftItems;
+        else
+            return false;
+
+        pattern = new SharedFastTailPattern(items, sizeState, sizeAddress, sizeMemory, stagedValue);
+        return true;
+    }
+
+    private static bool TryMatchSharedCapacityHead(
+        Block block,
+        Block slowBlock,
+        IOperand publicReceiver,
+        SharedFastTailPattern pattern)
+    {
+        var instructions = PatternInstructions(block);
+        if (instructions is not
+            [
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [var sizeAddress, var addressBase, Immediate { Value: 24 }],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [var sizeState, MemoryOperand sizeLoad],
+                },
+                {
+                    OpCode: OpCode.CheckGreaterOrEqualUnsigned,
+                    Operands: [LocalVariable condition, var checkedSize, ArrayLength length],
+                },
+                {
+                    OpCode: OpCode.ConditionalJump,
+                    Operands: [Block target, var branchCondition],
+                }
+            ]
+            || !ReferenceEquals(sizeAddress, pattern.SizeAddress)
+            || !AreEquivalentValue(addressBase, publicReceiver)
+            || !ReferenceEquals(sizeState, pattern.SizeState)
+            || !AreSameMemoryOperand(sizeLoad, pattern.SizeMemory)
+            || !(ReferenceEquals(checkedSize, pattern.SizeState)
+                 || checkedSize is MemoryOperand checkedMemory
+                 && AreSameMemoryOperand(checkedMemory, pattern.SizeMemory))
+            || !ReferenceEquals(length.Array, pattern.Items)
+            || !ReferenceEquals(condition, branchCondition)
+            || !ReferenceEquals(target, slowBlock))
+            return false;
+
+        return true;
+    }
+
+    private static bool TryMatchSharedStatePrefix(
+        Block capacityHead,
+        IOperand publicReceiver,
+        LocalVariable items,
+        out Block rewriteHead,
+        out List<Block> headPath,
+        out Instruction rewriteStart)
+    {
+        rewriteHead = null!;
+        headPath = [];
+        rewriteStart = null!;
+        if (capacityHead.Predecessors is not [var itemsBlock]
+            || itemsBlock.Predecessors is not [var aliasBlock])
+            return false;
+
+        var aliasInstructions = PatternInstructions(aliasBlock);
+        var itemsInstructions = PatternInstructions(itemsBlock);
+        if (aliasInstructions is not
+            [
+                { OpCode: OpCode.Move, Operands: [LocalVariable stateReceiver, var receiverSource] } aliasMove,
+                { OpCode: OpCode.CheckEqual, Operands: [LocalVariable receiverNull, var checkedReceiver, Immediate { Value: 0 }] },
+                { OpCode: OpCode.ConditionalJump, Operands: [Block receiverNullTarget, var receiverNullCondition] },
+            ]
+            || itemsInstructions is not
+            [
+                { OpCode: OpCode.Move, Operands: [var loadedItems, FieldReference itemsField] },
+                { OpCode: OpCode.Add, Operands: [LocalVariable version, FieldReference versionSource, Immediate { Value: 1 }] },
+                { OpCode: OpCode.Move, Operands: [FieldReference versionDestination, var writtenVersion] },
+                { OpCode: OpCode.CheckEqual, Operands: [LocalVariable itemsNull, FieldReference checkedItems, Immediate { Value: 0 }] },
+                { OpCode: OpCode.ConditionalJump, Operands: [Block itemsNullTarget, var itemsNullCondition] },
+            ]
+            || !AreEquivalentValue(receiverSource, publicReceiver)
+            || !AreEquivalentValue(checkedReceiver, publicReceiver)
+            || !ReferenceEquals(receiverNull, receiverNullCondition)
+            || !ReferenceEquals(loadedItems, items)
+            || !IsField(itemsField, stateReceiver, "_items")
+            || !IsField(versionSource, stateReceiver, "_version")
+            || !IsField(versionDestination, stateReceiver, "_version")
+            || !ReferenceEquals(version, writtenVersion)
+            || !IsField(checkedItems, stateReceiver, "_items")
+            || !ReferenceEquals(itemsNull, itemsNullCondition)
+            || !ReferenceEquals(receiverNullTarget, itemsNullTarget)
+            || !ContainsNullReferenceThrow(receiverNullTarget)
+            || aliasBlock.Successors.Count != 2
+            || !aliasBlock.Successors.Contains(itemsBlock)
+            || !aliasBlock.Successors.Contains(receiverNullTarget)
+            || itemsBlock.Successors.Count != 2
+            || !itemsBlock.Successors.Contains(capacityHead)
+            || !itemsBlock.Successors.Contains(itemsNullTarget))
+            return false;
+
+        rewriteHead = aliasBlock;
+        headPath = [aliasBlock, itemsBlock, capacityHead];
+        rewriteStart = aliasMove;
+        return true;
+    }
+
+    private static bool ContainsNullReferenceThrow(Block block)
+        => SemanticInstructions(block).Any(instruction =>
+            instruction is { OpCode: OpCode.Throw, Operands: [TypeAnalysisContext type] }
+            && type.FullName == "System.NullReferenceException");
+
+    private static bool TryMatchSharedStagingPath(
+        ISILControlFlowGraph graph,
+        Block stagingBlock,
+        Block sharedFastTail,
+        Block merge,
+        LocalVariable stagedValue,
+        IOperand slowValue,
+        IReadOnlyList<Instruction> slowCarrierTail,
+        ApplicationAnalysisContext appContext,
+        out IOperand publicValue,
+        out List<Instruction> preservedCarrierTail)
+    {
+        publicValue = null!;
+        preservedCarrierTail = [];
+        var instructions = PatternInstructions(stagingBlock);
+        var hasExplicitJump = instructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block target] }
+            && ReferenceEquals(target, sharedFastTail);
+        var stagingMoves = hasExplicitJump
+            ? instructions.Take(instructions.Count - 1).ToList()
+            : instructions;
+        if (stagingMoves.Count < 1
+            || stagingMoves.Any(instruction => instruction is not { OpCode: OpCode.Move }))
+            return false;
+
+        var valueMoves = stagingMoves.Where(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [var destination, _] }
+            && ReferenceEquals(destination, stagedValue)).ToList();
+        if (valueMoves.Count != 1
+            || !TryReconcileElementValue(
+                graph,
+                valueMoves[0].Operands[1],
+                slowValue,
+                appContext,
+                out publicValue))
+            return false;
+
+        var fastCarriers = stagingMoves
+            .Where(instruction => !ReferenceEquals(instruction, valueMoves[0]))
+            .ToList();
+        return TryMatchRequiredSharedCarriers(
+            fastCarriers,
+            slowCarrierTail,
+            merge,
+            out preservedCarrierTail);
+    }
+
+    private static bool TryMatchRequiredSharedCarriers(
+        IReadOnlyList<Instruction> fastCarriers,
+        IReadOnlyList<Instruction> slowCarriers,
+        Block merge,
+        out List<Instruction> preservedSlowCarriers)
+    {
+        preservedSlowCarriers = [];
+        if (fastCarriers.Concat(slowCarriers).Any(instruction =>
+                instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable, _] }))
+            return false;
+
+        var requiredDestinations = fastCarriers.Concat(slowCarriers)
+            .Select(instruction => (LocalVariable)instruction.Operands[0])
+            .Where(destination => IsReadBeforeDefinitionFromMerge(merge, destination))
+            .Distinct()
+            .ToList();
+        foreach (var destination in requiredDestinations)
+        {
+            var fast = fastCarriers.Where(instruction =>
+                ReferenceEquals(instruction.Operands[0], destination)).ToList();
+            var slow = slowCarriers.Where(instruction =>
+                ReferenceEquals(instruction.Operands[0], destination)).ToList();
+            if (fast.Count != 1
+                || slow.Count != 1
+                || !AreEquivalentValue(fast[0].Operands[1], slow[0].Operands[1]))
+                return false;
+            preservedSlowCarriers.Add(slow[0]);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 判断汇合点之后是否存在“先读后写”路径；后继中只有覆盖写而没有先读时，边载体已经死亡。
+    /// </summary>
+    private static bool IsReadBeforeDefinitionFromMerge(Block merge, LocalVariable local)
+    {
+        var pending = new Stack<Block>();
+        var visited = new HashSet<Block>();
+        pending.Push(merge);
+
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (!visited.Add(block))
+                continue;
+
+            var overwritten = false;
+            foreach (var instruction in SemanticInstructions(block))
+            {
+                var destination = instruction.Destination;
+                if (instruction.Operands.Any(operand =>
+                        !(ReferenceEquals(operand, destination) && ReferenceEquals(operand, local))
+                        && ReferencesLocal(operand, local)))
+                    return true;
+
+                if (ReferenceEquals(destination, local))
+                {
+                    overwritten = true;
+                    break;
+                }
+
+                // Throw/Return 之后附着的原生异常辅助调用不属于同一条托管可达路径。
+                if (instruction.OpCode is OpCode.Throw or OpCode.Return)
+                {
+                    overwritten = true;
+                    break;
+                }
+            }
+
+            if (overwritten)
+                continue;
+            foreach (var successor in block.Successors)
+                pending.Push(successor);
+        }
+
+        return false;
+    }
+
+    private static bool AreEquivalentValue(IOperand left, IOperand right)
+        => ReferenceEquals(left, right)
+           || left is Immediate leftImmediate
+           && right is Immediate rightImmediate
+           && leftImmediate.Value == rightImmediate.Value
+           || left is FieldReference leftField
+           && right is FieldReference rightField
+           && AreSameFieldRead(leftField, rightField)
+           || left is MemoryOperand leftMemory
+           && right is MemoryOperand rightMemory
+           && AreSameMemoryOperand(leftMemory, rightMemory);
+
+    private static bool AreSameMemoryOperand(MemoryOperand left, MemoryOperand right)
+        => left.Addend == right.Addend
+           && AreEquivalentNullableOperand(left.Base, right.Base)
+           && AreEquivalentNullableOperand(left.Index, right.Index);
+
+    private static bool AreEquivalentNullableOperand(IOperand? left, IOperand? right)
+        => left == null && right == null
+           || left != null && right != null && AreEquivalentValue(left, right);
+
+    private static void RewriteSharedFastTail(
+        ISILControlFlowGraph graph,
+        Block rewriteHead,
+        IReadOnlyList<Block> headPath,
+        Block stagingBlock,
+        Block slowBlock,
+        Block sharedFastTail,
+        Block merge,
+        Instruction rewriteStart,
+        Instruction slowCall,
+        IReadOnlyList<Instruction> preservedCarrierTail,
+        ConcreteGenericMethodAnalysisContext addTarget,
+        IOperand receiver,
+        IOperand value)
+    {
+        var firstRemovedIndex = rewriteHead.Instructions.IndexOf(rewriteStart);
+        rewriteHead.Instructions.RemoveRange(firstRemovedIndex, rewriteHead.Instructions.Count - firstRemovedIndex);
+        rewriteHead.Instructions.Add(new Instruction(slowCall.Index, OpCode.CallVoid, addTarget, receiver, value));
+        rewriteHead.Instructions.AddRange(preservedCarrierTail);
+
+        foreach (var pathBlock in headPath.Skip(1).ToList())
+            Detach(graph, pathBlock);
+        Detach(graph, stagingBlock);
+        Detach(graph, slowBlock);
+        if (sharedFastTail.Predecessors.Count == 0)
+            Detach(graph, sharedFastTail);
+
+        foreach (var successor in rewriteHead.Successors.ToList())
+            successor.Predecessors.Remove(rewriteHead);
+        rewriteHead.Successors.Clear();
+        rewriteHead.Successors.Add(merge);
+        if (!merge.Predecessors.Contains(rewriteHead))
+            merge.Predecessors.Add(rewriteHead);
+        rewriteHead.CalculateBlockType();
+    }
+
+    private sealed record SharedFastTailPattern(
+        LocalVariable Items,
+        IOperand SizeState,
+        LocalVariable SizeAddress,
+        MemoryOperand SizeMemory,
+        LocalVariable StagedValue);
 
     /// <summary>
     /// 容量不足分支有时会直接以AddWithResize结束方法，而快速分支跳到同一Return块。

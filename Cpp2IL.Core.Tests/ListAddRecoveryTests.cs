@@ -551,6 +551,75 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 两个接收者别名容量分支的共享快速尾按项恢复为公开Add()
+    {
+        var fixture = CreateSharedFastTailFixture([3, 7]);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var allInstructions = fixture.Graph.Blocks.SelectMany(block => block.Instructions).ToList();
+        var publicCalls = allInstructions.Where(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(publicCalls, Has.Count.EqualTo(2));
+            Assert.That(publicCalls.Select(call => ((Immediate)call.Operands[2]).Value),
+                Is.EqualTo(new long[] { 3, 7 }));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 三个共享快速尾整数追加保留负值零值与最大值()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [-1, 0, int.MaxValue],
+            omitExplicitStagingJumpAt: 2);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var values = fixture.Graph.Blocks.SelectMany(block => block.Instructions).Where(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" })
+            .Select(instruction => ((Immediate)instruction.Operands[2]).Value)
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(3));
+            Assert.That(values, Is.EquivalentTo(new long[] { -1, 0, int.MaxValue }));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 共享快速尾某项快慢值不同时仅保留该项原容量控制流()
+    {
+        var fixture = CreateSharedFastTailFixture([3, 7], mismatchFastValueAt: 1);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var allInstructions = fixture.Graph.Blocks.SelectMany(block => block.Instructions).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(allInstructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(allInstructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.EqualTo(1));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.SharedFastTail));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 集合状态更新前夹有业务赋值时保留赋值并闭合Add()
     {
         var fixture = CreateInterleavedHeadFixture(touchesReceiver: false);
@@ -1190,6 +1259,242 @@ public class ListAddRecoveryTests
         return new ChainedFixture(method, graph, receiver, sizeStates, versionStates);
     }
 
+    private static SharedFastTailFixture CreateSharedFastTailFixture(
+        IReadOnlyList<int> values,
+        int mismatchFastValueAt = -1,
+        int omitExplicitStagingJumpAt = -1)
+    {
+        if (values.Count < 2)
+            throw new ArgumentOutOfRangeException(nameof(values));
+
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var elementType = app.SystemTypes.SystemInt32Type;
+        var listType = listDefinition.MakeGenericInstanceType([elementType]);
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [genericElement]);
+        var addWithResizeTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [elementType],
+            []);
+        var itemsField = new InjectedFieldAnalysisContext(
+            "_items",
+            genericElement.MakeSzArrayType(),
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var versionField = new InjectedFieldAnalysisContext(
+            "_version",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var listHolderField = new InjectedFieldAnalysisContext(
+            "_targetList",
+            listType,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+
+        var owner = Local("owner", listType);
+        var items = Local("sharedItems", elementType.MakeSzArrayType());
+        var sizeState = Local("sharedSize", app.SystemTypes.SystemInt32Type);
+        var sizeAddress = Local("sharedSizeAddress", app.SystemTypes.SystemIntPtrType);
+        var stagedValue = Local("sharedValue", elementType);
+        var deadCarrier = Local("deadCarrier", app.SystemTypes.SystemInt32Type);
+        var masked = Local("masked", app.SystemTypes.SystemIntPtrType);
+        var biased = Local("biased", app.SystemTypes.SystemIntPtrType);
+        var normalized = Local("normalized", app.SystemTypes.SystemIntPtrType);
+        var elementOffset = Local("elementOffset", app.SystemTypes.SystemIntPtrType);
+        var elementAddress = Local("elementAddress", app.SystemTypes.SystemIntPtrType);
+        var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
+        var instructions = new List<Instruction>();
+        var targets = new List<(
+            Instruction ReceiverNullBranch,
+            Instruction ItemsNullBranch,
+            Instruction CapacityBranch,
+            Instruction StagingJump,
+            Instruction SlowCall,
+            Instruction SlowJump)>();
+
+        FieldReference PublicReceiver() => new(listHolderField, owner, 0x10);
+        for (var index = 0; index < values.Count; index++)
+        {
+            var stateReceiver = Local($"stateReceiver{index}", listType);
+            var receiverNull = Local($"receiverNull{index}", app.SystemTypes.SystemBooleanType);
+            var version = Local($"version{index}", app.SystemTypes.SystemInt32Type);
+            var itemsNull = Local($"itemsNull{index}", app.SystemTypes.SystemBooleanType);
+            var capacity = Local($"capacity{index}", app.SystemTypes.SystemBooleanType);
+
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, stateReceiver, PublicReceiver()));
+            instructions.Add(new Instruction(instructions.Count, OpCode.CheckEqual, receiverNull, PublicReceiver(), new Immediate(0)));
+            var receiverNullBranch = new Instruction(
+                instructions.Count,
+                OpCode.ConditionalJump,
+                new Immediate(-1),
+                receiverNull);
+            instructions.Add(receiverNullBranch);
+
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                items,
+                new FieldReference(itemsField, stateReceiver, 0)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Add,
+                version,
+                new FieldReference(versionField, stateReceiver, 0),
+                new Immediate(1)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                new FieldReference(versionField, stateReceiver, 0),
+                version));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.CheckEqual,
+                itemsNull,
+                new FieldReference(itemsField, stateReceiver, 0),
+                new Immediate(0)));
+            var itemsNullBranch = new Instruction(
+                instructions.Count,
+                OpCode.ConditionalJump,
+                new Immediate(-1),
+                itemsNull);
+            instructions.Add(itemsNullBranch);
+
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Add,
+                sizeAddress,
+                PublicReceiver(),
+                new Immediate(24)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                sizeState,
+                new MemoryOperand(sizeAddress)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.CheckGreaterOrEqualUnsigned,
+                capacity,
+                new MemoryOperand(sizeAddress),
+                new ArrayLength(items)));
+            var capacityBranch = new Instruction(
+                instructions.Count,
+                OpCode.ConditionalJump,
+                new Immediate(-1),
+                capacity);
+            instructions.Add(capacityBranch);
+
+            var fastValue = index == mismatchFastValueAt ? values[index] + 1L : values[index];
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                stagedValue,
+                new Immediate(fastValue)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                deadCarrier,
+                new Immediate(0)));
+            var stagingJump = new Instruction(
+                instructions.Count,
+                OpCode.Jump,
+                new Immediate(-1));
+            instructions.Add(stagingJump);
+
+            var slowCall = new Instruction(
+                instructions.Count,
+                OpCode.CallVoid,
+                addWithResizeTarget,
+                PublicReceiver(),
+                new Immediate(values[index]));
+            instructions.Add(slowCall);
+            // 该载体在汇合点以后无引用，模拟原生调用隐藏参数覆盖，恢复后应删除。
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                deadCarrier,
+                new Immediate(99)));
+            var slowJump = new Instruction(
+                instructions.Count,
+                OpCode.Jump,
+                new Immediate(-1));
+            instructions.Add(slowJump);
+            targets.Add((
+                receiverNullBranch,
+                itemsNullBranch,
+                capacityBranch,
+                stagingJump,
+                slowCall,
+                slowJump));
+        }
+
+        var sharedTailStart = new Instruction(
+            instructions.Count,
+            OpCode.And,
+            masked,
+            sizeState,
+            new Immediate(0xFFFFFFFFL));
+        instructions.Add(sharedTailStart);
+        instructions.Add(new Instruction(instructions.Count, OpCode.Xor, biased, masked, new Immediate(0x80000000L)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Subtract, normalized, biased, new Immediate(0x80000000L)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.ShiftLeft, elementOffset, normalized, new Immediate(2)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Add, elementAddress, items, elementOffset));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Add, newSize, sizeState, new Immediate(1)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, new MemoryOperand(sizeAddress), newSize));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            new MemoryOperand(elementAddress, null, 0x20),
+            stagedValue));
+        var sharedTailJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(sharedTailJump);
+
+        var merge = new Instruction(instructions.Count, OpCode.Return, owner);
+        instructions.Add(merge);
+        var nullThrows = values.Select(_ =>
+        {
+            var instruction = new Instruction(
+                instructions.Count,
+                OpCode.Throw,
+                app.GetAssemblyByName("mscorlib")!
+                    .GetTypeByFullName("System.NullReferenceException")!);
+            instructions.Add(instruction);
+            return instruction;
+        }).ToList();
+
+        for (var index = 0; index < targets.Count; index++)
+        {
+            targets[index].ReceiverNullBranch.SetOperand(0, nullThrows[index]);
+            targets[index].ItemsNullBranch.SetOperand(0, nullThrows[index]);
+            targets[index].CapacityBranch.SetOperand(0, targets[index].SlowCall);
+            targets[index].StagingJump.SetOperand(0, sharedTailStart);
+            targets[index].SlowJump.SetOperand(0, merge);
+        }
+        sharedTailJump.SetOperand(0, merge);
+
+        var graph = new ISILControlFlowGraph(instructions);
+        // 生产流水线在恢复器之前合并调用块，慢边调用与调用后载体因此属于同一块。
+        graph.MergeCallBlocks();
+        if (omitExplicitStagingJumpAt >= 0)
+        {
+            var stagingJump = targets[omitExplicitStagingJumpAt].StagingJump;
+            graph.FindBlockByInstruction(stagingJump)!.Instructions.Remove(stagingJump);
+        }
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new SharedFastTailFixture(
+            method,
+            graph,
+            graph.FindBlockByInstruction(sharedTailStart)!);
+    }
+
     private static Fixture CreateInterleavedHeadFixture(bool touchesReceiver)
     {
         var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
@@ -1285,4 +1590,9 @@ public class ListAddRecoveryTests
         LocalVariable Receiver,
         IReadOnlyList<LocalVariable> SizeStates,
         IReadOnlyList<LocalVariable> VersionStates);
+
+    private sealed record SharedFastTailFixture(
+        MethodAnalysisContext Method,
+        ISILControlFlowGraph Graph,
+        Block SharedFastTail);
 }
