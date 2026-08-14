@@ -81,6 +81,9 @@ public static class IlGenerator
             if (operand is StringLength stringLength)
                 local = stringLength.Value;
 
+            if (operand is ListCount listCount)
+                local = listCount.Value;
+
             if (operand is AddressOf { Target: LocalVariable addressed })
                 local = addressed;
 
@@ -967,6 +970,22 @@ public static class IlGenerator
                     MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
                 // callvirt同时保持原生字段解引用在空接收者上的NullReferenceException语义。
                 instructions.Add(CilOpCodes.Callvirt, importer.ImportMethod(lengthGetter));
+                break;
+            case ListCount listCount:
+                LoadLocal(listCount.Value, method, locals);
+                var concreteListType = importer.ImportTypeSignature(listCount.ListType.ToTypeSignature(module));
+                var concreteListTypeReference = concreteListType.ToTypeDefOrRef();
+                if (listCount.Value.Type?.FullName != listCount.ListType.FullName)
+                {
+                    // 控制流合并可能擦除接收者类型；调用公开属性前恢复具体List<T>栈类型。
+                    instructions.Add(CilOpCodes.Castclass, concreteListTypeReference);
+                }
+                var countGetter = new MemberReference(
+                    concreteListTypeReference,
+                    "get_Count",
+                    MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
+                // callvirt保持私有字段解引用在空接收者上的NullReferenceException语义。
+                instructions.Add(CilOpCodes.Callvirt, importer.ImportMethod(countGetter));
                 break;
             case AddressOf { Target: LocalVariable addressed }:
                 if (expectedType is { IsValueType: false }

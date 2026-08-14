@@ -212,6 +212,9 @@ public static class CopyCoalescer
                 case StringLength length:
                     yield return length.Value;
                     break;
+                case ListCount count:
+                    yield return count.Value;
+                    break;
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
@@ -256,6 +259,9 @@ public static class CopyCoalescer
                             break;
                         case StringLength length:
                             length.Value = groups.Find(length.Value);
+                            break;
+                        case ListCount count:
+                            count.Value = groups.Find(count.Value);
                             break;
                         case AddressOf { Target: LocalVariable addressed } addressOf:
                             addressOf.Target = groups.Find(addressed);

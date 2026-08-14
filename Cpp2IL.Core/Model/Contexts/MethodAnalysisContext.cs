@@ -469,6 +469,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 必须在最终控制流上把完整版本递增、清零和Array.Clear分支闭合为公开Clear调用。
         ListClearRecovery.Run(this);
 
+        // Add/Clear等完整写路径优先闭合；其余精确的List<T>._size读取在此恢复为公开Count属性。
+        // 只读恢复不掩盖未闭合的私有字段写入，后者仍会在源码编译阶段形成可量化红门。
+        ListCountRecovery.Run(this);
+
         // IL2CPP会把String.Length内联为私有布局字段读取；完整类型与读方向在这里已经稳定，
         // 此时恢复公开属性可避免输出运行库私有_stringLength字段。
         StringLengthRecovery.Run(this);

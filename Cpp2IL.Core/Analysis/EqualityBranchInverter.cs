@@ -155,6 +155,9 @@ public static class EqualityBranchInverter
                 case StringLength length:
                     yield return length.Value;
                     break;
+                case ListCount count:
+                    yield return count.Value;
+                    break;
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;

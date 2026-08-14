@@ -338,6 +338,12 @@ public static class Simplifier
                             return true;
                         }
 
+                        if (operand is ListCount listCount && listCount.Value == local)
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+
                         if (operand is AddressOf { Target: LocalVariable addressed } && addressed == local)
                         {
                             usedByMemory = true;

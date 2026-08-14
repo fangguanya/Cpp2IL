@@ -135,6 +135,9 @@ public static class DeadCodeEliminator
                 case StringLength { Value: { } stringValue }:
                     yield return stringValue;
                     break;
+                case ListCount { Value: { } listValue }:
+                    yield return listValue;
+                    break;
             }
         }
     }
