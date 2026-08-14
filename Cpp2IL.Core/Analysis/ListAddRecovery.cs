@@ -177,14 +177,30 @@ public static class ListAddRecovery
 
     private static bool IsValidSlowTail(IReadOnlyList<Instruction> instructions)
     {
-        if (instructions.All(instruction => instruction.OpCode == OpCode.Move))
+        if (instructions.All(IsPotentialSlowTailInstruction))
             return true;
 
         return instructions.Count > 0
                && instructions[^1] is { OpCode: OpCode.Return, Operands.Count: 0 }
                && instructions.Take(instructions.Count - 1)
-                   .All(instruction => instruction.OpCode == OpCode.Move);
+                   .All(IsPotentialSlowTailInstruction);
     }
+
+    /// <summary>
+    /// 慢边预筛选只额外放行下一项版本递增的固定加法；接收者、字段回写和快边等价性稍后统一验证。
+    /// </summary>
+    private static bool IsPotentialSlowTailInstruction(Instruction instruction)
+        => instruction.OpCode == OpCode.Move
+           || instruction is
+           {
+               OpCode: OpCode.Add,
+               Operands:
+               [
+                   LocalVariable,
+                   FieldReference { Field.Name: "_version" },
+                   Immediate { Value: 1 },
+               ],
+           };
 
     private static bool TryMatchHead(
         Block head,
@@ -569,11 +585,62 @@ public static class ListAddRecovery
             !slowStateRefreshes.Contains(instruction)
             || requiredStateRefreshes.Contains(instruction)).ToList();
         var callClobberRefreshes = preservedSlowTail.Where(instruction =>
-            IsRedundantCallClobberRefresh(graph, instruction)).ToList();
+            IsStateRefresh(instruction, receiver, "_items", items)
+            || IsRedundantCallClobberRefresh(graph, instruction)).ToList();
         var comparableSlowTail = preservedSlowTail.Where(instruction =>
             !requiredStateRefreshes.Contains(instruction)
             && !callClobberRefreshes.Contains(instruction)).ToList();
-        return HaveIdenticalCarrierMoves(fastTail, comparableSlowTail);
+        if (!TryCollectNextVersionAdvance(fastTail, receiver, out var fastVersionAdvance)
+            || !TryCollectNextVersionAdvance(comparableSlowTail, receiver, out var slowVersionAdvance)
+            || fastVersionAdvance.Count != slowVersionAdvance.Count)
+            return false;
+
+        // 连续内联 Add 还会把下一项的 _version++ 分别排到当前快慢边末尾。两边的 SSA
+        // 结果局部不同，但都严格读取并回写同一集合版本字段；保留慢边的一份供下一菱形匹配，
+        // 当前尾部比较则排除这组等价预更新。下一项提升为公开 Add 时会一并删除这份预更新。
+        var comparableFastTail = fastTail.Where(instruction => !fastVersionAdvance.Contains(instruction)).ToList();
+        comparableSlowTail = comparableSlowTail.Where(instruction => !slowVersionAdvance.Contains(instruction)).ToList();
+        return HaveIdenticalCarrierMoves(comparableFastTail, comparableSlowTail);
+    }
+
+    /// <summary>
+    /// 收集快慢边末尾为下一次 List.Add 预排的唯一版本递增；没有该尾部也属于有效终项。
+    /// </summary>
+    private static bool TryCollectNextVersionAdvance(
+        IReadOnlyList<Instruction> instructions,
+        LocalVariable receiver,
+        out List<Instruction> advance)
+    {
+        advance = [];
+        for (var index = 0; index + 1 < instructions.Count; index++)
+        {
+            if (instructions[index] is not
+                {
+                    OpCode: OpCode.Add,
+                    Operands:
+                    [
+                        LocalVariable version,
+                        FieldReference source,
+                        Immediate { Value: 1 },
+                    ],
+                }
+                || !IsField(source, receiver, "_version")
+                || instructions[index + 1] is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [FieldReference destination, var writtenVersion],
+                }
+                || !IsField(destination, receiver, "_version")
+                || !ReferenceEquals(version, writtenVersion))
+                continue;
+
+            if (advance.Count != 0)
+                return false;
+            advance.Add(instructions[index]);
+            advance.Add(instructions[index + 1]);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -618,6 +685,16 @@ public static class ListAddRecovery
     {
         publicValue = null!;
         if (ReferenceEquals(fastValue, slowValue))
+        {
+            publicValue = slowValue;
+            return true;
+        }
+
+        // ARM64 会为快速路径的数组写入和慢路径的 AddWithResize 实参分别创建 Immediate。
+        // 两个装箱实例的引用身份不同，但数值位完全相同时仍是同一个托管常量；数值不同则保留原菱形。
+        if (fastValue is Immediate fastImmediate
+            && slowValue is Immediate slowImmediate
+            && fastImmediate.Value == slowImmediate.Value)
         {
             publicValue = slowValue;
             return true;
