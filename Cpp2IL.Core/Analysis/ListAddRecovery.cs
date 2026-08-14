@@ -916,6 +916,8 @@ public static class ListAddRecovery
         LocalVariable receiver,
         string fieldName)
     {
+        if (IsPublicListSize(source, receiver, fieldName))
+            return true;
         if (source is FieldReference direct)
             return IsField(direct, receiver, fieldName);
         if (source is not LocalVariable local)
@@ -936,6 +938,8 @@ public static class ListAddRecovery
         string fieldName,
         ICollection<Instruction> allowed)
     {
+        if (IsPublicListSize(source, receiver, fieldName))
+            return true;
         if (source is FieldReference direct)
             return IsField(direct, receiver, fieldName);
         if (source is not LocalVariable local)
@@ -1128,10 +1132,27 @@ public static class ListAddRecovery
         // 连续内联 Add 还会把下一项的 _version++ 分别排到当前快慢边末尾。两边的 SSA
         // 结果局部不同，但都严格读取并回写同一集合版本字段；保留慢边的一份供下一菱形匹配，
         // 当前尾部比较则排除这组等价预更新。下一项提升为公开 Add 时会一并删除这份预更新。
-        var comparableFastTail = fastTail.Where(instruction => !fastVersionAdvance.Contains(instruction)).ToList();
-        comparableSlowTail = comparableSlowTail.Where(instruction => !slowVersionAdvance.Contains(instruction)).ToList();
+        var comparableFastTail = fastTail.Where(instruction =>
+            !fastVersionAdvance.Contains(instruction)
+            && !IsDeadMistypedRuntimeMethodCarrier(instruction, merge)).ToList();
+        comparableSlowTail = comparableSlowTail.Where(instruction =>
+            !slowVersionAdvance.Contains(instruction)
+            && !IsDeadMistypedRuntimeMethodCarrier(instruction, merge)).ToList();
         return HaveIdenticalCarrierMoves(comparableFastTail, comparableSlowTail);
     }
+
+    /// <summary>
+    /// ARM64 隐藏方法参数可能被类型传播误挂到通用调用寄存器局部；仅当该值在汇合点后
+    /// 被覆盖前从未读取时，才把它视为死亡的原生方法句柄载体。
+    /// </summary>
+    private static bool IsDeadMistypedRuntimeMethodCarrier(Instruction instruction, Block merge)
+        => instruction is
+           {
+               OpCode: OpCode.Move,
+               Operands: [LocalVariable destination, RuntimeMethodInfoAnalysisContext],
+           }
+           && destination.Type is not RuntimeMethodInfoAnalysisContext
+           && !IsReadBeforeDefinitionFromMerge(merge, destination);
 
     /// <summary>
     /// 收集快慢边末尾为下一次 List.Add 预排的唯一版本递增；没有该尾部也属于有效终项。
@@ -1449,10 +1470,28 @@ public static class ListAddRecovery
         LocalVariable receiver,
         string fieldName)
         => ReferenceEquals(left, right)
-           || left is FieldReference leftField
-           && right is FieldReference rightField
-           && IsField(leftField, receiver, fieldName)
-           && IsField(rightField, receiver, fieldName);
+           || IsDirectStateOperand(left, receiver, fieldName)
+           && IsDirectStateOperand(right, receiver, fieldName);
+
+    /// <summary>
+    /// 判断操作数是否直接读取同一集合状态；<see cref="ListCount"/> 只等价于具体
+    /// <c>List&lt;T&gt;</c> 接收者的 <c>_size</c> 读取，不参与版本或数组字段匹配。
+    /// </summary>
+    private static bool IsDirectStateOperand(
+        IOperand operand,
+        LocalVariable receiver,
+        string fieldName)
+        => operand is FieldReference field && IsField(field, receiver, fieldName)
+           || IsPublicListSize(operand, receiver, fieldName);
+
+    private static bool IsPublicListSize(
+        IOperand operand,
+        LocalVariable receiver,
+        string fieldName)
+        => fieldName == "_size"
+           && operand is ListCount count
+           && ReferenceEquals(count.Value, receiver)
+           && string.Equals(count.ListType.FullName, receiver.Type?.FullName, StringComparison.Ordinal);
 
     private static bool TryCreatePublicAddTarget(
         ConcreteGenericMethodAnalysisContext addWithResize,

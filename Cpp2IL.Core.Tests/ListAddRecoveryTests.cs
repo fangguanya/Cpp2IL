@@ -40,6 +40,117 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void Count公开读取参与容量菱形时恢复为公开Add调用()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var call = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(call.Operands[1], Is.SameAs(fixture.Receiver));
+            Assert.That(call.Operands[2], Is.SameAs(fixture.Value));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 三个独立Count操作数仍按同一接收者状态闭合()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true);
+
+        var countOperands = fixture.Graph.Instructions
+            .SelectMany(instruction => instruction.Operands)
+            .OfType<ListCount>()
+            .ToList();
+        Assert.That(countOperands, Has.Count.EqualTo(3));
+        Assert.That(countOperands.Distinct(ReferenceEqualityComparer.Instance).ToList(), Has.Count.EqualTo(3));
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction => instruction.IsCall), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Count来自其它集合时保持原容量控制流()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true,
+            publicCountWrongReceiver: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Count容量菱形含死亡错型方法句柄时仍恢复公开Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true,
+            includeMistypedRuntimeMethodCarrier: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)fixture.Graph.Instructions.Single(instruction => instruction.IsCall)
+                .Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 错型方法句柄在汇合后先读时保持原容量控制流()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true,
+            includeMistypedRuntimeMethodCarrier: true,
+            readMistypedRuntimeMethodCarrierFromMerge: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 快慢路径分别构造同一字段读取时恢复为公开Add调用()
     {
         var fixture = CreateFixture(
@@ -756,7 +867,11 @@ public class ListAddRecoveryTests
         bool useEquivalentFieldValues = false,
         bool mismatchValueField = false,
         bool mismatchValueFieldOwner = false,
-        bool mismatchValueFieldOffset = false)
+        bool mismatchValueFieldOffset = false,
+        bool usePublicCount = false,
+        bool publicCountWrongReceiver = false,
+        bool includeMistypedRuntimeMethodCarrier = false,
+        bool readMistypedRuntimeMethodCarrierFromMerge = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -822,22 +937,30 @@ public class ListAddRecoveryTests
         }
 
         FieldReference Field(FieldAnalysisContext field) => new(field, receiver, 0);
+        IOperand SizeRead() => usePublicCount
+            ? new ListCount(publicCountWrongReceiver ? otherValueOwner : receiver, listType)
+            : Field(sizeField);
         var instructions = new List<Instruction>
         {
             new(0, OpCode.Move, items, Field(itemsField)),
             new(1, OpCode.Add, version, Field(versionField), new Immediate(1)),
             new(2, OpCode.Move, Field(versionField), version),
-            new(3, OpCode.CheckGreaterOrEqualUnsigned, condition, Field(sizeField), new ArrayLength(items)),
+            new(3, OpCode.CheckGreaterOrEqualUnsigned, condition, SizeRead(), new ArrayLength(items)),
             new(4, OpCode.ConditionalJump, new Immediate(-1), condition),
-            new(5, OpCode.ShiftLeft, elementOffset, Field(sizeField), new Immediate(3)),
+            new(5, OpCode.ShiftLeft, elementOffset, SizeRead(), new Immediate(3)),
             new(6, OpCode.Add, elementAddress, useDirectItemsFieldForAddress ? Field(itemsField) : items, elementOffset),
-            new(7, OpCode.Add, newSize, Field(sizeField), new Immediate(1)),
+            new(7, OpCode.Add, newSize, SizeRead(), new Immediate(1)),
             new(8, OpCode.Move, Field(sizeField), newSize),
             new(9, OpCode.Move, new MemoryOperand(elementAddress, null, 0x20), mismatchStoredValue ? otherValue : fastValue),
         };
 
         if (includeMatchingCarrierMove)
             instructions.Add(new Instruction(instructions.Count, OpCode.Move, carrier, mismatchCarrierSource ? otherValue : value));
+        if (includeMistypedRuntimeMethodCarrier)
+        {
+            var runtimeMethod = new RuntimeMethodInfoAnalysisContext(addWithResize, listDefinition.DeclaringAssembly);
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, carrier, runtimeMethod));
+        }
         var fastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
         instructions.Add(fastJump);
 
@@ -892,6 +1015,11 @@ public class ListAddRecoveryTests
         method.ControlFlowGraph = graph;
         var slowBlock = graph.FindBlockByInstruction(instructions[slowCallIndex])!;
         var fastBlock = graph.FindBlockByInstruction(instructions[5])!;
+        if (readMistypedRuntimeMethodCarrierFromMerge)
+        {
+            var mergeBlock = graph.FindBlockByInstruction(instructions[mergeIndex])!;
+            mergeBlock.Instructions.Insert(0, new Instruction(-1, OpCode.Move, otherValue, carrier));
+        }
         // Phi消除发生在CFG构建之后，实际产物会把索引为-1的边复制追加到既有调用块。
         if (includeMatchingCarrierMove)
             slowBlock.Instructions.Add(new Instruction(-1, OpCode.Move, carrier, value));
