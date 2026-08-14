@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -76,6 +77,7 @@ public static class RuntimeMetadataSlotResolver
             .SelectMany(group => group.Select(candidate => candidate.Origin)));
 
         var initializedSlots = new HashSet<ulong>(capturedInitializedSlots);
+        var libContext = method.AppContext.LibCpp2IlContext;
         foreach (var instruction in instructions)
         {
             if (instruction.OpCode == OpCode.Move
@@ -87,10 +89,14 @@ public static class RuntimeMetadataSlotResolver
                         Scale: 0,
                         Addend: >= 0
                     } absolute]
-                && initializedSlots.Contains((ulong)absolute.Addend))
+                && initializedSlots.Contains((ulong)absolute.Addend)
+                && IsHiddenMethodInfoUsage(MetadataResolver.ResolveAbsoluteSlotUsage(
+                    (ulong)absolute.Addend,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt)?.Type))
             {
-                // 初始化保护区已证明该绝对地址保存运行时元数据；同一方法内再次读取
-                // 该地址仍是隐藏 MethodInfo，不会成为托管业务值。
+                // 初始化保护区只证明该地址属于运行时元数据目录；继续以元数据类型
+                // 证明它确实是隐藏MethodInfo，字符串、类型和字段槽均保留为业务定义。
                 provenOrigins.Add(destination);
             }
         }
@@ -108,6 +114,12 @@ public static class RuntimeMetadataSlotResolver
         }
         return changed;
     }
+
+    /// <summary>
+    /// 仅方法定义和泛型方法引用可作为托管调用签名之外的隐藏MethodInfo实参。
+    /// </summary>
+    internal static bool IsHiddenMethodInfoUsage(MetadataUsageType? usageType)
+        => usageType is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef;
 
     private static Dictionary<LocalVariable, Instruction> BuildDefinitions(
         IReadOnlyList<Instruction> instructions)

@@ -408,6 +408,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InjectedCheckRemover.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        // 初始化保护和注入异常边已经裁除，字符串目标类型也已收敛；此时闭合post-27
+        // 二层字符串槽，既保留第一层地址载体证据，也避免把其他元数据指针误写为字符串。
+        MetadataResolver.ResolveTypedPost27StringLoads(this);
         // 原生优化可省略从未被被调方法观察的this实参；仅在当前寄存器类型与托管签名矛盾时恢复入口this。
         ErasedInstanceReceiverRecovery.Run(this);
         // 值类型通过主不动点到达取址栈槽后，再把Object::Box唯一恢复为托管box。
@@ -449,6 +452,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Phi removal leaves a copy per merged version, most of which can share one local
         CopyCoalescer.Run(this);
+
+        // 将无副作用的共享Move/Return尾链改写为直接返回，使大型字符串分派反编译为
+        // 扁平早返回序列，避免数百层else触发Roslyn表达式复杂度上限。
+        TailReturnRecovery.Run(ControlFlowGraph);
 
         // Now out of SSA: clean up the per-edge copies that phi removal introduced (a local can have
         // several definitions merging at a join here, so this pass propagates conservatively), then

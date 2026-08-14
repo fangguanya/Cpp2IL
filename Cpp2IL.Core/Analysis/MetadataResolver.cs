@@ -5,6 +5,7 @@ using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
@@ -29,11 +30,7 @@ public static class MetadataResolver
     private static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
-        var definitions = new Dictionary<LocalVariable, Instruction>();
-
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
-            if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable destination)
-                definitions[destination] = instruction;
+        var definitions = BuildUniqueDefinitions(method.ControlFlowGraph!.Instructions);
 
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
@@ -66,29 +63,314 @@ public static class MetadataResolver
                 continue;
 
             var address = (ulong)memory.Addend;
-
-            var stringLiteral = libContext.GetLiteralByAddress(address);
-            if (stringLiteral != null)
-            {
-                instruction.SetOperand(1, new StringLiteral(stringLiteral));
-                continue;
-            }
-
-            if (method.DeclaringType is { } declaringType)
-            {
-                var typeGlobal = libContext.GetTypeGlobalByAddress(address);
-                if (typeGlobal != null)
-                {
-                    instruction.SetOperand(1, declaringType.AppContext.ResolveIl2CppType(typeGlobal));
-                    continue;
-                }
-            }
-
-            var methodUsage = libContext.GetMethodGlobalByAddress(address);
-            if (methodUsage?.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef
-                && method.AppContext.ResolveContextForMethod(methodUsage) is { DeclaringType: { } methodDeclaringType } methodContext)
-                instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly));
+            // 绝对槽在旧布局中直接保存编码值；post-27二级布局的第一层保存的是
+            // 编码项地址，必须留给后续[tableBase+offset]或Phi专用规则执行第二次读取。
+            var absoluteUsage = libContext.GetAnyGlobalByAddress(address);
+            if (absoluteUsage != null
+                && ResolveMetadataUsageOperand(method, absoluteUsage) is { } resolvedAbsoluteOperand)
+                instruction.SetOperand(1, resolvedAbsoluteOperand);
         }
+
+        var stringPhiDetails = new List<string>();
+        var stringPhiRecoveryCount = ResolvePhiBackedStringLoads(
+            method.ControlFlowGraph.Instructions,
+            stringPhiDetails,
+            address =>
+            {
+                var usage = libContext.CheckForPost27GlobalTableEntryAt(address, 0);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+        foreach (var detail in stringPhiDetails)
+            Logger.VerboseNewline(
+                $"字符串元数据Phi：method={method.Name}，recovered={stringPhiRecoveryCount}，{detail}",
+                "MetadataResolver");
+    }
+
+    /// <summary>
+    /// 统一解析绝对元数据槽：先识别槽内直接编码值，再识别“槽内保存编码项地址”的
+    /// post-27 二级布局。二级布局必须使用零字节偏移，避免把任意地址误判为元数据表。
+    /// </summary>
+    internal static TUsage? ResolveAbsoluteSlotUsage<TUsage>(
+        ulong address,
+        Func<ulong, TUsage?> directResolver,
+        Func<ulong, long, TUsage?> tableEntryResolver)
+        where TUsage : class
+        => directResolver(address) ?? tableEntryResolver(address, 0);
+
+    /// <summary>
+    /// 初始化保护区裁除和首次类型传播完成后，恢复“绝对槽保存编码项地址，强类型字符串局部
+    /// 再从该地址读取”的post-27二层布局。第一层地址载体保持原样，只有唯一Move定义、
+    /// 无索引内存读取、System.String目标和StringLiteral元数据四项证据同时成立时才改写。
+    /// </summary>
+    public static int ResolveTypedPost27StringLoads(MethodAnalysisContext method)
+    {
+        var libContext = method.AppContext.LibCpp2IlContext;
+        var changed = ResolveTypedPost27StringLoads(
+            method.ControlFlowGraph!.Instructions,
+            method.AppContext.SystemTypes.SystemStringType,
+            (address, offset) =>
+            {
+                var usage = libContext.CheckForPost27GlobalTableEntryAt(address, offset);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+
+        if (changed > 0)
+            Logger.VerboseNewline(
+                $"字符串元数据二层槽：method={method.Name}，recovered={changed}",
+                "MetadataResolver");
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 对已完成类型传播的指令执行可测试的二层字符串槽恢复。相同地址与偏移只解析一次，
+    /// 避免多个返回分支共享默认字符串槽时重复读取二进制和元数据。
+    /// </summary>
+    internal static int ResolveTypedPost27StringLoads(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext stringType,
+        Func<ulong, long, StringLiteral?> post27StringEntryResolver)
+    {
+        var definitions = BuildUniqueDefinitions(instructions);
+        var resolvedEntries = new Dictionary<(ulong Address, long Offset), StringLiteral?>();
+        var changed = 0;
+
+        foreach (var load in instructions)
+        {
+            if (load is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable destination,
+                        MemoryOperand
+                        {
+                            Base: LocalVariable tableBase,
+                            Index: null,
+                            Scale: 0,
+                            Addend: >= 0
+                        } entryMemory
+                    ]
+                }
+                || destination.Type != stringType
+                || ResolveAbsoluteSlotAddress(tableBase, definitions, []) is not { } tableGlobalAddress)
+                continue;
+
+            var key = (tableGlobalAddress, entryMemory.Addend);
+            if (!resolvedEntries.TryGetValue(key, out var literal))
+            {
+                literal = post27StringEntryResolver(key.Item1, key.Item2);
+                resolvedEntries[key] = literal;
+            }
+
+            if (literal == null)
+                continue;
+
+            load.SetOperand(1, literal);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 沿SSA单一定义链解析绝对槽地址。Move复制继续追踪；Phi只有在全部输入都能证明为
+    /// 同一绝对地址时才收敛，异址、缺失定义和循环链均保持未解析。
+    /// </summary>
+    private static ulong? ResolveAbsoluteSlotAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited)
+    {
+        if (operand is not LocalVariable local
+            || !visited.Add(local)
+            || !definitions.TryGetValue(local, out var definition))
+            return null;
+
+        if (definition is
+            {
+                OpCode: OpCode.Move,
+                Operands:
+                [
+                    LocalVariable,
+                    MemoryOperand
+                    {
+                        Base: null,
+                        Index: null,
+                        Scale: 0,
+                        Addend: >= 0
+                    } absoluteSlot
+                ]
+            })
+            return (ulong)absoluteSlot.Addend;
+
+        if (definition is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable source] })
+            return ResolveAbsoluteSlotAddress(source, definitions, visited);
+
+        if (definition.OpCode != OpCode.Phi || definition.Operands.Count < 2)
+            return null;
+
+        ulong? resolvedAddress = null;
+        for (var index = 1; index < definition.Operands.Count; index++)
+        {
+            var inputAddress = ResolveAbsoluteSlotAddress(
+                definition.Operands[index],
+                definitions,
+                new HashSet<LocalVariable>(visited));
+            if (inputAddress == null || resolvedAddress is { } existing && existing != inputAddress.Value)
+                return null;
+
+            resolvedAddress = inputAddress;
+        }
+
+        return resolvedAddress;
+    }
+
+    /// <summary>
+    /// 把“多个字符串元数据槽地址经Phi汇合，再统一解引用”的原生形态恢复为字符串值Phi。
+    /// MetadataUsage解析已经把每条输入边的绝对槽加载证明为StringLiteral；此时继续保留
+    /// 公共<c>[phi]</c>会把托管字符串再次当作地址读取，并让退SSA后的定义链丢失。
+    /// 只有全部输入都沿唯一Move链解析为字符串时才提交重写，任何混合输入均保持原样。
+    /// </summary>
+    internal static int ResolvePhiBackedStringLoads(
+        IReadOnlyList<Instruction> instructions,
+        List<string>? details = null,
+        Func<ulong, StringLiteral?>? post27StringSlotResolver = null)
+    {
+        var definitions = BuildUniqueDefinitions(instructions);
+        var changed = 0;
+
+        foreach (var load in instructions)
+        {
+            if (load is
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable { IsReturn: true },
+                        MemoryOperand
+                        {
+                            Base: LocalVariable returnBase,
+                            Index: null,
+                            Scale: 0,
+                            Addend: 0
+                        }
+                    ]
+                })
+            {
+                details?.Add(
+                    $"返回读取基址={returnBase}，定义="
+                    + (definitions.TryGetValue(returnBase, out var returnBaseDefinition)
+                        ? returnBaseDefinition.ToString()
+                        : "<非唯一或缺失>"));
+            }
+
+            if (load is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable,
+                        MemoryOperand
+                        {
+                            Base: LocalVariable phiValue,
+                            Index: null,
+                            Scale: 0,
+                            Addend: 0
+                        }
+                    ]
+                }
+                || !definitions.TryGetValue(phiValue, out var phi)
+                || phi.OpCode != OpCode.Phi
+                || phi.Operands.Count < 3)
+                continue;
+
+            var resolvedInputs = new List<StringLiteral>(phi.Operands.Count - 1);
+            var allInputsResolved = true;
+            string? firstUnresolved = null;
+            for (var index = 1; index < phi.Operands.Count; index++)
+            {
+                if (ResolveStringLiteral(
+                        phi.Operands[index],
+                        definitions,
+                        [],
+                        post27StringSlotResolver) is not { } literal)
+                {
+                    allInputsResolved = false;
+                    var unresolved = phi.Operands[index];
+                    firstUnresolved = unresolved is LocalVariable local
+                        && definitions.TryGetValue(local, out var unresolvedDefinition)
+                            ? $"{local} <- {unresolvedDefinition}"
+                            : unresolved.ToString();
+                    break;
+                }
+
+                resolvedInputs.Add(literal);
+            }
+
+            details?.Add(
+                $"候选Phi={phiValue}，输入={phi.Operands.Count - 1}，"
+                + $"已解析={resolvedInputs.Count}，首个未解析={firstUnresolved ?? "<无>"}");
+            if (!allInputsResolved)
+                continue;
+
+            for (var index = 0; index < resolvedInputs.Count; index++)
+                phi.SetOperand(index + 1, resolvedInputs[index]);
+
+            // Phi现在直接保存托管字符串值，公共读取退化为普通复制；后续类型传播会从
+            // 方法返回值反向绑定Phi，退SSA则在每条原始命中边写入对应字符串常量。
+            load.SetOperand(1, phiValue);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 建立单一定义索引；同一局部出现多个定义时排除该局部，避免跨控制流边猜测来源。
+    /// </summary>
+    private static Dictionary<LocalVariable, Instruction> BuildUniqueDefinitions(
+        IReadOnlyList<Instruction> instructions)
+        => instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+
+    private static StringLiteral? ResolveStringLiteral(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited,
+        Func<ulong, StringLiteral?>? post27StringSlotResolver)
+    {
+        if (operand is StringLiteral literal)
+            return literal;
+
+        if (operand is not LocalVariable local
+            || !visited.Add(local)
+            || !definitions.TryGetValue(local, out var definition)
+            || definition is not { OpCode: OpCode.Move, Operands.Count: >= 2 })
+            return null;
+
+        if (definition.Operands[1] is MemoryOperand
+            {
+                Base: null,
+                Index: null,
+                Scale: 0,
+                Addend: >= 0
+            } absoluteSlot
+            && post27StringSlotResolver != null)
+            return post27StringSlotResolver((ulong)absoluteSlot.Addend);
+
+        return ResolveStringLiteral(
+            definition.Operands[1],
+            definitions,
+            visited,
+            post27StringSlotResolver);
     }
 
     /// <summary>

@@ -64,6 +64,62 @@ public class InjectedCheckRemoverTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 删除不可达异常前驱时同步删除Phi对应输入()
+    {
+        var normal = new Block();
+        var exceptional = new Block();
+        var merge = CreatePhiBlock(normal, exceptional, out var phi, out var normalValue, out _);
+
+        var removed = ISILControlFlowGraph.RemovePredecessorAndPhiInputs(merge, exceptional);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.EqualTo(1));
+            Assert.That(merge.Predecessors, Is.EqualTo(new[] { normal }));
+            Assert.That(phi.Operands, Has.Count.EqualTo(2));
+            Assert.That(phi.Operands[1], Is.SameAs(normalValue));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 删除首索引前驱时Phi保留末索引输入()
+    {
+        var exceptional = new Block();
+        var normal = new Block();
+        var merge = CreatePhiBlock(exceptional, normal, out var phi, out _, out var normalValue);
+
+        var removed = ISILControlFlowGraph.RemovePredecessorAndPhiInputs(merge, exceptional);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.EqualTo(1));
+            Assert.That(merge.Predecessors, Is.EqualTo(new[] { normal }));
+            Assert.That(phi.Operands[1], Is.SameAs(normalValue));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 删除不存在的前驱时保持Phi和前驱顺序()
+    {
+        var first = new Block();
+        var second = new Block();
+        var missing = new Block();
+        var merge = CreatePhiBlock(first, second, out var phi, out var firstValue, out var secondValue);
+
+        var removed = ISILControlFlowGraph.RemovePredecessorAndPhiInputs(merge, missing);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.Zero);
+            Assert.That(merge.Predecessors, Is.EqualTo(new[] { first, second }));
+            Assert.That(phi.Operands.Skip(1), Is.EqualTo(new[] { firstValue, secondValue }));
+        });
+    }
+
     private static Fixture CreateFixture(long comparedValue, bool includeDeadPhi = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -98,6 +154,24 @@ public class InjectedCheckRemoverTests
             graph,
             graph.FindBlockByInstruction(instructions[1])!,
             graph.FindBlockByInstruction(instructions[^1])!);
+    }
+
+    private static Block CreatePhiBlock(
+        Block firstPredecessor,
+        Block secondPredecessor,
+        out Instruction phi,
+        out LocalVariable firstValue,
+        out LocalVariable secondValue)
+    {
+        firstValue = new LocalVariable("first", new Register(null, "X20", 1));
+        secondValue = new LocalVariable("second", new Register(null, "X20", 2));
+        var result = new LocalVariable("result", new Register(null, "X20", 3));
+        phi = new Instruction(-1, OpCode.Phi, result, firstValue, secondValue);
+        return new Block
+        {
+            Predecessors = [firstPredecessor, secondPredecessor],
+            Instructions = [phi],
+        };
     }
 
     private sealed record Fixture(

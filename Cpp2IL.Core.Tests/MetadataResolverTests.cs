@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
@@ -274,5 +275,324 @@ public class MetadataResolverTests
         Assert.That(
             MetadataResolver.SpecializeVTableMethodForReceiver(app.SystemTypes.SystemObjectType, getItem),
             Is.SameAs(getItem));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 字符串槽地址Phi后的公共解引用恢复为字符串值Phi()
+    {
+        var first = new LocalVariable("first", new Register(null, "X8", 1));
+        var second = new LocalVariable("second", new Register(null, "X8", 2));
+        var merged = new LocalVariable("merged", new Register(null, "X8", 3));
+        var result = new LocalVariable("result", new Register(null, "X0", 1));
+        var phi = new Instruction(-1, OpCode.Phi, merged, first, second);
+        var load = new Instruction(3, OpCode.Move, result, new MemoryOperand(merged));
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, first, new StringLiteral("alpha")),
+            new(1, OpCode.Move, second, new StringLiteral("beta")),
+            phi,
+            load,
+        };
+
+        var changed = MetadataResolver.ResolvePhiBackedStringLoads(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(load.Operands[1], Is.SameAs(merged));
+            Assert.That(phi.Operands.Skip(1).OfType<StringLiteral>().Select(item => item.Value),
+                Is.EqualTo(new[] { "alpha", "beta" }));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百个字符串槽输入保持逐边映射且只改写一次公共读取()
+    {
+        const int inputCount = 400;
+        var inputs = Enumerable.Range(0, inputCount)
+            .Select(index => new LocalVariable($"input{index}", new Register(null, "X8", index + 1)))
+            .ToArray();
+        var merged = new LocalVariable("merged", new Register(null, "X8", inputCount + 1));
+        var result = new LocalVariable("result", new Register(null, "X0", 1));
+        var instructions = inputs
+            .Select((input, index) => new Instruction(index, OpCode.Move, input, new StringLiteral($"value-{index}")))
+            .ToList();
+        var phi = new Instruction(-1, OpCode.Phi, new IOperand[] { merged }.Concat(inputs).ToList());
+        var load = new Instruction(inputCount, OpCode.Move, result, new MemoryOperand(merged));
+        instructions.Add(phi);
+        instructions.Add(load);
+
+        var changed = MetadataResolver.ResolvePhiBackedStringLoads(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(phi.Operands.Count, Is.EqualTo(inputCount + 1));
+            Assert.That(phi.Operands.Skip(1).OfType<StringLiteral>().Select(item => item.Value).Distinct().Count(),
+                Is.EqualTo(inputCount));
+            Assert.That(load.Operands[1], Is.SameAs(merged));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 字符串Phi混入未解析地址时保持公共解引用原样()
+    {
+        var resolved = new LocalVariable("resolved", new Register(null, "X8", 1));
+        var unresolved = new LocalVariable("unresolved", new Register(null, "X8", 2));
+        var merged = new LocalVariable("merged", new Register(null, "X8", 3));
+        var result = new LocalVariable("result", new Register(null, "X0", 1));
+        var phi = new Instruction(-1, OpCode.Phi, merged, resolved, unresolved);
+        var memory = new MemoryOperand(merged);
+        var load = new Instruction(3, OpCode.Move, result, memory);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, resolved, new StringLiteral("alpha")),
+            new(1, OpCode.Move, unresolved, new Immediate(0x1234)),
+            phi,
+            load,
+        };
+
+        var changed = MetadataResolver.ResolvePhiBackedStringLoads(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(phi.Operands[1], Is.SameAs(resolved));
+            Assert.That(phi.Operands[2], Is.SameAs(unresolved));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Post27绝对槽地址Phi经二级读取恢复字符串且保留第一层定义()
+    {
+        var first = new LocalVariable("first", new Register(null, "X8", 1));
+        var second = new LocalVariable("second", new Register(null, "X8", 2));
+        var merged = new LocalVariable("merged", new Register(null, "X8", 3));
+        var result = new LocalVariable("result", new Register(null, "X0", 1));
+        var firstLoad = new Instruction(0, OpCode.Move, first, new MemoryOperand(addend: 0x1000));
+        var secondLoad = new Instruction(1, OpCode.Move, second, new MemoryOperand(addend: 0x2000));
+        var phi = new Instruction(-1, OpCode.Phi, merged, first, second);
+        var commonLoad = new Instruction(2, OpCode.Move, result, new MemoryOperand(merged));
+        var values = new Dictionary<ulong, string>
+        {
+            [0x1000] = "alpha",
+            [0x2000] = "beta",
+        };
+
+        var changed = MetadataResolver.ResolvePhiBackedStringLoads(
+            [firstLoad, secondLoad, phi, commonLoad],
+            post27StringSlotResolver: address => values.TryGetValue(address, out var value)
+                ? new StringLiteral(value)
+                : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(firstLoad.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(secondLoad.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(phi.Operands.Skip(1).Cast<StringLiteral>().Select(value => value.Value),
+                Is.EqualTo(new[] { "alpha", "beta" }));
+            Assert.That(commonLoad.Operands[1], Is.SameAs(merged));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 绝对槽直接解码失败后使用Post27二级表项()
+    {
+        var directCalls = 0;
+        var tableCalls = 0;
+
+        var resolved = MetadataResolver.ResolveAbsoluteSlotUsage<string>(
+            0x5A22BB0,
+            _ =>
+            {
+                directCalls++;
+                return null;
+            },
+            (address, offset) =>
+            {
+                tableCalls++;
+                return address == 0x5A22BB0 && offset == 0 ? "acLiveTo80" : null;
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.EqualTo("acLiveTo80"));
+            Assert.That(directCalls, Is.EqualTo(1));
+            Assert.That(tableCalls, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 绝对槽直接解码成功时不重复读取二级表项()
+    {
+        var tableCalls = 0;
+
+        var resolved = MetadataResolver.ResolveAbsoluteSlotUsage<string>(
+            ulong.MaxValue,
+            address => address == ulong.MaxValue ? "direct" : null,
+            (_, _) =>
+            {
+                tableCalls++;
+                return "unexpected";
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.EqualTo("direct"));
+            Assert.That(tableCalls, Is.Zero);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 绝对槽两种布局均未解码时保持空结果()
+    {
+        var observedOffset = -1L;
+
+        var resolved = MetadataResolver.ResolveAbsoluteSlotUsage<object>(
+            0,
+            _ => null,
+            (_, offset) =>
+            {
+                observedOffset = offset;
+                return null;
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.Null);
+            Assert.That(observedOffset, Is.Zero);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 强类型字符串二层槽恢复所有共享读取并保留地址载体()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var beforeGuard = new LocalVariable("beforeGuard", new Register(null, "X21", 1));
+        var afterGuard = new LocalVariable("afterGuard", new Register(null, "X21", 2));
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X21", 3));
+        var firstResult = new LocalVariable("firstResult", new Register(null, "X0", 1), stringType);
+        var secondResult = new LocalVariable("secondResult", new Register(null, "X0", 2), stringType);
+        var beforeDefinition = new Instruction(0, OpCode.Move, beforeGuard, new MemoryOperand(addend: 0x5A00A98));
+        var afterDefinition = new Instruction(1, OpCode.Move, afterGuard, new MemoryOperand(addend: 0x5A00A98));
+        var tablePhi = new Instruction(-1, OpCode.Phi, tableBase, beforeGuard, afterGuard);
+        var firstLoad = new Instruction(2, OpCode.Move, firstResult, new MemoryOperand(tableBase));
+        var secondLoad = new Instruction(3, OpCode.Move, secondResult, new MemoryOperand(tableBase));
+        var resolverCalls = 0;
+
+        var changed = MetadataResolver.ResolveTypedPost27StringLoads(
+            [beforeDefinition, afterDefinition, tablePhi, firstLoad, secondLoad],
+            stringType,
+            (address, offset) =>
+            {
+                resolverCalls++;
+                return address == 0x5A00A98 && offset == 0 ? new StringLiteral("trophy") : null;
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(2));
+            Assert.That(resolverCalls, Is.EqualTo(1));
+            Assert.That(beforeDefinition.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(afterDefinition.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(tablePhi.Operands.Skip(1), Is.EqualTo(new IOperand[] { beforeGuard, afterGuard }));
+            Assert.That(((StringLiteral)firstLoad.Operands[1]).Value, Is.EqualTo("trophy"));
+            Assert.That(((StringLiteral)secondLoad.Operands[1]).Value, Is.EqualTo("trophy"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百个不同偏移的强类型字符串二层槽全部恢复()
+    {
+        const int inputCount = 400;
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X21", 1));
+        var tableDefinition = new Instruction(0, OpCode.Move, tableBase, new MemoryOperand(addend: 0x5A00000));
+        var loads = Enumerable.Range(0, inputCount)
+            .Select(index => new Instruction(
+                index + 1,
+                OpCode.Move,
+                new LocalVariable($"result{index}", new Register(null, "X0", index + 1), stringType),
+                new MemoryOperand(tableBase, addend: index * 8L)))
+            .ToList();
+        var instructions = new List<Instruction> { tableDefinition };
+        instructions.AddRange(loads);
+
+        var changed = MetadataResolver.ResolveTypedPost27StringLoads(
+            instructions,
+            stringType,
+            (address, offset) => address == 0x5A00000
+                ? new StringLiteral($"value-{offset / 8}")
+                : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(inputCount));
+            Assert.That(loads.Select(load => ((StringLiteral)load.Operands[1]).Value).Distinct().Count(),
+                Is.EqualTo(inputCount));
+            Assert.That(((StringLiteral)loads[^1].Operands[1]).Value, Is.EqualTo("value-399"));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非字符串目标多定义载体和未解析表项均保持原样()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X21", 1));
+        var ambiguousBase = new LocalVariable("ambiguousBase", new Register(null, "X22", 1));
+        var differentFirst = new LocalVariable("differentFirst", new Register(null, "X23", 1));
+        var differentSecond = new LocalVariable("differentSecond", new Register(null, "X23", 2));
+        var differentPhi = new LocalVariable("differentPhi", new Register(null, "X23", 3));
+        var integerResult = new LocalVariable(
+            "integerResult",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var stringResult = new LocalVariable("stringResult", new Register(null, "X0", 2), stringType);
+        var unresolvedResult = new LocalVariable("unresolvedResult", new Register(null, "X0", 3), stringType);
+        var differentResult = new LocalVariable("differentResult", new Register(null, "X0", 4), stringType);
+        var integerMemory = new MemoryOperand(tableBase);
+        var ambiguousMemory = new MemoryOperand(ambiguousBase);
+        var unresolvedMemory = new MemoryOperand(tableBase, addend: 8);
+        var differentMemory = new MemoryOperand(differentPhi);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, tableBase, new MemoryOperand(addend: 0x1000)),
+            new(1, OpCode.Move, ambiguousBase, new MemoryOperand(addend: 0x2000)),
+            new(2, OpCode.Move, ambiguousBase, new MemoryOperand(addend: 0x3000)),
+            new(3, OpCode.Move, differentFirst, new MemoryOperand(addend: 0x4000)),
+            new(4, OpCode.Move, differentSecond, new MemoryOperand(addend: 0x5000)),
+            new(-1, OpCode.Phi, differentPhi, differentFirst, differentSecond),
+            new(5, OpCode.Move, integerResult, integerMemory),
+            new(6, OpCode.Move, stringResult, ambiguousMemory),
+            new(7, OpCode.Move, unresolvedResult, unresolvedMemory),
+            new(8, OpCode.Move, differentResult, differentMemory),
+        };
+
+        var changed = MetadataResolver.ResolveTypedPost27StringLoads(
+            instructions,
+            stringType,
+            (_, _) => null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(instructions[6].Operands[1], Is.EqualTo(integerMemory));
+            Assert.That(instructions[7].Operands[1], Is.EqualTo(ambiguousMemory));
+            Assert.That(instructions[8].Operands[1], Is.EqualTo(unresolvedMemory));
+            Assert.That(instructions[9].Operands[1], Is.EqualTo(differentMemory));
+        });
     }
 }

@@ -292,6 +292,69 @@ public class SsaAndDominators
         });
     }
 
+    /// <summary>
+    /// 模拟大型字符串分派：条件链的每个命中块都写入同一地址寄存器，最后在公共块解引用。
+    /// </summary>
+    private static ISILControlFlowGraph WideMemoryLoadJoin(int branchCount)
+    {
+        var instructions = new List<Instruction>();
+        var successStart = branchCount + 1;
+        var joinIndex = successStart + branchCount * 2;
+
+        for (var index = 0; index < branchCount; index++)
+        {
+            var successIndex = successStart + index * 2;
+            instructions.Add(new Instruction(
+                index,
+                OpCode.ConditionalJump,
+                new Immediate(successIndex),
+                new Register(null, $"condition{index}")));
+        }
+
+        // 所有条件均未命中时直接返回，不得为成功路径伪造返回地址。
+        instructions.Add(new Instruction(branchCount, OpCode.Return));
+        for (var index = 0; index < branchCount; index++)
+        {
+            var successIndex = successStart + index * 2;
+            instructions.Add(new Instruction(
+                successIndex,
+                OpCode.Move,
+                new Register(null, "X8"),
+                new Immediate(0x1000 + index * 8)));
+            instructions.Add(new Instruction(successIndex + 1, OpCode.Jump, new Immediate(joinIndex)));
+        }
+
+        instructions.Add(new Instruction(
+            joinIndex,
+            OpCode.Move,
+            new Register(null, "X0"),
+            new MemoryOperand(new Register(null, "X8"))));
+        instructions.Add(new Instruction(joinIndex + 1, OpCode.Return, new Register(null, "X0")));
+        return BuildGraph(instructions);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百条地址定义汇入公共内存读取时必须建立完整Phi()
+    {
+        const int branchCount = 400;
+        var graph = WideMemoryLoadJoin(branchCount);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        var join = BlockWith(graph, instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand] });
+        var phi = join.Instructions.Single(instruction =>
+            instruction.OpCode == OpCode.Phi && RegName(instruction.Operands[0]) == "X8");
+        Assert.Multiple(() =>
+        {
+            Assert.That(join.Predecessors.Count, Is.EqualTo(branchCount));
+            Assert.That(phi.Operands.Count, Is.EqualTo(branchCount + 1));
+            Assert.That(phi.Operands.Skip(1).Cast<Register>().Select(register => register.Version).Distinct().Count(),
+                Is.EqualTo(branchCount));
+        });
+    }
+
     private static ISILControlFlowGraph ConditionalSelectGraph(bool includeSecondValue)
     {
         var instructions = new List<Instruction>();

@@ -215,6 +215,72 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Adrp标量加载接受零页内偏移()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X8] = 0x059F3000,
+        };
+
+        var resolved = NewArmV8InstructionSet.TryCreateAdrpMemoryOperand(
+            pages,
+            Arm64Register.X8,
+            Arm64Register.INVALID,
+            0,
+            out var memory);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(memory.IsConstant, Is.True);
+            Assert.That(memory.Addend, Is.EqualTo(0x059F3000));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Adrp标量加载合并最大页内偏移()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X8] = 0x059F3000,
+        };
+
+        var resolved = NewArmV8InstructionSet.TryCreateAdrpMemoryOperand(
+            pages,
+            Arm64Register.X8,
+            Arm64Register.INVALID,
+            0xFFF,
+            out var memory);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(memory.Addend, Is.EqualTo(0x059F3FFF));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Adrp标量加载带动态索引时保持寄存器寻址()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X8] = 0x059F3000,
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateAdrpMemoryOperand(
+                pages,
+                Arm64Register.X8,
+                Arm64Register.X9,
+                0,
+                out _),
+            Is.False);
+    }
+
+    [Test]
     [Category("异常输入")]
     public void IndexedAdrpStoreKeepsDynamicAddressing()
     {

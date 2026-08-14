@@ -123,7 +123,7 @@ public class ISILControlFlowGraph
             // (A reachable block can have an unreachable predecessor; leaving that reference
             // behind makes later passes such as dominator computation throw.)
             foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
+                RemovePredecessorAndPhiInputs(successor, block);
             foreach (var predecessor in block.Predecessors)
                 predecessor.Successors.Remove(block);
 
@@ -131,6 +131,34 @@ public class ISILControlFlowGraph
             block.Predecessors.Clear();
             Blocks.Remove(block);
         }
+    }
+
+    /// <summary>
+    /// 从块中删除指定前驱，并同步删除所有Phi的同索引输入。
+    /// SSA中Phi第一个操作数是目标，后续操作数与Predecessors严格按索引对应。
+    /// </summary>
+    internal static int RemovePredecessorAndPhiInputs(Block block, Block predecessor)
+    {
+        var removed = 0;
+        for (var predecessorIndex = block.Predecessors.Count - 1;
+             predecessorIndex >= 0;
+             predecessorIndex--)
+        {
+            if (!ReferenceEquals(block.Predecessors[predecessorIndex], predecessor))
+                continue;
+
+            foreach (var phi in block.Instructions.Where(instruction => instruction.OpCode == OpCode.Phi))
+            {
+                var operandIndex = predecessorIndex + 1;
+                if (operandIndex < phi.Operands.Count)
+                    phi.RemoveOperandAt(operandIndex);
+            }
+
+            block.Predecessors.RemoveAt(predecessorIndex);
+            removed++;
+        }
+
+        return removed;
     }
 
     public void RemoveNops()

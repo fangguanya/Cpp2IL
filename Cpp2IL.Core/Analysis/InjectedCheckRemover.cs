@@ -41,7 +41,7 @@ public static class InjectedCheckRemover
             terminator.SetOperands();
 
             block.Successors.Remove(target);
-            target.Predecessors.Remove(block);
+            ISILControlFlowGraph.RemovePredecessorAndPhiInputs(target, block);
             block.CalculateBlockType();
             removedAny = true;
         }

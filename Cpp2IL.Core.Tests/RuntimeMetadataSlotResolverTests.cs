@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -173,6 +174,36 @@ public class RuntimeMetadataSlotResolverTests
 
         Assert.That(
             RuntimeMetadataSlotResolver.TryFindSlotOrigin(value, definitions, out _, out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 方法定义元数据可证明隐藏MethodInfo()
+    {
+        Assert.That(
+            RuntimeMetadataSlotResolver.IsHiddenMethodInfoUsage(MetadataUsageType.MethodDef),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 泛型方法引用同样可证明隐藏MethodInfo()
+    {
+        Assert.That(
+            RuntimeMetadataSlotResolver.IsHiddenMethodInfoUsage(MetadataUsageType.MethodRef),
+            Is.True);
+    }
+
+    [TestCase(MetadataUsageType.StringLiteral)]
+    [TestCase(MetadataUsageType.Type)]
+    [TestCase(MetadataUsageType.FieldInfo)]
+    [TestCase(null)]
+    [Category("异常输入")]
+    public void 非方法或未解码元数据不得删除业务加载(MetadataUsageType? usageType)
+    {
+        Assert.That(
+            RuntimeMetadataSlotResolver.IsHiddenMethodInfoUsage(usageType),
             Is.False);
     }
 

@@ -1867,19 +1867,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                 }
 
-                if (instruction.Op1Kind == Arm64OperandKind.Memory && adrpOffsets.TryGetValue(instruction.MemBase, out var page) && instruction.MemOffset != 0 && instruction.MemAddendReg == Arm64Register.INVALID)
+                if (instruction.Op1Kind == Arm64OperandKind.Memory
+                    && TryCreateAdrpMemoryOperand(
+                        adrpOffsets,
+                        instruction.MemBase,
+                        instruction.MemAddendReg,
+                        instruction.MemOffset,
+                        out var absoluteLoadSource))
                 {
-                    //Maybe this is a bit hacky? But I really don't want to write paged load handling into ISIL itself, it's an Arm64 quirk
-                    //LDR X0, [X1, #0x1000], where X1 was previously loaded with a page address via an ADRP instruction
-                    //We just return the final address, it makes ISIL happier.
-                    //TODO check if this is correct
-                    var offset = instruction.MemOffset + (long)page;
-
-                    //We're also trashing any possible ADRP offsets in the dest here, so let's clear that now we've possibly grabbed the value if we need it (it's common to store the page and final address in the same register)
+                    // ADRP后的标量LDR无论页内偏移是否为零都属于绝对地址加载；与存储路径
+                    // 共用同一解析函数，避免零偏移槽退化为“页地址再解引用”的动态内存链。
                     if (instruction.Op0Kind == Arm64OperandKind.Register)
                         adrpOffsets.Remove(instruction.Op0Reg);
 
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), new MemoryOperand(addend: offset));
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), absoluteLoadSource);
                     break;
                 }
 
