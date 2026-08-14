@@ -26,6 +26,7 @@ public static class InlineTypeCheckRecovery
             if (!TryMatchSecondCheck(
                     secondCheckBlock,
                     definitions,
+                    method.AppContext.SystemTypes.SystemObjectType,
                     out var source,
                     out var targetType,
                     out var firstCheckBlock,
@@ -44,8 +45,8 @@ public static class InlineTypeCheckRecovery
                 new Instruction(-1, OpCode.CastClass, castResult, source, targetType));
 
             ReplaceSuccessRegionUses(secondCheckBlock, invalidCastBlock, source, castResult);
-            RemoveFailureBranch(firstCheckBlock, invalidCastBlock);
-            RemoveFailureBranch(secondCheckBlock, invalidCastBlock);
+            RemoveFailureBranch(firstCheckBlock);
+            RemoveFailureBranch(secondCheckBlock);
             changed = true;
         }
 
@@ -60,6 +61,7 @@ public static class InlineTypeCheckRecovery
     private static bool TryMatchSecondCheck(
         Block secondCheckBlock,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        TypeAnalysisContext objectType,
         out LocalVariable source,
         out TypeAnalysisContext targetType,
         out Block firstCheckBlock,
@@ -70,9 +72,9 @@ public static class InlineTypeCheckRecovery
         firstCheckBlock = null!;
         invalidCastBlock = null!;
 
-        if (!TryGetFailureBranch(secondCheckBlock, definitions, out var secondCondition, out invalidCastBlock))
+        if (!TryGetFailureBranch(secondCheckBlock, definitions, out var secondCondition, out var secondFailureEntry))
             return false;
-        if (!IsInvalidCastOnly(invalidCastBlock))
+        if (!TryResolveInvalidCastBlock(secondFailureEntry, out invalidCastBlock))
             return false;
         if (!definitions.TryGetValue(secondCondition, out var secondConditionDefinition))
             return false;
@@ -118,12 +120,16 @@ public static class InlineTypeCheckRecovery
         var sourceObjectOperand = ResolveMoveSource(sourceClassDefinition.Operands[1], definitions);
         if (sourceObjectOperand is not MemoryOperand { Addend: 0, Base: LocalVariable sourceObject })
             return false;
-        if (sourceObject.Type == null)
+        var inferredSourceType = sourceObject.Type
+            ?? RuntimeClassRepresentedType(sourceClass)
+            ?? objectType;
+        if (inferredSourceType is not { IsValueType: false })
             return false;
 
         var expectedFailureBlock = invalidCastBlock;
         var firstCandidates = secondCheckBlock.Predecessors
-            .Where(block => TryGetFailureBranch(block, definitions, out _, out var failure)
+            .Where(block => TryGetFailureBranch(block, definitions, out _, out var failureEntry)
+                && TryResolveInvalidCastBlock(failureEntry, out var failure)
                 && ReferenceEquals(failure, expectedFailureBlock))
             .ToList();
         if (firstCandidates.Count != 1)
@@ -146,6 +152,7 @@ public static class InlineTypeCheckRecovery
             return false;
 
         source = sourceObject;
+        source.Type ??= inferredSourceType;
         targetType = representedTarget;
         return true;
     }
@@ -238,13 +245,50 @@ public static class InlineTypeCheckRecovery
         && block.Instructions.All(instruction =>
             instruction.OpCode is OpCode.Nop or OpCode.Phi or OpCode.Throw or OpCode.Return);
 
-    private static void RemoveFailureBranch(Block block, Block failure)
+    /// <summary>
+    /// 解析由控制流拆边产生的纯跳转失败入口。这里只跨越不携带业务计算的Jump块，
+    /// 防止把带副作用或额外检查的路径误判成标准castclass失败闭包。
+    /// </summary>
+    private static bool TryResolveInvalidCastBlock(Block entry, out Block invalidCastBlock)
     {
-        if (block.Instructions.Count > 0 && block.Instructions[^1].OpCode == OpCode.ConditionalJump)
+        var visited = new HashSet<Block>();
+        var current = entry;
+        while (visited.Add(current))
         {
-            block.Instructions[^1].OpCode = OpCode.Nop;
-            block.Instructions[^1].SetOperands();
+            if (IsInvalidCastOnly(current))
+            {
+                invalidCastBlock = current;
+                return true;
+            }
+
+            if (current.Successors.Count != 1
+                || current.Instructions.Count == 0
+                || current.Instructions[^1].OpCode != OpCode.Jump
+                || current.Instructions.Any(instruction =>
+                    instruction.OpCode is not (OpCode.Nop or OpCode.Phi or OpCode.Jump)))
+            {
+                break;
+            }
+
+            current = current.Successors.Single();
         }
+
+        invalidCastBlock = null!;
+        return false;
+    }
+
+    private static void RemoveFailureBranch(Block block)
+    {
+        if (block.Instructions.Count == 0
+            || block.Instructions[^1] is not
+            {
+                OpCode: OpCode.ConditionalJump,
+                Operands: [Block failure, _],
+            } branch)
+            return;
+
+        branch.OpCode = OpCode.Nop;
+        branch.SetOperands();
 
         block.Successors.Remove(failure);
         failure.Predecessors.Remove(block);
@@ -268,6 +312,11 @@ public static class InlineTypeCheckRecovery
 
             foreach (var instruction in block.Instructions)
             {
+                // 成功区若经循环回边重新到达新插入的CastClass定义，该定义是replacement
+                // 的唯一生产者，绝不能把它自己的源对象重写成replacement形成自引用。
+                if (ReferenceEquals(instruction.Destination, replacement))
+                    continue;
+
                 for (var index = 0; index < instruction.Operands.Count; index++)
                 {
                     // 环形控制流可能从当前成功区重新到达更早的CastClass定义。定义目标不是

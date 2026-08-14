@@ -54,6 +54,71 @@ public class InlineTypeCheckRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 两个独立纯Jump失败入口汇合时仍恢复CastClass()
+    {
+        var fixture = CreateFixture(failureTrampolineDepth: 1);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.CastClass), Is.EqualTo(1));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 源对象类型尚未传播时从类指针身份恢复CastClass()
+    {
+        var fixture = CreateFixture(failureTrampolineDepth: 1);
+        fixture.Source.Type = null;
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                fixture.Method.ControlFlowGraph!.Instructions.Count(instruction => instruction.OpCode == OpCode.CastClass),
+                Is.EqualTo(1));
+            Assert.That(fixture.Source.Type, Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 多级纯Jump失败入口汇合时仍恢复CastClass()
+    {
+        var fixture = CreateFixture(failureTrampolineDepth: 2);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        Assert.That(
+            fixture.Method.ControlFlowGraph!.Instructions.Count(instruction => instruction.OpCode == OpCode.CastClass),
+            Is.EqualTo(1));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 失败跳板含业务计算时保持原始控制流()
+    {
+        var fixture = CreateFixture(failureTrampolineDepth: 1, failureTrampolineHasComputation: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.CastClass), Is.False);
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.EqualTo(2));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 环形成功区不得改写既有强制转换的定义目标()
     {
@@ -90,6 +155,38 @@ public class InlineTypeCheckRecoveryTests
         {
             Assert.That(definition.Destination, Is.SameAs(source));
             Assert.That(definition.Operands[1], Is.SameAs(originalInput));
+            Assert.That(read.Operands[1], Is.SameAs(replacement));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 成功区回到新CastClass定义时不得把源对象改成自引用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var replacement = Local("replacement", app.SystemTypes.SystemStringType);
+        var returned = Local("returned", app.SystemTypes.SystemObjectType);
+        var cast = new Instruction(
+            0,
+            OpCode.CastClass,
+            replacement,
+            source,
+            app.SystemTypes.SystemStringType);
+        var read = new Instruction(1, OpCode.Move, returned, source);
+        var loop = new Instruction(2, OpCode.Jump, cast);
+        var failureReturn = new Instruction(3, OpCode.Return);
+        var graph = new ISILControlFlowGraph([cast, read, loop, failureReturn]);
+
+        InlineTypeCheckRecovery.ReplaceSuccessRegionUses(
+            graph.FindBlockByInstruction(cast)!,
+            graph.FindBlockByInstruction(failureReturn)!,
+            source,
+            replacement);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(cast.Operands[1], Is.SameAs(source));
             Assert.That(read.Operands[1], Is.SameAs(replacement));
         });
     }
@@ -173,7 +270,9 @@ public class InlineTypeCheckRecoveryTests
 
     private static Fixture CreateFixture(
         long hierarchyOffset = 0xC8,
-        string exceptionFullName = "System.InvalidCastException")
+        string exceptionFullName = "System.InvalidCastException",
+        int failureTrampolineDepth = 0,
+        bool failureTrampolineHasComputation = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var mscorlib = app.GetAssemblyByName("mscorlib")!;
@@ -226,10 +325,8 @@ public class InlineTypeCheckRecoveryTests
         var successReturn = new Instruction(10, OpCode.Return, returned);
         var failureThrow = new Instruction(11, OpCode.Throw, exceptionType);
         var failureReturn = new Instruction(12, OpCode.Return);
-
-        firstJump.SetOperand(0, failureThrow);
-        secondJump.SetOperand(0, failureThrow);
-        var graph = new ISILControlFlowGraph([
+        var instructions = new List<Instruction>
+        {
             sourceClassLoad,
             targetClassLoad,
             depthCheck,
@@ -241,9 +338,36 @@ public class InlineTypeCheckRecoveryTests
             secondJump,
             useSource,
             successReturn,
-            failureThrow,
-            failureReturn,
-        ]);
+        };
+
+        if (failureTrampolineDepth == 0)
+        {
+            firstJump.SetOperand(0, failureThrow);
+            secondJump.SetOperand(0, failureThrow);
+        }
+        else
+        {
+            var firstFailureEntry = AddFailureTrampolineChain(
+                instructions,
+                failureThrow,
+                failureTrampolineDepth,
+                "first",
+                failureTrampolineHasComputation,
+                app.SystemTypes.SystemInt32Type);
+            var secondFailureEntry = AddFailureTrampolineChain(
+                instructions,
+                failureThrow,
+                failureTrampolineDepth,
+                "second",
+                failureTrampolineHasComputation,
+                app.SystemTypes.SystemInt32Type);
+            firstJump.SetOperand(0, firstFailureEntry);
+            secondJump.SetOperand(0, secondFailureEntry);
+        }
+
+        instructions.Add(failureThrow);
+        instructions.Add(failureReturn);
+        var graph = new ISILControlFlowGraph(instructions);
         var method = new InjectedMethodAnalysisContext(
             app.SystemTypes.SystemObjectType,
             "InlineTypeCheckFixture",
@@ -257,6 +381,41 @@ public class InlineTypeCheckRecoveryTests
             .ToList();
 
         return new Fixture(method, source, targetType, returned);
+    }
+
+    private static Instruction AddFailureTrampolineChain(
+        ICollection<Instruction> instructions,
+        Instruction failureThrow,
+        int depth,
+        string name,
+        bool hasComputation,
+        TypeAnalysisContext intType)
+    {
+        Instruction? entry = null;
+        Instruction? previousJump = null;
+        for (var index = 0; index < depth; index++)
+        {
+            if (hasComputation && index == 0)
+            {
+                var calculation = new Instruction(
+                    -1,
+                    OpCode.Add,
+                    Local($"{name}FailureValue", intType),
+                    new Immediate(1),
+                    new Immediate(2));
+                instructions.Add(calculation);
+                entry = calculation;
+            }
+
+            var jump = new Instruction(-1, OpCode.Jump, new Immediate(-1));
+            instructions.Add(jump);
+            entry ??= jump;
+            previousJump?.SetOperand(0, jump);
+            previousJump = jump;
+        }
+
+        previousJump!.SetOperand(0, failureThrow);
+        return entry!;
     }
 
     private static void WrapComparisonSources(MethodAnalysisContext method)

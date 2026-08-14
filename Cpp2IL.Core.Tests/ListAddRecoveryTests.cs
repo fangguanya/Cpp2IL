@@ -38,6 +38,99 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 快慢路径分别构造同一字段读取时恢复为公开Add调用()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useEquivalentFieldValues: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var call = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(call.Operands[2], Is.InstanceOf<FieldReference>());
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 慢路径在扩容调用后重载同一字段载体时保留重载并恢复Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useEquivalentFieldValues: true);
+        AddSlowFieldCarrierRefresh(fixture, mismatchOffset: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var calls = fixture.Graph.Instructions.Where(instruction => instruction.IsCall).ToList();
+        var carrierReloads = fixture.Graph.Instructions.Where(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [var destination, FieldReference] }
+            && ReferenceEquals(destination, fixture.Carrier)).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(calls, Has.Count.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)calls[0].Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(carrierReloads, Has.Count.EqualTo(2));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 慢路径重载字段偏移不同则保持原容量控制流()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useEquivalentFieldValues: true);
+        AddSlowFieldCarrierRefresh(fixture, mismatchOffset: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [TestCase("字段")]
+    [TestCase("接收者")]
+    [TestCase("偏移")]
+    [Category("异常输入")]
+    public void 快慢路径字段身份任一不同则保持原容量控制流(string mismatch)
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useEquivalentFieldValues: true,
+            mismatchValueField: mismatch == "字段",
+            mismatchValueFieldOwner: mismatch == "接收者",
+            mismatchValueFieldOffset: mismatch == "偏移");
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 值类型元素与原生空操作仍闭合为同一Add语义()
     {
@@ -395,7 +488,11 @@ public class ListAddRecoveryTests
         bool mismatchCarrierSource = false,
         bool includeRuntimeMetadataPrefix = false,
         bool includeDivergentRuntimeMetadataCarrier = false,
-        bool slowPathReturnsDirectly = false)
+        bool slowPathReturnsDirectly = false,
+        bool useEquivalentFieldValues = false,
+        bool mismatchValueField = false,
+        bool mismatchValueFieldOwner = false,
+        bool mismatchValueFieldOffset = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -428,6 +525,8 @@ public class ListAddRecoveryTests
             listDefinition);
 
         var receiver = Local("list", listType);
+        var valueOwner = Local("valueOwner", listType);
+        var otherValueOwner = Local("otherValueOwner", listType);
         var value = Local("value", elementType);
         var otherValue = Local("otherValue", elementType);
         var items = Local("items", elementType.MakeSzArrayType());
@@ -437,6 +536,26 @@ public class ListAddRecoveryTests
         var elementAddress = Local("elementAddress", app.SystemTypes.SystemIntPtrType);
         var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
         var carrier = Local("carrier", elementType);
+        var valueField = new InjectedFieldAnalysisContext(
+            "_testValue",
+            elementType,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var otherValueField = new InjectedFieldAnalysisContext(
+            "_otherTestValue",
+            elementType,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        IOperand fastValue = value;
+        IOperand slowValue = value;
+        if (useEquivalentFieldValues)
+        {
+            fastValue = new FieldReference(valueField, valueOwner, 0x10);
+            slowValue = new FieldReference(
+                mismatchValueField ? otherValueField : valueField,
+                mismatchValueFieldOwner ? otherValueOwner : valueOwner,
+                mismatchValueFieldOffset ? 0x18 : 0x10);
+        }
 
         FieldReference Field(FieldAnalysisContext field) => new(field, receiver, 0);
         var instructions = new List<Instruction>
@@ -450,7 +569,7 @@ public class ListAddRecoveryTests
             new(6, OpCode.Add, elementAddress, useDirectItemsFieldForAddress ? Field(itemsField) : items, elementOffset),
             new(7, OpCode.Add, newSize, Field(sizeField), new Immediate(1)),
             new(8, OpCode.Move, Field(sizeField), newSize),
-            new(9, OpCode.Move, new MemoryOperand(elementAddress, null, 0x20), mismatchStoredValue ? otherValue : value),
+            new(9, OpCode.Move, new MemoryOperand(elementAddress, null, 0x20), mismatchStoredValue ? otherValue : fastValue),
         };
 
         if (includeMatchingCarrierMove)
@@ -488,7 +607,7 @@ public class ListAddRecoveryTests
                 new MemoryOperand(runtimeContext, null, 0x70)));
         }
         var slowCallIndex = instructions.Count;
-        instructions.Add(new Instruction(slowCallIndex, OpCode.CallVoid, addWithResizeTarget, receiver, value));
+        instructions.Add(new Instruction(slowCallIndex, OpCode.CallVoid, addWithResizeTarget, receiver, slowValue));
         if (slowPathReturnsDirectly)
             instructions.Add(new Instruction(instructions.Count, OpCode.Return));
         var mergeEntryIndex = instructions.Count;
@@ -638,6 +757,32 @@ public class ListAddRecoveryTests
                 fixture.Carrier,
                 touchesReceiver ? fixture.Receiver : fixture.Value));
         return fixture;
+    }
+
+    private static void AddSlowFieldCarrierRefresh(Fixture fixture, bool mismatchOffset)
+    {
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var field = (FieldReference)slowCall.Operands[2];
+        var head = fixture.Graph.Blocks.Single(block => block.Instructions.Any(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] }));
+        var itemsLoadIndex = head.Instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] });
+        head.Instructions.Insert(
+            itemsLoadIndex + 1,
+            new Instruction(
+                3,
+                OpCode.Move,
+                fixture.Carrier,
+                new FieldReference(field.Field, field.Local, field.Offset)));
+
+        var slowBlock = fixture.Graph.FindBlockByInstruction(slowCall)!;
+        slowBlock.Instructions.Add(new Instruction(
+            slowCall.Index + 1,
+            OpCode.Move,
+            fixture.Carrier,
+            new FieldReference(field.Field, field.Local, mismatchOffset ? field.Offset + 8 : field.Offset)));
     }
 
     private static InjectedTypeAnalysisContext CreateHfaValueType(string name)

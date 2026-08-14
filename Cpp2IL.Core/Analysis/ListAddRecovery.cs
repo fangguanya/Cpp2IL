@@ -64,7 +64,8 @@ public static class ListAddRecovery
                     value,
                     slowTail,
                     addWithResize.AppContext,
-                    out var publicValue))
+                    out var publicValue,
+                    out var preservedSlowTail))
                 continue;
             if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
                 continue;
@@ -78,7 +79,7 @@ public static class ListAddRecovery
                 merge,
                 rewriteStart,
                 slowCall,
-                slowTail,
+                preservedSlowTail,
                 preservedHeadBusiness,
                 addTarget,
                 receiver,
@@ -473,9 +474,11 @@ public static class ListAddRecovery
         IOperand value,
         IReadOnlyList<Instruction> slowTail,
         ApplicationAnalysisContext appContext,
-        out IOperand publicValue)
+        out IOperand publicValue,
+        out List<Instruction> preservedSlowTail)
     {
         publicValue = null!;
+        preservedSlowTail = [];
         var instructions = PatternInstructions(block);
         if (instructions.Count < 6
             || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
@@ -556,8 +559,11 @@ public static class ListAddRecovery
             return false;
 
         var fastTail = instructions.Where(instruction => !allowed.Contains(instruction)).ToList();
-        var slowBusinessTail = slowTail.Where(instruction => !slowStateRefreshes.Contains(instruction)).ToList();
-        return HaveIdenticalCarrierMoves(fastTail, slowBusinessTail);
+        preservedSlowTail = slowTail.Where(instruction => !slowStateRefreshes.Contains(instruction)).ToList();
+        var callClobberRefreshes = preservedSlowTail.Where(instruction =>
+            IsRedundantCallClobberRefresh(graph, instruction)).ToList();
+        var comparableSlowTail = preservedSlowTail.Where(instruction => !callClobberRefreshes.Contains(instruction)).ToList();
+        return HaveIdenticalCarrierMoves(fastTail, comparableSlowTail);
     }
 
     /// <summary>
@@ -582,6 +588,16 @@ public static class ListAddRecovery
             return true;
         }
 
+        // 字段解析会为快路径数组写入与慢路径AddWithResize实参分别构造FieldReference。
+        // 只有字段元数据、接收者局部量与原生偏移三者完全相同，才把它们视为同一次托管字段读取。
+        if (fastValue is FieldReference fastField
+            && slowValue is FieldReference slowField
+            && AreSameFieldRead(fastField, slowField))
+        {
+            publicValue = slowValue;
+            return true;
+        }
+
         if (fastValue is not MemoryOperand { IsConstant: true, Addend: > 0 } packed
             || slowValue is not HomogeneousFloatingAggregateArgument aggregate
             || !TryDecodePackedHfaConstant(appContext, packed, aggregate, out var decoded))
@@ -597,6 +613,58 @@ public static class ListAddRecovery
         publicValue = decoded;
         return true;
     }
+
+    /// <summary>
+    /// 识别AddWithResize对原生调用者保存寄存器造成的字段载体重载。
+    /// 两次读取之间只允许出现这一处集合扩容调用，避免吞掉真正的字段更新。
+    /// </summary>
+    private static bool IsRedundantCallClobberRefresh(
+        ISILControlFlowGraph graph,
+        Instruction refresh)
+    {
+        if (refresh is not
+            {
+                Index: >= 0,
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable destination, FieldReference field],
+            })
+            return false;
+
+        foreach (var candidate in graph.Instructions)
+        {
+            if (ReferenceEquals(candidate, refresh)
+                || candidate.Index < 0
+                || candidate.Index >= refresh.Index
+                || candidate is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [var priorDestination, FieldReference priorField],
+                }
+                || !ReferenceEquals(priorDestination, destination)
+                || !AreSameFieldRead(priorField, field))
+                continue;
+
+            var interveningCalls = graph.Instructions.Where(instruction =>
+                instruction.Index > candidate.Index
+                && instruction.Index < refresh.Index
+                && instruction.IsCall).ToList();
+            if (interveningCalls is
+                [
+                    {
+                        OpCode: OpCode.CallVoid,
+                        Operands: [MethodAnalysisContext { Name: "AddWithResize" }, ..],
+                    },
+                ])
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool AreSameFieldRead(FieldReference left, FieldReference right)
+        => ReferenceEquals(left.Field, right.Field)
+           && ReferenceEquals(left.Local, right.Local)
+           && left.Offset == right.Offset;
 
     private static bool TryDecodePackedHfaConstant(
         ApplicationAnalysisContext appContext,
