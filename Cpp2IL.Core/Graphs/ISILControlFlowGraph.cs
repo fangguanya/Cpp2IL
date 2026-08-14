@@ -134,8 +134,9 @@ public class ISILControlFlowGraph
     }
 
     /// <summary>
-    /// 从块中删除指定前驱，并同步删除所有Phi的同索引输入。
+    /// 从块中删除指定前驱的全部边，并同步删除所有Phi的同索引输入。
     /// SSA中Phi第一个操作数是目标，后续操作数与Predecessors严格按索引对应。
+    /// 该函数用于彻底断开不可达块或已改写终结块；同一前驱产生的平行边必须一起清理。
     /// </summary>
     internal static int RemovePredecessorAndPhiInputs(Block block, Block predecessor)
     {

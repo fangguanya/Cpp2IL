@@ -40,8 +40,10 @@ public static class InjectedCheckRemover
             terminator.OpCode = OpCode.Nop;
             terminator.SetOperands();
 
+            // CIL成员访问仍隐含空引用异常边；这里只移除IL2CPP显式检查控制流，
+            // 保留异常Phi的保守类型证据，避免把剩余单一异常状态误传播为业务类型。
             block.Successors.Remove(target);
-            ISILControlFlowGraph.RemovePredecessorAndPhiInputs(target, block);
+            target.Predecessors.Remove(block);
             block.CalculateBlockType();
             removedAny = true;
         }

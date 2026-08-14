@@ -44,6 +44,8 @@ public class InjectedCheckRemoverTests
         {
             Assert.That(fixture.CheckBlock.Successors, Has.Count.EqualTo(1));
             Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.ThrowBlock));
+            Assert.That(fixture.DeadPhi!.OpCode, Is.EqualTo(OpCode.Phi));
+            Assert.That(fixture.DeadPhi.Operands, Has.Count.EqualTo(3));
         });
     }
 
@@ -102,6 +104,33 @@ public class InjectedCheckRemoverTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 重复前驱的全部平行边及其Phi输入同时删除()
+    {
+        var repeated = new Block();
+        var normal = new Block();
+        var firstValue = new LocalVariable("first", new Register(null, "X20", 1));
+        var secondValue = new LocalVariable("second", new Register(null, "X20", 2));
+        var normalValue = new LocalVariable("normal", new Register(null, "X20", 3));
+        var result = new LocalVariable("result", new Register(null, "X20", 4));
+        var phi = new Instruction(-1, OpCode.Phi, result, firstValue, secondValue, normalValue);
+        var merge = new Block
+        {
+            Predecessors = [repeated, repeated, normal],
+            Instructions = [phi],
+        };
+
+        var removed = ISILControlFlowGraph.RemovePredecessorAndPhiInputs(merge, repeated);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.EqualTo(2));
+            Assert.That(merge.Predecessors, Is.EqualTo(new[] { normal }));
+            Assert.That(phi.Operands.Skip(1), Is.EqualTo(new[] { normalValue }));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 删除不存在的前驱时保持Phi和前驱顺序()
     {
@@ -141,8 +170,12 @@ public class InjectedCheckRemoverTests
             new(1, OpCode.ConditionalJump, new Immediate(3), condition),
             new(2, OpCode.Return),
         };
+        Instruction? deadPhi = null;
         if (includeDeadPhi)
-            instructions.Add(new Instruction(3, OpCode.Phi, phiResult, value, value));
+        {
+            deadPhi = new Instruction(3, OpCode.Phi, phiResult, value, value);
+            instructions.Add(deadPhi);
+        }
         instructions.Add(new Instruction(
             instructions.Count,
             OpCode.Throw,
@@ -153,7 +186,8 @@ public class InjectedCheckRemoverTests
         return new Fixture(
             graph,
             graph.FindBlockByInstruction(instructions[1])!,
-            graph.FindBlockByInstruction(instructions[^1])!);
+            graph.FindBlockByInstruction(instructions[^1])!,
+            deadPhi);
     }
 
     private static Block CreatePhiBlock(
@@ -177,5 +211,6 @@ public class InjectedCheckRemoverTests
     private sealed record Fixture(
         ISILControlFlowGraph Graph,
         Block CheckBlock,
-        Block ThrowBlock);
+        Block ThrowBlock,
+        Instruction? DeadPhi);
 }
