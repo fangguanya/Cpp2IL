@@ -224,6 +224,74 @@ public class SsaAndDominators
         Assert.That(Phis(graph).Count(phi => RegName(phi.Operands[0]) == "x"), Is.EqualTo(1));
     }
 
+    /// <summary>
+    /// 构造两条地址定义路径汇入同一内存写入的控制流。
+    /// </summary>
+    private static ISILControlFlowGraph MemoryStoreDiamond(bool includeIndex, bool constantAddress)
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+
+        Add(0, OpCode.ConditionalJump, 4, new Register(null, "cond"));
+        Add(1, OpCode.Move, new Register(null, "X12"), 0x1000);
+        Add(2, OpCode.Move, new Register(null, "X13"), 1);
+        Add(3, OpCode.Jump, 6);
+        Add(4, OpCode.Move, new Register(null, "X12"), 0x2000);
+        Add(5, OpCode.Move, new Register(null, "X13"), 2);
+        var address = constantAddress
+            ? new MemoryOperand(addend: 0x3000)
+            : new MemoryOperand(
+                new Register(null, "X12"),
+                includeIndex ? new Register(null, "X13") : null,
+                0x20,
+                includeIndex ? 4 : 0);
+        Add(6, OpCode.Move, address, new Register(null, "value"));
+        Add(7, OpCode.Return);
+        return BuildGraph(instructions);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 汇合内存写入的基址读取必须建立Phi()
+    {
+        var graph = MemoryStoreDiamond(includeIndex: false, constantAddress: false);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.That(Phis(graph).Count(phi => RegName(phi.Operands[0]) == "X12"), Is.EqualTo(1));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 汇合内存写入的基址与索引必须分别建立Phi()
+    {
+        var graph = MemoryStoreDiamond(includeIndex: true, constantAddress: false);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Phis(graph).Count(phi => RegName(phi.Operands[0]) == "X12"), Is.EqualTo(1));
+            Assert.That(Phis(graph).Count(phi => RegName(phi.Operands[0]) == "X13"), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 常量地址写入不得为无关地址寄存器建立Phi()
+    {
+        var graph = MemoryStoreDiamond(includeIndex: true, constantAddress: true);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Phis(graph).Any(phi => RegName(phi.Operands[0]) == "X12"), Is.False);
+            Assert.That(Phis(graph).Any(phi => RegName(phi.Operands[0]) == "X13"), Is.False);
+        });
+    }
+
     private static ISILControlFlowGraph ConditionalSelectGraph(bool includeSecondValue)
     {
         var instructions = new List<Instruction>();

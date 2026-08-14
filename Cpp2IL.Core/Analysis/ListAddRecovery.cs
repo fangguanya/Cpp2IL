@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 
@@ -28,8 +29,35 @@ public static class ListAddRecovery
             .Where(block => block.Predecessors.Count >= 2)
             .ToHashSet();
 
+        while (true)
+        {
+            var passRecovered = RunRecoveryPass(graph, originalSharedFastTails);
+            if (passRecovered == 0)
+                return recovered;
+            recovered += passRecovered;
+        }
+    }
+
+    /// <summary>
+    /// 对当前 CFG 执行一轮唯一恢复规则；外层固定点迭代处理共享尾消除后新暴露的标准菱形。
+    /// </summary>
+    private static int RunRecoveryPass(
+        ISILControlFlowGraph graph,
+        HashSet<Block> originalSharedFastTails)
+    {
+        var recovered = 0;
         foreach (var slowBlock in graph.Blocks.ToList())
         {
+            var sharedSlowRecovered = 0;
+            while (graph.Blocks.Contains(slowBlock)
+                   && TryRecoverSharedSlowTail(graph, slowBlock, originalSharedFastTails))
+                sharedSlowRecovered++;
+            if (sharedSlowRecovered > 0)
+            {
+                recovered += sharedSlowRecovered;
+                continue;
+            }
+
             if (TryRecoverSharedFastTail(graph, slowBlock, originalSharedFastTails))
             {
                 recovered++;
@@ -59,6 +87,7 @@ public static class ListAddRecovery
                     out var items,
                     out var sizeState,
                     out var versionResult,
+                    out var versionSource,
                     out var preservedHeadBusiness))
                 continue;
             if (!TryGetFastRoute(
@@ -79,9 +108,11 @@ public static class ListAddRecovery
                     items,
                     sizeState,
                     versionResult,
+                    versionSource,
                     value,
                     slowTail,
                     addWithResize.AppContext,
+                    addWithResize.TypeGenericParameters.Single(),
                     out var publicValue,
                     out var preservedSlowTail))
                 continue;
@@ -107,6 +138,161 @@ public static class ListAddRecovery
         }
 
         return recovered;
+    }
+
+    /// <summary>
+    /// 恢复多个容量分支同时汇入共享快尾与共享慢调用块的 ARM64 形态。
+    /// </summary>
+    /// <remarks>
+    /// 每个分支在快边构造数组地址与元素位模式，在慢边把只读常量载入共享参数；
+    /// 两边各自汇合后再更新同一组 size/version 状态。改写按分支逐项进行，
+    /// 只在最后一个前驱移除后才删除共享尾，避免破坏尚未恢复的同组元素。
+    /// </remarks>
+    private static bool TryRecoverSharedSlowTail(
+        ISILControlFlowGraph graph,
+        Block slowBlock,
+        HashSet<Block> originalSharedFastTails)
+    {
+        if (!TryMatchSlowPath(
+                slowBlock,
+                out var slowCall,
+                out var addWithResize,
+                out var receiver,
+                out var sharedSlowValue,
+                out var slowTail)
+            || sharedSlowValue is not LocalVariable
+            || slowBlock.Predecessors.Count == 0
+            || !TryGetMergeBlock(graph, slowBlock, out var merge)
+            || !TryCreatePublicAddTarget(addWithResize, out var addTarget))
+            return false;
+
+        foreach (var slowEntry in slowBlock.Predecessors.ToList())
+        {
+            if (!TryMatchSharedSlowValueEntry(
+                    slowEntry,
+                    slowBlock,
+                    sharedSlowValue,
+                    out var branchSlowValue))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd共享慢尾拒绝：慢入口 b{slowEntry.ID} 未形成对共享参数 {sharedSlowValue} 的唯一载入。");
+                continue;
+            }
+
+            if (slowEntry.Predecessors is not [var head])
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd共享慢尾拒绝：慢入口 b{slowEntry.ID} 的容量头前驱数={slowEntry.Predecessors.Count}。");
+                continue;
+            }
+
+            if (!TryMatchHead(
+                    head,
+                    slowEntry,
+                    receiver,
+                    out var rewriteHead,
+                    out var headPath,
+                    out var rewriteStart,
+                    out var items,
+                    out var sizeState,
+                    out var versionResult,
+                    out var versionSource,
+                    out var preservedHeadBusiness))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd共享慢尾拒绝：容量头 b{head.ID} 的 items/size/version 状态后缀未闭合。");
+                continue;
+            }
+
+            if (!TryGetFastRoute(
+                    head,
+                    slowEntry,
+                    merge,
+                    originalSharedFastTails,
+                    out var fastEntry,
+                    out var fastBody,
+                    out var fastPrefix))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd共享慢尾拒绝：容量头 b{head.ID} 的快入口与共享快尾拓扑未闭合。");
+                continue;
+            }
+
+            if (!TryMatchFastPath(
+                    graph,
+                    fastBody,
+                    fastPrefix,
+                    merge,
+                    receiver,
+                    items,
+                    sizeState,
+                    versionResult,
+                    versionSource,
+                    branchSlowValue,
+                    slowTail,
+                    addWithResize.AppContext,
+                    addWithResize.TypeGenericParameters.Single(),
+                    out var publicValue,
+                    out var preservedSlowTail))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd共享慢尾拒绝：容量头 b{head.ID} 的快路径语义未闭合。");
+                continue;
+            }
+
+            RewriteSharedSlowTail(
+                graph,
+                rewriteHead,
+                headPath,
+                fastEntry,
+                fastBody,
+                slowEntry,
+                slowBlock,
+                merge,
+                rewriteStart,
+                slowCall,
+                preservedSlowTail,
+                preservedHeadBusiness,
+                addTarget,
+                receiver,
+                publicValue);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryMatchSharedSlowValueEntry(
+        Block entry,
+        Block slowBlock,
+        IOperand sharedSlowValue,
+        out IOperand branchValue)
+    {
+        branchValue = null!;
+        if (entry.Successors is not [var successor]
+            || !ReferenceEquals(successor, slowBlock))
+            return false;
+
+        var instructions = PatternInstructions(entry);
+        if (instructions.LastOrDefault() is { OpCode: OpCode.Jump, Operands: [Block target] })
+        {
+            if (!ReferenceEquals(target, slowBlock))
+                return false;
+            instructions = instructions.Take(instructions.Count - 1).ToList();
+        }
+
+        if (instructions is not
+            [
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [var destination, var source],
+                }
+            ]
+            || !ReferenceEquals(destination, sharedSlowValue))
+            return false;
+
+        branchValue = source;
+        return true;
     }
 
     /// <summary>
@@ -170,6 +356,7 @@ public static class ListAddRecovery
                 slowValue,
                 slowCarrierTail,
                 addWithResize.AppContext,
+                addWithResize.TypeGenericParameters.Single(),
                 out var publicValue,
                 out var preservedCarrierTail))
             return false;
@@ -448,6 +635,7 @@ public static class ListAddRecovery
         IOperand slowValue,
         IReadOnlyList<Instruction> slowCarrierTail,
         ApplicationAnalysisContext appContext,
+        TypeAnalysisContext elementType,
         out IOperand publicValue,
         out List<Instruction> preservedCarrierTail)
     {
@@ -473,7 +661,10 @@ public static class ListAddRecovery
                 valueMoves[0].Operands[1],
                 slowValue,
                 appContext,
-                out publicValue))
+                elementType,
+                graph.Instructions.ToList(),
+                out publicValue,
+                out _))
             return false;
 
         var fastCarriers = stagingMoves
@@ -622,6 +813,119 @@ public static class ListAddRecovery
         rewriteHead.CalculateBlockType();
     }
 
+    private static void RewriteSharedSlowTail(
+        ISILControlFlowGraph graph,
+        Block rewriteHead,
+        IReadOnlyList<Block> headPath,
+        Block fastEntry,
+        Block fastBody,
+        Block slowEntry,
+        Block slowBlock,
+        Block merge,
+        Instruction rewriteStart,
+        Instruction slowCall,
+        IReadOnlyList<Instruction> preservedSlowTail,
+        IReadOnlyList<Instruction> preservedHeadBusiness,
+        ConcreteGenericMethodAnalysisContext addTarget,
+        LocalVariable receiver,
+        IOperand value)
+    {
+        var firstRemovedIndex = rewriteHead.Instructions.IndexOf(rewriteStart);
+        rewriteHead.Instructions.RemoveRange(firstRemovedIndex, rewriteHead.Instructions.Count - firstRemovedIndex);
+        rewriteHead.Instructions.AddRange(preservedHeadBusiness);
+        rewriteHead.Instructions.Add(new Instruction(slowCall.Index, OpCode.CallVoid, addTarget, receiver, value));
+        rewriteHead.Instructions.AddRange(preservedSlowTail.Select(CloneInstruction));
+
+        foreach (var pathBlock in headPath.Skip(1).ToList())
+            Detach(graph, pathBlock);
+        Detach(graph, fastEntry);
+        Detach(graph, slowEntry);
+        var removedSharedFastTail = false;
+        if (!ReferenceEquals(fastBody, fastEntry) && fastBody.Predecessors.Count == 0)
+        {
+            Detach(graph, fastBody);
+            removedSharedFastTail = true;
+        }
+        var removedSharedSlowTail = false;
+        if (slowBlock.Predecessors.Count == 0)
+        {
+            Detach(graph, slowBlock);
+            removedSharedSlowTail = true;
+        }
+
+        foreach (var successor in rewriteHead.Successors.ToList())
+            successor.Predecessors.Remove(rewriteHead);
+        rewriteHead.Successors.Clear();
+        rewriteHead.Successors.Add(merge);
+        if (!merge.Predecessors.Contains(rewriteHead))
+            merge.Predecessors.Add(rewriteHead);
+        rewriteHead.CalculateBlockType();
+        if (removedSharedFastTail && removedSharedSlowTail)
+            TryHoistIdenticalPredecessorTail(merge, preservedSlowTail);
+    }
+
+    /// <summary>
+    /// 克隆共享慢尾指令对象，同时保留操作数的 SSA 引用身份。
+    /// </summary>
+    private static Instruction CloneInstruction(Instruction instruction)
+        => new(instruction.Index, instruction.OpCode, [.. instruction.Operands]);
+
+    /// <summary>
+    /// 将所有汇合前驱末尾完全相同的集合状态刷新上提到汇合块，避免多路径重复计算。
+    /// </summary>
+    private static bool TryHoistIdenticalPredecessorTail(
+        Block merge,
+        IReadOnlyList<Instruction> tail)
+    {
+        if (tail.Count == 0 || merge.Predecessors.Count < 2)
+            return false;
+
+        var predecessorTails = new List<List<Instruction>>(merge.Predecessors.Count);
+        foreach (var predecessor in merge.Predecessors)
+        {
+            var instructions = PatternInstructions(predecessor);
+            if (instructions.Count < tail.Count)
+                return false;
+            var candidate = instructions.TakeLast(tail.Count).ToList();
+            if (!HaveIdenticalInstructionIdentity(candidate, tail))
+                return false;
+            predecessorTails.Add(candidate);
+        }
+
+        foreach (var (predecessor, candidate) in merge.Predecessors.Zip(predecessorTails))
+        {
+            foreach (var instruction in candidate)
+                predecessor.Instructions.Remove(instruction);
+            predecessor.CalculateBlockType();
+        }
+
+        merge.Instructions.InsertRange(0, tail.Select(CloneInstruction));
+        merge.CalculateBlockType();
+        return true;
+    }
+
+    private static bool HaveIdenticalInstructionIdentity(
+        IReadOnlyList<Instruction> left,
+        IReadOnlyList<Instruction> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (left[index].OpCode != right[index].OpCode
+                || left[index].Operands.Count != right[index].Operands.Count)
+                return false;
+            for (var operandIndex = 0; operandIndex < left[index].Operands.Count; operandIndex++)
+            {
+                if (!ReferenceEquals(left[index].Operands[operandIndex], right[index].Operands[operandIndex]))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
     private sealed record SharedFastTailPattern(
         LocalVariable Items,
         IOperand SizeState,
@@ -758,6 +1062,7 @@ public static class ListAddRecovery
         out LocalVariable items,
         out IOperand sizeState,
         out LocalVariable versionResult,
+        out IOperand versionSource,
         out List<Instruction> preservedHeadBusiness)
     {
         rewriteHead = null!;
@@ -766,6 +1071,7 @@ public static class ListAddRecovery
         items = null!;
         sizeState = null!;
         versionResult = null!;
+        versionSource = null!;
         preservedHeadBusiness = [];
 
         // 首个 Add 直接读取字段，连续 Add 则会复用上一容量菱形在汇合边写入的
@@ -783,6 +1089,7 @@ public static class ListAddRecovery
                     out var loadedItems,
                     out var candidateSizeState,
                     out var candidateVersionResult,
+                    out var candidateVersionSource,
                     out var candidateBusiness))
                 continue;
 
@@ -795,6 +1102,7 @@ public static class ListAddRecovery
             items = loadedItems;
             sizeState = candidateSizeState;
             versionResult = candidateVersionResult;
+            versionSource = candidateVersionSource;
             preservedHeadBusiness = candidateBusiness;
             return true;
         }
@@ -810,12 +1118,14 @@ public static class ListAddRecovery
         out LocalVariable items,
         out IOperand sizeState,
         out LocalVariable versionResult,
+        out IOperand versionSource,
         out List<Instruction> preservedHeadBusiness)
     {
         itemsLoad = null!;
         items = null!;
         sizeState = null!;
         versionResult = null!;
+        versionSource = null!;
         preservedHeadBusiness = [];
 
         if (suffix.Count < 5
@@ -845,15 +1155,15 @@ public static class ListAddRecovery
             instruction is
             {
                 OpCode: OpCode.Add,
-                Operands: [LocalVariable, var versionSource, Immediate { Value: 1 }]
+                Operands: [LocalVariable, var candidateSource, Immediate { Value: 1 }]
             }
-            && IsStateSource(prefix, instruction, versionSource, receiver, "_version")).ToList();
+            && IsStateSource(prefix, instruction, candidateSource, receiver, "_version")).ToList();
         if (itemLoads.Count != 1
             || versionAdds.Count != 1
             || itemLoads[0].Operands[0] is not LocalVariable loadedItems
             || versionAdds[0].Operands[0] is not LocalVariable version)
             return false;
-        var versionSource = versionAdds[0].Operands[1];
+        var candidateOldVersionSource = versionAdds[0].Operands[1];
 
         var versionWrites = prefix.Where(instruction =>
             instruction is { OpCode: OpCode.Move, Operands: [FieldReference field, var source] }
@@ -866,7 +1176,7 @@ public static class ListAddRecovery
             return false;
 
         var allowed = new List<Instruction> { itemLoads[0], versionAdds[0], versionWrites[0] };
-        if (!CollectStateLoad(prefix, versionAdds[0], versionSource, receiver, "_version", allowed)
+        if (!CollectStateLoad(prefix, versionAdds[0], candidateOldVersionSource, receiver, "_version", allowed)
             || !CollectStateLoad(prefix, suffix[^2].Instruction, checkedSize, receiver, "_size", allowed)
             )
             return false;
@@ -909,6 +1219,7 @@ public static class ListAddRecovery
         items = loadedItems;
         sizeState = candidateSizeState;
         versionResult = version;
+        versionSource = candidateOldVersionSource;
         preservedHeadBusiness = business;
         return true;
     }
@@ -1182,15 +1493,23 @@ public static class ListAddRecovery
             return false;
 
         var stagingInstructions = PatternInstructions(fastEntry);
-        if (stagingInstructions.Count < 2
-            || stagingInstructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
-            || !ReferenceEquals(target, successor)
-            || stagingInstructions.Take(stagingInstructions.Count - 1).Any(instruction =>
-                instruction.OpCode != OpCode.Move))
+        var hasExplicitJump = false;
+        if (stagingInstructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block target] })
+        {
+            if (!ReferenceEquals(target, successor))
+                return false;
+            hasExplicitJump = true;
+        }
+
+        var prefix = hasExplicitJump
+            ? stagingInstructions.Take(stagingInstructions.Count - 1).ToList()
+            : stagingInstructions;
+        if (prefix.Count == 0)
             return false;
 
         fastBody = successor;
-        fastPrefix = stagingInstructions.Take(stagingInstructions.Count - 1).ToList();
+        fastPrefix = prefix;
         return true;
     }
 
@@ -1203,9 +1522,11 @@ public static class ListAddRecovery
         LocalVariable items,
         IOperand sizeState,
         LocalVariable versionResult,
+        IOperand versionSource,
         IOperand value,
         IReadOnlyList<Instruction> slowTail,
         ApplicationAnalysisContext appContext,
+        TypeAnalysisContext elementType,
         out IOperand publicValue,
         out List<Instruction> preservedSlowTail)
     {
@@ -1215,7 +1536,10 @@ public static class ListAddRecovery
         if (instructions.Count < 6
             || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
             || !ReferenceEquals(target, merge))
+        {
+            Logger.VerboseNewline("ListAdd恢复拒绝：快路径未以指向汇合块的唯一跳转结束。");
             return false;
+        }
 
         var stores = instructions.Where(instruction =>
             instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] }).ToList();
@@ -1226,14 +1550,23 @@ public static class ListAddRecovery
             || sizeAdds.Count != 1
             || stores[0].Operands[0] is not MemoryOperand memory
             || sizeAdds[0].Operands[0] is not LocalVariable newSize)
+        {
+            Logger.VerboseNewline($"ListAdd恢复拒绝：快路径元素写入数={stores.Count}，大小递增数={sizeAdds.Count}。");
             return false;
+        }
         if (!TryReconcileElementValue(
                 graph,
                 stores[0].Operands[1],
                 value,
                 appContext,
-                out publicValue))
+                elementType,
+                instructions,
+                out publicValue,
+                out var valueConstruction))
+        {
+            Logger.VerboseNewline($"ListAdd恢复拒绝：快慢元素值不等价，元素类型={elementType.FullName}，快值={stores[0].Operands[1]}，慢值={value}。");
             return false;
+        }
 
         var sizeWrites = instructions.Where(instruction =>
             instruction is { OpCode: OpCode.Move, Operands: [FieldReference field, var source] }
@@ -1248,7 +1581,10 @@ public static class ListAddRecovery
         if (sizeWrites.Count != 1
             || scales.Count != 1
             || scales[0].Operands[0] is not LocalVariable elementOffset)
+        {
+            Logger.VerboseNewline($"ListAdd恢复拒绝：大小回写数={sizeWrites.Count}，索引缩放数={scales.Count}。");
             return false;
+        }
         var scaleSource = scales[0].Operands[1];
 
         var addresses = instructions.Where(instruction =>
@@ -1257,7 +1593,10 @@ public static class ListAddRecovery
             && ((IsItemsAddressBase(left, receiver, items) && ReferenceEquals(right, elementOffset))
                 || (IsItemsAddressBase(right, receiver, items) && ReferenceEquals(left, elementOffset)))).ToList();
         if (addresses.Count != 1)
+        {
+            Logger.VerboseNewline($"ListAdd恢复拒绝：元素地址证据数={addresses.Count}。");
             return false;
+        }
 
         var allowed = new List<Instruction>
         {
@@ -1268,6 +1607,7 @@ public static class ListAddRecovery
             addresses[0],
             instructions[^1],
         };
+        allowed.AddRange(valueConstruction);
         if (!IsSameStateOperand(scaleSource, sizeState, receiver, "_size")
             && !CollectUInt32IndexNormalization(
                 instructions,
@@ -1276,7 +1616,10 @@ public static class ListAddRecovery
                 sizeState,
                 scaleSource,
                 allowed))
+        {
+            Logger.VerboseNewline("ListAdd恢复拒绝：索引归一化链未闭合。");
             return false;
+        }
 
         var slowStateRefreshes = slowTail.Where(instruction =>
             IsStateRefresh(instruction, receiver, "_size", newSize)
@@ -1288,7 +1631,10 @@ public static class ListAddRecovery
                 || instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference versionField] }
                 && IsField(versionField, receiver, "_version")
                 && !IsStateRefresh(instruction, receiver, "_version", versionResult)))
+        {
+            Logger.VerboseNewline("ListAdd恢复拒绝：慢路径含非等价的集合状态重载。");
             return false;
+        }
 
         var fastTail = instructions.Where(instruction => !allowed.Contains(instruction)).ToList();
         // 连续内联 Add 会在汇合块继续消费上一菱形的 size/version 载体。公开 Add 已经完成
@@ -1306,10 +1652,30 @@ public static class ListAddRecovery
         var comparableSlowTail = preservedSlowTail.Where(instruction =>
             !requiredStateRefreshes.Contains(instruction)
             && !callClobberRefreshes.Contains(instruction)).ToList();
-        if (!TryCollectNextVersionAdvance(fastTail, receiver, out var fastVersionAdvance)
-            || !TryCollectNextVersionAdvance(comparableSlowTail, receiver, out var slowVersionAdvance)
+        var fastVersionMatched = TryCollectNextVersionAdvance(
+            fastTail,
+            receiver,
+            versionResult,
+            versionSource,
+            out var fastVersionAdvance);
+        var slowVersionMatched = TryCollectNextVersionAdvance(
+            comparableSlowTail,
+            receiver,
+            carriedVersionState: null,
+            fusedVersionSource: null,
+            out var slowVersionAdvance);
+        if (!fastVersionMatched
+            || !slowVersionMatched
             || fastVersionAdvance.Count != slowVersionAdvance.Count)
+        {
+            Logger.VerboseNewline(
+                $"ListAdd恢复拒绝：下一项版本预更新不等价，" +
+                $"快路径={fastVersionAdvance.Count}，慢路径={slowVersionAdvance.Count}，" +
+                $"头部旧版本源={versionSource}，" +
+                $"快尾=[{string.Join(" | ", fastTail)}]，" +
+                $"慢尾=[{string.Join(" | ", comparableSlowTail)}]。");
             return false;
+        }
 
         // 连续内联 Add 还会把下一项的 _version++ 分别排到当前快慢边末尾。两边的 SSA
         // 结果局部不同，但都严格读取并回写同一集合版本字段；保留慢边的一份供下一菱形匹配，
@@ -1320,7 +1686,10 @@ public static class ListAddRecovery
         comparableSlowTail = comparableSlowTail.Where(instruction =>
             !slowVersionAdvance.Contains(instruction)
             && !IsDeadMistypedRuntimeMethodCarrier(instruction, merge)).ToList();
-        return HaveIdenticalCarrierMoves(comparableFastTail, comparableSlowTail);
+        var sameCarriers = HaveIdenticalCarrierMoves(comparableFastTail, comparableSlowTail);
+        if (!sameCarriers)
+            Logger.VerboseNewline($"ListAdd恢复拒绝：快慢路径载体尾不等价，快路径={comparableFastTail.Count}，慢路径={comparableSlowTail.Count}。");
+        return sameCarriers;
     }
 
     /// <summary>
@@ -1342,6 +1711,8 @@ public static class ListAddRecovery
     private static bool TryCollectNextVersionAdvance(
         IReadOnlyList<Instruction> instructions,
         LocalVariable receiver,
+        IOperand? carriedVersionState,
+        IOperand? fusedVersionSource,
         out List<Instruction> advance)
     {
         advance = [];
@@ -1353,11 +1724,18 @@ public static class ListAddRecovery
                     Operands:
                     [
                         LocalVariable version,
-                        FieldReference source,
-                        Immediate { Value: 1 },
+                        var source,
+                        Immediate increment,
                     ],
                 }
-                || !IsField(source, receiver, "_version")
+                || increment.Value is not (1 or 2)
+                || increment.Value == 1
+                && !IsDirectStateOperand(source, receiver, "_version")
+                && (carriedVersionState is null
+                    || !ReferenceEquals(source, carriedVersionState))
+                || increment.Value == 2
+                && (fusedVersionSource is null
+                    || !IsSameStateOperand(source, fusedVersionSource, receiver, "_version"))
                 || instructions[index + 1] is not
                 {
                     OpCode: OpCode.Move,
@@ -1402,24 +1780,42 @@ public static class ListAddRecovery
     }
 
     /// <summary>
-    /// 统一快速路径的整元素常量写入与慢路径的 HFA 参数。
+    /// 统一快慢路径中等价的元素值表示。
     /// </summary>
     /// <remarks>
-    /// ARM64 会把 <c>Vector2</c> 等 HFA 在快速路径打包成一次 D 寄存器常量写入，慢路径则按
-    /// V0/V1 分量调用 <c>AddWithResize</c>。后期死码清理可能只留下未定义的 ABI 分量局部变量；
-    /// 此时必须从同一快速路径的只读常量恢复完整值，不能把两个默认浮点数写入公开 Add。
+    /// ARM64 既会把 <c>Vector2</c> 等 HFA 打包为整元素只读常量，也会用
+    /// <c>AND/OR</c> 拼出 <c>Single</c> 位模式，而慢路径从只读地址传入同一常量。
+    /// 只在元素类型、地址映射和逐位结果同时闭合时才提升为公开 Add。
     /// </remarks>
     private static bool TryReconcileElementValue(
         ISILControlFlowGraph graph,
         IOperand fastValue,
         IOperand slowValue,
         ApplicationAnalysisContext appContext,
-        out IOperand publicValue)
+        TypeAnalysisContext elementType,
+        IReadOnlyList<Instruction> valueScope,
+        out IOperand publicValue,
+        out IReadOnlyList<Instruction> valueConstruction)
     {
         publicValue = null!;
+        valueConstruction = [];
         if (ReferenceEquals(fastValue, slowValue))
         {
             publicValue = slowValue;
+            return true;
+        }
+
+        if (TryReconcileScalarFloatingConstant(
+                graph,
+                fastValue,
+                slowValue,
+                appContext,
+                elementType,
+                valueScope,
+                out var scalar,
+                out valueConstruction))
+        {
+            publicValue = scalar;
             return true;
         }
 
@@ -1456,6 +1852,137 @@ public static class ListAddRecovery
             return false;
 
         publicValue = decoded;
+        return true;
+    }
+
+    /// <summary>
+    /// 将快路径唯一 SSA 定义的 32 位常量表达式与慢路径只读地址中的 Single 逐位对齐。
+    /// </summary>
+    private static bool TryReconcileScalarFloatingConstant(
+        ISILControlFlowGraph graph,
+        IOperand fastValue,
+        IOperand slowValue,
+        ApplicationAnalysisContext appContext,
+        TypeAnalysisContext elementType,
+        IReadOnlyList<Instruction> valueScope,
+        out FloatLiteral publicValue,
+        out IReadOnlyList<Instruction> valueConstruction)
+    {
+        publicValue = default;
+        valueConstruction = [];
+        if (elementType.FullName != "System.Single"
+            || slowValue is not MemoryOperand { IsConstant: true, Addend: > 0 } constant)
+            return false;
+
+        var construction = new List<Instruction>();
+        if (!TryEvaluateUInt32Constant(
+                valueScope,
+                fastValue,
+                new HashSet<LocalVariable>(),
+                construction,
+                out var fastBits))
+            return false;
+
+        try
+        {
+            if (!appContext.Binary.TryMapVirtualAddressToRaw(
+                    unchecked((ulong)constant.Addend),
+                    out var rawAddress))
+                return false;
+            var bytes = appContext.Binary.Reader.ReadByteArrayAtRawAddress(rawAddress, sizeof(float));
+            if (bytes.Length != sizeof(float)
+                || BitConverter.ToUInt32(bytes, 0) != fastBits)
+                return false;
+
+            publicValue = new FloatLiteral(BitConverter.Int32BitsToSingle(unchecked((int)fastBits)));
+            valueConstruction = construction.Distinct().ToList();
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 求值 ARM64 已经降为 ISIL 的唯一 32 位常量构造链。
+    /// </summary>
+    /// <remarks>
+    /// 仅接受已在真实产物中出现的 <c>Move/And/Or</c>；局部变量多定义、循环定义或
+    /// 任一非常量操作均中止恢复，避免将运行时浮点数冻结为字面量。
+    /// </remarks>
+    private static bool TryEvaluateUInt32Constant(
+        IReadOnlyList<Instruction> valueScope,
+        IOperand operand,
+        ISet<LocalVariable> active,
+        ICollection<Instruction> construction,
+        out uint value)
+    {
+        if (operand is Immediate immediate)
+        {
+            value = unchecked((uint)immediate.UnsignedValue);
+            return true;
+        }
+
+        value = 0;
+        if (operand is not LocalVariable local
+            || !active.Add(local))
+            return false;
+
+        try
+        {
+            var definitions = valueScope.Where(instruction =>
+                ReferenceEquals(instruction.Destination, local)).ToList();
+            if (definitions.Count != 1)
+                return false;
+
+            var definition = definitions[0];
+            var matched = definition switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, var source] } =>
+                    TryEvaluateUInt32Constant(valueScope, source, active, construction, out value),
+                {
+                    OpCode: OpCode.And or OpCode.Or,
+                    Operands: [_, var left, var right],
+                } => TryEvaluateBinaryUInt32Constant(
+                    valueScope,
+                    definition.OpCode,
+                    left,
+                    right,
+                    active,
+                    construction,
+                    out value),
+                _ => false,
+            };
+            if (!matched)
+                return false;
+
+            construction.Add(definition);
+            return true;
+        }
+        finally
+        {
+            active.Remove(local);
+        }
+    }
+
+    private static bool TryEvaluateBinaryUInt32Constant(
+        IReadOnlyList<Instruction> valueScope,
+        OpCode opCode,
+        IOperand left,
+        IOperand right,
+        ISet<LocalVariable> active,
+        ICollection<Instruction> construction,
+        out uint value)
+    {
+        value = 0;
+        if (!TryEvaluateUInt32Constant(valueScope, left, active, construction, out var leftValue)
+            || !TryEvaluateUInt32Constant(valueScope, right, active, construction, out var rightValue))
+            return false;
+
+        value = opCode == OpCode.And
+            ? leftValue & rightValue
+            : leftValue | rightValue;
         return true;
     }
 

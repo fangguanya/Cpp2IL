@@ -167,7 +167,9 @@ public class Instruction : IOperand
     {
         var sources = OpCode switch
         {
-            OpCode.Move or OpCode.ConditionalJump
+            OpCode.Move => GetMoveSources(),
+
+            OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
                 or OpCode.ConvertSignedIntegerToFloat
@@ -224,6 +226,33 @@ public class Instruction : IOperand
 
         if (constantsOnly)
             sources = sources.Where(o => !IsConstantValue(o)).ToList();
+
+        return sources;
+    }
+
+    /// <summary>
+    /// 返回 Move 读取的值与写目标地址。内存、实例字段和数组元素写入都会读取其
+    /// 基址或对象；遗漏这些读取会让 pruned SSA 漏建汇合 Phi，继而误删地址计算。
+    /// </summary>
+    private List<IOperand> GetMoveSources()
+    {
+        var sources = new List<IOperand> { _operands[1] };
+        switch (_operands[0])
+        {
+            case MemoryOperand memory:
+                if (memory.Base is not null)
+                    sources.Add(memory.Base);
+                if (memory.Index is not null)
+                    sources.Add(memory.Index);
+                break;
+            case FieldReference { Field.IsStatic: false } field:
+                sources.Add(field.Local);
+                break;
+            case ArrayAccess access:
+                sources.Add(access.Array);
+                sources.Add(access.Index);
+                break;
+        }
 
         return sources;
     }
