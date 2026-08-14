@@ -975,7 +975,7 @@ public static class LocalVariables
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
-            return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+            return BindResolvedFieldLoadType(loadDest, loadField.Field.FieldType);
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
@@ -995,6 +995,25 @@ public static class LocalVariables
             return SetTypeIfUnknown(klassDest, new RuntimeClassTypeAnalysisContext(baseType, baseType.DeclaringAssembly));
 
         return false;
+    }
+
+    /// <summary>
+    /// 已解析字段的声明类型是加载结果的权威证据。调用形参传播可能先把同一SSA局部
+    /// 收敛为<c>System.Object</c>、Unity基类或接口；若字段类型可赋给该宽类型，就恢复更精确的字段类型。
+    /// 不相容类型仍保持原样，避免用偏移猜测覆盖其它权威定义。
+    /// </summary>
+    internal static bool BindResolvedFieldLoadType(
+        LocalVariable destination,
+        TypeAnalysisContext fieldType)
+    {
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, fieldType))
+            return false;
+
+        if (destination.Type != null && !fieldType.IsAssignableTo(destination.Type))
+            return false;
+
+        destination.Type = fieldType;
+        return true;
     }
 
     /// <summary>

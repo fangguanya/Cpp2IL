@@ -19,6 +19,64 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 已解析字段加载覆盖先到的Object宽类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X19", 1),
+            appContext.SystemTypes.SystemObjectType);
+
+        var changed = LocalVariables.BindResolvedFieldLoadType(
+            destination,
+            appContext.SystemTypes.SystemStringType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已等价的字段类型不产生重复计算()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var destination = new LocalVariable("destination", new Register(null, "X19", 1), stringType);
+
+        var changed = LocalVariables.BindResolvedFieldLoadType(destination, stringType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.SameAs(stringType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不相容字段类型不得覆盖已有定义()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "W19", 1),
+            appContext.SystemTypes.SystemInt32Type);
+
+        var changed = LocalVariables.BindResolvedFieldLoadType(
+            destination,
+            appContext.SystemTypes.SystemStringType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void ARM64标准序言恢复栈帧基址的原生指针类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
