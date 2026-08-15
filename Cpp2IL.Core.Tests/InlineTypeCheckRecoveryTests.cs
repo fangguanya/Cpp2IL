@@ -102,6 +102,58 @@ public class InlineTypeCheckRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 相等条件跳成功且落空纯Jump失败时恢复CastClass()
+    {
+        var fixture = CreateFixture(secondCheckBranchesToSuccess: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.CastClass), Is.EqualTo(1));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 相等条件跳成功且落空多级纯Jump失败时仍恢复CastClass()
+    {
+        var fixture = CreateFixture(
+            failureTrampolineDepth: 2,
+            secondCheckBranchesToSuccess: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        Assert.That(
+            fixture.Method.ControlFlowGraph!.Instructions.Count(instruction => instruction.OpCode == OpCode.CastClass),
+            Is.EqualTo(1));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 相等条件跳成功但落空失败入口含业务计算时保持原图()
+    {
+        var fixture = CreateFixture(
+            failureTrampolineDepth: 1,
+            failureTrampolineHasComputation: true,
+            secondCheckBranchesToSuccess: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.CastClass), Is.False);
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.EqualTo(2));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.True);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 失败跳板含业务计算时保持原始控制流()
     {
@@ -325,7 +377,8 @@ public class InlineTypeCheckRecoveryTests
         int failureTrampolineDepth = 0,
         bool failureTrampolineHasComputation = false,
         bool dereferenceTargetOnSuccess = false,
-        bool sharedNullGuardPredecessor = false)
+        bool sharedNullGuardPredecessor = false,
+        bool secondCheckBranchesToSuccess = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var mscorlib = app.GetAssemblyByName("mscorlib")!;
@@ -373,7 +426,12 @@ public class InlineTypeCheckRecoveryTests
             new MemoryOperand(hierarchyAddress, addend: -8),
             targetType);
         var invertCheck = new Instruction(7, OpCode.Not, notEqual, equal);
-        var secondJump = new Instruction(8, OpCode.ConditionalJump, new Immediate(-1), notEqual);
+        var secondJump = new Instruction(
+            8,
+            OpCode.ConditionalJump,
+            new Immediate(-1),
+            secondCheckBranchesToSuccess ? equal : notEqual);
+        var secondFailureJump = new Instruction(-1, OpCode.Jump, new Immediate(-1));
         var useSource = dereferenceTargetOnSuccess
             ? new Instruction(
                 9,
@@ -407,9 +465,11 @@ public class InlineTypeCheckRecoveryTests
             hierarchyCheck,
             invertCheck,
             secondJump,
-            useSource,
-            successReturn,
         };
+        if (secondCheckBranchesToSuccess)
+            instructions.Add(secondFailureJump);
+        instructions.Add(useSource);
+        instructions.Add(successReturn);
 
         if (sharedNullGuardPredecessor)
         {
@@ -420,7 +480,15 @@ public class InlineTypeCheckRecoveryTests
         if (failureTrampolineDepth == 0)
         {
             firstJump.SetOperand(0, failureThrow);
-            secondJump.SetOperand(0, failureThrow);
+            if (secondCheckBranchesToSuccess)
+            {
+                secondJump.SetOperand(0, useSource);
+                secondFailureJump.SetOperand(0, failureThrow);
+            }
+            else
+            {
+                secondJump.SetOperand(0, failureThrow);
+            }
         }
         else
         {
@@ -439,7 +507,15 @@ public class InlineTypeCheckRecoveryTests
                 failureTrampolineHasComputation,
                 app.SystemTypes.SystemInt32Type);
             firstJump.SetOperand(0, firstFailureEntry);
-            secondJump.SetOperand(0, secondFailureEntry);
+            if (secondCheckBranchesToSuccess)
+            {
+                secondJump.SetOperand(0, useSource);
+                secondFailureJump.SetOperand(0, secondFailureEntry);
+            }
+            else
+            {
+                secondJump.SetOperand(0, secondFailureEntry);
+            }
         }
 
         instructions.Add(failureThrow);

@@ -37,6 +37,8 @@ public static class InlineTypeCheckRecovery
                     out var targetType,
                     out var firstCheckBlock,
                     out var failureBlock,
+                    out var secondFailureEntry,
+                    out var secondFailureUsesFallthrough,
                     out var recoveryOpCode))
                 continue;
 
@@ -53,7 +55,10 @@ public static class InlineTypeCheckRecovery
 
             ReplaceSuccessRegionUses(secondCheckBlock, failureBlock, source, castResult);
             RemoveFailureBranch(firstCheckBlock);
-            RemoveFailureBranch(secondCheckBlock);
+            if (secondFailureUsesFallthrough)
+                ReplaceFailureFallthroughWithSuccessJump(secondCheckBlock, secondFailureEntry);
+            else
+                RemoveFailureBranch(secondCheckBlock);
             changed = true;
         }
 
@@ -73,21 +78,32 @@ public static class InlineTypeCheckRecovery
         out TypeAnalysisContext targetType,
         out Block firstCheckBlock,
         out Block failureBlock,
+        out Block secondFailureEntry,
+        out bool secondFailureUsesFallthrough,
         out OpCode recoveryOpCode)
     {
         source = null!;
         targetType = null!;
         firstCheckBlock = null!;
         failureBlock = null!;
+        secondFailureEntry = null!;
+        secondFailureUsesFallthrough = false;
         recoveryOpCode = OpCode.Nop;
 
-        if (!TryGetFailureBranch(secondCheckBlock, definitions, out var secondCondition, out var secondFailureEntry))
-            return false;
-        if (!TryResolveFailureBlock(secondFailureEntry, out failureBlock, out var failureSemantics))
+        if (!TryGetSecondCheckFailure(
+                secondCheckBlock,
+                definitions,
+                out var secondCondition,
+                out secondFailureEntry,
+                out failureBlock,
+                out var failureSemantics,
+                out secondFailureUsesFallthrough))
             return false;
         if (!definitions.TryGetValue(secondCondition, out var secondConditionDefinition))
             return false;
         if (!TryUnwrapNot(secondConditionDefinition, definitions, out var equality))
+            return false;
+        if (secondFailureUsesFallthrough && secondConditionDefinition.OpCode != OpCode.CheckEqual)
             return false;
         if (equality.OpCode != OpCode.CheckEqual || equality.Operands.Count != 3)
             return false;
@@ -274,6 +290,58 @@ public static class InlineTypeCheckRecovery
         return true;
     }
 
+    /// <summary>
+    /// 解析类层级第二次比较的失败边。ARM64既会把“不相等”直接跳到失败块，
+    /// 也会把“相等”跳到成功块并让顺序落空块纯跳到同一失败闭包；两者都必须由
+    /// 唯一异常语义证明，避免按块顺序猜测成功与失败。
+    /// </summary>
+    private static bool TryGetSecondCheckFailure(
+        Block block,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        out LocalVariable condition,
+        out Block failureEntry,
+        out Block failureBlock,
+        out FailureSemantics failureSemantics,
+        out bool failureUsesFallthrough)
+    {
+        failureEntry = null!;
+        failureBlock = null!;
+        failureSemantics = default;
+        failureUsesFallthrough = false;
+        if (!TryGetFailureBranch(block, definitions, out condition, out var conditionalTarget))
+            return false;
+
+        if (TryResolveFailureBlock(conditionalTarget, out failureBlock, out failureSemantics))
+        {
+            failureEntry = conditionalTarget;
+            return true;
+        }
+
+        var fallthroughCandidates = block.Successors
+            .Where(successor => !ReferenceEquals(successor, conditionalTarget))
+            .Select(successor => new
+            {
+                Entry = successor,
+                Resolved = TryResolveFailureBlock(
+                    successor,
+                    out var resolvedFailure,
+                    out var resolvedSemantics),
+                Failure = resolvedFailure,
+                Semantics = resolvedSemantics,
+            })
+            .Where(candidate => candidate.Resolved)
+            .ToList();
+        if (fallthroughCandidates.Count != 1)
+            return false;
+
+        var candidate = fallthroughCandidates[0];
+        failureEntry = candidate.Entry;
+        failureBlock = candidate.Failure;
+        failureSemantics = candidate.Semantics;
+        failureUsesFallthrough = true;
+        return true;
+    }
+
     private static bool TryUnwrapNot(
         Instruction instruction,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
@@ -369,6 +437,31 @@ public static class InlineTypeCheckRecovery
 
         block.Successors.Remove(failure);
         failure.Predecessors.Remove(block);
+        block.CalculateBlockType();
+    }
+
+    /// <summary>
+    /// 当条件目标是成功块而顺序后继纯跳失败时，把条件跳转提升为无条件成功跳转，
+    /// 并精确断开失败入口；随后统一不可达块清理会移除类型层级计算。
+    /// </summary>
+    private static void ReplaceFailureFallthroughWithSuccessJump(
+        Block block,
+        Block failureEntry)
+    {
+        if (block.Instructions.Count == 0
+            || block.Instructions[^1] is not
+            {
+                OpCode: OpCode.ConditionalJump,
+                Operands: [Block success, _],
+            } branch
+            || !block.Successors.Contains(failureEntry)
+            || ReferenceEquals(success, failureEntry))
+            return;
+
+        branch.OpCode = OpCode.Jump;
+        branch.SetOperands(success);
+        block.Successors.Remove(failureEntry);
+        failureEntry.Predecessors.Remove(block);
         block.CalculateBlockType();
     }
 
