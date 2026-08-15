@@ -1,10 +1,14 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -256,7 +260,75 @@ public static class KeyFunctionRecovery
     /// 把运行时 Object::IsInst 调用恢复为托管 isinst。原生帮助器返回原对象或 null，
     /// 与强制转换的异常语义不同，因此必须保留独立操作码。
     /// </summary>
-    public static void RewriteTypeTests(MethodAnalysisContext method)
+    public static void RewriteTypeTests(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong>? initializedRuntimeMetadataSlots = null)
+    {
+        Func<ulong, TypeAnalysisContext?>? metadataSlotTypeResolver = null;
+        if (initializedRuntimeMetadataSlots is { Count: > 0 })
+        {
+            var appContext = method.AppContext;
+            var libContext = appContext.LibCpp2IlContext;
+            TypeAnalysisContext? ResolveTypeUsage(MetadataUsage? usage)
+            {
+                return usage?.Type is MetadataUsageType.Type or MetadataUsageType.TypeInfo
+                    ? appContext.ResolveIl2CppType(usage.AsType())
+                    : null;
+            }
+
+            metadataSlotTypeResolver = address =>
+            {
+                var directDescription = "<unread>";
+                var tableDescription = "<skipped>";
+                var resolvedType = ResolveMetadataTypeSlot(
+                    address,
+                    candidate =>
+                    {
+                        var usage = libContext.GetAnyGlobalByAddress(candidate);
+                        directDescription = DescribeMetadataUsage(usage);
+                        return ResolveTypeUsage(usage);
+                    },
+                    (candidate, offset) =>
+                    {
+                        var usage = libContext.CheckForPost27GlobalTableEntryAt(candidate, offset);
+                        tableDescription = DescribeMetadataUsage(usage);
+                        return ResolveTypeUsage(usage);
+                    });
+                Logger.VerboseNewline(
+                    $"类型测试元数据槽：method={method.Name}，slot=0x{address:X}，" +
+                    $"direct={directDescription}，table={tableDescription}",
+                    "KeyFunctionRecovery");
+                return resolvedType;
+            };
+        }
+
+        RewriteTypeTests(method, initializedRuntimeMetadataSlots, metadataSlotTypeResolver);
+    }
+
+    private static string DescribeMetadataUsage(MetadataUsage? usage)
+        => usage == null ? "<null>" : $"{usage.Type}/0x{usage.RawValue:X}";
+
+    /// <summary>
+    /// 解析只接受类型结果的绝对元数据槽。直接地址若可解码成其他usage，不得遮蔽
+    /// post-27二级表中的Type/TypeInfo项。
+    /// </summary>
+    internal static TypeAnalysisContext? ResolveMetadataTypeSlot(
+        ulong address,
+        Func<ulong, TypeAnalysisContext?> directTypeResolver,
+        Func<ulong, long, TypeAnalysisContext?> tableTypeResolver)
+        => MetadataResolver.ResolveAbsoluteSlotUsage(
+            address,
+            directTypeResolver,
+            tableTypeResolver);
+
+    /// <summary>
+    /// 执行可注入元数据槽解析器的类型测试恢复。生产路径传入真实二进制解析器，测试路径
+    /// 传入确定性解析函数；两条路径共享同一份指令筛选和改写逻辑，避免重复实现。
+    /// </summary>
+    internal static void RewriteTypeTests(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong>? initializedRuntimeMetadataSlots,
+        Func<ulong, TypeAnalysisContext?>? metadataSlotTypeResolver)
     {
         var instructions = method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions).ToList();
         var definitions = BuildUniqueDefinitions(instructions);
@@ -270,12 +342,20 @@ public static class KeyFunctionRecovery
                 })
                 continue;
 
-            var testedType = ResolveRuntimeClassType(typeHandle, definitions)
-                             ?? ResolveTypeTestResultStorageType(
-                                 instruction,
-                                 result,
-                                 instructions,
-                                 definitions);
+            var testedType = ResolveRuntimeClassType(
+                typeHandle,
+                definitions,
+                out var terminalTypeHandle);
+            testedType ??= ResolveInitializedMetadataType(
+                terminalTypeHandle,
+                definitions,
+                initializedRuntimeMetadataSlots,
+                metadataSlotTypeResolver);
+            testedType ??= ResolveTypeTestResultStorageType(
+                instruction,
+                result,
+                instructions,
+                definitions);
             if (testedType is not { IsValueType: false })
                 continue;
 
@@ -283,6 +363,122 @@ public static class KeyFunctionRecovery
             instruction.OpCode = OpCode.IsInst;
             instruction.SetOperands(result, source, testedType);
         }
+    }
+
+    /// <summary>
+    /// 恢复post-27二层TypeInfo槽：类型测试实参必须是对唯一地址载体的零偏移解引用，
+    /// 该载体必须经唯一Move/Phi链收敛到已初始化的绝对元数据槽。任一证据缺失时保持原生调用。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveInitializedMetadataType(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        IReadOnlyCollection<ulong>? initializedRuntimeMetadataSlots,
+        Func<ulong, TypeAnalysisContext?>? metadataSlotTypeResolver)
+    {
+        if (initializedRuntimeMetadataSlots is not { Count: > 0 }
+            || metadataSlotTypeResolver == null)
+            return null;
+
+        if (operand is not MemoryOperand
+            {
+                Base: { } tableBase,
+                Index: null,
+                Scale: 0,
+                Addend: 0,
+            })
+        {
+            Logger.VerboseNewline(
+                $"类型测试元数据槽形态未匹配：operand={operand}",
+                "KeyFunctionRecovery");
+            return null;
+        }
+
+        if (!TryResolveMetadataTableBaseAddress(
+                tableBase,
+                definitions,
+                new HashSet<LocalVariable>(),
+                out var address))
+        {
+            Logger.VerboseNewline(
+                $"类型测试元数据槽基址未收敛到唯一绝对槽：base={tableBase}",
+                "KeyFunctionRecovery");
+            return null;
+        }
+
+        if (!initializedRuntimeMetadataSlots.Contains(address))
+        {
+            Logger.VerboseNewline(
+                $"类型测试元数据槽未在初始化目录：slot=0x{address:X}，" +
+                $"initialized={string.Join(',', initializedRuntimeMetadataSlots.Select(slot => $"0x{slot:X}"))}",
+                "KeyFunctionRecovery");
+            return null;
+        }
+
+        return metadataSlotTypeResolver(address);
+    }
+
+    /// <summary>
+    /// 把类型表基址沿唯一Move/Phi定义链收敛到绝对槽。Phi的全部输入必须可解析且地址
+    /// 完全相同；循环、缺失定义、非绝对内存或冲突地址均不构成元数据证据。
+    /// </summary>
+    private static bool TryResolveMetadataTableBaseAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        ISet<LocalVariable> visited,
+        out ulong address)
+    {
+        if (operand is MemoryOperand
+            {
+                Base: null,
+                Index: null,
+                Scale: 0,
+                Addend: >= 0,
+            } absolute)
+        {
+            address = (ulong)absolute.Addend;
+            return true;
+        }
+
+        if (operand is not LocalVariable local
+            || !visited.Add(local)
+            || !definitions.TryGetValue(local, out var definition))
+        {
+            address = 0;
+            return false;
+        }
+
+        if (definition is { OpCode: OpCode.Move, Operands.Count: 2 })
+            return TryResolveMetadataTableBaseAddress(
+                definition.Operands[1],
+                definitions,
+                visited,
+                out address);
+
+        if (definition.OpCode != OpCode.Phi || definition.Operands.Count < 2)
+        {
+            address = 0;
+            return false;
+        }
+
+        ulong? commonAddress = null;
+        for (var index = 1; index < definition.Operands.Count; index++)
+        {
+            if (!TryResolveMetadataTableBaseAddress(
+                    definition.Operands[index],
+                    definitions,
+                    new HashSet<LocalVariable>(visited),
+                    out var sourceAddress)
+                || commonAddress.HasValue && commonAddress.Value != sourceAddress)
+            {
+                address = 0;
+                return false;
+            }
+
+            commonAddress ??= sourceAddress;
+        }
+
+        address = commonAddress.GetValueOrDefault();
+        return commonAddress.HasValue;
     }
 
     /// <summary>
@@ -348,18 +544,27 @@ public static class KeyFunctionRecovery
 
     private static TypeAnalysisContext? ResolveRuntimeClassType(
         IOperand operand,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        out IOperand terminalOperand)
     {
+        terminalOperand = operand;
         var visited = new HashSet<LocalVariable>();
         while (operand is LocalVariable local && visited.Add(local))
         {
             if (local.Type is RuntimeClassTypeAnalysisContext runtimeClass)
+            {
+                terminalOperand = local;
                 return runtimeClass.RepresentedType;
+            }
             if (!definitions.TryGetValue(local, out var definition)
                 || definition is not { OpCode: OpCode.Move, Operands.Count: 2 })
+            {
+                terminalOperand = local;
                 return null;
+            }
 
             operand = definition.Operands[1];
+            terminalOperand = operand;
         }
 
         return operand switch

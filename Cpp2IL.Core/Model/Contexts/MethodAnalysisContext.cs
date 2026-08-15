@@ -417,7 +417,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         KeyFunctionRecovery.RewriteBoxing(this);
         // 新版 ARM64 运行时把接口安全转换集中到 Object::IsInst 尾跳板；在接口分派前恢复，
         // 使成功值携带接口类型进入后续 vtable/BLR 识别。
-        KeyFunctionRecovery.RewriteTypeTests(this);
+        KeyFunctionRecovery.RewriteTypeTests(this, initializedRuntimeMetadataSlots);
         // IL2CPP把castclass展开成类深度与继承表比较；在字段解析前折回托管转换，
         // 让成功路径以派生类型进入同一个类型不动点，同时保留InvalidCastException语义。
         InlineTypeCheckRecovery.Run(this);
@@ -432,7 +432,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 第一次接口分派会给原生取址载体补出 T&。仅在这一新证据出现后，才能恢复
         // 共享泛型地址上的 Object::IsInst；恢复出的接口类型再驱动同一链的最终BLR绑定。
         // 这是固定的第二阶段闭包，不进行次数不定的重算。
-        KeyFunctionRecovery.RewriteTypeTests(this);
+        KeyFunctionRecovery.RewriteTypeTests(this, initializedRuntimeMetadataSlots);
         InterfaceDispatchRecovery.Run(this);
         LocalVariables.ResolveLateCallTypesAndAddressCarriers(this);
         // Object::Unbox 的返回值仍是原生地址；此时接口与普通调用形参均已精确定型，

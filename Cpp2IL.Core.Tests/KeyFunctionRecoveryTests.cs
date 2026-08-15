@@ -563,6 +563,215 @@ public class KeyFunctionRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 已初始化Post27类型槽恢复为托管IsInst()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const ulong slotAddress = 0x59EE370;
+        var tableBase = Local("tableBase", app.SystemTypes.SystemIntPtrType);
+        var result = Local("result", app.SystemTypes.SystemObjectType);
+        var testedType = app.SystemTypes.SystemStringType;
+        var call = new Instruction(
+            1,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            result,
+            Local("source", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(tableBase));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, tableBase, new MemoryOperand(addend: (long)slotAddress)),
+            call);
+
+        KeyFunctionRecovery.RewriteTypeTests(
+            method,
+            [slotAddress],
+            address => address == slotAddress ? testedType : null);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+            Assert.That(call.Operands[2], Is.SameAs(testedType));
+            Assert.That(result.Type, Is.SameAs(testedType));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 直接槽为非类型时继续解析Post27类型表项()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const ulong slotAddress = 0x59EE370;
+        var directCalls = 0;
+        var tableCalls = 0;
+
+        var resolved = KeyFunctionRecovery.ResolveMetadataTypeSlot(
+            slotAddress,
+            address =>
+            {
+                directCalls++;
+                Assert.That(address, Is.EqualTo(slotAddress));
+                // 直接usage已被调用方判定为非Type/TypeInfo，因此返回空类型结果。
+                return null;
+            },
+            (address, offset) =>
+            {
+                tableCalls++;
+                Assert.That(address, Is.EqualTo(slotAddress));
+                Assert.That(offset, Is.Zero);
+                return app.SystemTypes.SystemStringType;
+            });
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(resolved, Is.SameAs(app.SystemTypes.SystemStringType));
+            Assert.That(directCalls, Is.EqualTo(1));
+            Assert.That(tableCalls, Is.EqualTo(1));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Post27类型槽等价Phi合流恢复为托管IsInst()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const ulong slotAddress = 0x59EE370;
+        var firstBase = Local("firstBase", app.SystemTypes.SystemIntPtrType);
+        var secondBase = Local("secondBase", app.SystemTypes.SystemIntPtrType);
+        var mergedBase = Local("mergedBase", app.SystemTypes.SystemIntPtrType);
+        var testedType = app.SystemTypes.SystemStringType;
+        var call = new Instruction(
+            3,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(mergedBase));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, firstBase, new MemoryOperand(addend: (long)slotAddress)),
+            new Instruction(1, OpCode.Move, secondBase, new MemoryOperand(addend: (long)slotAddress)),
+            new Instruction(2, OpCode.Phi, mergedBase, firstBase, secondBase),
+            call);
+
+        KeyFunctionRecovery.RewriteTypeTests(
+            method,
+            [slotAddress],
+            address => address == slotAddress ? testedType : null);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.IsInst));
+        Assert.That(call.Operands[2], Is.SameAs(testedType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Post27类型槽冲突Phi合流保持原生调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const ulong firstSlotAddress = 0x59EE370;
+        const ulong secondSlotAddress = 0x59EE388;
+        var firstBase = Local("firstBase", app.SystemTypes.SystemIntPtrType);
+        var secondBase = Local("secondBase", app.SystemTypes.SystemIntPtrType);
+        var mergedBase = Local("mergedBase", app.SystemTypes.SystemIntPtrType);
+        var call = new Instruction(
+            3,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(mergedBase));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, firstBase, new MemoryOperand(addend: (long)firstSlotAddress)),
+            new Instruction(1, OpCode.Move, secondBase, new MemoryOperand(addend: (long)secondSlotAddress)),
+            new Instruction(2, OpCode.Phi, mergedBase, firstBase, secondBase),
+            call);
+        var resolverCalls = 0;
+
+        KeyFunctionRecovery.RewriteTypeTests(
+            method,
+            [firstSlotAddress, secondSlotAddress],
+            _ =>
+            {
+                resolverCalls++;
+                return app.SystemTypes.SystemStringType;
+            });
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(resolverCalls, Is.Zero);
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Post27类型槽非零解引用偏移保持原生调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const ulong slotAddress = 0x59EE370;
+        var tableBase = Local("tableBase", app.SystemTypes.SystemIntPtrType);
+        var call = new Instruction(
+            1,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(tableBase, addend: 8));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, tableBase, new MemoryOperand(addend: (long)slotAddress)),
+            call);
+        var resolverCalls = 0;
+
+        KeyFunctionRecovery.RewriteTypeTests(
+            method,
+            [slotAddress],
+            _ =>
+            {
+                resolverCalls++;
+                return app.SystemTypes.SystemStringType;
+            });
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(resolverCalls, Is.Zero);
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未初始化Post27类型槽不得恢复为托管IsInst()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        const ulong slotAddress = 0x59EE370;
+        var tableBase = Local("tableBase", app.SystemTypes.SystemIntPtrType);
+        var call = new Instruction(
+            1,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"),
+            Local("result", app.SystemTypes.SystemObjectType),
+            Local("source", app.SystemTypes.SystemObjectType),
+            new MemoryOperand(tableBase));
+        var method = CreateMethod(
+            new Instruction(0, OpCode.Move, tableBase, new MemoryOperand(addend: (long)slotAddress)),
+            call);
+        var resolverCalls = 0;
+
+        KeyFunctionRecovery.RewriteTypeTests(
+            method,
+            [0x1000],
+            _ =>
+            {
+                resolverCalls++;
+                return app.SystemTypes.SystemStringType;
+            });
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(resolverCalls, Is.Zero);
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 死代码清理保留Box数据槽的调用前写入链()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
