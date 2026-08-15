@@ -19,6 +19,11 @@ public static class MetadataInitGuardRemover
     private const string ClassInitActual = "il2cpp_runtime_class_init_actual";
     private const string ClassInitCodegen = "il2cpp_codegen_runtime_class_init";
 
+    // Il2CppMethodInfo::rgctx_data。泛型方法在首次读取该槽位前会调用
+    // 原生初始化函数，该函数的共享地址有时会被误绑定为当前托管方法。
+    private const long MethodRgctxOffset64 = 0x38;
+    private const long MethodRgctxOffset32 = 0x1C;
+
     // Byte holding Il2CppClass's bitfield, of which bit 0 is initialized_and_no_error.
     // TODO this is almost certainly not correct on every version... but which?
     private const long InitialisedFlagOffset64 = 0x135;
@@ -26,9 +31,24 @@ public static class MetadataInitGuardRemover
 
     public static void Run(MethodAnalysisContext method)
     {
-        if (RemoveGuards(
-                method.ControlFlowGraph!,
-                method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64))
+        var cfg = method.ControlFlowGraph!;
+        var is32Bit = method.AppContext.Binary.is32Bit;
+        var removedOrdinaryGuard = RemoveGuards(
+            cfg,
+            is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
+        if (removedOrdinaryGuard)
+            DeadCodeEliminator.Run(method);
+    }
+
+    /// <summary>
+    /// 在方法 rgctx 尾调用和调用实参均已定型后删除泛型方法初始化保护区。
+    /// 该阶段必须晚于 <see cref="MetadataResolver.ResolveMethodRgctxCalls"/>，否则合流块仍是未解析
+    /// 间接调用，无法同时证明初始化分支和真实业务尾调用。
+    /// </summary>
+    internal static void RunMethodRgctxInitGuards(MethodAnalysisContext method)
+    {
+        var offset = method.AppContext.Binary.is32Bit ? MethodRgctxOffset32 : MethodRgctxOffset64;
+        if (RemoveMethodRgctxInitGuards(method, method.ControlFlowGraph!, offset))
             DeadCodeEliminator.Run(method);
     }
 
@@ -45,6 +65,238 @@ public static class MetadataInitGuardRemover
             removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
         return removedAny;
     }
+
+    /// <summary>
+    /// 删除已由完整 CFG 证明的泛型方法 rgctx 初始化保护区。判定同时约束
+    /// MethodInfo::rgctx_data 零值测试、唯一的初始化分支、被误绑定的当前方法以及
+    /// 作为首个调用源的同一 MethodInfo 载体，不依赖某个游戏方法名或硬编码函数地址。
+    /// </summary>
+    internal static bool RemoveMethodRgctxInitGuards(
+        MethodAnalysisContext method,
+        ISILControlFlowGraph cfg,
+        long methodRgctxOffset)
+    {
+        var definitions = cfg.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+        var removedAny = false;
+
+        foreach (var guard in cfg.Blocks.ToList())
+        {
+            if (!TryGetMethodRgctxGuardCarrier(method, guard, methodRgctxOffset, definitions, out var guardCarrier))
+                continue;
+
+            var first = guard.Successors[0];
+            var second = guard.Successors[1];
+            if (TryExciseMethodRgctxGuard(method, cfg, guard, first, second, guardCarrier, definitions)
+                || TryExciseMethodRgctxGuard(method, cfg, guard, second, first, guardCarrier, definitions))
+                removedAny = true;
+        }
+
+        return removedAny;
+    }
+
+    private static bool TryGetMethodRgctxGuardCarrier(
+        MethodAnalysisContext method,
+        Block guard,
+        long methodRgctxOffset,
+        ILookup<LocalVariable, Instruction> definitions,
+        out LocalVariable carrier)
+    {
+        carrier = null!;
+        if (guard.BlockType != BlockType.TwoWay
+            || guard.Successors.Count != 2
+            || guard.Instructions.LastOrDefault() is not
+            {
+                OpCode: OpCode.ConditionalJump,
+                Operands: [Block _, LocalVariable condition]
+            })
+            return false;
+
+        var conditionDefinitions = GuardPrefixBlocks(guard)
+            .SelectMany(block => block.Instructions)
+            .Where(instruction => ReferenceEquals(instruction.Destination, condition))
+            .Take(2)
+            .ToArray();
+        if (conditionDefinitions is not
+            [
+                {
+                    OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                    Operands: [LocalVariable _, { } left, { } right]
+                }
+            ])
+            return false;
+
+        var testedOperand = IsZero(right) ? left : IsZero(left) ? right : null;
+        if (testedOperand == null)
+            return false;
+
+        if (ResolveMemoryOperand(testedOperand, UniqueDefinitions(definitions)) is not
+            {
+                Base: LocalVariable methodInfo,
+                Index: null,
+                Scale: 0,
+                Addend: var addend
+            }
+            || addend != methodRgctxOffset
+            || ResolveRuntimeMethodInfo(methodInfo, definitions) is not { } represented
+            || !SameMethod(represented.RepresentedMethod, method))
+            return false;
+
+        carrier = methodInfo;
+        return true;
+    }
+
+    private static bool TryExciseMethodRgctxGuard(
+        MethodAnalysisContext method,
+        ISILControlFlowGraph cfg,
+        Block guard,
+        Block initEntry,
+        Block merge,
+        LocalVariable guardCarrier,
+        ILookup<LocalVariable, Instruction> definitions)
+    {
+        if (merge == cfg.EntryBlock || merge == cfg.ExitBlock
+            || !TryCollectMethodRgctxInitRegion(
+                method,
+                cfg,
+                guard,
+                initEntry,
+                merge,
+                guardCarrier,
+                definitions,
+                out var region))
+            return false;
+
+        Logger.VerboseNewline(
+            $"方法 rgctx 初始化保护段删除：method={method.FullName}，guard=b{guard.ID}，region={region.Count}",
+            nameof(MetadataInitGuardRemover));
+        Excise(cfg, guard, initEntry, merge, region, false);
+        return true;
+    }
+
+    private static bool TryCollectMethodRgctxInitRegion(
+        MethodAnalysisContext method,
+        ISILControlFlowGraph cfg,
+        Block guard,
+        Block initEntry,
+        Block merge,
+        LocalVariable guardCarrier,
+        ILookup<LocalVariable, Instruction> definitions,
+        out HashSet<Block> region)
+    {
+        region = [];
+        if (initEntry == merge || initEntry == guard)
+            return false;
+
+        var initCallCount = 0;
+        var reconverges = false;
+        var queue = new Queue<Block>();
+        queue.Enqueue(initEntry);
+
+        while (queue.Count > 0)
+        {
+            var block = queue.Dequeue();
+            if (block == merge)
+            {
+                reconverges = true;
+                continue;
+            }
+
+            if (block == cfg.EntryBlock || block == cfg.ExitBlock || block == guard || !region.Add(block))
+                return false;
+
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
+                    continue;
+
+                // 原生初始化分支会先把保存寄存器搬到调用参数寄存器。只放行
+                // 结果写入局部的纯计算；内存写入、额外调用或其他控制转移仍使区域失配。
+                if (IsSideEffectFree(instruction))
+                    continue;
+
+                if (!IsMethodRgctxInitCall(method, instruction, guardCarrier, definitions)
+                    || ++initCallCount != 1)
+                    return false;
+            }
+
+            foreach (var successor in block.Successors)
+                queue.Enqueue(successor);
+        }
+
+        if (!reconverges || initCallCount != 1)
+            return false;
+
+        var collected = region;
+        return collected.All(block =>
+            block.Predecessors.All(predecessor => predecessor == guard || collected.Contains(predecessor))
+            && block.Successors.All(successor => successor == merge || collected.Contains(successor)));
+    }
+
+    private static bool IsMethodRgctxInitCall(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        LocalVariable guardCarrier,
+        ILookup<LocalVariable, Instruction> definitions)
+    {
+        if (!instruction.IsCall
+            || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
+            || !SameMethod(called, method)
+            || instruction.Sources.FirstOrDefault() is not LocalVariable callCarrier
+            || ResolveRuntimeMethodInfo(callCarrier, definitions) is not { } represented
+            || !SameMethod(represented.RepresentedMethod, method))
+            return false;
+
+        return ReferenceEquals(
+            ResolveUniqueMoveRoot(callCarrier, definitions),
+            ResolveUniqueMoveRoot(guardCarrier, definitions));
+    }
+
+    private static RuntimeMethodInfoAnalysisContext? ResolveRuntimeMethodInfo(
+        LocalVariable carrier,
+        ILookup<LocalVariable, Instruction> definitions) =>
+        carrier.Type as RuntimeMethodInfoAnalysisContext
+        ?? RgctxResolver.ResolveForwardedRuntimeMetadataType(carrier, definitions) as RuntimeMethodInfoAnalysisContext;
+
+    private static LocalVariable ResolveUniqueMoveRoot(
+        LocalVariable carrier,
+        ILookup<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var current = carrier;
+        while (visited.Add(current)
+               && definitions[current].Take(2).ToArray() is
+               [
+                   {
+                       OpCode: OpCode.Move,
+                       Operands: [LocalVariable _, LocalVariable previous]
+                   }
+               ])
+            current = previous;
+        return current;
+    }
+
+    private static IReadOnlyDictionary<LocalVariable, Instruction> UniqueDefinitions(
+        ILookup<LocalVariable, Instruction> definitions) =>
+        definitions
+            .Where(group => group.Take(2).Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+
+    private static bool SameMethod(MethodAnalysisContext left, MethodAnalysisContext right)
+    {
+        // 已闭合泛型调用使用 ConcreteGenericMethodAnalysisContext，而当前分析与
+        // 隐藏 MethodInfo 可能指向基方法。比较前统一回到基方法身份。
+        while (left is ConcreteGenericMethodAnalysisContext concreteLeft)
+            left = concreteLeft.BaseMethodContext;
+        while (right is ConcreteGenericMethodAnalysisContext concreteRight)
+            right = concreteRight.BaseMethodContext;
+
+        return ReferenceEquals(left, right)
+               || left.Definition != null && ReferenceEquals(left.Definition, right.Definition);
+    }
+
+    private static bool IsZero(IOperand operand) => operand is Immediate { Value: 0 };
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)
     {

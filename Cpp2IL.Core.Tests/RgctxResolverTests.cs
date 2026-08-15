@@ -1,4 +1,5 @@
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using LibCpp2IL.BinaryStructures;
 using System.Linq;
@@ -108,5 +109,62 @@ public class RgctxResolverTests
             .Single(type => type.FullName == "System.Nullable`1");
 
         Assert.That(RgctxResolver.ResolveEntry(nullableDefinition.GenericParameters.Single(), 0), Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 保存寄存器沿唯一Move恢复MethodInfo身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var target = app.SystemTypes.SystemObjectType.Methods.First();
+        var methodInfoType = new RuntimeMethodInfoAnalysisContext(target, target.DeclaringType!.DeclaringAssembly);
+        var methodInfo = new LocalVariable("methodInfo", new Register(null, "X2"), methodInfoType);
+        var saved = new LocalVariable("saved", new Register(null, "X21"), app.SystemTypes.SystemIntPtrType);
+        var move = new Instruction(0, OpCode.Move, saved, methodInfo);
+        var definitions = new[] { move }.ToLookup(instruction => (LocalVariable)instruction.Destination!);
+
+        var resolved = RgctxResolver.ResolveForwardedRuntimeMetadataType(saved, definitions);
+
+        Assert.That(resolved, Is.SameAs(methodInfoType));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 两级唯一Move链恢复同一MethodInfo身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var target = app.SystemTypes.SystemObjectType.Methods.First();
+        var methodInfoType = new RuntimeMethodInfoAnalysisContext(target, target.DeclaringType!.DeclaringAssembly);
+        var methodInfo = new LocalVariable("methodInfo", new Register(null, "X3"), methodInfoType);
+        var firstSaved = new LocalVariable("firstSaved", new Register(null, "X21"), app.SystemTypes.SystemIntPtrType);
+        var secondSaved = new LocalVariable("secondSaved", new Register(null, "X22"), app.SystemTypes.SystemIntPtrType);
+        var firstMove = new Instruction(0, OpCode.Move, firstSaved, methodInfo);
+        var secondMove = new Instruction(1, OpCode.Move, secondSaved, firstSaved);
+        var definitions = new[] { firstMove, secondMove }
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+
+        var resolved = RgctxResolver.ResolveForwardedRuntimeMetadataType(secondSaved, definitions);
+
+        Assert.That(resolved, Is.SameAs(methodInfoType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 多定义保存寄存器不恢复运行时元数据身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var target = app.SystemTypes.SystemObjectType.Methods.First();
+        var methodInfoType = new RuntimeMethodInfoAnalysisContext(target, target.DeclaringType!.DeclaringAssembly);
+        var methodInfo = new LocalVariable("methodInfo", new Register(null, "X2"), methodInfoType);
+        var other = new LocalVariable("other", new Register(null, "X3"), app.SystemTypes.SystemIntPtrType);
+        var saved = new LocalVariable("saved", new Register(null, "X21"), app.SystemTypes.SystemIntPtrType);
+        var firstMove = new Instruction(0, OpCode.Move, saved, methodInfo);
+        var secondMove = new Instruction(1, OpCode.Move, saved, other);
+        var definitions = new[] { firstMove, secondMove }
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+
+        var resolved = RgctxResolver.ResolveForwardedRuntimeMetadataType(saved, definitions);
+
+        Assert.That(resolved, Is.Null);
     }
 }

@@ -1,11 +1,74 @@
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+using System.Reflection;
 
 namespace Cpp2IL.Core.Tests;
 
 public class MetadataInitGuardRemoverTests
 {
+    [SetUp]
+    public void Setup()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 泛型方法Rgctx初始化保护区被完整删除()
+    {
+        var fixture = CreateMethodRgctxGuard(useSavedCarrier: false, ordinaryRecursiveCall: false);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(removed, Is.True);
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+            Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+            Assert.That(fixture.Guard.Instructions[^1].OpCode, Is.EqualTo(OpCode.Jump));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 保存寄存器上的唯一Move载体仍可删除Rgctx保护区()
+    {
+        var fixture = CreateMethodRgctxGuard(useSavedCarrier: true, ordinaryRecursiveCall: false);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.True);
+        Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通递归调用不得冒充Rgctx初始化分支()
+    {
+        var fixture = CreateMethodRgctxGuard(useSavedCarrier: false, ordinaryRecursiveCall: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(removed, Is.False);
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+            Assert.That(fixture.Guard.Instructions[^1].OpCode, Is.EqualTo(OpCode.ConditionalJump));
+        }
+    }
+
     [Test]
     [Category("基本功能")]
     public void ProvenMetadataGuardDropsConstantFlagTest()
@@ -170,4 +233,84 @@ public class MetadataInitGuardRemoverTests
             new LocalVariable("flag", new Register(null, "TEST_BIT_VALUE")),
             new MemoryOperand(addend: address),
             new Immediate(mask));
+
+    private static MethodRgctxGuardFixture CreateMethodRgctxGuard(
+        bool useSavedCarrier,
+        bool ordinaryRecursiveCall)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var objectType = app.SystemTypes.SystemObjectType;
+        var booleanType = app.SystemTypes.SystemBooleanType;
+        var method = new InjectedMethodAnalysisContext(
+            objectType,
+            "GenericOwner",
+            booleanType,
+            MethodAttributes.Public,
+            [objectType]);
+        var methodInfoType = new RuntimeMethodInfoAnalysisContext(method, objectType.DeclaringAssembly);
+        var concreteCallTarget = new ConcreteGenericMethodAnalysisContext(method, [], []);
+        var methodInfo = new LocalVariable("methodInfo", new Register(null, "X2"), methodInfoType);
+        var savedMethodInfo = new LocalVariable(
+            "savedMethodInfo",
+            new Register(null, "X21"),
+            app.SystemTypes.SystemIntPtrType);
+        var carrier = useSavedCarrier ? savedMethodInfo : methodInfo;
+        var callCarrier = useSavedCarrier
+            ? new LocalVariable("callMethodInfo", new Register(null, "X0", 2), app.SystemTypes.SystemIntPtrType)
+            : carrier;
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), objectType);
+        var condition = new LocalVariable("condition", new Register(null, "COND"), booleanType);
+        var callResult = new LocalVariable("initResult", new Register(null, "X0", 1), booleanType);
+
+        var graph = new ISILControlFlowGraph([new Instruction(100, OpCode.Return)]);
+        var guard = new Block { ID = 2 };
+        var init = new Block { ID = 3 };
+        var merge = new Block { ID = 4 };
+
+        if (useSavedCarrier)
+            graph.EntryBlock.Instructions.Add(new Instruction(0, OpCode.Move, savedMethodInfo, methodInfo));
+        guard.Instructions.Add(new Instruction(
+            1,
+            OpCode.CheckNotEqual,
+            condition,
+            new MemoryOperand(baseRegister: carrier, addend: 0x38),
+            new Immediate(0)));
+        guard.Instructions.Add(new Instruction(2, OpCode.ConditionalJump, merge, condition));
+        if (useSavedCarrier)
+            init.Instructions.Add(new Instruction(3, OpCode.Move, callCarrier, carrier));
+        init.Instructions.Add(new Instruction(
+            4,
+            OpCode.Call,
+            concreteCallTarget,
+            callResult,
+            ordinaryRecursiveCall ? receiver : callCarrier));
+        init.Instructions.Add(new Instruction(5, OpCode.Jump, merge));
+        merge.Instructions.Add(new Instruction(6, OpCode.Return, new Immediate(1)));
+
+        Connect(graph.EntryBlock, guard);
+        Connect(guard, init);
+        Connect(guard, merge);
+        Connect(init, merge);
+        Connect(merge, graph.ExitBlock);
+        guard.CalculateBlockType();
+        init.CalculateBlockType();
+        merge.CalculateBlockType();
+        graph.Blocks = [graph.EntryBlock, graph.ExitBlock, guard, init, merge];
+        method.ControlFlowGraph = graph;
+
+        return new MethodRgctxGuardFixture(method, graph, guard, init, merge);
+    }
+
+    private static void Connect(Block source, Block destination)
+    {
+        source.Successors.Add(destination);
+        destination.Predecessors.Add(source);
+    }
+
+    private sealed record MethodRgctxGuardFixture(
+        MethodAnalysisContext Method,
+        ISILControlFlowGraph Graph,
+        Block Guard,
+        Block Init,
+        Block Merge);
 }

@@ -439,6 +439,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 可把唯一零偏移读取闭合为 unbox.any，而无需重复运行早期装箱分析。
         KeyFunctionRecovery.RewriteUnboxing(this);
         RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
+        // 泛型方法的 rgctx 初始化函数可能与托管方法共享地址；只有在
+        // 真实 rgctx 尾调用已绑定后，才能从同一 CFG 排除该伪递归初始化分支。
+        MetadataInitGuardRemover.RunMethodRgctxInitGuards(this);
 
         // 所有可解析目标此时已经绑定。在SSA单一定义仍有效时裁掉原生猜测出的多余隐参，
         // 随后的死码删除才能精确移除只为MethodInfo隐参服务的全局加载；若等物理寄存器

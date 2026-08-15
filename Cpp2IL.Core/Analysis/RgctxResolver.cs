@@ -20,10 +20,13 @@ public static class RgctxResolver
         var methodRgctxOffset = is32Bit ? 0x1C : 0x38;
         var rgctxOffset = is32Bit ? 0x60 : 0xC0;
         var pointerSize = is32Bit ? 4 : 8;
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
 
         var changed = false;
 
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
                 continue;
@@ -34,7 +37,17 @@ public static class RgctxResolver
             if (instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0, Base: LocalVariable source } memory)
                 continue;
 
-            var resolved = source.Type switch
+            // 泛型方法会先把隐藏 MethodInfo 保存到非易失寄存器，再在慢初始化分支后重载
+            // rgctx。保存寄存器可能已被宽化为原生整数，必须沿唯一 SSA Move 定义取回
+            // 运行时元数据身份，不能依赖当前局部的宽类型。
+            var sourceType = ResolveForwardedRuntimeMetadataType(source, definitions) ?? source.Type;
+            if (sourceType != null && !DescribesSameThing(source.Type, sourceType))
+            {
+                source.Type = sourceType;
+                changed = true;
+            }
+
+            var resolved = sourceType switch
             {
                 // MethodInfo::klass - the instance the method belongs to, which is what carries the RGCTX
                 RuntimeMethodInfoAnalysisContext info when memory.Addend == klassOffset && info.RepresentedMethod.DeclaringType is { } declaring
@@ -66,6 +79,35 @@ public static class RgctxResolver
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 沿唯一的局部到局部 SSA Move 链恢复运行时元数据载体。普通整数、对象以及存在
+    /// 多定义的局部均不晋级，避免把地址算术或控制流合并误认作 MethodInfo/RGCTXData。
+    /// </summary>
+    internal static TypeAnalysisContext? ResolveForwardedRuntimeMetadataType(
+        LocalVariable source,
+        ILookup<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var current = source;
+        while (visited.Add(current))
+        {
+            if (current.Type is RuntimeMethodInfoAnalysisContext
+                or RuntimeClassTypeAnalysisContext
+                or RgctxTableTypeAnalysisContext
+                or MethodRgctxTableTypeAnalysisContext)
+                return current.Type;
+
+            if (definitions[current].Take(2).ToArray() is not [
+                    { OpCode: OpCode.Move, Operands: [LocalVariable _, LocalVariable previous] }
+                ])
+                return null;
+
+            current = previous;
+        }
+
+        return null;
     }
 
     internal static bool DescribesSameThing(TypeAnalysisContext? existing, TypeAnalysisContext candidate) =>
