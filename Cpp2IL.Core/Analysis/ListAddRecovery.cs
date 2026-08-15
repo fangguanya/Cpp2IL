@@ -2076,8 +2076,9 @@ public static class ListAddRecovery
     }
 
     /// <summary>
-    /// 识别AddWithResize对原生调用者保存寄存器造成的字段载体重载。
-    /// 两次读取之间只允许出现这一处集合扩容调用，避免吞掉真正的字段更新。
+    /// 识别 AddWithResize 对原生调用者保存寄存器造成的稳定存储载体重载。
+    /// 稳定位置包括同一字段和同一内存槽；两次读取之间只允许出现这一处集合扩容调用，
+    /// 避免吞掉真正的字段或栈槽更新。
     /// </summary>
     private static bool IsRedundantCallClobberRefresh(
         ISILControlFlowGraph graph,
@@ -2087,8 +2088,10 @@ public static class ListAddRecovery
             {
                 Index: >= 0,
                 OpCode: OpCode.Move,
-                Operands: [LocalVariable destination, FieldReference field],
+                Operands: [LocalVariable destination, var source],
             })
+            return false;
+        if (!IsStableCallClobberSource(source))
             return false;
 
         foreach (var candidate in graph.Instructions)
@@ -2099,10 +2102,10 @@ public static class ListAddRecovery
                 || candidate is not
                 {
                     OpCode: OpCode.Move,
-                    Operands: [var priorDestination, FieldReference priorField],
+                    Operands: [var priorDestination, var priorSource],
                 }
                 || !ReferenceEquals(priorDestination, destination)
-                || !AreSameFieldRead(priorField, field))
+                || !AreSameCallClobberSource(priorSource, source))
                 continue;
 
             var interveningCalls = graph.Instructions.Where(instruction =>
@@ -2121,6 +2124,24 @@ public static class ListAddRecovery
 
         return false;
     }
+
+    /// <summary>
+    /// 限定可跨调用重载的稳定源。局部量和立即数不代表可重读存储，保持失败关闭。
+    /// </summary>
+    private static bool IsStableCallClobberSource(IOperand source)
+        => source is FieldReference or MemoryOperand;
+
+    /// <summary>
+    /// 比较调用前后的稳定读取身份；字段要求字段、接收者和偏移一致，内存槽要求基址、索引
+    /// 与附加偏移全部一致。
+    /// </summary>
+    private static bool AreSameCallClobberSource(IOperand left, IOperand right)
+        => left is FieldReference leftField
+           && right is FieldReference rightField
+           && AreSameFieldRead(leftField, rightField)
+           || left is MemoryOperand leftMemory
+           && right is MemoryOperand rightMemory
+           && AreSameMemoryOperand(leftMemory, rightMemory);
 
     private static bool AreSameFieldRead(FieldReference left, FieldReference right)
         => ReferenceEquals(left.Field, right.Field)

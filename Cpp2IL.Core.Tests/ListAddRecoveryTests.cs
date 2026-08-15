@@ -290,6 +290,68 @@ public class ListAddRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 慢路径在扩容调用后重载同一栈槽载体时恢复公开Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        AddSlowMemoryCarrierRefresh(fixture, mismatchOffset: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var calls = fixture.Graph.Instructions.Where(instruction => instruction.IsCall).ToList();
+        var carrierReloads = fixture.Graph.Instructions.Where(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [var destination, MemoryOperand] }
+            && ReferenceEquals(destination, fixture.Carrier)).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(calls, Has.Count.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)calls[0].Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(carrierReloads, Has.Count.EqualTo(2));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一栈槽零偏移在扩容调用两侧保持同一读取身份()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        AddSlowMemoryCarrierRefresh(fixture, mismatchOffset: false, offset: 0);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.True);
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 慢路径重载栈槽偏移不同则保持原容量控制流()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        AddSlowMemoryCarrierRefresh(fixture, mismatchOffset: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
     [TestCase("字段")]
     [TestCase("接收者")]
     [TestCase("偏移")]
@@ -2447,6 +2509,40 @@ public class ListAddRecoveryTests
             OpCode.Move,
             fixture.Carrier,
             new FieldReference(field.Field, field.Local, mismatchOffset ? field.Offset + 8 : field.Offset)));
+    }
+
+    /// <summary>
+    /// 构造真实 ARM64 循环中的调用破坏重载：公开值位于固定栈槽，扩容调用后从同一槽恢复
+    /// 寄存器载体；异常夹具只改变后置读取偏移。
+    /// </summary>
+    private static void AddSlowMemoryCarrierRefresh(
+        Fixture fixture,
+        bool mismatchOffset,
+        long offset = 0x20)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stackBase = Local("stackBase", app.SystemTypes.SystemIntPtrType);
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var head = fixture.Graph.Blocks.Single(block => block.Instructions.Any(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] }));
+        var itemsLoadIndex = head.Instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] });
+        head.Instructions.Insert(
+            itemsLoadIndex + 1,
+            new Instruction(
+                3,
+                OpCode.Move,
+                fixture.Carrier,
+                new MemoryOperand(stackBase, null, offset)));
+
+        var slowBlock = fixture.Graph.FindBlockByInstruction(slowCall)!;
+        slowBlock.Instructions.Add(new Instruction(
+            slowCall.Index + 1,
+            OpCode.Move,
+            fixture.Carrier,
+            new MemoryOperand(stackBase, null, mismatchOffset ? offset + 8 : offset)));
     }
 
     private static void SetImmediateValues(Fixture fixture, long fastValue, long slowValue)
