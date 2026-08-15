@@ -11,6 +11,66 @@ public class NewArmV8InstructionSetTests
 {
     [Test]
     [Category("基本功能")]
+    public void 标量加载保留动态寄存器索引与左移步长()
+    {
+        // LDR X20, [X26, X23, LSL #3]
+        var decoded = new List<Arm64Instruction>();
+        foreach (var instruction in Disassembler.Disassemble(
+                     [0x54, 0x7B, 0x77, 0xF8],
+                     0x025D6414,
+                     new Disassembler.Options(true, true, false)))
+            decoded.Add(instruction);
+
+        Assert.That(decoded, Has.Count.EqualTo(1));
+
+        var memory = NewArmV8InstructionSet.CreateMemoryOperand(decoded[0]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(memory.Base, Is.InstanceOf<Register>());
+            Assert.That(((Register)memory.Base!).Name, Is.EqualTo("X26"));
+            Assert.That(memory.Index, Is.InstanceOf<Register>());
+            Assert.That(((Register)memory.Index!).Name, Is.EqualTo("X23"));
+            Assert.That(memory.Scale, Is.EqualTo(8));
+            Assert.That(memory.IndexExtension, Is.EqualTo(MemoryIndexExtension.None));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零位移寄存器索引保持单位步长()
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeMemoryIndex(
+            Arm64ShiftType.LSL,
+            Arm64ExtendType.NONE,
+            0,
+            out var scale,
+            out var extension);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(scale, Is.EqualTo(1));
+            Assert.That(extension, Is.EqualTo(MemoryIndexExtension.None));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非法右移寻址拒绝生成错误内存表达式()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeMemoryIndex(
+                Arm64ShiftType.LSR,
+                Arm64ExtendType.NONE,
+                3,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void InterfaceLookupSlotRecognizesRecentZeroImmediate()
     {
         Instruction[] instructions =

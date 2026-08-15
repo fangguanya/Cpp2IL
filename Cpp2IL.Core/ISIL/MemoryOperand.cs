@@ -4,14 +4,32 @@ using System.Text;
 namespace Cpp2IL.Core.ISIL;
 
 /// <summary>
+/// ARM64 寄存器偏移寻址在参与地址计算前执行的整数扩展。
+/// </summary>
+public enum MemoryIndexExtension
+{
+    None,
+    ZeroExtend32,
+    SignExtend32,
+    ZeroExtend64,
+    SignExtend64
+}
+
+/// <summary>
 /// Memory operand in the format of [base+addend+index*scale]
 /// </summary>
-public struct MemoryOperand(IOperand? baseRegister = null, IOperand? indexRegister = null, long addend = 0, int scale = 0) : IOperand
+public struct MemoryOperand(
+    IOperand? baseRegister = null,
+    IOperand? indexRegister = null,
+    long addend = 0,
+    int scale = 0,
+    MemoryIndexExtension indexExtension = MemoryIndexExtension.None) : IOperand
 {
     public IOperand? Base = baseRegister;
     public IOperand? Index = indexRegister;
     public long Addend = addend;
     public int Scale = scale;
+    public MemoryIndexExtension IndexExtension = indexExtension;
 
     public bool IsConstant => Base == null && Index == null && Scale == 0;
 
@@ -38,7 +56,17 @@ public struct MemoryOperand(IOperand? baseRegister = null, IOperand? indexRegist
         {
             if (needsPlus)
                 sb.Append('+');
+
+            if (IndexExtension != MemoryIndexExtension.None)
+            {
+                sb.Append(IndexExtension);
+                sb.Append('(');
+            }
+
             sb.Append(Index);
+
+            if (IndexExtension != MemoryIndexExtension.None)
+                sb.Append(')');
 
             if (Scale > 1)
             {

@@ -182,6 +182,72 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    /// <summary>
+    /// 将 ARM64 寄存器偏移寻址的移位与扩展精确转换为 ISIL 步长和扩展语义。
+    /// </summary>
+    internal static bool TryDecodeMemoryIndex(
+        Arm64ShiftType shiftType,
+        Arm64ExtendType extendType,
+        int shiftAmount,
+        out int scale,
+        out MemoryIndexExtension extension)
+    {
+        extension = extendType switch
+        {
+            Arm64ExtendType.NONE => MemoryIndexExtension.None,
+            Arm64ExtendType.UXTW => MemoryIndexExtension.ZeroExtend32,
+            Arm64ExtendType.SXTW => MemoryIndexExtension.SignExtend32,
+            Arm64ExtendType.UXTX => MemoryIndexExtension.ZeroExtend64,
+            Arm64ExtendType.SXTX => MemoryIndexExtension.SignExtend64,
+            _ => MemoryIndexExtension.None
+        };
+
+        if (shiftType is not (Arm64ShiftType.NONE or Arm64ShiftType.LSL)
+            || extendType is Arm64ExtendType.UXTB or Arm64ExtendType.UXTH
+                or Arm64ExtendType.SXTB or Arm64ExtendType.SXTH
+            || shiftAmount is < 0 or > 30)
+        {
+            scale = 0;
+            extension = MemoryIndexExtension.None;
+            return false;
+        }
+
+        scale = 1 << shiftAmount;
+        return true;
+    }
+
+    /// <summary>
+    /// 构造普通 ARM64 内存操作数；动态索引寄存器、扩展方式和 LSL 步长必须全部保留。
+    /// </summary>
+    internal static MemoryOperand CreateMemoryOperand(Arm64Instruction instruction)
+    {
+        IOperand? baseOperand = instruction.MemBase == Arm64Register.INVALID
+            ? null
+            : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase));
+
+        if (instruction.MemAddendReg == Arm64Register.INVALID)
+            return new MemoryOperand(baseOperand, addend: instruction.MemOffset);
+
+        if (instruction.MemIndexMode != Arm64MemoryIndexMode.Offset
+            || !TryDecodeMemoryIndex(
+                instruction.MemShiftType,
+                instruction.MemExtendType,
+                instruction.MemExtendOrShiftAmount,
+                out var scale,
+                out var extension))
+        {
+            throw new InvalidOperationException(
+                $"ARM64寄存器偏移寻址无法精确转换：{instruction}");
+        }
+
+        return new MemoryOperand(
+            baseOperand,
+            new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemAddendReg)),
+            instruction.MemOffset,
+            scale,
+            extension);
+    }
+
     internal static bool TryCreateStackAddressOffset(
         Arm64Mnemonic mnemonic,
         Arm64OperandKind destinationKind,
@@ -2832,8 +2898,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     out var stackOffset))
                 return stackOffset;
 
-            //TODO Handle more stuff here
-            return new MemoryOperand(new Register(null, Arm64RegisterHelper.CanonicalName(reg)), addend: offset);
+            return CreateMemoryOperand(instruction);
         }
 
         if (kind == Arm64OperandKind.VectorRegisterElement)

@@ -19,7 +19,10 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
-        RecoverPointerDerivedAccesses(method.ControlFlowGraph!, method.AppContext.Binary.PointerSizeBytes);
+        RecoverPointerDerivedAccesses(
+            method.ControlFlowGraph!,
+            method.AppContext.Binary.PointerSizeBytes,
+            method.AppContext.SystemTypes);
         RecoverAccesses(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);
@@ -33,6 +36,12 @@ public static class ArrayRecovery
     /// 改写为 ArrayAccess；多定义、非数组根或不完整步长保持原始操作。
     /// </summary>
     internal static void RecoverPointerDerivedAccesses(ISILControlFlowGraph cfg, int pointerSize)
+        => RecoverPointerDerivedAccesses(cfg, pointerSize, null);
+
+    private static void RecoverPointerDerivedAccesses(
+        ISILControlFlowGraph cfg,
+        int pointerSize,
+        SystemTypesContext? systemTypes)
     {
         var definitions = SingleDefinitions(cfg);
 
@@ -44,9 +53,33 @@ public static class ArrayRecovery
                     continue;
 
                 if (ReferenceArrayIndex(memory, pointerSize, definitions) is { } access)
+                {
+                    BindArrayIndexType(access.Index, memory.IndexExtension, systemTypes);
                     instruction.SetOperand(i, access);
+                }
             }
         }
+    }
+
+    /// <summary>
+    /// 数组索引的 ARM64 扩展方式是整数宽度的直接证据；只为尚未定型的局部量绑定类型。
+    /// </summary>
+    internal static void BindArrayIndexType(
+        IOperand index,
+        MemoryIndexExtension extension,
+        SystemTypesContext? systemTypes)
+    {
+        if (index is not LocalVariable { Type: null } local || systemTypes == null)
+            return;
+
+        local.Type = extension switch
+        {
+            MemoryIndexExtension.ZeroExtend32 => systemTypes.SystemUInt32Type,
+            MemoryIndexExtension.SignExtend32 => systemTypes.SystemInt32Type,
+            MemoryIndexExtension.ZeroExtend64 => systemTypes.SystemUIntPtrType,
+            MemoryIndexExtension.None or MemoryIndexExtension.SignExtend64 => systemTypes.SystemIntPtrType,
+            _ => throw new ArgumentOutOfRangeException(nameof(extension), extension, null)
+        };
     }
 
     private static ArrayAccess? ReferenceArrayIndex(
@@ -114,7 +147,10 @@ public static class ArrayRecovery
                 }
 
                 if (ElementIndex(memory, arrayType, pointerSize) is { } index)
+                {
+                    BindArrayIndexType(index, memory.IndexExtension, method.AppContext.SystemTypes);
                     instruction.SetOperand(i, new ArrayAccess(array, index));
+                }
             }
         }
     }

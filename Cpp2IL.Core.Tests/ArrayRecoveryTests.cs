@@ -61,6 +61,45 @@ public class ArrayRecoveryTests
         Assert.That(fixture.Read.Operands[1], Is.InstanceOf<MemoryOperand>());
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 原生宽度动态数组索引绑定为IntPtr()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var index = new LocalVariable("index", new Register(null, "X23"));
+
+        ArrayRecovery.BindArrayIndexType(index, MemoryIndexExtension.None, app.SystemTypes);
+
+        Assert.That(index.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Uxtw数组索引绑定为UInt32()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var index = new LocalVariable("index", new Register(null, "X23"));
+
+        ArrayRecovery.BindArrayIndexType(index, MemoryIndexExtension.ZeroExtend32, app.SystemTypes);
+
+        Assert.That(index.Type, Is.SameAs(app.SystemTypes.SystemUInt32Type));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 已定型数组索引不被地址模式覆盖()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var index = new LocalVariable(
+            "index",
+            new Register(null, "X23"),
+            app.SystemTypes.SystemInt64Type);
+
+        ArrayRecovery.BindArrayIndexType(index, MemoryIndexExtension.ZeroExtend32, app.SystemTypes);
+
+        Assert.That(index.Type, Is.SameAs(app.SystemTypes.SystemInt64Type));
+    }
+
     private static Fixture CreateFixture(bool indexed, bool wrongStride = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
