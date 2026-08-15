@@ -194,6 +194,111 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 未定型零偏移读取由后续整数加法恢复拆箱()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var unboxedValue = Local("unboxedValue", null);
+        var defaultValue = Local("defaultValue", null);
+        var value = Local("value", null);
+        var sum = Local("sum", null);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_unbox"),
+            resultAddress,
+            source,
+            Local("runtimeClass", app.SystemTypes.SystemIntPtrType),
+            Local("staleMethodInfo", app.SystemTypes.SystemIntPtrType));
+        var read = new Instruction(1, OpCode.Move, unboxedValue, new MemoryOperand(resultAddress));
+        var setDefault = new Instruction(2, OpCode.Move, defaultValue, new Immediate(0));
+        var merge = new Instruction(3, OpCode.Phi, value, defaultValue, unboxedValue);
+        var add = new Instruction(4, OpCode.Add, sum, value, new Immediate(1));
+        var store = new Instruction(5, OpCode.Move, Local("storedSum", app.SystemTypes.SystemInt32Type), sum);
+        var method = CreateMethod(unbox, read, setDefault, merge, add, store);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(unbox.Operands, Has.Count.EqualTo(3));
+            Assert.That(unbox.Operands[2], Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(read.Operands[1], Is.SameAs(resultAddress));
+            Assert.That(unboxedValue.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(value.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 多个同型算术消费者共同证明同一拆箱类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var value = Local("value", null);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_unbox"),
+            resultAddress,
+            source);
+        var read = new Instruction(1, OpCode.Move, value, new MemoryOperand(resultAddress));
+        var sum = Local("sum", null);
+        var product = Local("product", null);
+        var add = new Instruction(2, OpCode.Add, sum, value, new Immediate(1));
+        var multiply = new Instruction(3, OpCode.Multiply, product, value, new Immediate(2));
+        var storeSum = new Instruction(4, OpCode.Move, Local("storedSum", app.SystemTypes.SystemInt32Type), sum);
+        var storeProduct = new Instruction(5, OpCode.Move, Local("storedProduct", app.SystemTypes.SystemInt32Type), product);
+        var method = CreateMethod(unbox, read, add, multiply, storeSum, storeProduct);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(unbox.Operands[2], Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(value.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 冲突算术消费者保持原生拆箱调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var value = Local("value", null);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_object_unbox"),
+            resultAddress,
+            source);
+        var read = new Instruction(1, OpCode.Move, value, new MemoryOperand(resultAddress));
+        var intSum = Local("intSum", null);
+        var longSum = Local("longSum", null);
+        var intAdd = new Instruction(2, OpCode.Add, intSum, value, new Immediate(1));
+        var longAdd = new Instruction(3, OpCode.Add, longSum, value, new Immediate(1));
+        var storeInt = new Instruction(4, OpCode.Move, Local("storedInt", app.SystemTypes.SystemInt32Type), intSum);
+        var storeLong = new Instruction(5, OpCode.Move, Local("storedLong", app.SystemTypes.SystemInt64Type), longSum);
+        var method = CreateMethod(unbox, read, intAdd, longAdd, storeInt, storeLong);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(read.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(value.Type, Is.Null);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 整数值类型地址保留精确装箱类型()
     {

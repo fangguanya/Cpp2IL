@@ -104,11 +104,12 @@ public static class KeyFunctionRecovery
         var instructions = method.ControlFlowGraph!.Blocks
             .SelectMany(block => block.Instructions)
             .ToList();
+        var valueFlow = UnboxValueFlowIndex.Create(instructions);
         foreach (var instruction in instructions)
         {
             if (instruction.Operands is [StringLiteral { Value: var keyFunction }, ..]
                 && ObjectUnboxFunctions.Contains(keyFunction))
-                RewriteObjectUnbox(method, instruction, instructions);
+                RewriteObjectUnbox(method, instruction, instructions, valueFlow);
         }
     }
 
@@ -119,7 +120,8 @@ public static class KeyFunctionRecovery
     private static void RewriteObjectUnbox(
         MethodAnalysisContext method,
         Instruction instruction,
-        IReadOnlyList<Instruction> instructions)
+        IReadOnlyList<Instruction> instructions,
+        UnboxValueFlowIndex valueFlow)
     {
         if (instruction is not
             {
@@ -176,7 +178,7 @@ public static class KeyFunctionRecovery
                     && carriers.FirstOrDefault(carrier => SameSsaLocal(carrier, memoryBase)) is { } valueCarrier)
                 {
                     consumers.Add((candidate, operandIndex, valueCarrier));
-                    var candidateType = ResolveManagedConsumerType(candidate, operandIndex);
+                    var candidateType = ResolveManagedConsumerType(candidate, operandIndex, valueFlow);
                     Logger.VerboseNewline(
                         $"Object::Unbox消费者：method={method.Definition?.Name}，call={instruction.Index}，consumer={candidate.Index}，operand={operandIndex}，type={candidateType?.FullName ?? "<未解析>"}，valueType={candidateType?.IsValueType.ToString() ?? "<未解析>"}",
                         nameof(KeyFunctionRecovery));
@@ -215,13 +217,24 @@ public static class KeyFunctionRecovery
         instruction.OpCode = OpCode.Unbox;
         instruction.SetOperands(result, source, unboxedType);
         foreach (var (consumer, operandIndex, value) in consumers)
+        {
             consumer.SetOperand(operandIndex, value);
+            if (consumer is { OpCode: OpCode.Move, Operands: [LocalVariable destination, _] }
+                && destination.Type == null)
+            {
+                destination.Type = unboxedType;
+                PropagateRecoveredUnboxType(destination, unboxedType, valueFlow, []);
+            }
+        }
     }
 
     /// <summary>
     /// 从绑定后的托管调用参数或强类型 Move 目标读取零偏移值的期望类型。
     /// </summary>
-    private static TypeAnalysisContext? ResolveManagedConsumerType(Instruction consumer, int operandIndex)
+    private static TypeAnalysisContext? ResolveManagedConsumerType(
+        Instruction consumer,
+        int operandIndex,
+        UnboxValueFlowIndex valueFlow)
     {
         if (consumer.IsCall && consumer.Operands[0] is MethodAnalysisContext called)
         {
@@ -233,14 +246,211 @@ public static class KeyFunctionRecovery
                 return called.Parameters[parameterIndex].ParameterType;
         }
 
-        if (consumer is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { } destinationType }, _] }
+        if (consumer is { OpCode: OpCode.Move, Operands: [LocalVariable destination, _] }
             && operandIndex == 1)
-            return destinationType;
+            return destination.Type ?? ResolveUniqueValueConsumerType(destination, valueFlow, []);
         if (consumer is { OpCode: OpCode.Move, Operands: [FieldReference field, _] }
             && operandIndex == 1)
             return field.Field.FieldType;
 
         return null;
+    }
+
+    /// <summary>
+    /// ARM64 会先把拆箱地址读取到未定型局部变量，再进行整数运算。仅当该 SSA 值的全部
+    /// 已定型算术消费者给出同一个值类型时，才把该类型作为拆箱证据；冲突或引用类型保持未知。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveUniqueValueConsumerType(
+        LocalVariable value,
+        UnboxValueFlowIndex valueFlow,
+        List<LocalVariable> path)
+    {
+        if (path.Any(visited => SameSsaLocal(visited, value)))
+            return null;
+        path.Add(value);
+
+        TypeAnalysisContext? resolved = null;
+        foreach (var candidate in valueFlow.GetConsumers(value))
+        {
+            TypeAnalysisContext? candidateType = null;
+            if (candidate is { OpCode: OpCode.Move, Operands: [LocalVariable moveDestination, LocalVariable moveSource] }
+                && SameSsaLocal(moveSource, value))
+                candidateType = moveDestination.Type ?? ResolveUniqueValueConsumerType(moveDestination, valueFlow, path);
+            else if (candidate is { OpCode: OpCode.Move, Operands: [FieldReference field, LocalVariable fieldSource] }
+                     && SameSsaLocal(fieldSource, value))
+                candidateType = field.Field.FieldType;
+            else if (candidate.OpCode is
+                         OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                         or OpCode.And or OpCode.Or or OpCode.Xor
+                     && candidate.Operands is [LocalVariable arithmeticDestination, { } leftOperand, { } rightOperand]
+                     && (ReferencesLocal(leftOperand, value) || ReferencesLocal(rightOperand, value)))
+                candidateType = arithmeticDestination.Type
+                                ?? ResolveUniqueValueConsumerType(arithmeticDestination, valueFlow, path);
+            else if (candidate is { OpCode: OpCode.Phi, Operands: [LocalVariable phiDestination, ..] }
+                     && candidate.Operands.Skip(1).Any(input => ReferencesLocal(input, value)))
+            {
+                candidateType = phiDestination.Type
+                                ?? ResolveUniqueValueConsumerType(phiDestination, valueFlow, path);
+                if (candidateType != null
+                    && candidate.Operands.Skip(1).Any(input =>
+                        !ReferencesLocal(input, value)
+                        && !IsCompatiblePhiInput(input, candidateType, valueFlow, [])))
+                    candidateType = null;
+            }
+            else if (candidate.IsCall && candidate.Operands[0] is MethodAnalysisContext called)
+            {
+                var firstParameter = 1
+                                     + (candidate.OpCode == OpCode.Call ? 1 : 0)
+                                     + (called.IsStatic ? 0 : 1);
+                for (var operandIndex = firstParameter; operandIndex < candidate.Operands.Count; operandIndex++)
+                {
+                    if (!ReferencesLocal(candidate.Operands[operandIndex], value))
+                        continue;
+
+                    var parameterIndex = operandIndex - firstParameter;
+                    if (parameterIndex >= 0 && parameterIndex < called.Parameters.Count)
+                        candidateType = called.Parameters[parameterIndex].ParameterType;
+                    break;
+                }
+            }
+
+            if (candidateType == null)
+                continue;
+
+            if (!candidateType.IsValueType)
+            {
+                path.RemoveAt(path.Count - 1);
+                return null;
+            }
+            if (resolved != null && !GenericCallRebinder.TypesEquivalent(resolved, candidateType))
+            {
+                path.RemoveAt(path.Count - 1);
+                return null;
+            }
+
+            resolved = candidateType;
+        }
+
+        path.RemoveAt(path.Count - 1);
+        return resolved;
+    }
+
+    /// <summary>
+    /// 已证明拆箱类型后，只沿直接 Move 与“同型值或零默认值”Phi 写回类型。
+    /// 算术结果仍由其自身消费者定型，避免把操作数类型盲目扩散到结果。
+    /// </summary>
+    private static void PropagateRecoveredUnboxType(
+        LocalVariable value,
+        TypeAnalysisContext recoveredType,
+        UnboxValueFlowIndex valueFlow,
+        List<LocalVariable> visited)
+    {
+        if (visited.Any(existing => SameSsaLocal(existing, value)))
+            return;
+        visited.Add(value);
+
+        foreach (var candidate in valueFlow.GetConsumers(value))
+        {
+            LocalVariable? destination = null;
+            if (candidate is { OpCode: OpCode.Move, Operands: [LocalVariable moveDestination, LocalVariable source] }
+                && SameSsaLocal(source, value))
+                destination = moveDestination;
+            else if (candidate is { OpCode: OpCode.Phi, Operands: [LocalVariable phiDestination, ..] }
+                     && candidate.Operands.Skip(1).Any(input => ReferencesLocal(input, value))
+                     && candidate.Operands.Skip(1).All(input =>
+                         ReferencesLocal(input, value)
+                         || IsCompatiblePhiInput(input, recoveredType, valueFlow, [])))
+                destination = phiDestination;
+
+            if (destination == null
+                || destination.Type != null
+                && !GenericCallRebinder.TypesEquivalent(destination.Type, recoveredType))
+                continue;
+
+            destination.Type ??= recoveredType;
+            PropagateRecoveredUnboxType(destination, recoveredType, valueFlow, visited);
+        }
+
+        visited.RemoveAt(visited.Count - 1);
+    }
+
+    /// <summary>
+    /// Phi 的其他输入必须是同一值类型，或由唯一 Move 链证明的零默认值。
+    /// </summary>
+    private static bool IsCompatiblePhiInput(
+        IOperand input,
+        TypeAnalysisContext expectedType,
+        UnboxValueFlowIndex valueFlow,
+        List<LocalVariable> visited)
+    {
+        if (input is Immediate { Value: 0 })
+            return true;
+        if (input is not LocalVariable local)
+            return false;
+        if (local.Type != null)
+            return GenericCallRebinder.TypesEquivalent(local.Type, expectedType);
+        if (visited.Any(existing => SameSsaLocal(existing, local)))
+            return false;
+        visited.Add(local);
+
+        var compatible = valueFlow.GetUniqueDefinition(local) is
+                             { OpCode: OpCode.Move, Operands: [_, var source] }
+                         && IsCompatiblePhiInput(source, expectedType, valueFlow, visited);
+        visited.RemoveAt(visited.Count - 1);
+        return compatible;
+    }
+
+    /// <summary>
+    /// Object::Unbox 的 SSA 推导只建立一次定义和消费者索引，全部递归查询复用该不可变目录。
+    /// </summary>
+    private sealed class UnboxValueFlowIndex
+    {
+        private readonly IReadOnlyDictionary<Register, IReadOnlyList<Instruction>> _consumers;
+        private readonly IReadOnlyDictionary<Register, Instruction?> _definitions;
+
+        private UnboxValueFlowIndex(
+            IReadOnlyDictionary<Register, IReadOnlyList<Instruction>> consumers,
+            IReadOnlyDictionary<Register, Instruction?> definitions)
+        {
+            _consumers = consumers;
+            _definitions = definitions;
+        }
+
+        public IReadOnlyList<Instruction> GetConsumers(LocalVariable value)
+            => _consumers.TryGetValue(value.Register, out var consumers) ? consumers : [];
+
+        public Instruction? GetUniqueDefinition(LocalVariable value)
+            => _definitions.TryGetValue(value.Register, out var definition) ? definition : null;
+
+        public static UnboxValueFlowIndex Create(IReadOnlyList<Instruction> instructions)
+        {
+            var consumers = new Dictionary<Register, List<Instruction>>();
+            var definitions = new Dictionary<Register, Instruction?>();
+            foreach (var instruction in instructions)
+            {
+                var seenRegisters = new HashSet<Register>();
+                foreach (var local in instruction.Operands.OfType<LocalVariable>())
+                {
+                    if (!seenRegisters.Add(local.Register))
+                        continue;
+                    if (!consumers.TryGetValue(local.Register, out var localConsumers))
+                    {
+                        localConsumers = [];
+                        consumers.Add(local.Register, localConsumers);
+                    }
+                    localConsumers.Add(instruction);
+                }
+
+                if (instruction.Operands.FirstOrDefault() is not LocalVariable destination)
+                    continue;
+                if (!definitions.TryAdd(destination.Register, instruction))
+                    definitions[destination.Register] = null;
+            }
+
+            return new UnboxValueFlowIndex(
+                consumers.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<Instruction>)pair.Value),
+                definitions);
+        }
     }
 
     private static bool ReferencesLocal(IOperand operand, LocalVariable local)
