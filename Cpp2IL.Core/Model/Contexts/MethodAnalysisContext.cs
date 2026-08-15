@@ -490,6 +490,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 此时恢复公开属性可避免输出运行库私有_stringLength字段。
         StringLengthRecovery.Run(this);
 
+        // 异常清理路径会把IEnumerator等引用槽先取址再按零偏移读取；在最终类型已稳定后
+        // 折回直接引用访问，避免把托管地址写入object局部并生成不可编译的指针转换。
+        ManagedReferenceAddressRecovery.Run(this);
+
         LocalVariables.TypeAddressedLocals(this);
 
         // Near-last, as it depends on the final block layout

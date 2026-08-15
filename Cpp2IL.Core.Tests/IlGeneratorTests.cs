@@ -1124,6 +1124,60 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 接口引用取址写入Object槽时恢复接口引用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var enumeratorType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var source = new LocalVariable("enumerator", new Register(null, "X0"), enumeratorType);
+        var destination = new LocalVariable("disposableSource", new Register(null, "X1"), systemObject);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "RecoverInterfaceReference",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, destination, new AddressOf(source)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [source, destination];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        var enumeratorDefinition = new TypeDefinition(
+            "System.Collections",
+            "IEnumerator",
+            TypeAttributes.Interface | TypeAttributes.Public | TypeAttributes.Abstract);
+        module.TopLevelTypes.Add(enumeratorDefinition);
+        enumeratorType.PutExtraData("AsmResolverType", enumeratorDefinition);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "InterfaceReferenceProbeType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "RecoverInterfaceReference",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloc), Is.True);
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloca), Is.False);
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 原生内存值与无构造器类型比较时生成同型原生零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
