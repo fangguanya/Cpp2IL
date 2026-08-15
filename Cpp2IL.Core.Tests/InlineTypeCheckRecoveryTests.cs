@@ -246,8 +246,58 @@ public class InlineTypeCheckRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 空引用失败且成功块立即目标调用时恢复IsInst()
+    {
+        var fixture = CreateFixture(
+            exceptionFullName: "System.NullReferenceException",
+            dereferenceTargetOnSuccess: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        var isInst = instructions.Single(instruction => instruction.OpCode == OpCode.IsInst);
+        Assert.Multiple(() =>
+        {
+            Assert.That(isInst.Operands[1], Is.SameAs(fixture.Source));
+            Assert.That(isInst.Operands[2], Is.SameAs(fixture.TargetType));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.CastClass), Is.False);
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+            Assert.That(
+                instructions.Single(instruction => ReferenceEquals(instruction.Destination, fixture.Returned)).Operands[2],
+                Is.SameAs(isInst.Destination));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 空引用失败块仍有真实空值守卫前驱时只移除类型检查分支()
+    {
+        var fixture = CreateFixture(
+            exceptionFullName: "System.NullReferenceException",
+            dereferenceTargetOnSuccess: true,
+            sharedNullGuardPredecessor: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.IsInst), Is.EqualTo(1));
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.EqualTo(1));
+            Assert.That(
+                instructions.Any(instruction => instruction is
+                {
+                    OpCode: OpCode.Throw,
+                    Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }],
+                }),
+                Is.True);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
-    public void 失败块并非InvalidCast时不吞掉异常语义()
+    public void 空引用失败但成功块未立即解引用目标时保持原始控制流()
     {
         var fixture = CreateFixture(exceptionFullName: "System.NullReferenceException");
 
@@ -257,6 +307,7 @@ public class InlineTypeCheckRecoveryTests
         Assert.Multiple(() =>
         {
             Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.CastClass), Is.False);
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.IsInst), Is.False);
             Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.EqualTo(2));
             Assert.That(
                 instructions.Any(instruction => instruction is
@@ -272,7 +323,9 @@ public class InlineTypeCheckRecoveryTests
         long hierarchyOffset = 0xC8,
         string exceptionFullName = "System.InvalidCastException",
         int failureTrampolineDepth = 0,
-        bool failureTrampolineHasComputation = false)
+        bool failureTrampolineHasComputation = false,
+        bool dereferenceTargetOnSuccess = false,
+        bool sharedNullGuardPredecessor = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var mscorlib = app.GetAssemblyByName("mscorlib")!;
@@ -321,10 +374,28 @@ public class InlineTypeCheckRecoveryTests
             targetType);
         var invertCheck = new Instruction(7, OpCode.Not, notEqual, equal);
         var secondJump = new Instruction(8, OpCode.ConditionalJump, new Immediate(-1), notEqual);
-        var useSource = new Instruction(9, OpCode.Move, returned, source);
+        var useSource = dereferenceTargetOnSuccess
+            ? new Instruction(
+                9,
+                OpCode.Call,
+                targetType.Methods.Single(method =>
+                    method.Name == "ToString"
+                    && !method.IsStatic
+                    && method.Parameters.Count == 0),
+                returned,
+                source)
+            : new Instruction(9, OpCode.Move, returned, source);
         var successReturn = new Instruction(10, OpCode.Return, returned);
         var failureThrow = new Instruction(11, OpCode.Throw, exceptionType);
         var failureReturn = new Instruction(12, OpCode.Return);
+        var nullCondition = Local("nullCondition", app.SystemTypes.SystemBooleanType);
+        var nullCheck = new Instruction(
+            -1,
+            OpCode.CheckEqual,
+            nullCondition,
+            source,
+            new Immediate(0));
+        var nullJump = new Instruction(-1, OpCode.ConditionalJump, failureThrow, nullCondition);
         var instructions = new List<Instruction>
         {
             sourceClassLoad,
@@ -339,6 +410,12 @@ public class InlineTypeCheckRecoveryTests
             useSource,
             successReturn,
         };
+
+        if (sharedNullGuardPredecessor)
+        {
+            instructions.Insert(0, nullJump);
+            instructions.Insert(0, nullCheck);
+        }
 
         if (failureTrampolineDepth == 0)
         {

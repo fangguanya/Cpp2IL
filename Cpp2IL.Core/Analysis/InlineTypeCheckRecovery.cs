@@ -7,13 +7,19 @@ using Cpp2IL.Core.Model.Contexts;
 namespace Cpp2IL.Core.Analysis;
 
 /// <summary>
-/// 把IL2CPP内联的引用类型强制转换闭包恢复为托管CastClass。
+/// 把IL2CPP内联的引用类型检查闭包恢复为托管CastClass或IsInst。
 /// </summary>
 public static class InlineTypeCheckRecovery
 {
     private const long TypeDepthOffset = 0x130;
     private const long TypeHierarchyOffset = 0xC8;
     private const long PointerSize = 8;
+
+    private enum FailureSemantics
+    {
+        CastClass,
+        IsInstThenDereference,
+    }
 
     public static void Run(MethodAnalysisContext method)
     {
@@ -30,7 +36,8 @@ public static class InlineTypeCheckRecovery
                     out var source,
                     out var targetType,
                     out var firstCheckBlock,
-                    out var invalidCastBlock))
+                    out var failureBlock,
+                    out var recoveryOpCode))
                 continue;
 
             var castResult = new LocalVariable(
@@ -42,9 +49,9 @@ public static class InlineTypeCheckRecovery
                 insertAt--;
             firstCheckBlock.Instructions.Insert(
                 insertAt,
-                new Instruction(-1, OpCode.CastClass, castResult, source, targetType));
+                new Instruction(-1, recoveryOpCode, castResult, source, targetType));
 
-            ReplaceSuccessRegionUses(secondCheckBlock, invalidCastBlock, source, castResult);
+            ReplaceSuccessRegionUses(secondCheckBlock, failureBlock, source, castResult);
             RemoveFailureBranch(firstCheckBlock);
             RemoveFailureBranch(secondCheckBlock);
             changed = true;
@@ -65,16 +72,18 @@ public static class InlineTypeCheckRecovery
         out LocalVariable source,
         out TypeAnalysisContext targetType,
         out Block firstCheckBlock,
-        out Block invalidCastBlock)
+        out Block failureBlock,
+        out OpCode recoveryOpCode)
     {
         source = null!;
         targetType = null!;
         firstCheckBlock = null!;
-        invalidCastBlock = null!;
+        failureBlock = null!;
+        recoveryOpCode = OpCode.Nop;
 
         if (!TryGetFailureBranch(secondCheckBlock, definitions, out var secondCondition, out var secondFailureEntry))
             return false;
-        if (!TryResolveInvalidCastBlock(secondFailureEntry, out invalidCastBlock))
+        if (!TryResolveFailureBlock(secondFailureEntry, out failureBlock, out var failureSemantics))
             return false;
         if (!definitions.TryGetValue(secondCondition, out var secondConditionDefinition))
             return false;
@@ -126,11 +135,12 @@ public static class InlineTypeCheckRecovery
         if (inferredSourceType is not { IsValueType: false })
             return false;
 
-        var expectedFailureBlock = invalidCastBlock;
+        var expectedFailureBlock = failureBlock;
         var firstCandidates = secondCheckBlock.Predecessors
             .Where(block => TryGetFailureBranch(block, definitions, out _, out var failureEntry)
-                && TryResolveInvalidCastBlock(failureEntry, out var failure)
-                && ReferenceEquals(failure, expectedFailureBlock))
+                && TryResolveFailureBlock(failureEntry, out var failure, out var candidateSemantics)
+                && ReferenceEquals(failure, expectedFailureBlock)
+                && candidateSemantics == failureSemantics)
             .ToList();
         if (firstCandidates.Count != 1)
             return false;
@@ -154,7 +164,58 @@ public static class InlineTypeCheckRecovery
         source = sourceObject;
         source.Type ??= inferredSourceType;
         targetType = representedTarget;
+        recoveryOpCode = failureSemantics switch
+        {
+            FailureSemantics.CastClass => OpCode.CastClass,
+            FailureSemantics.IsInstThenDereference when SuccessStartsWithTargetDereference(
+                secondCheckBlock,
+                secondFailureEntry,
+                source,
+                targetType,
+                definitions) => OpCode.IsInst,
+            _ => OpCode.Nop,
+        };
+        if (recoveryOpCode == OpCode.Nop)
+            return false;
+
         return true;
+    }
+
+    /// <summary>
+    /// 证明类层级检查成功后的首个有效操作会以目标类型实例调用解引用源对象。
+    /// 这种形态来自“as T”结果的立即成员访问：类型不匹配与空对象都会在成员调用处保持空引用异常。
+    /// </summary>
+    private static bool SuccessStartsWithTargetDereference(
+        Block secondCheckBlock,
+        Block failureEntry,
+        LocalVariable source,
+        TypeAnalysisContext targetType,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var successBlocks = secondCheckBlock.Successors
+            .Where(block => !ReferenceEquals(block, failureEntry))
+            .ToList();
+        if (successBlocks.Count != 1)
+            return false;
+
+        foreach (var instruction in successBlocks[0].Instructions)
+        {
+            if (instruction.OpCode is OpCode.Nop or OpCode.Phi)
+                continue;
+            if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid)
+                || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
+                || called.IsStatic
+                || !GenericCallRebinder.TypesEquivalent(called.DeclaringType, targetType))
+                return false;
+
+            var receiverIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+            return receiverIndex < instruction.Operands.Count
+                && ReferenceEquals(
+                    ResolveMoveSource(instruction.Operands[receiverIndex], definitions),
+                    source);
+        }
+
+        return false;
     }
 
     private static IOperand ResolveMoveSource(
@@ -236,28 +297,43 @@ public static class InlineTypeCheckRecovery
         return false;
     }
 
-    private static bool IsInvalidCastOnly(Block block) =>
-        block.Instructions.Any(instruction => instruction is
+    private static bool TryGetFailureSemantics(Block block, out FailureSemantics semantics)
+    {
+        semantics = default;
+        var throws = block.Instructions
+            .Where(instruction => instruction.OpCode == OpCode.Throw)
+            .ToList();
+        if (throws.Count != 1
+            || throws[0].Operands is not [TypeAnalysisContext exceptionType]
+            || block.Instructions.Any(instruction =>
+                instruction.OpCode is not (OpCode.Nop or OpCode.Phi or OpCode.Throw or OpCode.Return)))
+            return false;
+
+        semantics = exceptionType.FullName switch
         {
-            OpCode: OpCode.Throw,
-            Operands: [TypeAnalysisContext { FullName: "System.InvalidCastException" }],
-        })
-        && block.Instructions.All(instruction =>
-            instruction.OpCode is OpCode.Nop or OpCode.Phi or OpCode.Throw or OpCode.Return);
+            "System.InvalidCastException" => FailureSemantics.CastClass,
+            "System.NullReferenceException" => FailureSemantics.IsInstThenDereference,
+            _ => default,
+        };
+        return exceptionType.FullName is "System.InvalidCastException" or "System.NullReferenceException";
+    }
 
     /// <summary>
     /// 解析由控制流拆边产生的纯跳转失败入口。这里只跨越不携带业务计算的Jump块，
-    /// 防止把带副作用或额外检查的路径误判成标准castclass失败闭包。
+    /// 防止把带副作用或额外检查的路径误判成标准类型检查失败闭包。
     /// </summary>
-    private static bool TryResolveInvalidCastBlock(Block entry, out Block invalidCastBlock)
+    private static bool TryResolveFailureBlock(
+        Block entry,
+        out Block failureBlock,
+        out FailureSemantics semantics)
     {
         var visited = new HashSet<Block>();
         var current = entry;
         while (visited.Add(current))
         {
-            if (IsInvalidCastOnly(current))
+            if (TryGetFailureSemantics(current, out semantics))
             {
-                invalidCastBlock = current;
+                failureBlock = current;
                 return true;
             }
 
@@ -273,7 +349,8 @@ public static class InlineTypeCheckRecovery
             current = current.Successors.Single();
         }
 
-        invalidCastBlock = null!;
+        failureBlock = null!;
+        semantics = default;
         return false;
     }
 
