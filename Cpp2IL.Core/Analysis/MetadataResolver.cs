@@ -469,6 +469,7 @@ public static class MetadataResolver
 
     private static void ResolveCalls(MethodAnalysisContext method)
     {
+        var resolvedThrow = false;
         foreach (var block in method.ControlFlowGraph!.Blocks)
         {
             if (block.BlockType != BlockType.Call && block.BlockType != BlockType.TailCall)
@@ -497,6 +498,8 @@ public static class MetadataResolver
                 {
                     callInstruction.OpCode = OpCode.Throw;
                     callInstruction.SetOperands(thrown);
+                    method.ControlFlowGraph.TerminateAtThrow(block);
+                    resolvedThrow = true;
                 }
 
                 continue;
@@ -513,6 +516,8 @@ public static class MetadataResolver
             TryBindCallTarget(method, callInstruction, singleTargetMethod);
         }
 
+        if (resolvedThrow)
+            method.ControlFlowGraph.RemoveUnreachableBlocks();
         method.ControlFlowGraph.MergeCallBlocks();
     }
 

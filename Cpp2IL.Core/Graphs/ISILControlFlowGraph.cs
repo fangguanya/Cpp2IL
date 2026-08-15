@@ -134,6 +134,29 @@ public class ISILControlFlowGraph
     }
 
     /// <summary>
+    /// 把已经确认的托管抛出块收束到唯一退出边，并同步清理原调用块遗留的后继与Phi输入。
+    /// 原生调用在CFG建立后才可能解析为Throw，因此不能继续沿原Call的顺序后继执行。
+    /// </summary>
+    internal void TerminateAtThrow(Block block)
+    {
+        if (block == null)
+            throw new ArgumentNullException(nameof(block));
+        if (!Blocks.Contains(block))
+            throw new ArgumentException("抛出块必须属于当前控制流图。", nameof(block));
+        if (block.Instructions.LastOrDefault()?.OpCode != OpCode.Throw)
+            throw new InvalidOperationException("终结块的最后一条指令必须是Throw。");
+
+        foreach (var successor in block.Successors.ToList())
+            RemovePredecessorAndPhiInputs(successor, block);
+        block.Successors.Clear();
+
+        block.Successors.Add(ExitBlock);
+        if (!ExitBlock.Predecessors.Contains(block))
+            ExitBlock.Predecessors.Add(block);
+        block.CalculateBlockType();
+    }
+
+    /// <summary>
     /// 从块中删除指定前驱的全部边，并同步删除所有Phi的同索引输入。
     /// SSA中Phi第一个操作数是目标，后续操作数与Predecessors严格按索引对应。
     /// 该函数用于彻底断开不可达块或已改写终结块；同一前驱产生的平行边必须一起清理。
@@ -402,7 +425,8 @@ public class ISILControlFlowGraph
                 case OpCode.Call:
                 case OpCode.CallVoid:
                 case OpCode.Return:
-                    var isReturn = instructions[i].OpCode == OpCode.Return;
+                case OpCode.Throw:
+                    var exitsMethod = instructions[i].OpCode is OpCode.Return or OpCode.Throw;
 
                     currentBlock.AddInstruction(instructions[i]);
 
@@ -410,7 +434,7 @@ public class ISILControlFlowGraph
                     {
                         newBlock = new Block() { ID = idCounter++ };
                         AddBlock(newBlock);
-                        AddDirectedEdge(currentBlock, isReturn ? ExitBlock : newBlock);
+                        AddDirectedEdge(currentBlock, exitsMethod ? ExitBlock : newBlock);
                         currentBlock.CalculateBlockType();
                         currentBlock = newBlock;
                     }
