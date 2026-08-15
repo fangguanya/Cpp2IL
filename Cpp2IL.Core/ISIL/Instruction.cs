@@ -129,6 +129,7 @@ public class Instruction : IOperand
             case OpCode.CheckLessOrEqualUnsigned:
             case OpCode.Newobj:
             case OpCode.Box:
+            case OpCode.Unbox:
             case OpCode.CastClass:
             case OpCode.IsInst:
                 if (newDestination != null)
@@ -177,7 +178,7 @@ public class Instruction : IOperand
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
                 or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
-                or OpCode.Newobj or OpCode.Box or OpCode.CastClass or OpCode.IsInst
+                or OpCode.Newobj or OpCode.Box or OpCode.Unbox or OpCode.CastClass or OpCode.IsInst
                 => [_operands[1]],
 
             OpCode.VectorBitwiseSelect

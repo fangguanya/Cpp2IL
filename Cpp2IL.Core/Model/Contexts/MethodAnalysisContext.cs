@@ -435,6 +435,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         KeyFunctionRecovery.RewriteTypeTests(this);
         InterfaceDispatchRecovery.Run(this);
         LocalVariables.ResolveLateCallTypesAndAddressCarriers(this);
+        // Object::Unbox 的返回值仍是原生地址；此时接口与普通调用形参均已精确定型，
+        // 可把唯一零偏移读取闭合为 unbox.any，而无需重复运行早期装箱分析。
+        KeyFunctionRecovery.RewriteUnboxing(this);
         RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
 
         // 所有可解析目标此时已经绑定。在SSA单一定义仍有效时裁掉原生猜测出的多余隐参，

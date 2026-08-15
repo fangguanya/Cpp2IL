@@ -167,7 +167,7 @@ public class InterfaceDispatchRecoveryTests
 
     [Test]
     [Category("基本功能")]
-    public void 未写入W2时MethodInfo载体解析为零号接口槽位()
+    public void 未写入W2时MethodInfo载体保留到快速路径交叉验证()
     {
         var carrier = new LocalVariable("methodInfoCarrier", new Register(null, "X2"))
         {
@@ -179,9 +179,60 @@ public class InterfaceDispatchRecoveryTests
         Assert.Multiple(() =>
         {
             Assert.That(matched, Is.True);
-            Assert.That(slot, Is.TypeOf<Immediate>());
-            Assert.That(((Immediate)slot).Value, Is.Zero);
+            Assert.That(slot, Is.SameAs(carrier));
         });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void MethodInfo载体与唯一非零快速槽位闭合为同一接口方法()
+    {
+        var carrier = new LocalVariable("methodInfoCarrier", new Register(null, "X2"))
+        {
+            IsMethodInfo = true,
+        };
+
+        var matched = InterfaceDispatchRecovery.TryResolveConsistentDirectSlot(
+            [],
+            carrier,
+            new HashSet<int> { 1 },
+            out var slot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(slot, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 显式零号慢槽位只接受零号快速路径()
+    {
+        var matched = InterfaceDispatchRecovery.TryResolveConsistentDirectSlot(
+            [],
+            new Immediate(0),
+            new HashSet<int> { 0 },
+            out var slot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matched, Is.True);
+            Assert.That(slot, Is.Zero);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 显式慢槽位与快速路径冲突时保持未解析()
+    {
+        Assert.That(
+            InterfaceDispatchRecovery.TryResolveConsistentDirectSlot(
+                [],
+                new Immediate(0),
+                new HashSet<int> { 1 },
+                out _),
+            Is.False);
     }
 
     [Test]

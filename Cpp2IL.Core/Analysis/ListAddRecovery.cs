@@ -33,9 +33,98 @@ public static class ListAddRecovery
         {
             var passRecovered = RunRecoveryPass(graph, originalSharedFastTails);
             if (passRecovered == 0)
-                return recovered;
+                break;
             recovered += passRecovered;
         }
+
+        // 完整容量菱形已经优先闭合。剩余的开放 List<T>.AddWithResize 若以立即数零，
+        // 或“地址载体唯一写零”作为接收者，只可能来自共享原生地址的错误托管绑定；
+        // 真正的实例调用既不能以空接收者继续正常执行，也不能把 byref 地址当作 List 对象。
+        var residualInstructions = graph.Blocks.SelectMany(block => block.Instructions).ToList();
+        var suppressed = residualInstructions.Count(instruction =>
+            TrySuppressResidualOpenGenericCall(instruction, residualInstructions));
+        if (suppressed > 0)
+            DeadCodeEliminator.Run(method);
+
+        return recovered + suppressed;
+    }
+
+    /// <summary>
+    /// 删除共享地址误绑定形成的开放泛型 AddWithResize。该规则同时要求：目标仍为 List&lt;T&gt;
+    /// 的开放实例、调用形状精确为接收者加单值参数、接收者由唯一零证据证明为无效载体。
+    /// </summary>
+    internal static bool TrySuppressResidualOpenGenericCall(
+        Instruction instruction,
+        IReadOnlyList<Instruction> allInstructions)
+    {
+        if (instruction is not
+            {
+                OpCode: OpCode.CallVoid,
+                Operands:
+                [
+                    ConcreteGenericMethodAnalysisContext target,
+                    IOperand receiver,
+                    _,
+                ],
+            }
+            || target.Name != "AddWithResize"
+            || target.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
+            || !target.TypeGenericParameters.Any(type => type is GenericParameterTypeAnalysisContext)
+            || !IsProvenResidualReceiver(receiver, allInstructions))
+            return false;
+
+        Logger.VerboseNewline(
+            $"ListAdd开放泛型残留删除：调用 {instruction.Index} 的接收者 {receiver} 具有唯一零载体证据。",
+            nameof(ListAddRecovery));
+        instruction.OpCode = OpCode.Nop;
+        instruction.SetOperands();
+        return true;
+    }
+
+    /// <summary>
+    /// 只沿引用相同的局部 Move 定义回溯；每一层必须恰好一个定义，且最终为整数零。
+    /// AddressOf 仅在其目标局部满足同一唯一零链时成立，避免删除真实对象或多定义合并路径。
+    /// </summary>
+    private static bool IsProvenResidualReceiver(
+        IOperand receiver,
+        IReadOnlyList<Instruction> allInstructions)
+    {
+        if (receiver is Immediate { Value: 0 })
+            return true;
+
+        var current = receiver switch
+        {
+            AddressOf { Target: LocalVariable addressed } => addressed,
+            LocalVariable local => local,
+            _ => null,
+        };
+        if (current == null)
+            return false;
+
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(current))
+        {
+            var definitions = allInstructions
+                .Where(candidate => ReferenceEquals(candidate.Destination, current))
+                .Take(2)
+                .ToList();
+            if (definitions.Count != 1
+                || definitions[0] is not { OpCode: OpCode.Move, Operands.Count: 2 })
+                return false;
+
+            switch (definitions[0].Operands[1])
+            {
+                case Immediate { Value: 0 }:
+                    return true;
+                case LocalVariable source:
+                    current = source;
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

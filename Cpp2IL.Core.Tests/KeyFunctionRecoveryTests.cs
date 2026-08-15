@@ -52,6 +52,148 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 代码生成拆箱入口与唯一托管形参恢复为Unbox指令()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_unbox"),
+            resultAddress,
+            source);
+        var consumer = new Instruction(
+            1,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(app.SystemTypes.SystemInt32Type),
+            new MemoryOperand(resultAddress));
+        var method = CreateMethod(unbox, consumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(unbox.Operands, Has.Count.EqualTo(3));
+            Assert.That(unbox.Operands[0], Is.SameAs(resultAddress));
+            Assert.That(unbox.Operands[1], Is.SameAs(source));
+            Assert.That(unbox.Operands[2], Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(resultAddress.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(consumer.Operands[1], Is.SameAs(resultAddress));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 两个同型零偏移消费者共享同一次拆箱值()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_unbox"),
+            resultAddress,
+            source);
+        var firstConsumer = new Instruction(
+            1,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(app.SystemTypes.SystemInt32Type),
+            new MemoryOperand(resultAddress));
+        // 转换器会为同一 SSA 寄存器的第二个内存操作数创建独立局部对象。
+        var aliasedResultAddress = new LocalVariable(
+            "aliasedResultAddress",
+            resultAddress.Register,
+            app.SystemTypes.SystemIntPtrType);
+        var secondConsumer = new Instruction(
+            2,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(app.SystemTypes.SystemInt32Type),
+            new MemoryOperand(aliasedResultAddress));
+        var method = CreateMethod(unbox, firstConsumer, secondConsumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(firstConsumer.Operands[1], Is.SameAs(resultAddress));
+            Assert.That(secondConsumer.Operands[1], Is.SameAs(resultAddress));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 拆箱地址经唯一Move载体后恢复为同一值类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var savedAddress = Local("savedAddress", app.SystemTypes.SystemIntPtrType);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_unbox"),
+            resultAddress,
+            source);
+        var saveAddress = new Instruction(1, OpCode.Move, savedAddress, resultAddress);
+        var consumer = new Instruction(
+            2,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(app.SystemTypes.SystemInt32Type),
+            new MemoryOperand(savedAddress));
+        var method = CreateMethod(unbox, saveAddress, consumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(resultAddress.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(savedAddress.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(consumer.Operands[1], Is.SameAs(savedAddress));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 冲突值类型消费者保持原生拆箱调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_object_unbox"),
+            resultAddress,
+            source);
+        var firstConsumer = new Instruction(
+            1,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(app.SystemTypes.SystemInt32Type),
+            new MemoryOperand(resultAddress));
+        var conflictingConsumer = new Instruction(
+            2,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(app.SystemTypes.SystemInt64Type),
+            new MemoryOperand(resultAddress));
+        var method = CreateMethod(unbox, firstConsumer, conflictingConsumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(firstConsumer.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(conflictingConsumer.Operands[1], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 整数值类型地址保留精确装箱类型()
     {
@@ -882,6 +1024,17 @@ public class KeyFunctionRecoveryTests
             Local(resultName, app.SystemTypes.SystemObjectType),
             new MemoryOperand(typeClass, addend: 0x28),
             new AddressOf(value));
+
+    private static InjectedMethodAnalysisContext CreateStaticValueConsumer(TypeAnalysisContext parameterType)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        return new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "ConsumeValue",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static,
+            [parameterType]);
+    }
 
     private static MethodAnalysisContext CreateMethod(params Instruction[] instructions)
     {

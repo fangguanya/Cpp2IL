@@ -201,10 +201,8 @@ public static class InterfaceDispatchRecovery
                 slow.InterfaceType,
                 slow.Receiver,
                 fast.KlassLocal) is not { } declaringInterface
-            || ResolveConstant(definitions, slow.Slot) is not { } slot
-            || slot is < 0 or > ushort.MaxValue
-            || !fast.Slots.SetEquals([(int)slot])
-            || ResolveInterfaceSlot(declaringInterface, (int)slot) is not { } resolved)
+            || !TryResolveConsistentDirectSlot(definitions, slow.Slot, fast.Slots, out var slot)
+            || ResolveInterfaceSlot(declaringInterface, slot) is not { } resolved)
         {
             Logger.VerboseNewline(
                 $"共享接口返回槽拒绝 {dispatch.Index}：接口、槽位或快速地址链结论不一致",
@@ -561,21 +559,27 @@ public static class InterfaceDispatchRecovery
         if (!homeBlock.TryGetValue(phi, out var merge))
             return null;
 
-        if (ResolveConstant(definitions, slotArg) is { } slotValue)
+        if (TryResolveConsistentDirectSlot(definitions, slotArg, vtableMatch.Slots, out var slotValue))
         {
-            rejection = "慢路径槽位越界或与快速路径不一致";
-            if (slotValue is < 0 or > ushort.MaxValue || !vtableMatch.Slots.SetEquals([(int)slotValue]))
-                return null;
-
             rejection = "接口槽位没有方法定义";
-            if (ResolveInterfaceSlot(declaringInterface, (int)slotValue) is not { } resolved)
+            if (ResolveInterfaceSlot(declaringInterface, slotValue) is not { } resolved)
                 return null;
 
             rejection = string.Empty;
             return new DirectMatch(resolved, phi, merge, slowCall, vtableMatch.KlassLocal);
         }
 
-        rejection = $"慢路径槽位既非常量也不是可证明的双路 Phi：{DescribeOperandDefinition(definitions, slotArg)}";
+        // 显式常量已经给出确定结论；一旦与快速路径不一致，不再把它误报为条件 Phi。
+        if (ResolveConstant(definitions, slotArg) != null)
+        {
+            rejection = "慢路径槽位越界或与快速路径不一致";
+            return null;
+        }
+
+        rejection = vtableMatch.Slots.Count == 1
+                    && IsMethodInfoSlotCarrier(slotArg)
+            ? "慢路径 MethodInfo 载体与快速路径槽位不一致"
+            : $"慢路径槽位既非常量也不是可证明的双路 Phi：{DescribeOperandDefinition(definitions, slotArg)}";
         if (!TryResolveConditionalSlots(method, definitions, homeBlock, slotArg, out var selection, out var slowSlots))
             return null;
 
@@ -672,9 +676,17 @@ public static class InterfaceDispatchRecovery
         IOperand? operand,
         out IOperand slot)
     {
-        if (operand == null || operand is LocalVariable { IsMethodInfo: true } or LocalVariable { Type: RuntimeMethodInfoAnalysisContext })
+        if (operand == null)
         {
             slot = new Immediate(0);
+            return true;
+        }
+
+        // X2 未显式写入时会保留 MethodInfo 载体；它只证明“慢路径槽位常量在 SSA 合并时丢失”，
+        // 不再武断地等同于零。最终槽位必须与已经完整验证的唯一快速 vtable 地址链一致。
+        if (IsMethodInfoSlotCarrier(operand))
+        {
+            slot = operand;
             return true;
         }
 
@@ -687,6 +699,48 @@ public static class InterfaceDispatchRecovery
         slot = null!;
         return false;
     }
+
+    /// <summary>
+    /// 将慢查表槽位与快速 vtable 地址链闭合为唯一结论。显式常量必须逐值一致；
+    /// MethodInfo 载体只表示 W2 的常量定义在 SSA 边复制中被覆盖，此时仅接受唯一快速槽位。
+    /// </summary>
+    internal static bool TryResolveConsistentDirectSlot(
+        Dictionary<LocalVariable, Instruction> definitions,
+        IOperand slowSlot,
+        IReadOnlyCollection<int> fastSlots,
+        out int slot)
+    {
+        if (ResolveConstant(definitions, slowSlot) is { } constant)
+        {
+            if (constant is >= 0 and <= ushort.MaxValue
+                && fastSlots.Count == 1
+                && fastSlots.Contains((int)constant))
+            {
+                slot = (int)constant;
+                return true;
+            }
+
+            slot = default;
+            return false;
+        }
+
+        if (IsMethodInfoSlotCarrier(slowSlot) && fastSlots.Count == 1)
+        {
+            var fastSlot = fastSlots.Single();
+            if (fastSlot is >= 0 and <= ushort.MaxValue)
+            {
+                slot = fastSlot;
+                return true;
+            }
+        }
+
+        slot = default;
+        return false;
+    }
+
+    private static bool IsMethodInfoSlotCarrier(IOperand operand)
+        => operand is LocalVariable { IsMethodInfo: true }
+           or LocalVariable { Type: RuntimeMethodInfoAnalysisContext };
 
     /// <summary>
     /// 接口慢路径的接收者既可能直接位于 X0，也可能是值类型枚举器的地址。

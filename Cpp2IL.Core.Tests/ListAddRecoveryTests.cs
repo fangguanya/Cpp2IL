@@ -20,6 +20,80 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 开放AddWithResize的直接零接收者残留被删除()
+    {
+        var call = new Instruction(
+            0,
+            OpCode.CallVoid,
+            CreateOpenAddWithResizeTarget(),
+            new Immediate(0),
+            new Immediate(7));
+
+        var suppressed = ListAddRecovery.TrySuppressResidualOpenGenericCall(call, [call]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(suppressed, Is.True);
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(call.Operands, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 唯一写零局部的地址载体残留被删除()
+    {
+        var receiverStorage = Local(
+            "receiverStorage",
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt64Type);
+        var defineReceiver = new Instruction(0, OpCode.Move, receiverStorage, new Immediate(0));
+        var call = new Instruction(
+            1,
+            OpCode.CallVoid,
+            CreateOpenAddWithResizeTarget(),
+            new AddressOf(receiverStorage),
+            new Immediate(9));
+
+        var suppressed = ListAddRecovery.TrySuppressResidualOpenGenericCall(
+            call,
+            [defineReceiver, call]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(suppressed, Is.True);
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Nop));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 多定义地址载体保持原调用以免删除合并语义()
+    {
+        var receiverStorage = Local(
+            "receiverStorage",
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt64Type);
+        var firstDefinition = new Instruction(0, OpCode.Move, receiverStorage, new Immediate(0));
+        var secondDefinition = new Instruction(1, OpCode.Move, receiverStorage, new Immediate(0));
+        var call = new Instruction(
+            2,
+            OpCode.CallVoid,
+            CreateOpenAddWithResizeTarget(),
+            new AddressOf(receiverStorage),
+            new Immediate(11));
+
+        var suppressed = ListAddRecovery.TrySuppressResidualOpenGenericCall(
+            call,
+            [firstDefinition, secondDefinition, call]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(suppressed, Is.False);
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.CallVoid));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 完整引用类型容量菱形恢复为公开Add调用()
     {
         var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
@@ -2455,6 +2529,21 @@ public class ListAddRecoveryTests
         aggregate.InjectFieldContext("x", app.SystemTypes.SystemSingleType, System.Reflection.FieldAttributes.Public);
         aggregate.InjectFieldContext("y", app.SystemTypes.SystemSingleType, System.Reflection.FieldAttributes.Public);
         return aggregate;
+    }
+
+    private static ConcreteGenericMethodAnalysisContext CreateOpenAddWithResizeTarget()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericParameter = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [genericParameter]);
+        return new ConcreteGenericMethodAnalysisContext(addWithResize, [genericParameter], []);
     }
 
     private static LocalVariable Local(string name, TypeAnalysisContext type, string? registerName = null)

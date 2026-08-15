@@ -389,6 +389,18 @@ public static class IlGenerator
                 StoreToOperand(boxDestination, method, locals, writeLine);
                 break;
 
+            case OpCode.Unbox:
+                if (instruction.Operands is not
+                    [{ } unboxDestination, { } boxedObject, TypeAnalysisContext { IsValueType: true } unboxedType])
+                    throw new InvalidOperationException($"Unbox指令操作数不完整: {instruction}");
+
+                LoadOperand(boxedObject, method, locals, writeLine, stringCtor, context.AppContext.SystemTypes.SystemObjectType);
+                instructions.Add(
+                    CilOpCodes.Unbox_Any,
+                    importer.ImportTypeSignature(unboxedType.ToTypeSignature(module)).ToTypeDefOrRef());
+                StoreToOperand(unboxDestination, method, locals, writeLine);
+                break;
+
             case OpCode.CastClass:
                 if (instruction.Operands is not
                     [{ } castDestination, { } castSource, TypeAnalysisContext { IsValueType: false } castType])

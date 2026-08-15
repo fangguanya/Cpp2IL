@@ -43,6 +43,7 @@ public abstract class BaseKeyFunctionAddresses
 
     public ulong il2cpp_object_unbox; //Api function
     public ulong il2cpp_vm_object_unbox; //Thunked from above
+    public ulong il2cpp_codegen_object_unbox; //直接尾跳转到Object::Unbox的代码生成入口
 
     public ulong il2cpp_raise_exception; //Api function (exported)
     public ulong il2cpp_vm_exception_raise; //Thunked from above
@@ -254,6 +255,16 @@ public abstract class BaseKeyFunctionAddresses
             Logger.VerboseNewline($"Found at 0x{il2cpp_vm_object_unbox:X}");
         }
 
+        if (il2cpp_vm_object_unbox != 0)
+        {
+            Logger.Verbose("\t\tMapping Object::Unbox to il2cpp_codegen_object_unbox...");
+            il2cpp_codegen_object_unbox = FindAllThunkFunctions(
+                il2cpp_vm_object_unbox,
+                0,
+                il2cpp_object_unbox).FirstOrDefault();
+            Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_object_unbox:X}");
+        }
+
         if (il2cpp_raise_exception != 0)
         {
             Logger.Verbose("\t\tMapping il2cpp_raise_exception to il2cpp::vm::Exception::Raise...");
@@ -369,6 +380,7 @@ public abstract class BaseKeyFunctionAddresses
 
         AddResolved(il2cpp_object_unbox);
         AddResolved(il2cpp_vm_object_unbox);
+        AddResolved(il2cpp_codegen_object_unbox);
 
         AddResolved(il2cpp_raise_exception);
         AddResolved(il2cpp_vm_exception_raise);

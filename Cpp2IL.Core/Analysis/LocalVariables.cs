@@ -772,6 +772,9 @@ public static class LocalVariables
                 case OpCode.Box:
                     instructionChanged = PropagateBox(instruction, method);
                     break;
+                case OpCode.Unbox:
+                    instructionChanged = PropagateUnbox(instruction);
+                    break;
                 case OpCode.CastClass:
                     instructionChanged = PropagateCastClass(instruction);
                     break;
@@ -844,6 +847,19 @@ public static class LocalVariables
             return false;
 
         destination.Type = castType;
+        return true;
+    }
+
+    private static bool PropagateUnbox(Instruction instruction)
+    {
+        if (instruction.Operands is not
+            [LocalVariable destination, _, TypeAnalysisContext { IsValueType: true } unboxedType])
+            return false;
+
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, unboxedType))
+            return false;
+
+        destination.Type = unboxedType;
         return true;
     }
 

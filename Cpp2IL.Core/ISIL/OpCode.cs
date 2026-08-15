@@ -175,6 +175,9 @@ public enum OpCode
     /// <summary>把 op 2 的值类型值装箱为 op 3 指定的值类型，并把对象写入 op 1。</summary>
     Box,
 
+    /// <summary>把 op 2 的对象按 op 3 指定的值类型拆箱，并把值写入 op 1。</summary>
+    Unbox,
+
     /// <summary>把 op 2 的对象强制转换为 op 3 指定的引用类型，并把结果写入 op 1。</summary>
     CastClass,
 

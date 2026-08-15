@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -26,6 +27,13 @@ public static class KeyFunctionRecovery
         "il2cpp_value_box",
         "il2cpp_vm_object_box",
         "il2cpp_codegen_object_box",
+    ];
+
+    private static readonly HashSet<string> ObjectUnboxFunctions =
+    [
+        "il2cpp_object_unbox",
+        "il2cpp_vm_object_unbox",
+        "il2cpp_codegen_object_unbox",
     ];
 
     private const string ObjectIsInstFunction = nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst);
@@ -65,8 +73,10 @@ public static class KeyFunctionRecovery
             for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
             {
                 var instruction = block.Instructions[instructionIndex];
-                if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..]
-                    || !ObjectBoxFunctions.Contains(keyFunction))
+                if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
+                    continue;
+
+                if (!ObjectBoxFunctions.Contains(keyFunction))
                     continue;
 
                 RewriteObjectBox(
@@ -80,6 +90,167 @@ public static class KeyFunctionRecovery
             }
         }
     }
+
+    /// <summary>
+    /// 接口与普通调用的真实签名均已绑定后，使用托管消费者的值类型形参恢复 Object::Unbox。
+    /// 该阶段与早期装箱恢复分离，避免在间接调用仍未定型时重复扫描或猜测值类型。
+    /// </summary>
+    public static void RewriteUnboxing(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions)
+            .ToList();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Operands is [StringLiteral { Value: var keyFunction }, ..]
+                && ObjectUnboxFunctions.Contains(keyFunction))
+                RewriteObjectUnbox(method, instruction, instructions);
+        }
+    }
+
+    /// <summary>
+    /// 把 Object::Unbox 返回的原生值地址与其零偏移读取合并为托管 unbox.any。
+    /// 值类型必须由该读取进入的真实托管形参唯一证明；全部消费者都必须是同一地址的零偏移读取。
+    /// </summary>
+    private static void RewriteObjectUnbox(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        IReadOnlyList<Instruction> instructions)
+    {
+        if (instruction is not
+            {
+                OpCode: OpCode.Call,
+                Operands: [StringLiteral, LocalVariable result, IOperand source, ..],
+            })
+            return;
+
+        // ARM64 常先把返回地址从 X0 搬入保存寄存器，再于后续块解引用。先闭合只含
+        // LocalVariable->LocalVariable 的 SSA Move 载体；其他算术、Phi 或带偏移地址仍拒绝。
+        var carriers = new List<LocalVariable> { result };
+        var carrierMoves = new HashSet<Instruction>();
+        var carrierAdded = true;
+        while (carrierAdded)
+        {
+            carrierAdded = false;
+            foreach (var candidate in instructions)
+            {
+                if (candidate.Index <= instruction.Index
+                    || candidate is not
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable destination, LocalVariable sourceCarrier],
+                    }
+                    || !carriers.Any(carrier => SameSsaLocal(carrier, sourceCarrier)))
+                    continue;
+
+                carrierMoves.Add(candidate);
+                if (carriers.Any(carrier => SameSsaLocal(carrier, destination)))
+                    continue;
+
+                carriers.Add(destination);
+                carrierAdded = true;
+            }
+        }
+
+        var consumers = new List<(Instruction Instruction, int OperandIndex, LocalVariable Value)>();
+        TypeAnalysisContext? unboxedType = null;
+        foreach (var candidate in instructions)
+        {
+            if (ReferenceEquals(candidate, instruction) || carrierMoves.Contains(candidate))
+                continue;
+
+            for (var operandIndex = 0; operandIndex < candidate.Operands.Count; operandIndex++)
+            {
+                var operand = candidate.Operands[operandIndex];
+                if (operand is MemoryOperand
+                    {
+                        Base: LocalVariable memoryBase,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0,
+                    }
+                    && carriers.FirstOrDefault(carrier => SameSsaLocal(carrier, memoryBase)) is { } valueCarrier)
+                {
+                    consumers.Add((candidate, operandIndex, valueCarrier));
+                    var candidateType = ResolveManagedConsumerType(candidate, operandIndex);
+                    Logger.VerboseNewline(
+                        $"Object::Unbox消费者：method={method.Definition?.Name}，call={instruction.Index}，consumer={candidate.Index}，operand={operandIndex}，type={candidateType?.FullName ?? "<未解析>"}，valueType={candidateType?.IsValueType.ToString() ?? "<未解析>"}",
+                        nameof(KeyFunctionRecovery));
+                    if (candidateType == null)
+                        continue;
+                    if (!candidateType.IsValueType
+                        || unboxedType != null
+                        && !GenericCallRebinder.TypesEquivalent(unboxedType, candidateType))
+                        return;
+                    unboxedType ??= candidateType;
+                    continue;
+                }
+
+                // 指针结果一旦被直接使用、带偏移读取或嵌入其他地址表达式，便不再满足 unbox.any 的值语义。
+                if (carriers.Any(carrier => ReferencesLocal(operand, carrier)))
+                {
+                    Logger.VerboseNewline(
+                        $"Object::Unbox拒绝：method={method.Definition?.Name}，call={instruction.Index}，consumer={candidate.Index}，operand={operandIndex}，instruction={candidate}，reason=直接或非零偏移地址使用",
+                        nameof(KeyFunctionRecovery));
+                    return;
+                }
+            }
+        }
+
+        if (consumers.Count == 0 || unboxedType is not { IsValueType: true })
+        {
+            Logger.VerboseNewline(
+                $"Object::Unbox拒绝：method={method.Definition?.Name}，call={instruction.Index}，consumers={consumers.Count}，type={unboxedType?.FullName ?? "<未解析>"}，reason=缺少唯一值类型证据",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+
+        result.Type = unboxedType;
+        foreach (var carrier in carriers)
+            carrier.Type = unboxedType;
+        instruction.OpCode = OpCode.Unbox;
+        instruction.SetOperands(result, source, unboxedType);
+        foreach (var (consumer, operandIndex, value) in consumers)
+            consumer.SetOperand(operandIndex, value);
+    }
+
+    /// <summary>
+    /// 从绑定后的托管调用参数或强类型 Move 目标读取零偏移值的期望类型。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveManagedConsumerType(Instruction consumer, int operandIndex)
+    {
+        if (consumer.IsCall && consumer.Operands[0] is MethodAnalysisContext called)
+        {
+            var firstParameter = 1
+                                 + (consumer.OpCode == OpCode.Call ? 1 : 0)
+                                 + (called.IsStatic ? 0 : 1);
+            var parameterIndex = operandIndex - firstParameter;
+            if (parameterIndex >= 0 && parameterIndex < called.Parameters.Count)
+                return called.Parameters[parameterIndex].ParameterType;
+        }
+
+        if (consumer is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { } destinationType }, _] }
+            && operandIndex == 1)
+            return destinationType;
+        if (consumer is { OpCode: OpCode.Move, Operands: [FieldReference field, _] }
+            && operandIndex == 1)
+            return field.Field.FieldType;
+
+        return null;
+    }
+
+    private static bool ReferencesLocal(IOperand operand, LocalVariable local)
+        => operand is LocalVariable candidate && SameSsaLocal(candidate, local)
+           || operand is MemoryOperand memory
+           && (memory.Base != null && ReferencesLocal(memory.Base, local)
+               || memory.Index != null && ReferencesLocal(memory.Index, local))
+           || operand is AddressOf address && ReferencesLocal(address.Target, local)
+           || operand is FieldReference field && SameSsaLocal(field.Local, local)
+           || operand is ArrayAccess array
+           && (SameSsaLocal(array.Array, local) || ReferencesLocal(array.Index, local));
+
+    private static bool SameSsaLocal(LocalVariable left, LocalVariable right)
+        => ReferenceEquals(left, right) || left.Register == right.Register;
 
     /// <summary>
     /// 把运行时 Object::IsInst 调用恢复为托管 isinst。原生帮助器返回原对象或 null，
