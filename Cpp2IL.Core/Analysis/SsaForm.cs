@@ -215,17 +215,30 @@ public class SsaForm
                 || destination.Name != carrier.Name)
                 continue;
 
-            return candidate is
+            if (candidate is not
             {
                 OpCode: OpCode.Move,
                 Operands: [Register, AddressOf { Target: Register addressed }]
-            }
+            })
+                return null;
+
+            // 早期阶段尚未解析被调方法签名，不能把任意原生指针实参猜成托管 ref/out。
+            // out 形态会在地址计算后、调用前显式初始化同一槽；以该写入作为唯一提交证据，
+            // 排除值类型实例接收者及复用栈区的只读地址载体。
+            return block.Instructions
+                .Skip(index + 1)
+                .Take(beforeIndex - index - 1)
+                .Any(intermediate => intermediate.Destination is Register written
+                                     && SamePhysicalRegister(written, addressed))
                 ? addressed
                 : null;
         }
 
         return null;
     }
+
+    private static bool SamePhysicalRegister(Register left, Register right) =>
+        left.Number == right.Number && left.Name == right.Name;
 
     internal static bool IsReadOnlyBoxDataAddress(
         Instruction instruction,

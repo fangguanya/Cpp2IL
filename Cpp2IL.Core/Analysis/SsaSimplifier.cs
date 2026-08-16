@@ -20,15 +20,12 @@ public static class SsaSimplifier
         var forwarded = new Dictionary<LocalVariable, IOperand>();
         // ref/out 调用可在原生栈槽地址上写回新值；即使槽在进入调用前由零常量初始化，
         // 也不得把调用后的读取全局替换成旧常量。地址目录一次建立，后续传播统一复用。
-        var addressTakenStorage = cfg.Blocks
+        var addressTaken = cfg.Blocks
             .SelectMany(block => block.Instructions)
             .SelectMany(instruction => instruction.Operands)
             .OfType<AddressOf>()
             .Select(address => address.Target)
             .OfType<LocalVariable>()
-            // SSA 会给同一原生槽位的初始化值和取址值分配不同版本；ref/out 写回作用于
-            // 底层槽位而非某个版本，因此目录必须忽略版本，只计算一次物理存储身份。
-            .Select(StorageIdentity)
             .ToHashSet();
 
         foreach (var block in cfg.Blocks)
@@ -36,8 +33,7 @@ public static class SsaSimplifier
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && !parameterLocals.Contains(dest)
-                    && (!addressTakenStorage.Contains(StorageIdentity(dest))
-                        || instruction.Operands[1] is LocalVariable)
+                    && (!addressTaken.Contains(dest) || instruction.Operands[1] is LocalVariable)
                     && IsForwardable(instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
 
@@ -184,7 +180,4 @@ public static class SsaSimplifier
             FieldReference => false,
             _ => true
         };
-
-    private static (int Number, string Name) StorageIdentity(LocalVariable local) =>
-        (local.Register.Number, local.Register.Name);
 }

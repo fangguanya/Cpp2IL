@@ -735,6 +735,26 @@ public class SsaAndDominators
     }
 
     [Test]
+    [Category("边界值")]
+    public void 地址计算后未初始化槽位时保持原生指针参数()
+    {
+        var stack = new Register(null, "stack_-70");
+        var pointer = new Register(null, "X19");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, stack, new Immediate(5)),
+            new(1, OpCode.Move, pointer, new AddressOf(stack)),
+            new(2, OpCode.CallVoid, new StringLiteral("ReadStructReceiver"), pointer),
+            new(3, OpCode.Return, stack),
+        };
+        var graph = BuildGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.That(instructions[2].Operands[1], Is.TypeOf<Register>());
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 装箱只读数据的地址载体保持非写回语义()
     {

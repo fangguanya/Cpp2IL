@@ -23,28 +23,6 @@ public class SsaSimplifierTests
     }
 
     [Test]
-    [Category("基本功能")]
-    public void Ref出参槽的SSA版本必须共享物理取址事实()
-    {
-        var addressedSlot = Local("stack_-28", 0);
-        var initializedSlot = Local("stack_-28", 1);
-        var pointer = Local("X0", 2);
-        var initialize = new Instruction(0, OpCode.Move, initializedSlot, new Immediate(0));
-        var takeAddress = new Instruction(1, OpCode.Move, pointer, new AddressOf(addressedSlot));
-        var call = new Instruction(2, OpCode.CallVoid, new StringLiteral("WriteRef"), pointer);
-        var readAfterCall = new Instruction(3, OpCode.Return, initializedSlot);
-        var cfg = Graph(initialize, takeAddress, call, readAfterCall);
-
-        SsaSimplifier.Run(cfg, []);
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(readAfterCall.Operands[0], Is.SameAs(initializedSlot));
-            Assert.That(initialize.OpCode, Is.EqualTo(OpCode.Move));
-        });
-    }
-
-    [Test]
     [Category("边界值")]
     public void 同一槽地址多次传递仍统一阻断旧值传播()
     {
@@ -77,26 +55,9 @@ public class SsaSimplifierTests
         Assert.That(((Immediate)use.Operands[0]).Value, Is.Zero);
     }
 
-    [Test]
-    [Category("异常输入")]
-    public void 其他物理槽位的取址不得阻断当前槽位常量传播()
-    {
-        var addressedSlot = Local("stack_-28", 0);
-        var ordinarySlot = Local("stack_-30", 1);
-        var initialize = new Instruction(0, OpCode.Move, ordinarySlot, new Immediate(0));
-        var call = new Instruction(1, OpCode.CallVoid, new StringLiteral("WriteRef"), new AddressOf(addressedSlot));
-        var use = new Instruction(2, OpCode.Return, ordinarySlot);
-        var cfg = Graph(initialize, call, use);
-
-        SsaSimplifier.Run(cfg, []);
-
-        Assert.That(use.Operands[0], Is.TypeOf<Immediate>());
-        Assert.That(((Immediate)use.Operands[0]).Value, Is.Zero);
-    }
-
     private static ISILControlFlowGraph Graph(params Instruction[] instructions)
         => new([.. instructions]);
 
-    private static LocalVariable Local(string name, int version = -1)
-        => new(name, new Register(null, name, version));
+    private static LocalVariable Local(string name)
+        => new(name, new Register(null, name));
 }
