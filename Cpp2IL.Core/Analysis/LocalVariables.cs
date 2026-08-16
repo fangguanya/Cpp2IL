@@ -853,7 +853,8 @@ public static class LocalVariables
     private static bool PropagateUnbox(Instruction instruction)
     {
         if (instruction.Operands is not
-            [LocalVariable destination, _, TypeAnalysisContext { IsValueType: true } unboxedType])
+            [LocalVariable destination, _, TypeAnalysisContext unboxedType]
+            || !unboxedType.IsValueType && unboxedType is not GenericParameterTypeAnalysisContext)
             return false;
 
         if (GenericCallRebinder.TypesEquivalent(destination.Type, unboxedType))
@@ -1445,6 +1446,14 @@ public static class LocalVariables
         MethodAnalysisContext calledMethod,
         IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
     {
+        // 共享泛型方法会把隐藏 MethodInfo 保存到非易失寄存器，再把它搬入 X0 调用
+        // 原生 rgctx 初始化函数。该原生地址可能与当前托管方法共享并被暂时绑定为伪递归；
+        // 若先按实例调用传播，保存寄存器会被误写成声明类型，随后 [MethodInfo+rgctx]
+        // 又会被字段偏移解析器错误投影成同偏移业务字段。必须在写入任何接收者类型前，
+        // 对完整唯一 Move/Phi 复制闭包执行一次运行时元数据身份预检。
+        if (ContainsRuntimeMetadataCarrier(receiver, uniqueDefinitions))
+            return false;
+
         var changed = false;
         var pending = new Queue<LocalVariable>();
         var visited = new HashSet<LocalVariable>();
@@ -1475,6 +1484,52 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 沿唯一复制闭包判断接收者是否源自 IL2CPP 运行时元数据载体。任一入边携带
+    /// MethodInfo、RuntimeClass、RGCTXData表或静态字段存储身份时，整个闭包均不得按
+    /// 托管实例接收者定型；普通业务对象和没有唯一定义的局部保持原有传播规则。
+    /// </summary>
+    internal static bool ContainsRuntimeMetadataCarrier(
+        LocalVariable receiver,
+        IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
+    {
+        var pending = new Queue<LocalVariable>();
+        var visited = new HashSet<LocalVariable>();
+        pending.Enqueue(receiver);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Dequeue();
+            if (!visited.Add(current))
+                continue;
+
+            if (current.Type is RuntimeMethodInfoAnalysisContext
+                or RuntimeClassTypeAnalysisContext
+                or RgctxTableTypeAnalysisContext
+                or MethodRgctxTableTypeAnalysisContext
+                or StaticFieldStorageTypeAnalysisContext)
+                return true;
+
+            if (!uniqueDefinitions.TryGetValue(current, out var definition))
+                continue;
+
+            if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            {
+                pending.Enqueue(source);
+                continue;
+            }
+
+            if (definition.OpCode != OpCode.Phi)
+                continue;
+
+            for (var operandIndex = 1; operandIndex < definition.Operands.Count; operandIndex++)
+                if (definition.Operands[operandIndex] is LocalVariable input)
+                    pending.Enqueue(input);
+        }
+
+        return false;
     }
 
     /// <summary>

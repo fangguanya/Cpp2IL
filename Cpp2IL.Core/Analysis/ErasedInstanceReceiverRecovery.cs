@@ -15,6 +15,12 @@ public static class ErasedInstanceReceiverRecovery
         if (method.IsStatic || method.DeclaringType == null || method.ControlFlowGraph == null)
             return 0;
 
+        // 中文注释：一次构建唯一SSA定义目录，供所有调用共同判定隐藏元数据复制闭包。
+        var uniqueDefinitions = method.ControlFlowGraph.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
         LocalVariable? thisLocal = null;
         var rewrittenCount = 0;
         foreach (var instruction in method.ControlFlowGraph.Instructions)
@@ -31,13 +37,19 @@ public static class ErasedInstanceReceiverRecovery
 
             var receiverIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
             if (receiverIndex >= instruction.Operands.Count
-                || instruction.Operands[receiverIndex] is not LocalVariable { Type: { } receiverType })
+                || instruction.Operands[receiverIndex] is not LocalVariable { Type: { } receiverType } receiver)
                 continue;
 
             // 泛型值T既可能是值类型，也可能是引用类型；它对Object实例方法的调用必须由
             // constrained.callvirt保留真实接收者。IsAssignableTo在开放泛型上没有足够信息，
             // 因此绝不能把T误判成原生残留寄存器并改写成当前方法的this。
             if (receiverType is GenericParameterTypeAnalysisContext)
+                continue;
+
+            // 泛型方法的隐藏 MethodInfo 会被保存后搬入 X0 调用 rgctx 初始化入口；该原生
+            // 地址可能暂时绑定为当前托管实例方法。运行时元数据闭包必须保留给后续保护段
+            // 删除器，禁止恢复器把它改写成入口 this 并抹掉原始载体证据。
+            if (LocalVariables.ContainsRuntimeMetadataCarrier(receiver, uniqueDefinitions))
                 continue;
 
             // 已经可赋值的接收者保留原身份；只有原生寄存器值与托管签名矛盾时才恢复入口this。

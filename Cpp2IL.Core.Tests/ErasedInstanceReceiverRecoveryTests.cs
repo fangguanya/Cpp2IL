@@ -118,6 +118,68 @@ public class ErasedInstanceReceiverRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 隐藏MethodInfo伪递归调用保持元数据接收者()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "GenericTarget", app.SystemTypes.SystemVoidType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local(
+            "methodInfo",
+            new RuntimeMethodInfoAnalysisContext(target, owner.DeclaringAssembly),
+            4);
+        var call = new Instruction(0, OpCode.CallVoid, target, receiver);
+        Prepare(caller, call, receiver);
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.Operands[1], Is.SameAs(receiver));
+            Assert.That(caller.ParameterLocals, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void MethodInfo经两级Move进入调用时仍保持原载体()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "GenericTarget", app.SystemTypes.SystemVoidType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var methodInfo = Local(
+            "methodInfo",
+            new RuntimeMethodInfoAnalysisContext(target, owner.DeclaringAssembly),
+            1);
+        var saved = Local("savedMethodInfo", app.SystemTypes.SystemIntPtrType, 2);
+        var receiver = Local("callReceiver", app.SystemTypes.SystemIntPtrType, 3);
+        var save = new Instruction(0, OpCode.Move, saved, methodInfo);
+        var copy = new Instruction(1, OpCode.Move, receiver, saved);
+        var call = new Instruction(2, OpCode.CallVoid, target, receiver);
+        caller.ParameterOperands = [new Register(null, "X0")];
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            save,
+            copy,
+            call,
+            new Instruction(3, OpCode.Return),
+        ]);
+        caller.Locals = [methodInfo, saved, receiver];
+        caller.ParameterLocals = [];
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.Operands[1], Is.SameAs(receiver));
+            Assert.That(caller.ParameterLocals, Is.Empty);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 无关调用者类型保持错误证据而不改写()
     {

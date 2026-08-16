@@ -863,6 +863,114 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 隐藏MethodInfo复制载体拒绝伪递归接收者定型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var objectType = appContext.SystemTypes.SystemObjectType;
+        var target = new InjectedMethodAnalysisContext(
+            objectType,
+            "GenericTarget",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public,
+            []);
+        var methodInfo = new LocalVariable(
+            "methodInfo",
+            new Register(null, "X5"),
+            new RuntimeMethodInfoAnalysisContext(target, objectType.DeclaringAssembly));
+        var saved = new LocalVariable("savedMethodInfo", new Register(null, "X21"));
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [saved] = new Instruction(0, OpCode.Move, saved, methodInfo),
+        };
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverCopySources(
+            saved,
+            target,
+            definitions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(saved.Type, Is.Null);
+            Assert.That(methodInfo.Type, Is.TypeOf<RuntimeMethodInfoAnalysisContext>());
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 两级Move后的MethodInfo身份仍阻断实例接收者传播()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var objectType = appContext.SystemTypes.SystemObjectType;
+        var target = new InjectedMethodAnalysisContext(
+            objectType,
+            "GenericTarget",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public,
+            []);
+        var methodInfo = new LocalVariable(
+            "methodInfo",
+            new Register(null, "X5"),
+            new RuntimeMethodInfoAnalysisContext(target, objectType.DeclaringAssembly));
+        var saved = new LocalVariable("savedMethodInfo", new Register(null, "X21"));
+        var callReceiver = new LocalVariable("callReceiver", new Register(null, "X0", 1));
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [saved] = new Instruction(0, OpCode.Move, saved, methodInfo),
+            [callReceiver] = new Instruction(1, OpCode.Move, callReceiver, saved),
+        };
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverCopySources(
+            callReceiver,
+            target,
+            definitions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(callReceiver.Type, Is.Null);
+            Assert.That(saved.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi任一入边为运行时元数据时整个接收者闭包保持原类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var objectType = appContext.SystemTypes.SystemObjectType;
+        var target = new InjectedMethodAnalysisContext(
+            objectType,
+            "GenericTarget",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public,
+            []);
+        var methodInfo = new LocalVariable(
+            "methodInfo",
+            new Register(null, "X5"),
+            new RuntimeMethodInfoAnalysisContext(target, objectType.DeclaringAssembly));
+        var ordinary = new LocalVariable("ordinary", new Register(null, "X0", 1));
+        var receiver = new LocalVariable("receiver", new Register(null, "PHI", 1));
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [receiver] = new Instruction(0, OpCode.Phi, receiver, methodInfo, ordinary),
+        };
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverCopySources(
+            receiver,
+            target,
+            definitions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.Null);
+            Assert.That(ordinary.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 已闭合List调用目标闭合同定义开放接收者()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

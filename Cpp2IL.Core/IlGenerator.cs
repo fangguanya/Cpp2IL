@@ -391,7 +391,8 @@ public static class IlGenerator
 
             case OpCode.Unbox:
                 if (instruction.Operands is not
-                    [{ } unboxDestination, { } boxedObject, TypeAnalysisContext { IsValueType: true } unboxedType])
+                    [{ } unboxDestination, { } boxedObject, TypeAnalysisContext unboxedType]
+                    || !unboxedType.IsValueType && unboxedType is not GenericParameterTypeAnalysisContext)
                     throw new InvalidOperationException($"Unbox指令操作数不完整: {instruction}");
 
                 LoadOperand(boxedObject, method, locals, writeLine, stringCtor, context.AppContext.SystemTypes.SystemObjectType);

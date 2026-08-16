@@ -79,10 +79,18 @@ public static class MetadataInitGuardRemover
         var definitions = cfg.Instructions
             .Where(instruction => instruction.Destination is LocalVariable)
             .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+        var blockDepths = ComputeBlockDepths(cfg);
         var removedAny = false;
 
-        foreach (var guard in cfg.Blocks.ToList())
+        // 泛型方法常把“初始化运行时元数据”和“初始化当前 MethodInfo::rgctx_data”嵌套。
+        // 深层守卫先折叠后，外层区域才只剩唯一初始化调用；深度目录只计算一次，避免重复扫描CFG。
+        foreach (var guard in cfg.Blocks
+                     .OrderByDescending(block => blockDepths.GetValueOrDefault(block, -1))
+                     .ThenByDescending(block => block.ID)
+                     .ToList())
         {
+            if (!cfg.Blocks.Contains(guard))
+                continue;
             if (!TryGetMethodRgctxGuardCarrier(method, guard, methodRgctxOffset, definitions, out var guardCarrier))
                 continue;
 
@@ -94,6 +102,27 @@ public static class MetadataInitGuardRemover
         }
 
         return removedAny;
+    }
+
+    private static IReadOnlyDictionary<Block, int> ComputeBlockDepths(ISILControlFlowGraph cfg)
+    {
+        var depths = new Dictionary<Block, int> { [cfg.EntryBlock] = 0 };
+        var queue = new Queue<Block>();
+        queue.Enqueue(cfg.EntryBlock);
+        while (queue.Count > 0)
+        {
+            var block = queue.Dequeue();
+            var successorDepth = depths[block] + 1;
+            foreach (var successor in block.Successors)
+            {
+                if (depths.ContainsKey(successor))
+                    continue;
+                depths.Add(successor, successorDepth);
+                queue.Enqueue(successor);
+            }
+        }
+
+        return depths;
     }
 
     private static bool TryGetMethodRgctxGuardCarrier(
@@ -111,7 +140,14 @@ public static class MetadataInitGuardRemover
                 OpCode: OpCode.ConditionalJump,
                 Operands: [Block _, LocalVariable condition]
             })
+        {
+            if (guard.Instructions.LastOrDefault()?.OpCode == OpCode.ConditionalJump)
+                Logger.VerboseNewline(
+                    $"方法 rgctx 守卫跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                    $"blockType={guard.BlockType}，successors={guard.Successors.Count}，reason=控制流形态不匹配",
+                    nameof(MetadataInitGuardRemover));
             return false;
+        }
 
         var conditionDefinitions = GuardPrefixBlocks(guard)
             .SelectMany(block => block.Instructions)
@@ -125,7 +161,13 @@ public static class MetadataInitGuardRemover
                     Operands: [LocalVariable _, { } left, { } right]
                 }
             ])
+        {
+            Logger.VerboseNewline(
+                $"方法 rgctx 守卫跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                $"conditionDefinitions={conditionDefinitions.Length}，reason=条件定义不唯一",
+                nameof(MetadataInitGuardRemover));
             return false;
+        }
 
         var testedOperand = IsZero(right) ? left : IsZero(left) ? right : null;
         if (testedOperand == null)
@@ -138,10 +180,31 @@ public static class MetadataInitGuardRemover
                 Scale: 0,
                 Addend: var addend
             }
-            || addend != methodRgctxOffset
-            || ResolveRuntimeMethodInfo(methodInfo, definitions) is not { } represented
-            || !SameMethod(represented.RepresentedMethod, method))
+            || addend != methodRgctxOffset)
+        {
+            Logger.VerboseNewline(
+                $"方法 rgctx 守卫跳过：method={method.FullName}，guard=b{guard.ID}，reason=槽地址形态不匹配",
+                nameof(MetadataInitGuardRemover));
             return false;
+        }
+
+        if (ResolveRuntimeMethodInfo(methodInfo, definitions) is not { } represented)
+        {
+            Logger.VerboseNewline(
+                $"方法 rgctx 守卫跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                $"carrier={methodInfo}，type={methodInfo.Type?.FullName ?? "<未定型>"}，reason=载体不是MethodInfo",
+                nameof(MetadataInitGuardRemover));
+            return false;
+        }
+
+        if (!SameMethod(represented.RepresentedMethod, method))
+        {
+            Logger.VerboseNewline(
+                $"方法 rgctx 守卫跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                $"represented={represented.RepresentedMethod.FullName}，reason=方法身份不一致",
+                nameof(MetadataInitGuardRemover));
+            return false;
+        }
 
         carrier = methodInfo;
         return true;
@@ -187,7 +250,12 @@ public static class MetadataInitGuardRemover
     {
         region = [];
         if (initEntry == merge || initEntry == guard)
+        {
+            Logger.VerboseNewline(
+                $"方法 rgctx 初始化区域跳过：method={method.FullName}，guard=b{guard.ID}，reason=入口与合流重叠",
+                nameof(MetadataInitGuardRemover));
             return false;
+        }
 
         var initCallCount = 0;
         var reconverges = false;
@@ -204,7 +272,13 @@ public static class MetadataInitGuardRemover
             }
 
             if (block == cfg.EntryBlock || block == cfg.ExitBlock || block == guard || !region.Add(block))
+            {
+                Logger.VerboseNewline(
+                    $"方法 rgctx 初始化区域跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                    $"block=b{block.ID}，reason=区域触及边界或重复进入",
+                    nameof(MetadataInitGuardRemover));
                 return false;
+            }
 
             foreach (var instruction in block.Instructions)
             {
@@ -218,7 +292,13 @@ public static class MetadataInitGuardRemover
 
                 if (!IsMethodRgctxInitCall(method, instruction, guardCarrier, definitions)
                     || ++initCallCount != 1)
+                {
+                    Logger.VerboseNewline(
+                        $"方法 rgctx 初始化区域跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                        $"instruction={instruction}，count={initCallCount}，reason=副作用调用不匹配",
+                        nameof(MetadataInitGuardRemover));
                     return false;
+                }
             }
 
             foreach (var successor in block.Successors)
@@ -226,12 +306,23 @@ public static class MetadataInitGuardRemover
         }
 
         if (!reconverges || initCallCount != 1)
+        {
+            Logger.VerboseNewline(
+                $"方法 rgctx 初始化区域跳过：method={method.FullName}，guard=b{guard.ID}，" +
+                $"reconverges={reconverges}，count={initCallCount}，reason=区域未唯一合流",
+                nameof(MetadataInitGuardRemover));
             return false;
+        }
 
         var collected = region;
-        return collected.All(block =>
+        var closed = collected.All(block =>
             block.Predecessors.All(predecessor => predecessor == guard || collected.Contains(predecessor))
             && block.Successors.All(successor => successor == merge || collected.Contains(successor)));
+        if (!closed)
+            Logger.VerboseNewline(
+                $"方法 rgctx 初始化区域跳过：method={method.FullName}，guard=b{guard.ID}，reason=区域存在外部边",
+                nameof(MetadataInitGuardRemover));
+        return closed;
     }
 
     private static bool IsMethodRgctxInitCall(
@@ -240,8 +331,19 @@ public static class MetadataInitGuardRemover
         LocalVariable guardCarrier,
         ILookup<LocalVariable, Instruction> definitions)
     {
-        if (!instruction.IsCall
-            || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
+        if (!instruction.IsCall)
+            return false;
+
+        // 当前 MethodInfo::rgctx_data 的精确零值守卫已经由调用方证明；该分支内唯一的
+        // 运行时元数据初始化入口就是新版 IL2CPP 的正常形态。它不携带 MethodInfo 实参，
+        // 因而不能套用下方“伪递归调用载体同源”规则，但同名调用若脱离该守卫仍不会命中。
+        if (instruction.Operands.FirstOrDefault() is StringLiteral
+            {
+                Value: InitializeRuntimeMetadata
+            })
+            return true;
+
+        if (instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
             || !SameMethod(called, method)
             || instruction.Sources.FirstOrDefault() is not LocalVariable callCarrier
             || ResolveRuntimeMethodInfo(callCarrier, definitions) is not { } represented

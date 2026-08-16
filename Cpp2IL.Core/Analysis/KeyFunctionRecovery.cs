@@ -105,11 +105,12 @@ public static class KeyFunctionRecovery
             .SelectMany(block => block.Instructions)
             .ToList();
         var valueFlow = UnboxValueFlowIndex.Create(instructions);
+        var definitions = BuildUniqueDefinitions(instructions);
         foreach (var instruction in instructions)
         {
             if (instruction.Operands is [StringLiteral { Value: var keyFunction }, ..]
                 && ObjectUnboxFunctions.Contains(keyFunction))
-                RewriteObjectUnbox(method, instruction, instructions, valueFlow);
+                RewriteObjectUnbox(method, instruction, instructions, valueFlow, definitions);
         }
     }
 
@@ -121,14 +122,46 @@ public static class KeyFunctionRecovery
         MethodAnalysisContext method,
         Instruction instruction,
         IReadOnlyList<Instruction> instructions,
-        UnboxValueFlowIndex valueFlow)
+        UnboxValueFlowIndex valueFlow,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
     {
         if (instruction is not
             {
                 OpCode: OpCode.Call,
-                Operands: [StringLiteral, LocalVariable result, IOperand source, ..],
+                Operands: [StringLiteral, LocalVariable result, ..],
             })
             return;
+
+        // ARM64 调用分析会保留调用点仍活跃的物理寄存器，Object::Unbox 的真实对象
+        // 因而不保证紧邻返回局部。只接受唯一的 System.Object 值或其 ref/out 栈槽地址。
+        var source = ResolveUnboxSource(instruction.Operands.Skip(2));
+        if (source == null)
+        {
+            Logger.VerboseNewline(
+                $"Object::Unbox拒绝：method={method.Definition?.Name}，call={instruction.Index}，reason=对象源不唯一",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+
+        // 共享泛型方法的 T 在静态元数据中不带值类型约束，但原生 Object::Unbox 调用、
+        // Il2CppClass<T> 与托管消费者 T 三者一致时，CIL 的 unbox.any !!T 对值/引用实例均精确。
+        var runtimeTypes = new List<TypeAnalysisContext>();
+        foreach (var operand in instruction.Operands.Skip(2))
+        {
+            var runtimeType = ResolveUnboxRuntimeClassType(operand, definitions);
+            if (runtimeType != null
+                && runtimeTypes.All(existing => !GenericCallRebinder.TypesEquivalent(existing, runtimeType)))
+                runtimeTypes.Add(runtimeType);
+        }
+        if (runtimeTypes.Count > 1)
+        {
+            Logger.VerboseNewline(
+                $"Object::Unbox拒绝：method={method.Definition?.Name}，call={instruction.Index}，" +
+                $"runtimeTypes={string.Join(",", runtimeTypes.Select(type => type.FullName))}，reason=运行时类冲突",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+        var runtimeUnboxedType = runtimeTypes.SingleOrDefault();
 
         // ARM64 常先把返回地址从 X0 搬入保存寄存器，再于后续块解引用。先闭合只含
         // LocalVariable->LocalVariable 的 SSA Move 载体；其他算术、Phi 或带偏移地址仍拒绝。
@@ -178,13 +211,17 @@ public static class KeyFunctionRecovery
                     && carriers.FirstOrDefault(carrier => SameSsaLocal(carrier, memoryBase)) is { } valueCarrier)
                 {
                     consumers.Add((candidate, operandIndex, valueCarrier));
-                    var candidateType = ResolveManagedConsumerType(candidate, operandIndex, valueFlow);
+                    var candidateType = ResolveManagedConsumerType(
+                        candidate,
+                        operandIndex,
+                        valueFlow,
+                        runtimeUnboxedType);
                     Logger.VerboseNewline(
                         $"Object::Unbox消费者：method={method.Definition?.Name}，call={instruction.Index}，consumer={candidate.Index}，operand={operandIndex}，type={candidateType?.FullName ?? "<未解析>"}，valueType={candidateType?.IsValueType.ToString() ?? "<未解析>"}",
                         nameof(KeyFunctionRecovery));
                     if (candidateType == null)
                         continue;
-                    if (!candidateType.IsValueType
+                    if (!IsRecoverableUnboxType(candidateType, runtimeUnboxedType)
                         || unboxedType != null
                         && !GenericCallRebinder.TypesEquivalent(unboxedType, candidateType))
                         return;
@@ -203,7 +240,9 @@ public static class KeyFunctionRecovery
             }
         }
 
-        if (consumers.Count == 0 || unboxedType is not { IsValueType: true })
+        if (consumers.Count == 0
+            || unboxedType == null
+            || !IsRecoverableUnboxType(unboxedType, runtimeUnboxedType))
         {
             Logger.VerboseNewline(
                 $"Object::Unbox拒绝：method={method.Definition?.Name}，call={instruction.Index}，consumers={consumers.Count}，type={unboxedType?.FullName ?? "<未解析>"}，reason=缺少唯一值类型证据",
@@ -226,6 +265,215 @@ public static class KeyFunctionRecovery
                 PropagateRecoveredUnboxType(destination, unboxedType, valueFlow, []);
             }
         }
+
+        if (unboxedType is GenericParameterTypeAnalysisContext)
+            RemoveRedundantGenericUnboxGuard(method, instruction, unboxedType, definitions);
+    }
+
+    /// <summary>
+    /// IL2CPP 在共享泛型拆箱前内联比较 object 类与 Il2CppClass&lt;T&gt;，失败时抛出
+    /// InvalidCastException。恢复成 unbox.any !!T 后该 CIL 已完整承载同一检查与异常语义，
+    /// 因此仅在“类身份比较 + 单一异常闭包 + 成功块以该 Unbox 开始”同时成立时折叠原生守卫。
+    /// </summary>
+    private static void RemoveRedundantGenericUnboxGuard(
+        MethodAnalysisContext method,
+        Instruction unbox,
+        TypeAnalysisContext unboxedType,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var cfg = method.ControlFlowGraph!;
+        var methodLogName = method.Definition?.Name ?? "<注入方法>";
+        var success = cfg.Blocks.SingleOrDefault(block => block.Instructions.Contains(unbox));
+        if (success?.Predecessors is not [{ } guard])
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，reason=成功块前驱不唯一",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+        if (guard.Successors.Count != 2 || !guard.Successors.Contains(success))
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，guard=b{guard.ID}，reason=守卫后继不匹配",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+        if (guard.Instructions.LastOrDefault() is not
+            {
+                OpCode: OpCode.ConditionalJump,
+                Operands: [Block _, LocalVariable condition]
+            })
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，guard=b{guard.ID}，reason=条件跳转不匹配",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+        if (!definitions.TryGetValue(condition, out var conditionDefinition))
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，guard=b{guard.ID}，reason=条件定义不唯一",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+
+        var equality = conditionDefinition;
+        if (conditionDefinition is { OpCode: OpCode.Not, Operands: [_, LocalVariable inner] }
+            && definitions.TryGetValue(inner, out var innerDefinition))
+            equality = innerDefinition;
+        if (equality is not { OpCode: OpCode.CheckEqual, Operands.Count: 3 })
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，guard=b{guard.ID}，reason=相等比较不匹配",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+        var resolvedLeft = ResolveUniqueMoveSource(equality.Operands[1], definitions);
+        var resolvedRight = ResolveUniqueMoveSource(equality.Operands[2], definitions);
+        if (resolvedLeft is not MemoryOperand left
+            || resolvedRight is not MemoryOperand right
+            || !TryGetComparedRuntimeClass(left, out var leftType)
+            || !TryGetComparedRuntimeClass(right, out var rightType)
+            || !IsObjectAndGenericPair(leftType, rightType, unboxedType))
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，guard=b{guard.ID}，reason=类身份比较不匹配",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+
+        var failure = guard.Successors.Single(block => !ReferenceEquals(block, success));
+        if (!IsInvalidCastFailureRegion(failure))
+        {
+            Logger.VerboseNewline(
+                $"泛型拆箱类型守卫跳过：method={methodLogName}，guard=b{guard.ID}，reason=异常闭包不匹配",
+                nameof(KeyFunctionRecovery));
+            return;
+        }
+
+        guard.Successors.Remove(failure);
+        failure.Predecessors.Remove(guard);
+        var terminator = guard.Instructions[^1];
+        terminator.OpCode = OpCode.Jump;
+        terminator.SetOperands(success);
+        guard.CalculateBlockType();
+        cfg.RemoveUnreachableBlocks();
+        DeadCodeEliminator.Run(method);
+        Logger.VerboseNewline(
+            $"泛型拆箱类型守卫删除：method={methodLogName}，guard=b{guard.ID}，type={unboxedType.FullName}",
+            nameof(KeyFunctionRecovery));
+    }
+
+    private static IOperand ResolveUniqueMoveSource(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (operand is LocalVariable local
+               && visited.Add(local)
+               && definitions.TryGetValue(local, out var definition)
+               && definition is { OpCode: OpCode.Move, Operands: [_, { } source] })
+            operand = source;
+        return operand;
+    }
+
+    private static bool TryGetComparedRuntimeClass(
+        MemoryOperand operand,
+        out TypeAnalysisContext representedType)
+    {
+        representedType = null!;
+        if (operand is not
+            {
+                Base: LocalVariable
+                {
+                    Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented }
+                },
+                Index: null,
+                Scale: 0,
+                Addend: 0x40
+            })
+            return false;
+        representedType = represented;
+        return true;
+    }
+
+    private static bool IsObjectAndGenericPair(
+        TypeAnalysisContext left,
+        TypeAnalysisContext right,
+        TypeAnalysisContext genericType)
+        => left.FullName == "System.Object"
+           && GenericCallRebinder.TypesEquivalent(right, genericType)
+           || right.FullName == "System.Object"
+           && GenericCallRebinder.TypesEquivalent(left, genericType);
+
+    private static bool IsInvalidCastFailureRegion(Block entry)
+    {
+        var visited = new HashSet<Block>();
+        var current = entry;
+        while (visited.Add(current))
+        {
+            var throws = current.Instructions.Where(instruction => instruction.OpCode == OpCode.Throw).ToList();
+            if (throws.Count == 1
+                && throws[0].Operands is [TypeAnalysisContext { FullName: "System.InvalidCastException" }]
+                && current.Instructions.All(instruction =>
+                    instruction.OpCode is OpCode.Nop or OpCode.Phi or OpCode.Throw or OpCode.Return))
+                return true;
+            if (current.Successors.Count != 1
+                || current.Instructions.Any(instruction =>
+                    instruction.OpCode is not (OpCode.Nop or OpCode.Phi or OpCode.Jump)))
+                return false;
+            current = current.Successors.Single();
+        }
+
+        return false;
+    }
+
+    private static IOperand? ResolveUnboxSource(IEnumerable<IOperand> operands)
+    {
+        var candidates = new List<IOperand>();
+        foreach (var operand in operands)
+        {
+            var candidate = operand switch
+            {
+                LocalVariable { Type: { } type } local
+                    when type.FullName == "System.Object" => local,
+                AddressOf { Target: LocalVariable { Type: { } type } slot }
+                    when type.FullName == "System.Object" => slot,
+                _ => null,
+            };
+            if (candidate != null && !candidates.Contains(candidate))
+                candidates.Add(candidate);
+        }
+
+        return candidates.Count == 1 ? candidates[0] : null;
+    }
+
+    private static TypeAnalysisContext? ResolveUnboxRuntimeClassType(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (operand is LocalVariable local && visited.Add(local))
+        {
+            if (local.Type is RuntimeClassTypeAnalysisContext runtimeClass)
+                return runtimeClass.RepresentedType;
+            if (!definitions.TryGetValue(local, out var definition)
+                || definition is not { OpCode: OpCode.Move, Operands: [_, { } source] })
+                return null;
+            operand = source;
+        }
+
+        return operand is RuntimeClassTypeAnalysisContext direct ? direct.RepresentedType : null;
+    }
+
+    private static bool IsRecoverableUnboxType(
+        TypeAnalysisContext candidate,
+        TypeAnalysisContext? runtimeType)
+    {
+        if (runtimeType != null && !GenericCallRebinder.TypesEquivalent(candidate, runtimeType))
+            return false;
+        return candidate.IsValueType
+               || candidate is GenericParameterTypeAnalysisContext && runtimeType != null;
     }
 
     /// <summary>
@@ -234,7 +482,8 @@ public static class KeyFunctionRecovery
     private static TypeAnalysisContext? ResolveManagedConsumerType(
         Instruction consumer,
         int operandIndex,
-        UnboxValueFlowIndex valueFlow)
+        UnboxValueFlowIndex valueFlow,
+        TypeAnalysisContext? runtimeUnboxedType)
     {
         if (consumer.IsCall && consumer.Operands[0] is MethodAnalysisContext called)
         {
@@ -248,7 +497,8 @@ public static class KeyFunctionRecovery
 
         if (consumer is { OpCode: OpCode.Move, Operands: [LocalVariable destination, _] }
             && operandIndex == 1)
-            return destination.Type ?? ResolveUniqueValueConsumerType(destination, valueFlow, []);
+            return destination.Type
+                   ?? ResolveUniqueValueConsumerType(destination, valueFlow, [], runtimeUnboxedType);
         if (consumer is { OpCode: OpCode.Move, Operands: [FieldReference field, _] }
             && operandIndex == 1)
             return field.Field.FieldType;
@@ -263,7 +513,8 @@ public static class KeyFunctionRecovery
     private static TypeAnalysisContext? ResolveUniqueValueConsumerType(
         LocalVariable value,
         UnboxValueFlowIndex valueFlow,
-        List<LocalVariable> path)
+        List<LocalVariable> path,
+        TypeAnalysisContext? runtimeUnboxedType)
     {
         if (path.Any(visited => SameSsaLocal(visited, value)))
             return null;
@@ -275,7 +526,12 @@ public static class KeyFunctionRecovery
             TypeAnalysisContext? candidateType = null;
             if (candidate is { OpCode: OpCode.Move, Operands: [LocalVariable moveDestination, LocalVariable moveSource] }
                 && SameSsaLocal(moveSource, value))
-                candidateType = moveDestination.Type ?? ResolveUniqueValueConsumerType(moveDestination, valueFlow, path);
+                candidateType = moveDestination.Type
+                                ?? ResolveUniqueValueConsumerType(
+                                    moveDestination,
+                                    valueFlow,
+                                    path,
+                                    runtimeUnboxedType);
             else if (candidate is { OpCode: OpCode.Move, Operands: [FieldReference field, LocalVariable fieldSource] }
                      && SameSsaLocal(fieldSource, value))
                 candidateType = field.Field.FieldType;
@@ -285,12 +541,20 @@ public static class KeyFunctionRecovery
                      && candidate.Operands is [LocalVariable arithmeticDestination, { } leftOperand, { } rightOperand]
                      && (ReferencesLocal(leftOperand, value) || ReferencesLocal(rightOperand, value)))
                 candidateType = arithmeticDestination.Type
-                                ?? ResolveUniqueValueConsumerType(arithmeticDestination, valueFlow, path);
+                                ?? ResolveUniqueValueConsumerType(
+                                    arithmeticDestination,
+                                    valueFlow,
+                                    path,
+                                    runtimeUnboxedType);
             else if (candidate is { OpCode: OpCode.Phi, Operands: [LocalVariable phiDestination, ..] }
                      && candidate.Operands.Skip(1).Any(input => ReferencesLocal(input, value)))
             {
                 candidateType = phiDestination.Type
-                                ?? ResolveUniqueValueConsumerType(phiDestination, valueFlow, path);
+                                ?? ResolveUniqueValueConsumerType(
+                                    phiDestination,
+                                    valueFlow,
+                                    path,
+                                    runtimeUnboxedType);
                 if (candidateType != null
                     && candidate.Operands.Skip(1).Any(input =>
                         !ReferencesLocal(input, value)
@@ -317,7 +581,7 @@ public static class KeyFunctionRecovery
             if (candidateType == null)
                 continue;
 
-            if (!candidateType.IsValueType)
+            if (!IsRecoverableUnboxType(candidateType, runtimeUnboxedType))
             {
                 path.RemoveAt(path.Count - 1);
                 return null;

@@ -71,6 +71,81 @@ public class MetadataInitGuardRemoverTests
 
     [Test]
     [Category("基本功能")]
+    public void 当前MethodInfo守卫内的运行时元数据初始化入口被删除()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            namedRuntimeMetadataCall: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.True);
+        Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 保存寄存器MethodInfo守卫内的运行时元数据初始化入口仍被删除()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: true,
+            ordinaryRecursiveCall: false,
+            namedRuntimeMetadataCall: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.True);
+        Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 嵌套MethodInfo守卫按内层到外层一次性完整删除()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: true,
+            ordinaryRecursiveCall: false,
+            namedRuntimeMetadataCall: true,
+            nestedPseudoGuard: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.True);
+        Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+        Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通数据零值守卫不得借同名初始化入口删除业务分支()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            namedRuntimeMetadataCall: true,
+            useOrdinaryGuardCarrier: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.False);
+        Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void ProvenMetadataGuardDropsConstantFlagTest()
     {
         var test = CreateFlagTest(0x05E7411F, 1);
@@ -236,7 +311,10 @@ public class MetadataInitGuardRemoverTests
 
     private static MethodRgctxGuardFixture CreateMethodRgctxGuard(
         bool useSavedCarrier,
-        bool ordinaryRecursiveCall)
+        bool ordinaryRecursiveCall,
+        bool namedRuntimeMetadataCall = false,
+        bool useOrdinaryGuardCarrier = false,
+        bool nestedPseudoGuard = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var objectType = app.SystemTypes.SystemObjectType;
@@ -259,6 +337,10 @@ public class MetadataInitGuardRemoverTests
             ? new LocalVariable("callMethodInfo", new Register(null, "X0", 2), app.SystemTypes.SystemIntPtrType)
             : carrier;
         var receiver = new LocalVariable("receiver", new Register(null, "X0"), objectType);
+        var ordinaryGuardCarrier = new LocalVariable(
+            "ordinaryGuardCarrier",
+            new Register(null, "X9"),
+            app.SystemTypes.SystemIntPtrType);
         var condition = new LocalVariable("condition", new Register(null, "COND"), booleanType);
         var callResult = new LocalVariable("initResult", new Register(null, "X0", 1), booleanType);
 
@@ -266,6 +348,7 @@ public class MetadataInitGuardRemoverTests
         var guard = new Block { ID = 2 };
         var init = new Block { ID = 3 };
         var merge = new Block { ID = 4 };
+        var nestedInit = new Block { ID = 5 };
 
         if (useSavedCarrier)
             graph.EntryBlock.Instructions.Add(new Instruction(0, OpCode.Move, savedMethodInfo, methodInfo));
@@ -273,29 +356,74 @@ public class MetadataInitGuardRemoverTests
             1,
             OpCode.CheckNotEqual,
             condition,
-            new MemoryOperand(baseRegister: carrier, addend: 0x38),
+            new MemoryOperand(
+                baseRegister: useOrdinaryGuardCarrier ? ordinaryGuardCarrier : carrier,
+                addend: 0x38),
             new Immediate(0)));
         guard.Instructions.Add(new Instruction(2, OpCode.ConditionalJump, merge, condition));
         if (useSavedCarrier)
             init.Instructions.Add(new Instruction(3, OpCode.Move, callCarrier, carrier));
-        init.Instructions.Add(new Instruction(
-            4,
-            OpCode.Call,
-            concreteCallTarget,
-            callResult,
-            ordinaryRecursiveCall ? receiver : callCarrier));
-        init.Instructions.Add(new Instruction(5, OpCode.Jump, merge));
+        init.Instructions.Add(namedRuntimeMetadataCall
+            ? new Instruction(
+                4,
+                OpCode.Call,
+                new StringLiteral("il2cpp_codegen_initialize_runtime_metadata"),
+                callResult,
+                new MemoryOperand(addend: 0x1000))
+            : new Instruction(
+                4,
+                OpCode.Call,
+                concreteCallTarget,
+                callResult,
+                ordinaryRecursiveCall ? receiver : callCarrier));
+        if (nestedPseudoGuard)
+        {
+            var nestedCondition = new LocalVariable(
+                "nestedCondition",
+                new Register(null, "NESTED_COND"),
+                booleanType);
+            init.Instructions.Add(new Instruction(
+                5,
+                OpCode.CheckNotEqual,
+                nestedCondition,
+                new MemoryOperand(baseRegister: carrier, addend: 0x38),
+                new Immediate(0)));
+            init.Instructions.Add(new Instruction(6, OpCode.ConditionalJump, merge, nestedCondition));
+            nestedInit.Instructions.Add(new Instruction(
+                7,
+                OpCode.Call,
+                concreteCallTarget,
+                callResult,
+                callCarrier));
+            nestedInit.Instructions.Add(new Instruction(8, OpCode.Jump, merge));
+        }
+        else
+        {
+            init.Instructions.Add(new Instruction(5, OpCode.Jump, merge));
+        }
         merge.Instructions.Add(new Instruction(6, OpCode.Return, new Immediate(1)));
 
         Connect(graph.EntryBlock, guard);
         Connect(guard, init);
         Connect(guard, merge);
-        Connect(init, merge);
+        if (nestedPseudoGuard)
+        {
+            Connect(init, nestedInit);
+            Connect(init, merge);
+            Connect(nestedInit, merge);
+        }
+        else
+        {
+            Connect(init, merge);
+        }
         Connect(merge, graph.ExitBlock);
         guard.CalculateBlockType();
         init.CalculateBlockType();
         merge.CalculateBlockType();
-        graph.Blocks = [graph.EntryBlock, graph.ExitBlock, guard, init, merge];
+        nestedInit.CalculateBlockType();
+        graph.Blocks = nestedPseudoGuard
+            ? [graph.EntryBlock, graph.ExitBlock, guard, init, nestedInit, merge]
+            : [graph.EntryBlock, graph.ExitBlock, guard, init, merge];
         method.ControlFlowGraph = graph;
 
         return new MethodRgctxGuardFixture(method, graph, guard, init, merge);

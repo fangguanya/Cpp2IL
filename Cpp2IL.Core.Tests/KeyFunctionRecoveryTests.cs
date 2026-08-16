@@ -5,6 +5,7 @@ using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -459,6 +460,119 @@ public class KeyFunctionRecoveryTests
             Assert.That(call.Operands, Is.EqualTo(new IOperand[] { result, source, testedType }));
             Assert.That(result.Type, Is.SameAs(testedType));
         }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 泛型运行时类与托管消费者共同恢复出参槽拆箱()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var genericType = CreateGenericMethodParameter("T");
+        var sourceSlot = Local("sourceSlot", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var runtimeClass = Local(
+            "runtimeClass",
+            new RuntimeClassTypeAnalysisContext(genericType, app.SystemTypes.SystemObjectType.DeclaringAssembly));
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_unbox"),
+            resultAddress,
+            new Immediate(0),
+            runtimeClass,
+            new AddressOf(sourceSlot),
+            Local("staleMethodInfo", app.SystemTypes.SystemIntPtrType));
+        var consumer = new Instruction(
+            1,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(genericType),
+            new MemoryOperand(resultAddress));
+        var method = CreateMethod(unbox, consumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(unbox.Operands[1], Is.SameAs(sourceSlot));
+            Assert.That(unbox.Operands[2], Is.SameAs(genericType));
+            Assert.That(consumer.Operands[1], Is.SameAs(resultAddress));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 泛型运行时类经唯一Move且拆箱地址经保存寄存器仍可恢复()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var genericType = CreateGenericMethodParameter("T");
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var runtimeClass = Local(
+            "runtimeClass",
+            new RuntimeClassTypeAnalysisContext(genericType, app.SystemTypes.SystemObjectType.DeclaringAssembly));
+        var savedRuntimeClass = Local("savedRuntimeClass", app.SystemTypes.SystemIntPtrType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var savedResultAddress = Local("savedResultAddress", app.SystemTypes.SystemIntPtrType);
+        var unboxedValue = Local("unboxedValue", null);
+        var saveRuntimeClass = new Instruction(0, OpCode.Move, savedRuntimeClass, runtimeClass);
+        var unbox = new Instruction(
+            1,
+            OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_unbox"),
+            resultAddress,
+            source,
+            savedRuntimeClass);
+        var saveResult = new Instruction(2, OpCode.Move, savedResultAddress, resultAddress);
+        var readValue = new Instruction(3, OpCode.Move, unboxedValue, new MemoryOperand(savedResultAddress));
+        var consumer = new Instruction(
+            4,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(genericType),
+            unboxedValue);
+        var method = CreateMethod(saveRuntimeClass, unbox, saveResult, readValue, consumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Unbox));
+            Assert.That(savedResultAddress.Type, Is.SameAs(genericType));
+            Assert.That(readValue.Operands[1], Is.SameAs(savedResultAddress));
+            Assert.That(unboxedValue.Type, Is.SameAs(genericType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 泛型消费者与运行时类冲突时保持原生拆箱调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var genericType = CreateGenericMethodParameter("T");
+        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var resultAddress = Local("resultAddress", app.SystemTypes.SystemIntPtrType);
+        var runtimeClass = Local(
+            "runtimeClass",
+            new RuntimeClassTypeAnalysisContext(
+                app.SystemTypes.SystemInt32Type,
+                app.SystemTypes.SystemObjectType.DeclaringAssembly));
+        var unbox = new Instruction(
+            0,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_object_unbox"),
+            resultAddress,
+            source,
+            runtimeClass);
+        var consumer = new Instruction(
+            1,
+            OpCode.CallVoid,
+            CreateStaticValueConsumer(genericType),
+            new MemoryOperand(resultAddress));
+        var method = CreateMethod(unbox, consumer);
+
+        KeyFunctionRecovery.RewriteUnboxing(method);
+
+        Assert.That(unbox.OpCode, Is.EqualTo(OpCode.Call));
+        Assert.That(consumer.Operands[1], Is.TypeOf<MemoryOperand>());
     }
 
     [Test]
@@ -1348,6 +1462,23 @@ public class KeyFunctionRecoveryTests
             app.SystemTypes.SystemVoidType,
             System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static,
             [parameterType]);
+    }
+
+    private static GenericParameterTypeAnalysisContext CreateGenericMethodParameter(string name)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "GenericOwner",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static,
+            []);
+        return new GenericParameterTypeAnalysisContext(
+            name,
+            0,
+            Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+            System.Reflection.GenericParameterAttributes.None,
+            owner);
     }
 
     private static MethodAnalysisContext CreateMethod(params Instruction[] instructions)
