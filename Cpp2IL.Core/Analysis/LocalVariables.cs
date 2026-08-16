@@ -1375,7 +1375,7 @@ public static class LocalVariables
 
         // 比较的一侧若已有精确标量类型，另一侧局部量必处于同一数值域；先恢复循环计数器等载体。
         foreach (var instruction in instructions)
-            changed |= BindFinalComparisonOperandTypes(instruction);
+            changed |= BindFinalComparisonOperandTypes(instruction, method.AppContext);
 
         // 原生目标寄存器位宽随后裁决算术结果；该顺序避免仅凭小立即数猜测32/64位。
         foreach (var instruction in instructions)
@@ -1384,32 +1384,89 @@ public static class LocalVariables
         return changed;
     }
 
-    internal static bool BindFinalComparisonOperandTypes(Instruction instruction)
+    /// <summary>
+    /// 数组、List 与字符串长度直到布局恢复阶段才会成为专用操作数，因此必须在这些恢复器之后
+    /// 单独回填与长度比较的归纳变量。这里不重复字段或算术推导，只消费刚生成的长度事实。
+    /// </summary>
+    public static bool ResolveRecoveredLengthComparisonCarrierTypes(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            changed |= BindRecoveredLengthComparisonOperandTypes(instruction, method.AppContext);
+        return changed;
+    }
+
+    internal static bool BindFinalComparisonOperandTypes(
+        Instruction instruction,
+        ApplicationAnalysisContext? appContext = null)
     {
         if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
             || instruction.Operands.Count != 3)
             return false;
 
-        var left = instruction.Operands[1] as LocalVariable;
-        var right = instruction.Operands[2] as LocalVariable;
-        if (left == null || right == null)
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
+        var leftScalar = FinalScalarOperandType(left, appContext);
+        var rightScalar = FinalScalarOperandType(right, appContext);
+        var changed = false;
+        if (left is LocalVariable leftLocal && rightScalar != null)
+            changed |= BindReplaceableComparisonCarrier(leftLocal, rightScalar);
+        if (right is LocalVariable rightLocal && leftScalar != null)
+            changed |= BindReplaceableComparisonCarrier(rightLocal, leftScalar);
+        return changed;
+    }
+
+    internal static bool BindRecoveredLengthComparisonOperandTypes(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
+            || instruction.Operands.Count != 3)
             return false;
 
-        var leftScalar = IsFinalScalarType(left.Type) ? left.Type : null;
-        var rightScalar = IsFinalScalarType(right.Type) ? right.Type : null;
-        if (leftScalar != null && right.Type == null)
-        {
-            right.Type = leftScalar;
-            return true;
-        }
-
-        if (rightScalar != null && left.Type == null)
-        {
-            left.Type = rightScalar;
-            return true;
-        }
-
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
+        if (left is LocalVariable leftLocal && IsRecoveredLengthOperand(right))
+            return BindReplaceableComparisonCarrier(leftLocal, appContext.SystemTypes.SystemInt32Type);
+        if (right is LocalVariable rightLocal && IsRecoveredLengthOperand(left))
+            return BindReplaceableComparisonCarrier(rightLocal, appContext.SystemTypes.SystemInt32Type);
         return false;
+    }
+
+    private static bool IsRecoveredLengthOperand(IOperand operand) =>
+        operand is ArrayLength or ListCount or StringLength;
+
+    /// <summary>
+    /// 字段、数组长度、List.Count 与字符串长度都携带托管层的精确标量类型。比较指令可直接消费
+    /// 这些操作数，因此循环归纳变量无需先经过一个额外 Move 才能获得类型。
+    /// </summary>
+    private static TypeAnalysisContext? FinalScalarOperandType(
+        IOperand operand,
+        ApplicationAnalysisContext? appContext)
+    {
+        var type = operand switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            ArrayLength or ListCount or StringLength when appContext != null =>
+                appContext.SystemTypes.SystemInt32Type,
+            _ => null,
+        };
+        return IsFinalScalarType(type) ? type : null;
+    }
+
+    /// <summary>
+    /// 精确比较操作数只替换尚未定型、object 或布尔 ABI 占位；另一数值域和普通托管引用保持不变。
+    /// </summary>
+    private static bool BindReplaceableComparisonCarrier(
+        LocalVariable local,
+        TypeAnalysisContext targetType)
+    {
+        if (IsFinalScalarType(local.Type)
+            || local.Type?.FullName is not (null or "System.Object" or "System.Boolean"))
+            return false;
+        return SetAuthoritativeNumericType(local, targetType);
     }
 
     internal static bool BindSizedIntegerOperationTypes(

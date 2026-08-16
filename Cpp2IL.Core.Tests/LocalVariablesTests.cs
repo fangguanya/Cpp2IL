@@ -2084,6 +2084,252 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 整型字段比较恢复对象占位循环计数器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X22", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var owner = new LocalVariable(
+            "owner",
+            new Register(null, "X23", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var field = new InjectedFieldAnalysisContext(
+            "CommonnessScore",
+            appContext.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public,
+            appContext.SystemTypes.SystemObjectType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckLess,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            counter,
+            new FieldReference(field, owner, 0x10));
+
+        var changed = LocalVariables.BindFinalComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 数组长度比较恢复反向操作数中的对象占位计数器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = new SzArrayTypeAnalysisContext(appContext.SystemTypes.SystemStringType);
+        var array = new LocalVariable("array", new Register(null, "X20", 1), arrayType);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X21", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckGreater,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            new ArrayLength(array),
+            counter);
+
+        var changed = LocalVariables.BindFinalComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 后期数组长度操作数恢复对象占位循环计数器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = new SzArrayTypeAnalysisContext(appContext.SystemTypes.SystemStringType);
+        var array = new LocalVariable("array", new Register(null, "X20", 1), arrayType);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X21", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckLess,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            counter,
+            new ArrayLength(array));
+
+        var changed = LocalVariables.BindRecoveredLengthComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 后期字符串长度操作数恢复反向对象占位循环计数器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var text = new LocalVariable(
+            "text",
+            new Register(null, "X20", 1),
+            appContext.SystemTypes.SystemStringType);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X21", 1),
+            appContext.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckGreater,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            new StringLength(text),
+            counter);
+
+        var changed = LocalVariables.BindRecoveredLengthComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 后期长度操作数不得覆盖普通托管引用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = new SzArrayTypeAnalysisContext(appContext.SystemTypes.SystemStringType);
+        var array = new LocalVariable("array", new Register(null, "X20", 1), arrayType);
+        var text = new LocalVariable(
+            "text",
+            new Register(null, "X21", 1),
+            appContext.SystemTypes.SystemStringType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckLess,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            text,
+            new ArrayLength(array));
+
+        var changed = LocalVariables.BindRecoveredLengthComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(text.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 单精度字段比较恢复对象占位浮点载体()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "V0", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var owner = new LocalVariable(
+            "owner",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var field = new InjectedFieldAnalysisContext(
+            "Threshold",
+            appContext.SystemTypes.SystemSingleType,
+            FieldAttributes.Public,
+            appContext.SystemTypes.SystemObjectType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckLessOrEqual,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            value,
+            new FieldReference(field, owner, 0x10));
+
+        var changed = LocalVariables.BindFinalComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(value.Type, Is.SameAs(appContext.SystemTypes.SystemSingleType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 整型字段比较不得覆盖普通字符串引用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var text = new LocalVariable(
+            "text",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemStringType);
+        var owner = new LocalVariable(
+            "owner",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var field = new InjectedFieldAnalysisContext(
+            "Limit",
+            appContext.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public,
+            appContext.SystemTypes.SystemObjectType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckEqual,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            text,
+            new FieldReference(field, owner, 0x10));
+
+        var changed = LocalVariables.BindFinalComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(text.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同精确数值域比较保持既有局部类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemInt64Type);
+        var owner = new LocalVariable(
+            "owner",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var field = new InjectedFieldAnalysisContext(
+            "Limit",
+            appContext.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public,
+            appContext.SystemTypes.SystemObjectType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckLess,
+            new LocalVariable("condition", new Register(null, "Z", 1)),
+            counter,
+            new FieldReference(field, owner, 0x10));
+
+        var changed = LocalVariables.BindFinalComparisonOperandTypes(comparison, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 带位宽的整数运算不得覆盖引用载体()
     {

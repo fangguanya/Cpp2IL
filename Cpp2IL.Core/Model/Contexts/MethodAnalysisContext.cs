@@ -518,6 +518,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ListClearRecovery.Run(this);
         ListCountRecovery.Run(this);
         StringLengthRecovery.Run(this);
+        // 中文注释：长度专用操作数刚在上方生成；此处只把长度的 Int32 事实回填到循环归纳变量，
+        // 不重复早期字段比较和原生位宽推导。
+        LocalVariables.ResolveRecoveredLengthComparisonCarrierTypes(this);
         EmptyArrayRecovery.Run(this);
         PropertyBackingFieldRecovery.Run(this);
 
