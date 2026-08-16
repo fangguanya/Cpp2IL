@@ -35,6 +35,39 @@ public class PropertyBackingFieldRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 嵌套调用接收者字段读取先物化为公开Getter()
+    {
+        var fixture = CreateFixture("<Value>k__BackingField", write: false);
+        var consumer = ((InjectedTypeAnalysisContext)fixture.Caller.DeclaringType!).InjectMethodContext(
+            "Consume",
+            fixture.Caller.AppContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            fixture.Value.Type!);
+        var call = new Instruction(1, OpCode.CallVoid, consumer, new FieldReference(
+            ((FieldReference)fixture.Access.Operands[1]).Field,
+            fixture.Receiver,
+            16));
+        fixture.Caller.ControlFlowGraph = new ISILControlFlowGraph([
+            call,
+            new Instruction(2, OpCode.Return),
+        ]);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+        var instructions = fixture.Caller.ControlFlowGraph.Instructions;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(instructions, Has.Count.EqualTo(3));
+            Assert.That(instructions[0].OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(instructions[0].Operands[0], Is.SameAs(fixture.Getter));
+            Assert.That(call.Operands[1], Is.SameAs(instructions[0].Operands[1]));
+            Assert.That(call.Operands.OfType<FieldReference>(), Is.Empty);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 小驼峰字段写入恢复为公开Setter()
     {

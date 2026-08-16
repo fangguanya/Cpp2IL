@@ -22,32 +22,70 @@ public static class PropertyBackingFieldRecovery
             return 0;
 
         var recovered = 0;
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        var temporaryIndex = 0;
+        foreach (var block in method.ControlFlowGraph.Blocks)
         {
-            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, FieldReference source] }
-                && TryResolveAccessor(method.DeclaringType, source.Field, read: true, out var getter))
+            for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
             {
-                instruction.OpCode = OpCode.Call;
-                instruction.SetOperands(source.Field.IsStatic
-                    ? [getter, destination]
-                    : [getter, destination, source.Local]);
-                recovered++;
-                continue;
-            }
+                var instruction = block.Instructions[instructionIndex];
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, FieldReference source] }
+                    && TryResolveAccessor(method.DeclaringType, source.Field, read: true, out var getter))
+                {
+                    instruction.OpCode = OpCode.Call;
+                    instruction.SetOperands(source.Field.IsStatic
+                        ? [getter, destination]
+                        : [getter, destination, source.Local]);
+                    recovered++;
+                    continue;
+                }
 
-            if (instruction is { OpCode: OpCode.Move, Operands: [FieldReference fieldDestination, var sourceValue] }
-                && TryResolveAccessor(method.DeclaringType, fieldDestination.Field, read: false, out var setter))
-            {
-                instruction.OpCode = OpCode.CallVoid;
-                instruction.SetOperands(fieldDestination.Field.IsStatic
-                    ? [setter, sourceValue]
-                    : [setter, fieldDestination.Local, sourceValue]);
-                recovered++;
+                if (instruction is { OpCode: OpCode.Move, Operands: [FieldReference fieldDestination, var sourceValue] }
+                    && TryResolveAccessor(method.DeclaringType, fieldDestination.Field, read: false, out var setter))
+                {
+                    instruction.OpCode = OpCode.CallVoid;
+                    instruction.SetOperands(fieldDestination.Field.IsStatic
+                        ? [setter, sourceValue]
+                        : [setter, fieldDestination.Local, sourceValue]);
+                    recovered++;
+                    continue;
+                }
+
+                // 中文注释：字段读取可能已被折叠进另一调用或返回的操作数；先物化公开 getter
+                // 结果，再由原指令消费同一个临时局部，避免 CIL 继续直接访问跨类型私有字段。
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    if (instruction.Operands[operandIndex] is not FieldReference embedded
+                        || !IsSourceOperand(instruction, operandIndex)
+                        || !TryResolveAccessor(method.DeclaringType, embedded.Field, read: true, out var embeddedGetter))
+                        continue;
+
+                    var temporary = new LocalVariable(
+                        $"propertyValue{temporaryIndex}",
+                        new Register(null, $"PROPERTY_VALUE_{temporaryIndex}"),
+                        embedded.Field.FieldType);
+                    temporaryIndex++;
+                    var getterCall = new Instruction(
+                        instruction.Index,
+                        OpCode.Call,
+                        embedded.Field.IsStatic
+                            ? [embeddedGetter, temporary]
+                            : [embeddedGetter, temporary, embedded.Local]);
+                    block.Instructions.Insert(instructionIndex, getterCall);
+                    instructionIndex++;
+                    instruction.SetOperand(operandIndex, temporary);
+                    recovered++;
+                }
             }
         }
 
         return recovered;
     }
+
+    /// <summary>
+    /// 区分字段读取操作数与 Move 的字段写入目标，防止把 setter 目标再次当作 getter 物化。
+    /// </summary>
+    private static bool IsSourceOperand(Instruction instruction, int operandIndex) =>
+        instruction.OpCode != OpCode.Move || operandIndex != 0;
 
     /// <summary>
     /// 只接受跨私有访问边界、唯一命名匹配、同类型且公开非虚的访问器。

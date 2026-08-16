@@ -498,6 +498,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // null 并定型目标，再运行字段偏移解析，才能识别上一 Scenario 的链式字段写入。
         CopyCoalescer.ResolveNullReferencePhiCopyTypes(ControlFlowGraph);
         MetadataResolver.ResolveFieldOffsets(this);
+        InlineConstructorRecovery.Run(this);
 
         // 中文注释：异常清理 Phi 可能仅留下未定义的 X19-X28 接收者；以此前唯一相容的
         // 托管生产值恢复 List<T> 与 IEnumerator<T> 的跨调用保存身份，并同步泛型签名。
@@ -514,6 +515,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ListClearRecovery.Run(this);
         ListCountRecovery.Run(this);
         StringLengthRecovery.Run(this);
+        EmptyArrayRecovery.Run(this);
         PropertyBackingFieldRecovery.Run(this);
 
         // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
