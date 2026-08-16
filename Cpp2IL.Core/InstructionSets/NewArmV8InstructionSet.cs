@@ -981,6 +981,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             or Arm64Mnemonic.STURH;
     }
 
+    /// <summary>
+    /// 返回标量存储真实覆盖的位数；字节与半字由操作码决定，其余由源寄存器宽度决定。
+    /// </summary>
+    internal static int GetScalarStoreWidthBits(
+        Arm64Mnemonic mnemonic,
+        Arm64Register sourceRegister)
+    {
+        return mnemonic switch
+        {
+            Arm64Mnemonic.STRB => 8,
+            Arm64Mnemonic.STRH or Arm64Mnemonic.STURH => 16,
+            Arm64Mnemonic.STR or Arm64Mnemonic.STUR =>
+                Arm64RegisterHelper.SizeBytes(sourceRegister) * 8,
+            _ => 0
+        };
+    }
+
     internal static bool IsExactlyRepresentableMovi(Arm64OperandKind immediateKind, long immediate)
     {
         return immediateKind == Arm64OperandKind.Immediate && immediate == 0;
@@ -1601,6 +1618,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return emitted;
         }
 
+        Instruction AddMemory(
+            ulong address,
+            int widthBits,
+            OpCode opCode,
+            params List<IOperand> operands)
+        {
+            var emitted = Add(address, opCode, operands);
+            emitted.MemoryAccessWidthBits = widthBits;
+            return emitted;
+        }
+
         void AddCall(MethodAnalysisContext context, ulong address, ulong target)
         {
             var hasObservedIndirectReturnBuffer =
@@ -2120,6 +2148,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case var scalarStore when IsScalarStoreMnemonic(scalarStore):
                 //Store is (src, dest)
                 {
+                    var storeWidthBits = GetScalarStoreWidthBits(
+                        instruction.Mnemonic,
+                        instruction.Op0Reg);
                     var vectorMemoryCode = ReadMachineCodeAtAddress(context, address);
                     if (TryDecodeUnsignedVector128Memory(
                             vectorMemoryCode,
@@ -2138,7 +2169,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             : new MemoryOperand(
                                 new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase)),
                                 addend: vectorByteOffset);
-                        Add(address, OpCode.Move, vectorDestination, ConvertStoreSourceOperand(instruction));
+                        AddMemory(
+                            address,
+                            128,
+                            OpCode.Move,
+                            vectorDestination,
+                            ConvertStoreSourceOperand(instruction));
                         break;
                     }
 
@@ -2150,7 +2186,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             instruction.MemOffset,
                             out var absoluteStoreDestination))
                     {
-                        Add(address, OpCode.Move, absoluteStoreDestination, ConvertStoreSourceOperand(instruction));
+                        AddMemory(
+                            address,
+                            storeWidthBits,
+                            OpCode.Move,
+                            absoluteStoreDestination,
+                            ConvertStoreSourceOperand(instruction));
                         break;
                     }
 
@@ -2163,11 +2204,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     {
                         // 预索引先调整SP，再把值写入新SP的零偏移槽位。
                         Add(address, OpCode.ShiftStack, Imm(preIndexedStoreOffset.Offset));
-                        Add(address, OpCode.Move, new StackOffset(0), ConvertStoreSourceOperand(instruction));
+                        AddMemory(
+                            address,
+                            storeWidthBits,
+                            OpCode.Move,
+                            new StackOffset(0),
+                            ConvertStoreSourceOperand(instruction));
                         break;
                     }
 
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 1), ConvertStoreSourceOperand(instruction));
+                    AddMemory(
+                        address,
+                        storeWidthBits,
+                        OpCode.Move,
+                        ConvertOperand(instruction, 1),
+                        ConvertStoreSourceOperand(instruction));
                     break;
                 }
             case Arm64Mnemonic.STP:
@@ -2183,25 +2234,35 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         }
 
                         var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
-                        Add(address, OpCode.Move, stackOffset, ConvertStorePairSourceOperand(instruction, 0));
-                        Add(address, OpCode.Move, new StackOffset(stackOffset.Offset + size), ConvertStorePairSourceOperand(instruction, 1));
+                        AddMemory(
+                            address,
+                            size * 8,
+                            OpCode.Move,
+                            stackOffset,
+                            ConvertStorePairSourceOperand(instruction, 0));
+                        AddMemory(
+                            address,
+                            size * 8,
+                            OpCode.Move,
+                            new StackOffset(stackOffset.Offset + size),
+                            ConvertStorePairSourceOperand(instruction, 1));
                     }
                     else if (dest3 is MemoryOperand memory)
                     {
                         var firstRegister = ConvertOperand(instruction, 0);
                         var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
-                        Add(address, OpCode.Move, dest3, firstRegister); // [REG + offset] = REG1
+                        AddMemory(address, size * 8, OpCode.Move, dest3, firstRegister); // [REG + offset] = REG1
                         memory = new MemoryOperand((Register)memory.Base!, addend: memory.Addend + size);
                         dest3 = memory;
-                        Add(address, OpCode.Move, dest3, ConvertOperand(instruction, 1)); // [REG + offset + size] = REG2
+                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertOperand(instruction, 1)); // [REG + offset + size] = REG2
                     }
                     else // reg pointer
                     {
                         var firstRegister = ConvertOperand(instruction, 0);
                         var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
-                        Add(address, OpCode.Move, dest3, firstRegister);
+                        AddMemory(address, size * 8, OpCode.Move, dest3, firstRegister);
                         Add(address, OpCode.Add, dest3, dest3, Imm(size));
-                        Add(address, OpCode.Move, dest3, ConvertOperand(instruction, 1));
+                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertOperand(instruction, 1));
                     }
                 }
                 break;

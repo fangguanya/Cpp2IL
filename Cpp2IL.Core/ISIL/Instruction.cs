@@ -16,6 +16,12 @@ public class Instruction : IOperand
     /// </summary>
     public int IntegerWidthBits { get; set; }
 
+    /// <summary>
+    /// 原生内存读写覆盖的精确位宽；零表示该指令没有携带可验证的访问宽度。
+    /// 该值独立于托管值类型，用于识别一次宽写覆盖多个相邻字段的优化形态。
+    /// </summary>
+    public int MemoryAccessWidthBits { get; set; }
+
     public OpCode OpCode
     {
         get;

@@ -658,6 +658,110 @@ public class MetadataResolverTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 托管对象加常量地址与附加偏移合并为实例字段()
+    {
+        var fixture = CreateIndirectInstanceFieldFixture(
+            addSecondDefinition: false,
+            useIndexedMemory: false);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Access.Operands[0], Is.TypeOf<FieldReference>());
+            var reference = (FieldReference)fixture.Access.Operands[0];
+            Assert.That(reference.Field, Is.SameAs(fixture.Field));
+            Assert.That(reference.Local, Is.SameAs(fixture.Receiver));
+            Assert.That(reference.Offset, Is.EqualTo(0x25));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 带索引的托管地址访问保持内存语义()
+    {
+        var fixture = CreateIndirectInstanceFieldFixture(
+            addSecondDefinition: false,
+            useIndexedMemory: true);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.Access.Operands[0], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 多定义托管字段地址保持未解析()
+    {
+        var fixture = CreateIndirectInstanceFieldFixture(
+            addSecondDefinition: true,
+            useIndexedMemory: false);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.Access.Operands[0], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    private static IndirectInstanceFieldFixture CreateIndirectInstanceFieldFixture(
+        bool addSecondDefinition,
+        bool useIndexedMemory)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "IndirectInstanceFieldOwner",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public);
+        var field = owner.InjectFieldContext(
+            "PackedFlag",
+            app.SystemTypes.SystemBooleanType,
+            System.Reflection.FieldAttributes.Private);
+        field.OverrideOffset = 0x25;
+        var method = owner.InjectMethodContext(
+            "Write",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var receiver = new LocalVariable("this", new Register(null, "X0"), owner);
+        var address = new LocalVariable("address", new Register(null, "X8"));
+        var index = new LocalVariable(
+            "index",
+            new Register(null, "X9"),
+            app.SystemTypes.SystemInt32Type);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Add, address, receiver, new Immediate(0x20))
+        };
+        if (addSecondDefinition)
+            instructions.Add(new Instruction(1, OpCode.Add, address, receiver, new Immediate(0x28)));
+        var memory = useIndexedMemory
+            ? new MemoryOperand(address, index, addend: 5, scale: 1)
+            : new MemoryOperand(address, addend: 5);
+        var access = new Instruction(2, OpCode.Move, memory, new Immediate(0));
+        instructions.Add(access);
+        instructions.Add(new Instruction(3, OpCode.Return));
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        return new IndirectInstanceFieldFixture(method, receiver, field, access);
+    }
+
+    private sealed record IndirectInstanceFieldFixture(
+        MethodAnalysisContext Method,
+        LocalVariable Receiver,
+        InjectedFieldAnalysisContext Field,
+        Instruction Access);
+
     private static StaticFieldOffsetFixture CreateStaticFieldOffsetFixture(
         bool includeLiteral,
         int runtimeFieldCount)

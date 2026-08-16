@@ -9,6 +9,29 @@ namespace Cpp2IL.Core.Tests;
 
 public class NewArmV8InstructionSetTests
 {
+    [TestCase(Arm64Mnemonic.STRB, Arm64Register.W0, 8, TestName = "基本_字节存储保留8位覆盖宽度")]
+    [TestCase(Arm64Mnemonic.STURH, Arm64Register.W0, 16, TestName = "边界_无符号半字节存储保留16位覆盖宽度")]
+    [TestCase(Arm64Mnemonic.STUR, Arm64Register.X0, 64, TestName = "边界_64位寄存器存储保留64位覆盖宽度")]
+    [Category("基本功能")]
+    public void 标量存储宽度由操作码与源寄存器共同确定(
+        Arm64Mnemonic mnemonic,
+        Arm64Register sourceRegister,
+        int expectedWidthBits)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetScalarStoreWidthBits(mnemonic, sourceRegister),
+            Is.EqualTo(expectedWidthBits));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非存储操作码不生成伪内存写宽度()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.GetScalarStoreWidthBits(Arm64Mnemonic.LDR, Arm64Register.X0),
+            Is.Zero);
+    }
+
     [Test]
     [Category("基本功能")]
     public void 标量加载保留动态寄存器索引与左移步长()

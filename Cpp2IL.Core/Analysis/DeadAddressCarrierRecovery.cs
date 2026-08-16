@@ -5,11 +5,12 @@ using Cpp2IL.Core.Model.Contexts;
 namespace Cpp2IL.Core.Analysis;
 
 /// <summary>
-/// 删除没有任何可观察读取的取址载体。
+/// 删除没有任何可观察读取的取址载体与托管字段地址计算。
 ///
 /// 原生异常清理路径常生成“取局部地址→写入临时寄存器”的孤立链；若该链不再传给
 /// 调用、内存读写或返回，保留它只会让ILSpy发射object*并产生不可编译的伪转换。
-/// 只有唯一的Move(AddressOf)定义且全图没有读取时才删除，任何真实ref/out语义保持不动。
+/// 成组字段写入完成解析后也会留下“托管对象+常量偏移”的孤立地址。只有全图没有读取时
+/// 才删除这两类纯定义，任何真实ref/out、内存或调用语义保持不动。
 /// </summary>
 public static class DeadAddressCarrierRecovery
 {
@@ -21,11 +22,7 @@ public static class DeadAddressCarrierRecovery
 
         foreach (var instruction in cfg.Instructions)
         {
-            if (instruction is not
-                {
-                    OpCode: OpCode.Move,
-                    Operands: [LocalVariable destination, AddressOf]
-                })
+            if (!TryGetAddressDestination(instruction, out var destination))
                 continue;
 
             if (uses.Contains(destination))
@@ -37,6 +34,45 @@ public static class DeadAddressCarrierRecovery
         }
 
         return removed;
+    }
+
+    private static bool TryGetAddressDestination(
+        Instruction instruction,
+        out LocalVariable destination)
+    {
+        destination = null!;
+        if (instruction is
+            {
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable addressDestination, AddressOf]
+            })
+        {
+            destination = addressDestination;
+            return true;
+        }
+
+        if (instruction is not
+            {
+                OpCode: OpCode.Add,
+                Operands.Count: 3
+            }
+            || instruction.Operands[0] is not LocalVariable addDestination)
+            return false;
+
+        var receiver = instruction.Operands[1] as LocalVariable
+            ?? instruction.Operands[2] as LocalVariable;
+        var hasConstant = instruction.Operands[1] is Immediate
+            || instruction.Operands[2] is Immediate;
+        if (!hasConstant
+            || receiver?.Type == null
+            || receiver.Type.IsValueType
+            || receiver.Type is PointerTypeAnalysisContext
+                or ByRefTypeAnalysisContext
+                or StaticFieldStorageTypeAnalysisContext)
+            return false;
+
+        destination = addDestination;
+        return true;
     }
 
     private static HashSet<LocalVariable> CollectUses(IReadOnlyList<Instruction> instructions)

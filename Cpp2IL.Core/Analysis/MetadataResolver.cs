@@ -406,9 +406,10 @@ public static class MetadataResolver
     /// </summary>
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
-        var changed = false;
+        var changed = PackedFieldStoreRecovery.Run(method) > 0;
+        var definitions = BuildDefinitionIndex(method.ControlFlowGraph!.Instructions);
 
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
@@ -421,12 +422,12 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                if (memory.Base is not LocalVariable local || local?.Type == null)
+                if (!TryResolveFieldBase(memory, definitions, out var local, out var fieldOffset))
                     continue;
 
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
+                var owner = staticOwner ?? local.Type!;
                 // 泛型声明的字段元数据偏移均可能为零；必须先以声明自身的 T 参数构造开放布局实例，
                 // 否则委托字段无法获得 Func<T>/Comparison<T> 等精确类型，后续 BR 尾调用也无法绑定 Invoke。
                 var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
@@ -435,14 +436,14 @@ public static class MetadataResolver
                 if (genericOwner != null && staticOwner == null)
                 {
                     // 泛型定义的字段元数据偏移不可信，统一按具体或开放实例重新计算布局。
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, memory.Addend);
+                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, fieldOffset);
                 }
                 else
                 {
                     field = FindUniqueRuntimeFieldAtOffset(
                         genericOwner?.GenericType ?? owner,
                         staticOwner != null,
-                        memory.Addend);
+                        fieldOffset);
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
@@ -453,12 +454,91 @@ public static class MetadataResolver
                     && field is not ConcreteGenericFieldAnalysisContext)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                instruction.SetOperand(i, new FieldReference(field, local, checked((int)fieldOffset)));
                 changed = true;
             }
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 一次建立局部量定义索引；每个局部最多保留两个定义，足以区分唯一与歧义而不重复保存大方法数据。
+    /// </summary>
+    internal static IReadOnlyDictionary<LocalVariable, Instruction[]> BuildDefinitionIndex(
+        IReadOnlyList<Instruction> instructions)
+    {
+        return instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.Take(2).ToArray());
+    }
+
+    /// <summary>
+    /// 解析直接字段基址，或把唯一的“托管对象加常量”地址定义与内存附加偏移合并。
+    /// 后一种形态来自 ARM64 为成组字段写入预先计算的内部地址；只有单定义、无索引、
+    /// 精确托管引用接收者同时成立时才折回字段，数值和指针算术保持原图。
+    /// </summary>
+    internal static bool TryResolveFieldBase(
+        MemoryOperand memory,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
+        out LocalVariable local,
+        out long fieldOffset)
+    {
+        local = null!;
+        fieldOffset = 0;
+        if (memory.Base is not LocalVariable memoryBase)
+            return false;
+
+        if (memoryBase.Type != null)
+        {
+            local = memoryBase;
+            fieldOffset = memory.Addend;
+            return true;
+        }
+
+        if (!definitions.TryGetValue(memoryBase, out var addressDefinitions)
+            || addressDefinitions.Length != 1
+            || addressDefinitions[0] is not
+            {
+                OpCode: OpCode.Add,
+                Operands.Count: 3
+            } addressDefinition)
+            return false;
+
+        LocalVariable? receiver = null;
+        long addressOffset = 0;
+        if (addressDefinition.Operands[1] is LocalVariable leftReceiver
+            && addressDefinition.Operands[2] is Immediate rightOffset)
+        {
+            receiver = leftReceiver;
+            addressOffset = rightOffset.Value;
+        }
+        else if (addressDefinition.Operands[1] is Immediate leftOffset
+                 && addressDefinition.Operands[2] is LocalVariable rightReceiver)
+        {
+            receiver = rightReceiver;
+            addressOffset = leftOffset.Value;
+        }
+
+        if (receiver?.Type == null
+            || receiver.Type.IsValueType
+            || receiver.Type is PointerTypeAnalysisContext
+                or ByRefTypeAnalysisContext
+                or StaticFieldStorageTypeAnalysisContext)
+            return false;
+
+        try
+        {
+            fieldOffset = checked(addressOffset + memory.Addend);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
+        local = receiver;
+        return true;
     }
 
     /// <summary>

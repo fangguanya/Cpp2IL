@@ -134,7 +134,7 @@ public static class GenericInstanceFieldLayout
             .Field;
     }
 
-    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
+    internal static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
     {
         // TODO support user-defined value types
         if (fieldType is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !fieldType.IsValueType)
