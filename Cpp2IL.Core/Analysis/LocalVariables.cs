@@ -745,6 +745,181 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// post-27运行时会把常用TypeInfo集中放入启动时初始化的二级表；该表位于BSS时，离线文件中
+    /// 没有可供元数据解析器读取的第二级指针。这里单次扫描全部指令，从封闭调用形参、已定型局部
+    /// 或已解析字段写入取得预期类型；只有自类型静态字段、精确static_fields偏移和完整二级表链
+    /// 同时闭合时才写入字段引用。定义表只构建一次，每个操作数只裁决一次。
+    /// </summary>
+    public static int ResolveExpectedSelfTypedStaticFields(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var uniqueDefinitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+        var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
+        var resolvedCount = 0;
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode == OpCode.Move && instruction.Operands.Count >= 2)
+            {
+                var expectedType = instruction.Operands[0] switch
+                {
+                    LocalVariable { Type: { } localType } => localType,
+                    FieldReference fieldReference => fieldReference.Field.FieldType,
+                    _ => null,
+                };
+
+                if (expectedType != null
+                    && TryResolveSelfTypedStaticFieldLoad(
+                        instruction.Operands[1],
+                        expectedType,
+                        uniqueDefinitions,
+                        staticFieldsOffset,
+                        out var resolvedMoveField))
+                {
+                    instruction.SetOperand(1, resolvedMoveField!);
+                    resolvedCount++;
+                }
+            }
+
+            if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
+                continue;
+
+            var argumentOffset = instruction.OpCode == OpCode.Call ? 2 : 1;
+            if (!calledMethod.IsStatic)
+                argumentOffset++;
+
+            for (var operandIndex = argumentOffset; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                var parameterIndex = operandIndex - argumentOffset;
+                if (parameterIndex >= calledMethod.Parameters.Count)
+                    break;
+
+                if (!TryResolveSelfTypedStaticFieldLoad(
+                    instruction.Operands[operandIndex],
+                    calledMethod.Parameters[parameterIndex].ParameterType,
+                    uniqueDefinitions,
+                    staticFieldsOffset,
+                    out var resolvedField))
+                    continue;
+
+                instruction.SetOperand(operandIndex, resolvedField!);
+                resolvedCount++;
+            }
+        }
+
+        return resolvedCount;
+    }
+
+    /// <summary>
+    /// 把形如<c>[staticStorage + fieldOffset]</c>的值绑定到“字段类型与所有者类型相同”的静态字段。
+    /// 该窄规则覆盖System.String.Empty等自类型静态值，同时排除普通对象字段、宽System.Object
+    /// 预期类型、错位静态存储以及已存在的冲突类型。
+    /// </summary>
+    internal static bool TryResolveSelfTypedStaticFieldLoad(
+        IOperand argument,
+        TypeAnalysisContext expectedValueType,
+        IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions,
+        long staticFieldsOffset,
+        out FieldReference? resolvedField)
+    {
+        resolvedField = null;
+        if (expectedValueType is ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext
+            || expectedValueType.IsValueType
+            || argument is not MemoryOperand
+            {
+                Base: LocalVariable staticStorage,
+                Index: null,
+                Scale: 0,
+                Addend: >= 0
+            } fieldLoad
+            || !uniqueDefinitions.TryGetValue(staticStorage, out var storageDefinition)
+            || storageDefinition is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [_, MemoryOperand
+                {
+                    Base: LocalVariable runtimeClass,
+                    Index: null,
+                    Scale: 0
+                } staticStorageLoad]
+            }
+            || staticStorageLoad.Addend != staticFieldsOffset
+            || !IsPost27RuntimeClassTableLoad(runtimeClass, uniqueDefinitions))
+            return false;
+
+        var representedField = expectedValueType.Fields.FirstOrDefault(field =>
+            field.IsStatic
+            && field.Offset == fieldLoad.Addend
+            && GenericCallRebinder.TypesEquivalent(field.FieldType, expectedValueType));
+        if (representedField == null)
+            return false;
+
+        if (runtimeClass.Type is { } runtimeClassType
+            && (runtimeClassType is not RuntimeClassTypeAnalysisContext existingRuntimeClass
+                || !GenericCallRebinder.TypesEquivalent(existingRuntimeClass.RepresentedType, expectedValueType)))
+            return false;
+
+        if (staticStorage.Type is { } staticStorageType
+            && (staticStorageType is not StaticFieldStorageTypeAnalysisContext existingStaticStorage
+                || !GenericCallRebinder.TypesEquivalent(existingStaticStorage.OwnerType, expectedValueType)))
+            return false;
+
+        if (runtimeClass.Type == null)
+            runtimeClass.Type = new RuntimeClassTypeAnalysisContext(
+                expectedValueType,
+                expectedValueType.DeclaringAssembly);
+
+        if (staticStorage.Type == null)
+            staticStorage.Type = new StaticFieldStorageTypeAnalysisContext(
+                expectedValueType,
+                expectedValueType.DeclaringAssembly);
+
+        resolvedField = new FieldReference(representedField, staticStorage, (int)fieldLoad.Addend);
+        return true;
+    }
+
+    /// <summary>
+    /// 确认运行时类局部量确实来自post-27二级表：先从绝对槽读取表基址，再从表项读取类指针。
+    /// 绝对地址和表项偏移均保持为证据，不把任何单一游戏地址写入生产器规则。
+    /// </summary>
+    private static bool IsPost27RuntimeClassTableLoad(
+        LocalVariable runtimeClass,
+        IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
+    {
+        if (!uniqueDefinitions.TryGetValue(runtimeClass, out var runtimeClassDefinition)
+            || runtimeClassDefinition is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [_, MemoryOperand
+                {
+                    Base: LocalVariable tableBase,
+                    Index: null,
+                    Scale: 0,
+                    Addend: >= 0
+                }]
+            }
+            || !uniqueDefinitions.TryGetValue(tableBase, out var tableBaseDefinition)
+            || tableBaseDefinition is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [_, MemoryOperand
+                {
+                    Base: null,
+                    Index: null,
+                    Scale: 0,
+                    Addend: >= 0
+                }]
+            })
+            return false;
+
+        return true;
+    }
+
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
     private static bool PropagateTypesOnce(MethodAnalysisContext method, List<string>? changeDetails = null)
     {

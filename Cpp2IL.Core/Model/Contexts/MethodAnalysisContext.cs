@@ -467,6 +467,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        // SSA拆除后的保守复制传播才把局部承载的方法目标物化为最终MethodAnalysisContext。
+        // 这里仅执行一次二级TypeInfo静态字段闭合，并从调用形参、定型局部和字段写入读取预期类型；
+        // 链上每个局部仍必须只有一个定义。
+        LocalVariables.ResolveExpectedSelfTypedStaticFields(this);
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);

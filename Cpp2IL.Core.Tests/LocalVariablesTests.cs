@@ -39,6 +39,126 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Post27二级表恢复StringEmpty静态字段所有者()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var emptyField = stringType.Fields.Single(field =>
+            field.IsStatic
+            && field.Name == "Empty"
+            && GenericCallRebinder.TypesEquivalent(field.FieldType, stringType));
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X8", 1));
+        var runtimeClass = new LocalVariable("runtimeClass", new Register(null, "X8", 2));
+        var staticStorage = new LocalVariable("staticStorage", new Register(null, "X8", 3));
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [tableBase] = new(0, OpCode.Move, tableBase, new MemoryOperand(null, null, 0x1000)),
+            [runtimeClass] = new(1, OpCode.Move, runtimeClass, new MemoryOperand(tableBase, null, 0x90)),
+            [staticStorage] = new(2, OpCode.Move, staticStorage, new MemoryOperand(runtimeClass, null, 0xB8)),
+        };
+        var argument = new MemoryOperand(staticStorage, null, emptyField.Offset);
+
+        var firstResolved = LocalVariables.TryResolveSelfTypedStaticFieldLoad(
+            argument,
+            stringType,
+            definitions,
+            0xB8,
+            out var resolvedField);
+        var secondResolved = LocalVariables.TryResolveSelfTypedStaticFieldLoad(
+            resolvedField!,
+            stringType,
+            definitions,
+            0xB8,
+            out var repeatedField);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstResolved, Is.True);
+            Assert.That(secondResolved, Is.False);
+            Assert.That(resolvedField, Is.Not.Null);
+            Assert.That(resolvedField!.Field.Name, Is.EqualTo("Empty"));
+            Assert.That(repeatedField, Is.Null);
+            Assert.That(runtimeClass.Type, Is.TypeOf<RuntimeClassTypeAnalysisContext>());
+            Assert.That(
+                ((RuntimeClassTypeAnalysisContext)runtimeClass.Type!).RepresentedType,
+                Is.SameAs(stringType));
+            Assert.That(staticStorage.Type, Is.TypeOf<StaticFieldStorageTypeAnalysisContext>());
+            Assert.That(
+                ((StaticFieldStorageTypeAnalysisContext)staticStorage.Type!).OwnerType,
+                Is.SameAs(stringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 错位StaticFields读取不得绑定StringEmpty所有者()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var emptyField = stringType.Fields.Single(field => field.IsStatic && field.Name == "Empty");
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X8", 1));
+        var runtimeClass = new LocalVariable("runtimeClass", new Register(null, "X8", 2));
+        var staticStorage = new LocalVariable("staticStorage", new Register(null, "X8", 3));
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [tableBase] = new(0, OpCode.Move, tableBase, new MemoryOperand(null, null, 0x1000)),
+            [runtimeClass] = new(1, OpCode.Move, runtimeClass, new MemoryOperand(tableBase, null, 0x90)),
+            [staticStorage] = new(2, OpCode.Move, staticStorage, new MemoryOperand(runtimeClass, null, 0xB0)),
+        };
+
+        var resolved = LocalVariables.TryResolveSelfTypedStaticFieldLoad(
+            new MemoryOperand(staticStorage, null, emptyField.Offset),
+            stringType,
+            definitions,
+            0xB8,
+            out var resolvedField);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.False);
+            Assert.That(resolvedField, Is.Null);
+            Assert.That(runtimeClass.Type, Is.Null);
+            Assert.That(staticStorage.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 已有冲突运行时类禁止重解释为StringEmpty所有者()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var objectType = appContext.SystemTypes.SystemObjectType;
+        var emptyField = stringType.Fields.Single(field => field.IsStatic && field.Name == "Empty");
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X8", 1));
+        var conflictingType = new RuntimeClassTypeAnalysisContext(objectType, objectType.DeclaringAssembly);
+        var runtimeClass = new LocalVariable("runtimeClass", new Register(null, "X8", 2), conflictingType);
+        var staticStorage = new LocalVariable("staticStorage", new Register(null, "X8", 3));
+        var definitions = new Dictionary<LocalVariable, Instruction>
+        {
+            [tableBase] = new(0, OpCode.Move, tableBase, new MemoryOperand(null, null, 0x1000)),
+            [runtimeClass] = new(1, OpCode.Move, runtimeClass, new MemoryOperand(tableBase, null, 0x90)),
+            [staticStorage] = new(2, OpCode.Move, staticStorage, new MemoryOperand(runtimeClass, null, 0xB8)),
+        };
+
+        var resolved = LocalVariables.TryResolveSelfTypedStaticFieldLoad(
+            new MemoryOperand(staticStorage, null, emptyField.Offset),
+            stringType,
+            definitions,
+            0xB8,
+            out var resolvedField);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.False);
+            Assert.That(resolvedField, Is.Null);
+            Assert.That(runtimeClass.Type, Is.SameAs(conflictingType));
+            Assert.That(staticStorage.Type, Is.Null);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 已等价的字段类型不产生重复计算()
     {
