@@ -424,6 +424,21 @@ public class Arm64CallingConventionResolverTests
 
     [Test]
     [Category("异常输入")]
+    public void 缺操作数的原始Move不触发返回投影扫描异常()
+    {
+        var projections = TwoSingleReturnProjections();
+        var malformed = new Instruction(0, OpCode.Move);
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                [malformed],
+                0,
+                projections),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
     public void MixedOrFiveFieldAggregatesAreRejectedAsHfa()
     {
         var systemTypes = Cpp2IlApi.CurrentAppContext!.SystemTypes;

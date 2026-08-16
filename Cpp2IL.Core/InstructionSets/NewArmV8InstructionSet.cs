@@ -1422,8 +1422,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
              instructionIndex++)
         {
             var instruction = instructions[instructionIndex];
-            var readRegisters = instruction.Sources
-                .SelectMany(EnumerateOperandRegisters)
+            var readRegisters = EnumerateSourceRegisters(instruction)
                 .Select(register => register.Number)
                 .ToHashSet();
 
@@ -1433,7 +1432,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 && ReadsAggregateCarrierAsScalar(instruction, aggregateCarrier))
                 return true;
 
-            if (instruction.Destination is Register destination)
+            if (TryGetDirectDestinationRegister(instruction, out var destination))
                 activeRegisters.Remove(destination.Number);
 
             // 分支前尚未得到确定消费者时保守保留投影，跨边数据流交给后续CFG/SSA处理。
@@ -1466,8 +1465,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
              instructionIndex++)
         {
             var instruction = instructions[instructionIndex];
-            var componentReads = instruction.Sources
-                .SelectMany(EnumerateOperandRegisters)
+            var componentReads = EnumerateSourceRegisters(instruction)
                 .Select(register => register.Number)
                 .Where(remaining.Contains)
                 .Distinct()
@@ -1475,7 +1473,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             if (componentReads.Length == 0)
             {
-                if (instruction.Destination is Register destination
+                if (TryGetDirectDestinationRegister(instruction, out var destination)
                     && remaining.Contains(destination.Number))
                     return false;
                 if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
@@ -1562,6 +1560,75 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             or OpCode.ReinterpretFloatBitsAsInteger or OpCode.RoundFloatTowardPositiveInfinity
             or OpCode.RoundFloatTowardNegativeInfinity
             or >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned;
+    }
+
+    /// <summary>
+    /// 在CFG构建前从原始操作数安全枚举读取寄存器。部分尚未恢复的原生指令会以缺操作数的
+    /// Move或比较形态存在，此阶段不得调用要求完整形态的Instruction.Sources。
+    /// </summary>
+    private static IEnumerable<Register> EnumerateSourceRegisters(Instruction instruction)
+    {
+        var destinationIndex = TryGetDestinationOperandIndex(instruction, out var index)
+            ? index
+            : -1;
+        for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+        {
+            var operand = instruction.Operands[operandIndex];
+            // 直接寄存器目标只写不读；内存目标仍需枚举其基址和索引。
+            if (operandIndex == destinationIndex && operand is Register)
+                continue;
+
+            foreach (var register in EnumerateOperandRegisters(operand))
+                yield return register;
+        }
+    }
+
+    private static bool TryGetDirectDestinationRegister(
+        Instruction instruction,
+        out Register destination)
+    {
+        if (TryGetDestinationOperandIndex(instruction, out var destinationIndex)
+            && instruction.Operands[destinationIndex] is Register register)
+        {
+            destination = register;
+            return true;
+        }
+
+        destination = default;
+        return false;
+    }
+
+    /// <summary>
+    /// 安全取得目标操作数位置；缺少目标槽的畸形指令返回false并保持保守读取语义。
+    /// </summary>
+    private static bool TryGetDestinationOperandIndex(
+        Instruction instruction,
+        out int destinationIndex)
+    {
+        destinationIndex = instruction.OpCode switch
+        {
+            OpCode.Call or OpCode.IndirectCall => 1,
+            OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
+                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or
+                or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.AbsoluteNumber
+                or OpCode.AbsoluteDifference or OpCode.MaximumNumber
+                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ReinterpretIntegerBitsAsFloat
+                or OpCode.ReinterpretFloatBitsAsInteger or OpCode.VectorDuplicate
+                or OpCode.VectorWidenUnsignedInt16ToInt32 or OpCode.VectorShiftLeft
+                or OpCode.VectorCompareLessThanZero or OpCode.VectorBitwiseSelect
+                or OpCode.VectorMultiplyByElement or OpCode.VectorAllLanesPredicate
+                or OpCode.VectorExtractUnsignedInt16 or OpCode.RoundFloatTowardPositiveInfinity
+                or OpCode.RoundFloatTowardNegativeInfinity
+                or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
+                or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+                or OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned
+                or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned
+                or OpCode.Newobj or OpCode.Box or OpCode.Unbox or OpCode.CastClass or OpCode.IsInst => 0,
+            _ => -1
+        };
+        return destinationIndex >= 0 && instruction.Operands.Count > destinationIndex;
     }
 
     private static IEnumerable<Register> EnumerateOperandRegisters(IOperand operand)
