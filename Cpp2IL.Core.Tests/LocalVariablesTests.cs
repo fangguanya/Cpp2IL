@@ -281,6 +281,60 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 绝对值位宽不得覆盖已经落定的另一浮点生命期()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var shared = new LocalVariable(
+            "shared",
+            new Register(null, "V0", 8),
+            appContext.SystemTypes.SystemSingleType);
+        var absolute = new Instruction(
+            0,
+            OpCode.AbsoluteNumber,
+            shared,
+            shared,
+            new Immediate(64));
+
+        var firstChanged = LocalVariables.BindScalarFloatingMathTypes(absolute, appContext);
+        var secondChanged = LocalVariables.BindScalarFloatingMathTypes(absolute, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstChanged, Is.False);
+            Assert.That(secondChanged, Is.False);
+            Assert.That(shared.Type, Is.SameAs(appContext.SystemTypes.SystemSingleType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 单精度算术不得覆盖已经落定的双精度目标()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "V0", 8),
+            appContext.SystemTypes.SystemDoubleType);
+        var multiply = new Instruction(
+            0,
+            OpCode.Multiply,
+            destination,
+            new FloatLiteral(2f),
+            new FloatLiteral(8f));
+
+        var firstChanged = LocalVariables.BindFloatingArithmeticTypes(multiply, appContext);
+        var secondChanged = LocalVariables.BindFloatingArithmeticTypes(multiply, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstChanged, Is.False);
+            Assert.That(secondChanged, Is.False);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemDoubleType));
+        });
+    }
+
+    [Test]
     [Category("基本功能")]
     public void 已解析字段加载覆盖先到的Object宽类型()
     {
@@ -564,6 +618,36 @@ public class LocalVariablesTests
         {
             Assert.That(changed, Is.True);
             Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 一位掩码只定义布尔目标并保留已定型整数源()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X8", 7),
+            appContext.SystemTypes.SystemInt32Type);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "TEST_BIT_VALUE", 3));
+        var instruction = new Instruction(0, OpCode.And, destination, source, new Immediate(1));
+
+        var firstChanged = LocalVariables.BindBooleanBitTestOperands(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+        var secondChanged = LocalVariables.BindBooleanBitTestOperands(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstChanged, Is.True);
+            Assert.That(secondChanged, Is.False);
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
             Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
         });
     }

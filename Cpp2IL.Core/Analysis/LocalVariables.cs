@@ -677,11 +677,19 @@ public static class LocalVariables
             or RuntimeClassTypeAnalysisContext
             or RuntimeMethodInfoAnalysisContext
             or RgctxTableTypeAnalysisContext);
-        var changed = destination.Type != booleanType
-            || (bindSource && source.Type != booleanType);
+        var changed = destination.Type != booleanType;
         destination.Type = booleanType;
-        if (bindSource)
+        // 中文注释：位测试只权威定义目标。源局部若已有整数转换或字段类型，说明同一物理
+        // 寄存器的前一生命期已经定型；此时保留源类型，避免 Boolean 与 Int32 在不动点振荡。
+        // 只有空类型或 object ABI 占位仍可由布尔返回值证据收窄。
+        if (bindSource
+            && (source.Type == null
+                || source.Type.FullName == "System.Object")
+            && source.Type != booleanType)
+        {
             source.Type = booleanType;
+            changed = true;
+        }
         return changed;
     }
 
@@ -1198,13 +1206,8 @@ public static class LocalVariables
             };
         }
 
-        var changed = false;
-        if (destinationType != null
-            && !GenericCallRebinder.TypesEquivalent(destination.Type, destinationType))
-        {
-            destination.Type = destinationType;
-            changed = true;
-        }
+        var changed = destinationType != null
+            && SetAuthoritativeNumericType(destination, destinationType);
         changed |= SetTypeIfUnknown(source, sourceType);
         return changed;
     }
@@ -1254,10 +1257,10 @@ public static class LocalVariables
         if (floatingType == null)
             return false;
 
-        var changed = SetExactType(destination, floatingType);
+        var changed = SetAuthoritativeNumericType(destination, floatingType);
         for (var operandIndex = 1; operandIndex < instruction.Operands.Count - 1; operandIndex++)
             if (instruction.Operands[operandIndex] is LocalVariable sourceLocal)
-                changed |= SetExactType(sourceLocal, floatingType);
+                changed |= SetTypeIfUnknown(sourceLocal, floatingType);
         return changed;
     }
 
@@ -1272,6 +1275,21 @@ public static class LocalVariables
     private static bool SetExactType(LocalVariable local, TypeAnalysisContext type)
     {
         if (GenericCallRebinder.TypesEquivalent(local.Type, type))
+            return false;
+
+        local.Type = type;
+        return true;
+    }
+
+    /// <summary>
+    /// 原生数值操作码可覆盖引用、结构或 object ABI 占位，却不覆盖已经落定的另一数值域。
+    /// 同一个 SSA 局部偶尔会因 SIMD 子寄存器别名同时出现在 S/D 或 W/X 生命期；保留第一项
+    /// 原生种子使传播严格单调，后续 IL 生成仍按每条操作码携带的位宽执行显式转换。
+    /// </summary>
+    private static bool SetAuthoritativeNumericType(LocalVariable local, TypeAnalysisContext type)
+    {
+        if (GenericCallRebinder.TypesEquivalent(local.Type, type)
+            || IsFinalScalarType(local.Type))
             return false;
 
         local.Type = type;
@@ -1302,10 +1320,10 @@ public static class LocalVariables
         var floatingType = sourceKinds[0] == 32
             ? appContext.SystemTypes.SystemSingleType
             : appContext.SystemTypes.SystemDoubleType;
-        var changed = SetExactType(destination, floatingType);
+        var changed = SetAuthoritativeNumericType(destination, floatingType);
         for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
             if (instruction.Operands[operandIndex] is LocalVariable sourceLocal)
-                changed |= SetExactType(sourceLocal, floatingType);
+                changed |= SetTypeIfUnknown(sourceLocal, floatingType);
         return changed;
     }
 
