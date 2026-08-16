@@ -439,6 +439,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 可把唯一零偏移读取闭合为 unbox.any，而无需重复运行早期装箱分析。
         KeyFunctionRecovery.RewriteUnboxing(this);
         RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
+        // 运行时元数据槽到此才从原生地址闭合为直接 typeof(T)；紧接着折叠其与零的比较，
+        // 防止 IL 生成器把类型元数据误投影成托管构造器调用。
+        MetadataInitGuardRemover.RunRuntimeClassNullComparisons(this);
         // 中文注释：运行时类型槽到此才全部闭合；按最终 Newobj 类型一次性校准分配结果及其直接泛型调用。
         LocalVariables.RefreshResolvedNewobjTypesAndCalls(this);
         // 泛型方法的 rgctx 初始化函数可能与托管方法共享地址；只有在

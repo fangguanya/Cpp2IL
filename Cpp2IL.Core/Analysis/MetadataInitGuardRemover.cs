@@ -36,7 +36,8 @@ public static class MetadataInitGuardRemover
         var removedOrdinaryGuard = RemoveGuards(
             cfg,
             is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
-        if (removedOrdinaryGuard)
+        var foldedRuntimeClassComparisons = FoldRuntimeClassNullComparisons(cfg);
+        if (removedOrdinaryGuard || foldedRuntimeClassComparisons > 0)
             DeadCodeEliminator.Run(method);
     }
 
@@ -52,9 +53,20 @@ public static class MetadataInitGuardRemover
             DeadCodeEliminator.Run(method);
     }
 
+    /// <summary>
+    /// 运行时元数据槽完成解析后，折叠此前仍以原生地址形式存在的类型空值比较。
+    /// </summary>
+    internal static void RunRuntimeClassNullComparisons(MethodAnalysisContext method)
+    {
+        if (FoldRuntimeClassNullComparisons(method.ControlFlowGraph!) > 0)
+            DeadCodeEliminator.Run(method);
+    }
+
     public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
     {
-        if (RemoveGuards(cfg, initialisedFlagOffset))
+        var removedOrdinaryGuard = RemoveGuards(cfg, initialisedFlagOffset);
+        var foldedRuntimeClassComparisons = FoldRuntimeClassNullComparisons(cfg);
+        if (removedOrdinaryGuard || foldedRuntimeClassComparisons > 0)
             DeadCodeEliminator.Run(cfg);
     }
 
@@ -418,6 +430,55 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool IsZero(IOperand operand) => operand is Immediate { Value: 0 };
+
+    /// <summary>
+    /// 把直接类型元数据地址与原生零值的比较折叠为托管布尔常量。
+    /// IL2CPP 的 <c>typeof(T)</c> 操作数在这里代表已解析的 Il2CppClass 指针，
+    /// 并非待构造的托管对象；已成功解析的直接元数据地址恒为非零。
+    /// </summary>
+    internal static int FoldRuntimeClassNullComparisons(ISILControlFlowGraph cfg)
+    {
+        var definitions = UniqueDefinitions(cfg.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!));
+        var folded = 0;
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+                || instruction.Operands is not [LocalVariable destination, { } left, { } right])
+                continue;
+
+            var metadata = IsZero(right) ? left : IsZero(left) ? right : null;
+            var resolvedMetadata = ResolveDirectRuntimeClassMetadata(metadata, definitions);
+            if (resolvedMetadata is not TypeAnalysisContext
+                || resolvedMetadata is RuntimeMethodInfoAnalysisContext)
+                continue;
+
+            var comparisonResult = instruction.OpCode == OpCode.CheckNotEqual ? 1 : 0;
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(destination, new Immediate(comparisonResult));
+            folded++;
+        }
+
+        return folded;
+    }
+
+    /// <summary>
+    /// 沿唯一 Move 定义追溯运行时类载体；Phi、调用结果和多定义局部变量均在原位停止。
+    /// </summary>
+    private static IOperand? ResolveDirectRuntimeClassMetadata(
+        IOperand? operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var current = operand;
+        var visited = new HashSet<LocalVariable>();
+        while (current is LocalVariable local
+               && visited.Add(local)
+               && definitions.TryGetValue(local, out var definition)
+               && definition is { OpCode: OpCode.Move, Operands: [LocalVariable _, { } source] })
+            current = source;
+        return current;
+    }
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)
     {

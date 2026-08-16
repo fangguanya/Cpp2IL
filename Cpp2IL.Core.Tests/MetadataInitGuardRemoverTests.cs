@@ -402,6 +402,152 @@ public class MetadataInitGuardRemoverTests
         }
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 直接类型元数据等于零折叠为假()
+    {
+        var destination = new LocalVariable(
+            "condition",
+            new Register(null, "COND"),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckEqual,
+            destination,
+            Cpp2IlApi.CurrentAppContext.SystemTypes.SystemObjectType,
+            new Immediate(0));
+        var graph = new ISILControlFlowGraph([comparison, new Instruction(1, OpCode.Return)]);
+
+        var folded = MetadataInitGuardRemover.FoldRuntimeClassNullComparisons(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(folded, Is.EqualTo(1));
+            Assert.That(comparison.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(comparison.Operands[0], Is.SameAs(destination));
+            Assert.That(comparison.Operands[1], Is.TypeOf<Immediate>());
+            Assert.That(((Immediate)comparison.Operands[1]).Value, Is.EqualTo(0));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 唯一Move链上的类型元数据等于零仍折叠为假()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var runtimeClass = new LocalVariable(
+            "runtimeClass",
+            new Register(null, "X8"),
+            new RuntimeClassTypeAnalysisContext(
+                app.SystemTypes.SystemObjectType,
+                app.SystemTypes.SystemObjectType.DeclaringAssembly));
+        var copiedRuntimeClass = new LocalVariable(
+            "copiedRuntimeClass",
+            new Register(null, "X9"),
+            runtimeClass.Type);
+        var destination = new LocalVariable(
+            "condition",
+            new Register(null, "COND"),
+            app.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(
+            2,
+            OpCode.CheckEqual,
+            destination,
+            copiedRuntimeClass,
+            new Immediate(0));
+        var graph = new ISILControlFlowGraph(
+        [
+            new Instruction(0, OpCode.Move, runtimeClass, app.SystemTypes.SystemObjectType),
+            new Instruction(1, OpCode.Move, copiedRuntimeClass, runtimeClass),
+            comparison,
+            new Instruction(3, OpCode.Return)
+        ]);
+
+        var folded = MetadataInitGuardRemover.FoldRuntimeClassNullComparisons(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(folded, Is.EqualTo(1));
+            Assert.That(comparison.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(((Immediate)comparison.Operands[1]).Value, Is.Zero);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零不等于直接类型元数据折叠为真并支持反向操作数()
+    {
+        var destination = new LocalVariable(
+            "condition",
+            new Register(null, "COND"),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckNotEqual,
+            destination,
+            new Immediate(0),
+            Cpp2IlApi.CurrentAppContext.SystemTypes.SystemObjectType);
+        var graph = new ISILControlFlowGraph([comparison, new Instruction(1, OpCode.Return)]);
+
+        var folded = MetadataInitGuardRemover.FoldRuntimeClassNullComparisons(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(folded, Is.EqualTo(1));
+            Assert.That(comparison.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(((Immediate)comparison.Operands[1]).Value, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通局部变量与零比较保持原业务语义()
+    {
+        var objectType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType;
+        var source = new LocalVariable("source", new Register(null, "X0"), objectType);
+        var destination = new LocalVariable(
+            "condition",
+            new Register(null, "COND"),
+            Cpp2IlApi.CurrentAppContext.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(0, OpCode.CheckEqual, destination, source, new Immediate(0));
+        var graph = new ISILControlFlowGraph([comparison, new Instruction(1, OpCode.Return)]);
+
+        var folded = MetadataInitGuardRemover.FoldRuntimeClassNullComparisons(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(folded, Is.Zero);
+            Assert.That(comparison.OpCode, Is.EqualTo(OpCode.CheckEqual));
+            Assert.That(comparison.Operands[1], Is.SameAs(source));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 类型元数据与非零常量比较保持原条件()
+    {
+        var destination = new LocalVariable(
+            "condition",
+            new Register(null, "COND"),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckEqual,
+            destination,
+            Cpp2IlApi.CurrentAppContext.SystemTypes.SystemObjectType,
+            new Immediate(1));
+        var graph = new ISILControlFlowGraph([comparison, new Instruction(1, OpCode.Return)]);
+
+        var folded = MetadataInitGuardRemover.FoldRuntimeClassNullComparisons(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(folded, Is.Zero);
+            Assert.That(comparison.OpCode, Is.EqualTo(OpCode.CheckEqual));
+            Assert.That(((Immediate)comparison.Operands[2]).Value, Is.EqualTo(1));
+        });
+    }
+
     private static Instruction CreateFlagTest(long address, long mask) =>
         new(
             0,
