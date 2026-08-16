@@ -783,6 +783,42 @@ public class LocalVariablesTests
 
     [Test]
     [Category("边界值")]
+    public void 内联可空字段的低字节掩码恢复存在标志类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var nullableDefinition = appContext.Assemblies
+            .SelectMany(assembly => assembly.Types)
+            .Single(type => type.FullName == "System.Nullable`1");
+        var nullableBoolean = new GenericInstanceTypeAnalysisContext(
+            nullableDefinition,
+            [appContext.SystemTypes.SystemBooleanType]);
+        var owner = new LocalVariable(
+            "owner",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var field = new InjectedFieldAnalysisContext(
+            "isMarketingChecked",
+            nullableBoolean,
+            FieldAttributes.Public,
+            appContext.SystemTypes.SystemObjectType);
+        var source = new FieldReference(field, owner, 0x10);
+        var destination = new LocalVariable("destination", new Register(null, "X1", 3));
+        var instruction = new Instruction(0, OpCode.And, destination, source, new Immediate(0xFF));
+
+        var changed = LocalVariables.BindNullablePresenceTestResult(
+            instruction,
+            appContext.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemBooleanType));
+            Assert.That(LocalVariables.NullableOperandType(source), Is.SameAs(nullableBoolean));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
     public void 可空一位掩码不冒充低字节存在测试()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

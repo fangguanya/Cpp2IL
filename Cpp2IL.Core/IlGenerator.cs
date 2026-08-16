@@ -1441,21 +1441,32 @@ public static class IlGenerator
     {
         if (instruction.OpCode != OpCode.And
             || instruction.Operands.Count != 3
-            || instruction.Operands[1] is not LocalVariable
-            {
-                Type: GenericInstanceTypeAnalysisContext
-                {
-                    GenericType.FullName: "System.Nullable`1"
-                }
-            } nullableSource
+            || LocalVariables.NullableOperandType(instruction.Operands[1]) is not { } nullableType
             || instruction.Operands[2] is not Immediate { Value: 0xFF })
             return false;
 
         var instructions = method.CilMethodBody!.Instructions;
         var module = method.DeclaringModule!;
-        LoadLocalAddress(nullableSource, method, locals);
+        switch (instruction.Operands[1])
+        {
+            case LocalVariable nullableLocal:
+                LoadLocalAddress(nullableLocal, method, locals);
+                break;
+            case FieldReference nullableField:
+                var fieldDescriptor = nullableField.Field.ToFieldDescriptor(module);
+                if (nullableField.Field.IsStatic)
+                    instructions.Add(CilOpCodes.Ldsflda, fieldDescriptor);
+                else
+                {
+                    LoadFieldReceiver(nullableField, method, locals);
+                    instructions.Add(CilOpCodes.Ldflda, fieldDescriptor);
+                }
+                break;
+            default:
+                return false;
+        }
 
-        var nullableOwner = nullableSource.Type.ToTypeSignature(module).ToTypeDefOrRef();
+        var nullableOwner = nullableType.ToTypeSignature(module).ToTypeDefOrRef();
         var getter = new MemberReference(
             nullableOwner,
             "get_HasValue",

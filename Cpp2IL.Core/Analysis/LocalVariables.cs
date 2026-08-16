@@ -711,13 +711,7 @@ public static class LocalVariables
         if (instruction.OpCode != OpCode.And
             || instruction.Operands.Count != 3
             || instruction.Operands[0] is not LocalVariable destination
-            || instruction.Operands[1] is not LocalVariable
-            {
-                Type: GenericInstanceTypeAnalysisContext
-                {
-                    GenericType.FullName: "System.Nullable`1"
-                }
-            }
+            || NullableOperandType(instruction.Operands[1]) == null
             || instruction.Operands[2] is not Immediate { Value: 0xFF })
             return false;
 
@@ -727,6 +721,30 @@ public static class LocalVariables
         destination.Type = booleanType;
         return true;
     }
+
+    /// <summary>
+    /// 返回局部量或已解析字段操作数携带的 Nullable&lt;T&gt; 类型。复制合并可能把字段加载
+    /// 直接内联到按位测试，因此类型分析和 IL 生成必须共用同一操作数分类规则。
+    /// </summary>
+    internal static GenericInstanceTypeAnalysisContext? NullableOperandType(IOperand operand)
+        => operand switch
+        {
+            LocalVariable
+            {
+                Type: GenericInstanceTypeAnalysisContext
+                {
+                    GenericType.FullName: "System.Nullable`1"
+                } nullableType
+            } => nullableType,
+            FieldReference
+            {
+                Field.FieldType: GenericInstanceTypeAnalysisContext
+                {
+                    GenericType.FullName: "System.Nullable`1"
+                } nullableType
+            } => nullableType,
+            _ => null,
+        };
     
     //Handles typing of locals for ref/out params
     public static void TypeAddressedLocals(MethodAnalysisContext method)
