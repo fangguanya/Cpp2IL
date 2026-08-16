@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -595,4 +596,129 @@ public class MetadataResolverTests
             Assert.That(instructions[9].Operands[1], Is.EqualTo(differentMemory));
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 静态偏移跳过常量并解析真实存储字段()
+    {
+        var fixture = CreateStaticFieldOffsetFixture(includeLiteral: true, runtimeFieldCount: 1);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Access.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)fixture.Access.Operands[1]).Field, Is.SameAs(fixture.RuntimeFields.Single()));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 静态偏移仅有一个真实字段时保持精确解析()
+    {
+        var fixture = CreateStaticFieldOffsetFixture(includeLiteral: false, runtimeFieldCount: 1);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(((FieldReference)fixture.Access.Operands[1]).Field, Is.SameAs(fixture.RuntimeFields.Single()));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 同偏移多个真实静态字段保持未解析()
+    {
+        var fixture = CreateStaticFieldOffsetFixture(includeLiteral: true, runtimeFieldCount: 2);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.Access.Operands[1], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 静态偏移只有常量时保持未解析()
+    {
+        var fixture = CreateStaticFieldOffsetFixture(includeLiteral: true, runtimeFieldCount: 0);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.Access.Operands[1], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    private static StaticFieldOffsetFixture CreateStaticFieldOffsetFixture(
+        bool includeLiteral,
+        int runtimeFieldCount)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "StaticFieldOwner",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public);
+
+        if (includeLiteral)
+        {
+            var literal = owner.InjectFieldContext(
+                "MetadataOnlyConstant",
+                app.SystemTypes.SystemStringType,
+                System.Reflection.FieldAttributes.Public
+                | System.Reflection.FieldAttributes.Static
+                | System.Reflection.FieldAttributes.Literal
+                | System.Reflection.FieldAttributes.HasDefault);
+            literal.OverrideOffset = 0;
+            literal.UseOverrideConstantValue = true;
+            literal.OverrideConstantValue = "fixture";
+        }
+
+        var runtimeFields = Enumerable.Range(0, runtimeFieldCount)
+            .Select(index =>
+            {
+                var field = owner.InjectFieldContext(
+                    $"RuntimeField{index}",
+                    app.SystemTypes.SystemObjectType,
+                    System.Reflection.FieldAttributes.Private | System.Reflection.FieldAttributes.Static);
+                field.OverrideOffset = 0;
+                return field;
+            })
+            .ToArray();
+        var method = owner.InjectMethodContext(
+            "Read",
+            app.SystemTypes.SystemObjectType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        var storage = new LocalVariable(
+            "staticStorage",
+            new Register(null, "X8"),
+            new StaticFieldStorageTypeAnalysisContext(owner, assembly));
+        var result = new LocalVariable(
+            "result",
+            new Register(null, "X0"),
+            app.SystemTypes.SystemObjectType);
+        var access = new Instruction(0, OpCode.Move, result, new MemoryOperand(storage));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            access,
+            new Instruction(1, OpCode.Return, result),
+        ]);
+
+        return new StaticFieldOffsetFixture(method, access, runtimeFields);
+    }
+
+    private sealed record StaticFieldOffsetFixture(
+        MethodAnalysisContext Method,
+        Instruction Access,
+        InjectedFieldAnalysisContext[] RuntimeFields);
 }

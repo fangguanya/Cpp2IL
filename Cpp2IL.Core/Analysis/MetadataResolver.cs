@@ -439,16 +439,10 @@ public static class MetadataResolver
                 }
                 else
                 {
-                    // an inherited field exists on the base type but sits at the same offset in the
-                    // derived layout, so the whole chain is searched
-                    field = null;
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                    {
-                        // FieldAnalysisContext.Offset统一封装原始元数据偏移、注入字段偏移和经过验证的布局覆盖。
-                        // 直接读取BackingData会绕过后两类权威输入，使合法字段永久停留为裸内存操作数。
-                        field = candidateOwner.Fields.FirstOrDefault(f =>
-                            f.IsStatic == (staticOwner != null) && f.Offset == memory.Addend);
-                    }
+                    field = FindUniqueRuntimeFieldAtOffset(
+                        genericOwner?.GenericType ?? owner,
+                        staticOwner != null,
+                        memory.Addend);
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
@@ -465,6 +459,35 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 沿声明类型及其基类查找给定偏移上的唯一运行时字段。
+    /// 常量字段只存在于元数据，不占用实例或静态存储；同一声明类型仍有多个候选时保持未解析，避免猜测字段身份。
+    /// </summary>
+    private static FieldAnalysisContext? FindUniqueRuntimeFieldAtOffset(
+        TypeAnalysisContext owner,
+        bool isStatic,
+        long offset)
+    {
+        for (var candidateOwner = owner; candidateOwner != null; candidateOwner = candidateOwner.BaseType)
+        {
+            var candidates = candidateOwner.Fields
+                .Where(field =>
+                    field.IsStatic == isStatic
+                    && field.Offset == offset
+                    && (field.Attributes & System.Reflection.FieldAttributes.Literal) == 0)
+                .Take(2)
+                .ToArray();
+
+            if (candidates.Length == 1)
+                return candidates[0];
+
+            if (candidates.Length > 1)
+                return null;
+        }
+
+        return null;
     }
 
     private static void ResolveCalls(MethodAnalysisContext method)
