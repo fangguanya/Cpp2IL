@@ -1,5 +1,7 @@
+using System.Collections.Generic;
 using System.Reflection;
 using System.Linq;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -155,6 +157,269 @@ public class Arm64CallingConventionResolverTests
             Assert.That(registers, Is.EqualTo(new[] { "V0", "V1", "V2", "V3" }));
             Assert.That(Arm64CallingConventionResolver.ReturnsViaHiddenBuffer(method), Is.False);
         }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 两个Single字段按V1到V0逆序投影完整返回值()
+    {
+        var singleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType;
+        var aggregate = CreateValueType(
+            "ProjectedVector2",
+            singleType,
+            singleType);
+        SetSequentialFieldOffsets(aggregate, sizeof(float));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        var projections = Arm64CallingConventionResolver.ReturnProjections(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                projections.Select(projection => projection.Destination.Name),
+                Is.EqualTo(new[] { "V1", "V0" }));
+            Assert.That(
+                projections.Select(projection => projection.Source.Addend),
+                Is.EqualTo(new long[] { sizeof(float), 0 }));
+            Assert.That(
+                projections.Select(projection => ((Register)projection.Source.Base!).Name),
+                Is.EqualTo(new[] { "V0", "V0" }));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四个Double字段从V3到V0完整投影()
+    {
+        var doubleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemDoubleType;
+        var aggregate = CreateValueType(
+            "ProjectedDouble4",
+            doubleType,
+            doubleType,
+            doubleType,
+            doubleType);
+        SetSequentialFieldOffsets(aggregate, sizeof(double));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        var projections = Arm64CallingConventionResolver.ReturnProjections(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                projections.Select(projection => projection.Destination.Name),
+                Is.EqualTo(new[] { "V3", "V2", "V1", "V0" }));
+            Assert.That(
+                projections.Select(projection => projection.Source.Addend),
+                Is.EqualTo(new long[] { 24, 16, 8, 0 }));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 缺失字段偏移的Hfa不生成猜测投影()
+    {
+        var singleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType;
+        var aggregate = CreateValueType(
+            "UnknownLayoutVector2",
+            singleType,
+            singleType);
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        Assert.That(Arm64CallingConventionResolver.ReturnProjections(method), Is.Empty);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 浮点标量返回值不生成聚合体字段投影()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "ReturnSingle",
+            app.SystemTypes.SystemSingleType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        Assert.That(Arm64CallingConventionResolver.ReturnProjections(method), Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Hfa实参消费使返回字段投影保持有效()
+    {
+        var projections = TwoSingleReturnProjections();
+        var aggregate = new HomogeneousFloatingAggregateArgument(
+            null!,
+            [new Register(null, "V0"), new Register(null, "V1")]);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.CallVoid, new Immediate(0x1234), aggregate),
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                instructions,
+                0,
+                projections),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 仅V0参与浮点算术仍保留返回字段投影()
+    {
+        var projections = TwoSingleReturnProjections();
+        var instructions = new Instruction[]
+        {
+            new(
+                0,
+                OpCode.Add,
+                new Register(null, "V2"),
+                new Register(null, "V0"),
+                new FloatLiteral(1f)),
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                instructions,
+                0,
+                projections),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 一百二十八位完整值存储不触发标量字段投影()
+    {
+        var projections = TwoSingleReturnProjections();
+        var store = new Instruction(
+            0,
+            OpCode.Move,
+            new MemoryOperand(new Register(null, "X0")),
+            new Register(null, "V0"))
+        {
+            MemoryAccessWidthBits = 128
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                [store],
+                0,
+                projections),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 四个连续Single字段存储识别为完整Color赋值()
+    {
+        var singleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType;
+        var aggregate = CreateValueType(
+            "StoredColor",
+            singleType,
+            singleType,
+            singleType,
+            singleType);
+        SetSequentialFieldOffsets(aggregate, sizeof(float));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var projections = Arm64CallingConventionResolver.ReturnProjections(method);
+        var instructions = Enumerable.Range(0, 4)
+            .Select(index => new Instruction(
+                index,
+                OpCode.Move,
+                new MemoryOperand(new Register(null, "X19"), addend: 0x48 + index * sizeof(float)),
+                new Register(null, $"V{index}"))
+            {
+                MemoryAccessWidthBits = 32
+            })
+            .ToArray();
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                instructions,
+                0,
+                projections),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 缺少最后字段的连续存储仍按标量消费者处理()
+    {
+        var singleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType;
+        var aggregate = CreateValueType(
+            "PartiallyStoredColor",
+            singleType,
+            singleType,
+            singleType,
+            singleType);
+        SetSequentialFieldOffsets(aggregate, sizeof(float));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var projections = Arm64CallingConventionResolver.ReturnProjections(method);
+        var instructions = Enumerable.Range(0, 3)
+            .Select(index => new Instruction(
+                index,
+                OpCode.Move,
+                new MemoryOperand(new Register(null, "X19"), addend: 0x48 + index * sizeof(float)),
+                new Register(null, $"V{index}"))
+            {
+                MemoryAccessWidthBits = 32
+            })
+            .ToArray();
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                instructions,
+                0,
+                projections),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 极端字段偏移不溢出聚合体存储判定()
+    {
+        var projections = new (Register Destination, MemoryOperand Source)[]
+        {
+            (
+                new Register(null, "V0"),
+                new MemoryOperand(new Register(null, "V0"), addend: long.MaxValue))
+        };
+        var store = new Instruction(
+            0,
+            OpCode.Move,
+            new MemoryOperand(new Register(null, "X19"), addend: long.MinValue),
+            new Register(null, "V0"))
+        {
+            MemoryAccessWidthBits = 32
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasHomogeneousFloatingComponentConsumer(
+                [store],
+                0,
+                projections),
+            Is.True);
     }
 
     [Test]
@@ -336,5 +601,30 @@ public class Arm64CallingConventionResolverTests
             aggregate.InjectFieldContext($"Component{index}", fieldTypes[index], FieldAttributes.Public);
 
         return aggregate;
+    }
+
+    private static void SetSequentialFieldOffsets(
+        InjectedTypeAnalysisContext aggregate,
+        int componentSize)
+    {
+        for (var index = 0; index < aggregate.Fields.Count; index++)
+            aggregate.Fields[index].Offset = checked(index * componentSize);
+    }
+
+    private static IReadOnlyList<(Register Destination, MemoryOperand Source)>
+        TwoSingleReturnProjections()
+    {
+        var singleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType;
+        var aggregate = CreateValueType(
+            "ConsumerVector2",
+            singleType,
+            singleType);
+        SetSequentialFieldOffsets(aggregate, sizeof(float));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        return Arm64CallingConventionResolver.ReturnProjections(method);
     }
 }

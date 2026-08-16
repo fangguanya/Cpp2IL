@@ -159,4 +159,64 @@ public class DeadCodeEliminationTests
 
         Assert.That(Live(graph).Count(instruction => instruction.OpCode == OpCode.Move), Is.EqualTo(2));
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void Hfa调用实参保留全部标量分量定义()
+    {
+        var first = new LocalVariable("first", new Register(null, "V0"));
+        var second = new LocalVariable("second", new Register(null, "V1"));
+        var aggregate = new HomogeneousFloatingAggregateArgument(null!, [first, second]);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, first, Imm(1)),
+            new(1, OpCode.Move, second, Imm(2)),
+            new(2, OpCode.CallVoid, Imm(0x1234), aggregate),
+            new(3, OpCode.Return),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        Assert.That(Live(graph).Count(instruction => instruction.OpCode == OpCode.Move), Is.EqualTo(2));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Hfa内存分量保留基址与索引定义()
+    {
+        var baseLocal = new LocalVariable("base", new Register(null, "X8"));
+        var indexLocal = new LocalVariable("index", new Register(null, "X9"));
+        var aggregate = new HomogeneousFloatingAggregateArgument(
+            null!,
+            [new MemoryOperand(baseLocal, indexLocal, addend: 8, scale: 4)]);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, baseLocal, Imm(1)),
+            new(1, OpCode.Move, indexLocal, Imm(2)),
+            new(2, OpCode.CallVoid, Imm(0x1234), aggregate),
+            new(3, OpCode.Return),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        Assert.That(Live(graph).Count(instruction => instruction.OpCode == OpCode.Move), Is.EqualTo(2));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Hfa常量分量不错误保留无关局部定义()
+    {
+        var unrelated = new LocalVariable("unrelated", new Register(null, "X8"));
+        var aggregate = new HomogeneousFloatingAggregateArgument(null!, [Imm(1)]);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, unrelated, Imm(7)),
+            new(1, OpCode.CallVoid, Imm(0x1234), aggregate),
+            new(2, OpCode.Return),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        Assert.That(Live(graph).Any(instruction => instruction.OpCode == OpCode.Move), Is.False);
+    }
 }

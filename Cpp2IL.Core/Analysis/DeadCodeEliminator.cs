@@ -100,45 +100,60 @@ public static class DeadCodeEliminator
         var destination = instruction.Destination as LocalVariable;
 
         foreach (var operand in instruction.Operands)
+        foreach (var used in UsedLocals(operand, destination))
+            yield return used;
+    }
+
+    /// <summary>
+    /// 递归枚举一个操作数读取的局部量。HFA在托管签名中是单个实参，但其每个分量都是
+    /// 独立的数据流源；统一递归后，普通局部量、内存基址和索引都只在一个位置计算。
+    /// </summary>
+    private static IEnumerable<LocalVariable> UsedLocals(
+        IOperand operand,
+        LocalVariable? destination)
+    {
+        switch (operand)
         {
-            switch (operand)
-            {
-                case LocalVariable local when !ReferenceEquals(local, destination):
-                    yield return local;
-                    break;
-                case MemoryOperand memory:
-                    if (memory.Base is LocalVariable baseLocal)
-                        yield return baseLocal;
-                    if (memory.Index is LocalVariable indexLocal)
-                        yield return indexLocal;
-                    break;
-                // A static field access doesn't read the storage pointer it was resolved from, so that
-                // pointer (and the class load feeding it) is free to die.
-                case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
-                    yield return fieldLocal;
-                    break;
-                // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
-                case AddressOf { Target: LocalVariable addressed }:
-                    yield return addressed;
-                    break;
-                case AddressOf { Target: ArrayAccess addressedElement }:
-                    foreach (var used in ArrayAccessLocals(addressedElement))
-                        yield return used;
-                    break;
-                case ArrayAccess access:
-                    foreach (var used in ArrayAccessLocals(access))
-                        yield return used;
-                    break;
-                case ArrayLength { Array: { } lengthArray }:
-                    yield return lengthArray;
-                    break;
-                case StringLength { Value: { } stringValue }:
-                    yield return stringValue;
-                    break;
-                case ListCount { Value: { } listValue }:
-                    yield return listValue;
-                    break;
-            }
+            case LocalVariable local when !ReferenceEquals(local, destination):
+                yield return local;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is LocalVariable baseLocal)
+                    yield return baseLocal;
+                if (memory.Index is LocalVariable indexLocal)
+                    yield return indexLocal;
+                break;
+            // A static field access doesn't read the storage pointer it was resolved from, so that
+            // pointer (and the class load feeding it) is free to die.
+            case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
+                yield return fieldLocal;
+                break;
+            // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
+            case AddressOf { Target: LocalVariable addressed }:
+                yield return addressed;
+                break;
+            case AddressOf { Target: ArrayAccess addressedElement }:
+                foreach (var used in ArrayAccessLocals(addressedElement))
+                    yield return used;
+                break;
+            case ArrayAccess access:
+                foreach (var used in ArrayAccessLocals(access))
+                    yield return used;
+                break;
+            case ArrayLength { Array: { } lengthArray }:
+                yield return lengthArray;
+                break;
+            case StringLength { Value: { } stringValue }:
+                yield return stringValue;
+                break;
+            case ListCount { Value: { } listValue }:
+                yield return listValue;
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var used in UsedLocals(component, destination))
+                    yield return used;
+                break;
         }
     }
 

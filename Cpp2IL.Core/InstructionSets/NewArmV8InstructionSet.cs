@@ -1300,6 +1300,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 ref conditionalComparisonFallbackNzcv);
         }
 
+        PruneUnconsumedHomogeneousFloatingReturnProjections(instructions, context);
+
         // fix branches
         for (var i = 0; i < instructions.Count; i++)
         {
@@ -1325,6 +1327,269 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         adrpOffsets.Clear();
         return instructions;
+    }
+
+    /// <summary>
+    /// HFA返回后的V0既代表完整值类型，也可被后续标量指令当作第一个字段读取。
+    /// 只有观察到字段分量消费者时才保留调用后投影；若调用结果直接通过128位存储写入托管字段，
+    /// 则保留完整聚合体，避免把Color等值类型错误降级为第一个Single字段。
+    /// </summary>
+    private static void PruneUnconsumedHomogeneousFloatingReturnProjections(
+        IReadOnlyList<Instruction> instructions,
+        MethodAnalysisContext context)
+    {
+        for (var callIndex = 0; callIndex < instructions.Count; callIndex++)
+        {
+            var call = instructions[callIndex];
+            if (call.OpCode != OpCode.Call
+                || call.Operands.Count < 2
+                || call.Operands[0] is not Immediate target
+                || !context.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var methods)
+                || methods.Count != 1)
+                continue;
+
+            var projections = Arm64CallingConventionResolver.ReturnProjections(methods[0]);
+            if (projections.Count == 0
+                || !MatchesReturnProjectionSequence(instructions, callIndex + 1, projections))
+                continue;
+
+            var consumerStart = callIndex + 1 + projections.Count;
+            if (HasHomogeneousFloatingComponentConsumer(instructions, consumerStart, projections))
+            {
+                callIndex += projections.Count;
+                continue;
+            }
+
+            for (var projectionIndex = callIndex + 1; projectionIndex < consumerStart; projectionIndex++)
+            {
+                instructions[projectionIndex].OpCode = OpCode.Nop;
+                instructions[projectionIndex].SetOperands();
+            }
+            callIndex += projections.Count;
+        }
+    }
+
+    private static bool MatchesReturnProjectionSequence(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        IReadOnlyList<(Register Destination, MemoryOperand Source)> projections)
+    {
+        if (startIndex < 0 || startIndex + projections.Count > instructions.Count)
+            return false;
+
+        for (var projectionIndex = 0; projectionIndex < projections.Count; projectionIndex++)
+        {
+            var expected = projections[projectionIndex];
+            var actual = instructions[startIndex + projectionIndex];
+            if (actual is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands.Count: 2
+                }
+                || actual.Operands[0] is not Register destination
+                || actual.Operands[1] is not MemoryOperand source
+                || destination.Number != expected.Destination.Number
+                || source.Base is not Register sourceBase
+                || expected.Source.Base is not Register expectedBase
+                || sourceBase.Number != expectedBase.Number
+                || source.Index != null
+                || source.Addend != expected.Source.Addend)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 判断投影寄存器在下一次定义前是否以字段分量身份被读取。
+    /// V1及更高寄存器天然只承载后续字段；V0则根据HFA实参、标量运算、标量存储或直接标量调用区分。
+    /// </summary>
+    internal static bool HasHomogeneousFloatingComponentConsumer(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        IReadOnlyList<(Register Destination, MemoryOperand Source)> projections)
+    {
+        if (IsCompleteHomogeneousFloatingAggregateStore(instructions, startIndex, projections))
+            return false;
+
+        var activeRegisters = projections
+            .Select(projection => projection.Destination.Number)
+            .ToHashSet();
+        var aggregateCarrier = ((Register)projections[^1].Source.Base!).Number;
+
+        for (var instructionIndex = startIndex;
+             instructionIndex < instructions.Count && activeRegisters.Count > 0;
+             instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            var readRegisters = instruction.Sources
+                .SelectMany(EnumerateOperandRegisters)
+                .Select(register => register.Number)
+                .ToHashSet();
+
+            if (readRegisters.Any(register =>
+                    register != aggregateCarrier && activeRegisters.Contains(register))
+                || activeRegisters.Contains(aggregateCarrier)
+                && ReadsAggregateCarrierAsScalar(instruction, aggregateCarrier))
+                return true;
+
+            if (instruction.Destination is Register destination)
+                activeRegisters.Remove(destination.Number);
+
+            // 分支前尚未得到确定消费者时保守保留投影，跨边数据流交给后续CFG/SSA处理。
+            if (instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 识别编译器把一个HFA返回值按字段拆成连续标量存储的完整聚合体赋值。
+    /// 所有V分量必须各出现一次、写入同一基址且“目标偏移减源字段偏移”完全一致；
+    /// 缺字段、重复字段、额外消费者和基址漂移均保持标量投影。
+    /// </summary>
+    private static bool IsCompleteHomogeneousFloatingAggregateStore(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        IReadOnlyList<(Register Destination, MemoryOperand Source)> projections)
+    {
+        var fieldOffsets = projections.ToDictionary(
+            projection => projection.Destination.Number,
+            projection => projection.Source.Addend);
+        var remaining = fieldOffsets.Keys.ToHashSet();
+        int? destinationBase = null;
+        long? aggregateOffset = null;
+
+        for (var instructionIndex = startIndex;
+             instructionIndex < instructions.Count && remaining.Count > 0;
+             instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            var componentReads = instruction.Sources
+                .SelectMany(EnumerateOperandRegisters)
+                .Select(register => register.Number)
+                .Where(remaining.Contains)
+                .Distinct()
+                .ToArray();
+
+            if (componentReads.Length == 0)
+            {
+                if (instruction.Destination is Register destination
+                    && remaining.Contains(destination.Number))
+                    return false;
+                if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
+                    or OpCode.Jump or OpCode.ConditionalJump or OpCode.Return or OpCode.Throw)
+                    return false;
+                continue;
+            }
+
+            if (componentReads.Length != 1
+                || instruction is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands.Count: 2
+                }
+                || instruction.Operands[0] is not MemoryOperand
+                {
+                    Base: Register memoryBase,
+                    Index: null,
+                    Scale: 0
+                } memory
+                || instruction.Operands[1] is not Register source
+                || source.Number != componentReads[0]
+                || instruction.MemoryAccessWidthBits is not (32 or 64))
+                return false;
+
+            long candidateAggregateOffset;
+            try
+            {
+                candidateAggregateOffset = checked(memory.Addend - fieldOffsets[source.Number]);
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+            destinationBase ??= memoryBase.Number;
+            aggregateOffset ??= candidateAggregateOffset;
+            if (destinationBase.Value != memoryBase.Number
+                || aggregateOffset.Value != candidateAggregateOffset)
+                return false;
+
+            remaining.Remove(source.Number);
+        }
+
+        return remaining.Count == 0;
+    }
+
+    private static bool ReadsAggregateCarrierAsScalar(Instruction instruction, int aggregateCarrier)
+    {
+        foreach (var aggregate in instruction.Operands.OfType<HomogeneousFloatingAggregateArgument>())
+            if (aggregate.Components
+                .SelectMany(EnumerateOperandRegisters)
+                .Any(register => register.Number == aggregateCarrier))
+                return true;
+
+        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+        {
+            var argumentBase = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+            if (instruction.Operands
+                .Skip(argumentBase)
+                .OfType<Register>()
+                .Any(register => register.Number == aggregateCarrier))
+                return true;
+        }
+
+        if (instruction.OpCode == OpCode.Move
+            && instruction.Operands.Count > 1
+            && instruction.Operands[1] is Register moveSource
+            && moveSource.Number == aggregateCarrier)
+        {
+            if (instruction.MemoryAccessWidthBits is 32 or 64)
+                return true;
+            if (instruction.MemoryAccessWidthBits >= 128)
+                return false;
+            return instruction.Operands[0] is Register;
+        }
+
+        return instruction.OpCode is
+            OpCode.ConditionalSelect or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+            or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight
+            or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+            or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
+            or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+            or OpCode.ConvertSignedIntegerToFloat or OpCode.ReinterpretIntegerBitsAsFloat
+            or OpCode.ReinterpretFloatBitsAsInteger or OpCode.RoundFloatTowardPositiveInfinity
+            or OpCode.RoundFloatTowardNegativeInfinity
+            or >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned;
+    }
+
+    private static IEnumerable<Register> EnumerateOperandRegisters(IOperand operand)
+    {
+        switch (operand)
+        {
+            case Register register:
+                yield return register;
+                break;
+            case MemoryOperand { Base: Register baseRegister, Index: Register indexRegister }:
+                yield return baseRegister;
+                yield return indexRegister;
+                break;
+            case MemoryOperand { Base: Register baseRegister }:
+                yield return baseRegister;
+                break;
+            case MemoryOperand { Index: Register indexRegister }:
+                yield return indexRegister;
+                break;
+            case AddressOf { Target: Register addressed }:
+                yield return addressed;
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var componentRegister in EnumerateOperandRegisters(component))
+                    yield return componentRegister;
+                break;
+        }
     }
 
     private bool TryRecoverByteJumpTableMethod(
@@ -1503,6 +1768,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                 result[index].SetOperand(0, result[targetIndex]);
             }
+            PruneUnconsumedHomogeneousFloatingReturnProjections(result, context);
             instructions = result;
             return true;
         }
@@ -1675,6 +1941,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             {
                 // 调用点已观察到X8=&stack且目标返回值类型；先保留候选，待SSA后绑定到唯一栈局部。
                 call.AddOperands([new Register(null, nameof(Arm64Register.X8))]);
+            }
+
+            if (methodsAtAddress.Count == 1)
+            {
+                // HFA调用在托管CIL中返回一个完整值类型，在AAPCS64中则会改写连续V寄存器。
+                // 逆序字段投影让SSA同时看到V0..Vn的新定义，并保证所有字段都从尚未覆盖的V0
+                // 聚合体载体读取；后续字段偏移解析会把这些内存形态精确绑定到值类型字段。
+                foreach (var projection in Arm64CallingConventionResolver.ReturnProjections(calledMethod))
+                    Add(address, OpCode.Move, projection.Destination, projection.Source);
             }
         }
 

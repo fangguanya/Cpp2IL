@@ -53,6 +53,31 @@ public static class Arm64CallingConventionResolver
     }
 
     /// <summary>
+    /// 为直接返回的同质浮点聚合体建立调用后字段投影。
+    /// 托管调用先把完整值类型保存在V0对应的聚合体局部量中，再把每个字段投影回原生ABI使用的
+    /// 连续V寄存器。投影必须按高编号到V0的顺序发射；若先覆盖V0，后续字段便会错误地从第一个
+    /// 标量分量而不是完整聚合体读取。
+    /// </summary>
+    internal static IReadOnlyList<(Register Destination, MemoryOperand Source)> ReturnProjections(
+        MethodAnalysisContext method)
+    {
+        if (!TryGetHomogeneousFloatingAggregateFields(method.ReturnType, out var fields)
+            || fields.Any(field => field.Offset < 0))
+            return [];
+
+        var aggregateCarrier = ReturnRegister(method);
+        var projections = new List<(Register Destination, MemoryOperand Source)>(fields.Count);
+        for (var fieldIndex = fields.Count - 1; fieldIndex >= 0; fieldIndex--)
+        {
+            projections.Add((
+                new Register(null, $"V{fieldIndex}"),
+                new MemoryOperand(aggregateCarrier, addend: fields[fieldIndex].Offset)));
+        }
+
+        return projections;
+    }
+
+    /// <summary>
     /// 按 AAPCS64 C.1-C.15 计算一个已知托管方法在调用点的实参载体。
     /// 浮点标量与 HFA 使用独立的 V0-V7 序列；HFA 若不能完整放入剩余 V 寄存器，
     /// 整体进入栈参数区。整数寄存器耗尽后的引用和标量同样依序进入该栈参数区。
