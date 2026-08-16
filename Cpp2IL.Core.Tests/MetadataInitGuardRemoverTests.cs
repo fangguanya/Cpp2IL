@@ -51,6 +51,50 @@ public class MetadataInitGuardRemoverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 被引用泛型方法的Rgctx初始化保护区按同源MethodInfo删除()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            referencedMethod: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.True);
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+            Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零参泛型初始化调用返回值未消费时仍按守卫身份删除()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            referencedMethod: true,
+            omitCallCarrier: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.True);
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 普通递归调用不得冒充Rgctx初始化分支()
     {
@@ -67,6 +111,29 @@ public class MetadataInitGuardRemoverTests
             Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
             Assert.That(fixture.Guard.Instructions[^1].OpCode, Is.EqualTo(OpCode.ConditionalJump));
         }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 零参泛型调用返回值被业务路径消费时保留完整分支()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            referencedMethod: true,
+            omitCallCarrier: true,
+            consumeCallResult: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.False);
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+        });
     }
 
     [Test]
@@ -301,6 +368,40 @@ public class MetadataInitGuardRemoverTests
         Assert.That(MetadataInitGuardRemover.HasInitialisedFlagTest(guard, 0x135), Is.False);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 类初始化保护区通过独占跳转代理合流时被删除()
+    {
+        var fixture = CreateClassInitGuardWithBypass();
+
+        MetadataInitGuardRemover.Run(fixture.Graph, 0x135);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Bypass));
+            Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+            Assert.That(fixture.Guard.Instructions[^1].OpCode, Is.EqualTo(OpCode.Jump));
+            Assert.That(fixture.Merge.Predecessors, Does.Contain(fixture.Guard));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 含业务计算的跳转块不得冒充类初始化代理()
+    {
+        var fixture = CreateClassInitGuardWithBypass(includeBusinessMove: true);
+
+        MetadataInitGuardRemover.Run(fixture.Graph, 0x135);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Bypass));
+            Assert.That(fixture.Guard.Instructions[^1].OpCode, Is.EqualTo(OpCode.ConditionalJump));
+        }
+    }
+
     private static Instruction CreateFlagTest(long address, long mask) =>
         new(
             0,
@@ -309,12 +410,70 @@ public class MetadataInitGuardRemoverTests
             new MemoryOperand(addend: address),
             new Immediate(mask));
 
+    private static ClassInitBypassFixture CreateClassInitGuardWithBypass(bool includeBusinessMove = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var booleanType = app.SystemTypes.SystemBooleanType;
+        var intPtrType = app.SystemTypes.SystemIntPtrType;
+        var classCarrier = new LocalVariable("classCarrier", new Register(null, "X0"), intPtrType);
+        var condition = new LocalVariable("condition", new Register(null, "COND"), booleanType);
+        var callResult = new LocalVariable("callResult", new Register(null, "X0", 1), intPtrType);
+        var reloadedField = new LocalVariable("reloadedField", new Register(null, "X8"), intPtrType);
+
+        var graph = new ISILControlFlowGraph([new Instruction(100, OpCode.Return)]);
+        var guard = new Block { ID = 2 };
+        var init = new Block { ID = 3 };
+        var bypass = new Block { ID = 4 };
+        var merge = new Block { ID = 5 };
+
+        guard.Instructions.Add(new Instruction(
+            1,
+            OpCode.CheckNotEqual,
+            condition,
+            new MemoryOperand(baseRegister: classCarrier, addend: 0xE4),
+            new Immediate(0)));
+        guard.Instructions.Add(new Instruction(2, OpCode.ConditionalJump, bypass, condition));
+        init.Instructions.Add(new Instruction(
+            3,
+            OpCode.Call,
+            new StringLiteral("il2cpp_codegen_runtime_class_init"),
+            callResult,
+            classCarrier));
+        init.Instructions.Add(new Instruction(
+            4,
+            OpCode.Move,
+            reloadedField,
+            new MemoryOperand(baseRegister: classCarrier, addend: 0xB8)));
+        init.Instructions.Add(new Instruction(5, OpCode.Jump, merge));
+        if (includeBusinessMove)
+            bypass.Instructions.Add(new Instruction(6, OpCode.Move, reloadedField, new Immediate(1)));
+        bypass.Instructions.Add(new Instruction(7, OpCode.Jump, merge));
+        merge.Instructions.Add(new Instruction(8, OpCode.Return, new Immediate(1)));
+
+        Connect(graph.EntryBlock, guard);
+        Connect(guard, init);
+        Connect(guard, bypass);
+        Connect(init, merge);
+        Connect(bypass, merge);
+        Connect(merge, graph.ExitBlock);
+        guard.CalculateBlockType();
+        init.CalculateBlockType();
+        bypass.CalculateBlockType();
+        merge.CalculateBlockType();
+        graph.Blocks = [graph.EntryBlock, graph.ExitBlock, guard, init, bypass, merge];
+
+        return new ClassInitBypassFixture(graph, guard, init, bypass, merge);
+    }
+
     private static MethodRgctxGuardFixture CreateMethodRgctxGuard(
         bool useSavedCarrier,
         bool ordinaryRecursiveCall,
         bool namedRuntimeMetadataCall = false,
         bool useOrdinaryGuardCarrier = false,
-        bool nestedPseudoGuard = false)
+        bool nestedPseudoGuard = false,
+        bool referencedMethod = false,
+        bool omitCallCarrier = false,
+        bool consumeCallResult = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var objectType = app.SystemTypes.SystemObjectType;
@@ -325,8 +484,18 @@ public class MetadataInitGuardRemoverTests
             booleanType,
             MethodAttributes.Public,
             [objectType]);
-        var methodInfoType = new RuntimeMethodInfoAnalysisContext(method, objectType.DeclaringAssembly);
-        var concreteCallTarget = new ConcreteGenericMethodAnalysisContext(method, [], []);
+        var representedMethod = referencedMethod
+            ? new InjectedMethodAnalysisContext(
+                objectType,
+                "ReferencedGenericMethod",
+                booleanType,
+                MethodAttributes.Public | MethodAttributes.Static,
+                omitCallCarrier ? [] : [objectType])
+            : method;
+        var methodInfoType = new RuntimeMethodInfoAnalysisContext(
+            representedMethod,
+            objectType.DeclaringAssembly);
+        var concreteCallTarget = new ConcreteGenericMethodAnalysisContext(representedMethod, [], []);
         var methodInfo = new LocalVariable("methodInfo", new Register(null, "X2"), methodInfoType);
         var savedMethodInfo = new LocalVariable(
             "savedMethodInfo",
@@ -370,12 +539,18 @@ public class MetadataInitGuardRemoverTests
                 new StringLiteral("il2cpp_codegen_initialize_runtime_metadata"),
                 callResult,
                 new MemoryOperand(addend: 0x1000))
-            : new Instruction(
-                4,
-                OpCode.Call,
-                concreteCallTarget,
-                callResult,
-                ordinaryRecursiveCall ? receiver : callCarrier));
+            : omitCallCarrier
+                ? new Instruction(
+                    4,
+                    OpCode.Call,
+                    concreteCallTarget,
+                    callResult)
+                : new Instruction(
+                    4,
+                    OpCode.Call,
+                    concreteCallTarget,
+                    callResult,
+                    ordinaryRecursiveCall ? receiver : callCarrier));
         if (nestedPseudoGuard)
         {
             var nestedCondition = new LocalVariable(
@@ -401,7 +576,10 @@ public class MetadataInitGuardRemoverTests
         {
             init.Instructions.Add(new Instruction(5, OpCode.Jump, merge));
         }
-        merge.Instructions.Add(new Instruction(6, OpCode.Return, new Immediate(1)));
+        merge.Instructions.Add(new Instruction(
+            6,
+            OpCode.Return,
+            consumeCallResult ? callResult : new Immediate(1)));
 
         Connect(graph.EntryBlock, guard);
         Connect(guard, init);
@@ -440,5 +618,12 @@ public class MetadataInitGuardRemoverTests
         ISILControlFlowGraph Graph,
         Block Guard,
         Block Init,
+        Block Merge);
+
+    private sealed record ClassInitBypassFixture(
+        ISILControlFlowGraph Graph,
+        Block Guard,
+        Block Init,
+        Block Bypass,
         Block Merge);
 }

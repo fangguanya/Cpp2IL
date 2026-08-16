@@ -765,6 +765,68 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void 标量浮点指令接受全部单精度寄存器()
+    {
+        var accepted = NewArmV8InstructionSet.TryGetMatchingScalarFloatingWidth(
+            [
+                (Arm64OperandKind.Register, Arm64Register.S0),
+                (Arm64OperandKind.Register, Arm64Register.S1),
+                (Arm64OperandKind.Register, Arm64Register.S8),
+            ],
+            out var widthBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(accepted, Is.True);
+            Assert.That(widthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 标量浮点指令接受最高编号双精度寄存器()
+    {
+        var accepted = NewArmV8InstructionSet.TryGetMatchingScalarFloatingWidth(
+            [
+                (Arm64OperandKind.Register, Arm64Register.D31),
+                (Arm64OperandKind.Register, Arm64Register.D0),
+            ],
+            out var widthBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(accepted, Is.True);
+            Assert.That(widthBits, Is.EqualTo(64));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 标量浮点指令拒绝混合精度和非寄存器操作数()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryGetMatchingScalarFloatingWidth(
+                    [
+                        (Arm64OperandKind.Register, Arm64Register.S0),
+                        (Arm64OperandKind.Register, Arm64Register.D0),
+                    ],
+                    out _),
+                Is.False);
+            Assert.That(
+                NewArmV8InstructionSet.TryGetMatchingScalarFloatingWidth(
+                    [
+                        (Arm64OperandKind.Register, Arm64Register.S0),
+                        (Arm64OperandKind.Immediate, Arm64Register.S1),
+                    ],
+                    out _),
+                Is.False);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void ReplicatedVectorMoveDecodesBleedFollowersNegativeSaturationValue()
     {
         var decoded = NewArmV8InstructionSet.TryDecodeReplicatedVectorMoveImmediate32(

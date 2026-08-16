@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -618,6 +619,12 @@ public class SsaForm
                     if (Equals(destination, source))
                         continue;
 
+                    // pruned SSA 按物理寄存器编号建 Phi；同一 ARM64 寄存器在不相交生命期中
+                    // 可以先承载值类型 Enumerator，随后承载 Single。类型传播已经证明两端属于
+                    // 不同托管值时，这条 Phi 入边只是寄存器复用伪依赖，绝不能生成非法赋值。
+                    if (!ShouldEmitPhiCopy(destination, source))
+                        continue;
+
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
 
@@ -656,6 +663,23 @@ public class SsaForm
 
         cfg.RemoveNops();
         cfg.RemoveEmptyBlocks();
+    }
+
+    /// <summary>
+    /// 判定退 SSA 时是否应把一条 Phi 入边写成托管赋值。未知类型保留既有数据流；已知类型
+    /// 必须相同，或源引用类型可赋给目标基类/接口。不同值类型及值类型到引用类型都属于
+    /// 物理寄存器复用证据，不参与当前 Phi。
+    /// </summary>
+    internal static bool ShouldEmitPhiCopy(IOperand destination, IOperand source)
+    {
+        if (destination is not LocalVariable destinationLocal
+            || source is not LocalVariable sourceLocal
+            || destinationLocal.Type == null
+            || sourceLocal.Type == null)
+            return true;
+
+        return GenericCallRebinder.TypesEquivalent(destinationLocal.Type, sourceLocal.Type)
+               || sourceLocal.Type.IsAssignableTo(destinationLocal.Type);
     }
 
     /// <summary>

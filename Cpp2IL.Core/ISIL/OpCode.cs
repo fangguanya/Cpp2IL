@@ -89,6 +89,15 @@ public enum OpCode
     /// <summary>Negates op 2, moves the result into op 1</summary>
     Negate,
 
+    /// <summary>按 op 3 浮点位宽计算 op 2 的绝对值并写入 op 1</summary>
+    AbsoluteNumber,
+
+    /// <summary>按 op 4 浮点位宽计算 op 2 与 op 3 之差的绝对值并写入 op 1</summary>
+    AbsoluteDifference,
+
+    /// <summary>按 IEEE-754 maximumNumber 语义选择 op 2/op 3 并写入 op 1；op 4 为浮点位宽</summary>
+    MaximumNumber,
+
     /// <summary>按 op 3 指定的目标位宽转换浮点精度，并把 op 2 写入 op 1</summary>
     ConvertFloatingPointPrecision,
 

@@ -45,8 +45,10 @@ public static class ListCountRecovery
         var fieldDefinition = field.Field is ConcreteGenericFieldAnalysisContext concreteField
             ? concreteField.BaseFieldContext
             : field.Field;
-        listType = field.Field.DeclaringType as GenericInstanceTypeAnalysisContext
-                   ?? field.Local.Type as GenericInstanceTypeAnalysisContext
+        // 中文注释：字段上下文可能仍来自 List<object> 共享布局，而接收者已由 Newobj/保存
+        // 寄存器恢复为 List<T>；接收者是当前调用点的精确证据，应优先决定 Count 的实例类型。
+        listType = field.Local.Type as GenericInstanceTypeAnalysisContext
+                   ?? field.Field.DeclaringType as GenericInstanceTypeAnalysisContext
                    ?? null!;
 
         return !fieldDefinition.IsStatic

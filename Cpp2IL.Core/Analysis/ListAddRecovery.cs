@@ -23,6 +23,9 @@ public static class ListAddRecovery
     public static int Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
+        // 中文注释：Newobj 的类型槽在元数据闭合后可能已从 List<object> 精确到 List<T>；
+        // 容量菱形匹配前只校准 AddWithResize，使公开 Add 的元素类型直接继承真实接收者。
+        RebindAddWithResizeCallsFromReceivers(graph);
         var recovered = 0;
         // 共享快尾会在逐项改写后只剩一个前驱，因此必须在任何图修改之前冻结其身份。
         var originalSharedFastTails = graph.Blocks
@@ -47,6 +50,30 @@ public static class ListAddRecovery
             DeadCodeEliminator.Run(method);
 
         return recovered + suppressed;
+    }
+
+    internal static int RebindAddWithResizeCallsFromReceivers(ISILControlFlowGraph graph)
+    {
+        var rebound = 0;
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction is not
+                {
+                    OpCode: OpCode.CallVoid,
+                    Operands:
+                    [
+                        ConcreteGenericMethodAnalysisContext { Name: "AddWithResize" },
+                        LocalVariable,
+                        _,
+                    ],
+                })
+                continue;
+
+            if (GenericCallRebinder.TryRebind(instruction))
+                rebound++;
+        }
+
+        return rebound;
     }
 
     /// <summary>
@@ -1631,18 +1658,19 @@ public static class ListAddRecovery
         }
 
         var stores = instructions.Where(instruction =>
-            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] }).ToList();
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand or ArrayAccess, _] }).ToList();
         var sizeAdds = instructions.Where(instruction =>
             instruction is { OpCode: OpCode.Add, Operands: [LocalVariable, var source, Immediate { Value: 1 }] }
             && IsSameStateOperand(source, sizeState, receiver, "_size")).ToList();
         if (stores.Count != 1
             || sizeAdds.Count != 1
-            || stores[0].Operands[0] is not MemoryOperand memory
             || sizeAdds[0].Operands[0] is not LocalVariable newSize)
         {
             Logger.VerboseNewline($"ListAdd恢复拒绝：快路径元素写入数={stores.Count}，大小递增数={sizeAdds.Count}。");
             return false;
         }
+        MemoryOperand? memory = stores[0].Operands[0] is MemoryOperand rawMemory ? rawMemory : null;
+        var arrayAccess = stores[0].Operands[0] as ArrayAccess;
         if (!TryReconcileElementValue(
                 graph,
                 stores[0].Operands[1],
@@ -1678,12 +1706,16 @@ public static class ListAddRecovery
 
         var addresses = instructions.Where(instruction =>
             instruction is { OpCode: OpCode.Add, Operands: [LocalVariable destination, var left, var right] }
-            && ReferenceEquals(destination, memory.Base)
+            && (memory.HasValue && ReferenceEquals(destination, memory.Value.Base) || arrayAccess != null)
             && ((IsItemsAddressBase(left, receiver, items) && ReferenceEquals(right, elementOffset))
                 || (IsItemsAddressBase(right, receiver, items) && ReferenceEquals(left, elementOffset)))).ToList();
-        if (addresses.Count != 1)
+        if (addresses.Count != 1
+            || arrayAccess != null
+            && (!ReferenceEquals(arrayAccess.Array, items)
+                || !IsSameStateOperand(arrayAccess.Index, sizeState, receiver, "_size")))
         {
-            Logger.VerboseNewline($"ListAdd恢复拒绝：元素地址证据数={addresses.Count}。");
+            Logger.VerboseNewline(
+                $"ListAdd恢复拒绝：元素地址证据数={addresses.Count}，数组访问匹配={arrayAccess != null}。");
             return false;
         }
 
@@ -1777,7 +1809,10 @@ public static class ListAddRecovery
             && !IsDeadMistypedRuntimeMethodCarrier(instruction, merge)).ToList();
         var sameCarriers = HaveIdenticalCarrierMoves(comparableFastTail, comparableSlowTail);
         if (!sameCarriers)
-            Logger.VerboseNewline($"ListAdd恢复拒绝：快慢路径载体尾不等价，快路径={comparableFastTail.Count}，慢路径={comparableSlowTail.Count}。");
+            Logger.VerboseNewline(
+                $"ListAdd恢复拒绝：快慢路径载体尾不等价，快路径={comparableFastTail.Count}，" +
+                $"慢路径={comparableSlowTail.Count}，快尾=[{string.Join(" | ", comparableFastTail)}]，" +
+                $"慢尾=[{string.Join(" | ", comparableSlowTail)}]。");
         return sameCarriers;
     }
 

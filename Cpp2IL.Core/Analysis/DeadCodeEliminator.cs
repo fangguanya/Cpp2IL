@@ -162,6 +162,7 @@ public static class DeadCodeEliminator
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.Not or OpCode.Negate
+                or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
                 or OpCode.ConvertSignedIntegerToFloat
                 or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger

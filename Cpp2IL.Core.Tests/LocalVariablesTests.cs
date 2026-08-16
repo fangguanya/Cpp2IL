@@ -19,6 +19,269 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 有符号整数转单精度结果覆盖先到的Enumerator占位类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var enumeratorType = enumeratorDefinition.MakeGenericInstanceType(
+            [appContext.SystemTypes.SystemObjectType]);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "V0", 4),
+            enumeratorType);
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0", 7),
+            appContext.SystemTypes.SystemInt32Type);
+        var conversion = new Instruction(
+            0,
+            OpCode.ConvertSignedIntegerToFloat,
+            destination,
+            source,
+            new Immediate(32),
+            new Immediate(32));
+
+        var changed = LocalVariables.BindNumericConversionTypes(conversion, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemSingleType));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Phi全部局部入边类型一致时才建立目标类型共识()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var singleType = appContext.SystemTypes.SystemSingleType;
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8));
+        var first = new LocalVariable("first", new Register(null, "V0", 5), singleType);
+        var second = new LocalVariable("second", new Register(null, "V0", 6), singleType);
+        var phi = new Instruction(-1, OpCode.Phi, destination, first, second);
+
+        var changed = LocalVariables.PropagatePhi(phi);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(singleType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi混合Enumerator与单精度入边时拒绝跨语义类型传播()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var enumeratorType = enumeratorDefinition.MakeGenericInstanceType(
+            [appContext.SystemTypes.SystemObjectType]);
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8));
+        var enumerator = new LocalVariable("enumerator", new Register(null, "V0", 4), enumeratorType);
+        var weight = new LocalVariable(
+            "weight",
+            new Register(null, "V0", 5),
+            appContext.SystemTypes.SystemSingleType);
+        var phi = new Instruction(-1, OpCode.Phi, destination, enumerator, weight);
+
+        var changed = LocalVariables.PropagatePhi(phi);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.Null);
+            Assert.That(enumerator.Type, Is.SameAs(enumeratorType));
+            Assert.That(weight.Type, Is.SameAs(appContext.SystemTypes.SystemSingleType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi存在未定型局部入边时等待完整证据()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8));
+        var known = new LocalVariable(
+            "known",
+            new Register(null, "V0", 5),
+            appContext.SystemTypes.SystemSingleType);
+        var unknown = new LocalVariable("unknown", new Register(null, "V0", 6));
+        var phi = new Instruction(-1, OpCode.Phi, destination, known, unknown);
+
+        var changed = LocalVariables.PropagatePhi(phi);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.Null);
+            Assert.That(unknown.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Phi具体泛型入边共识覆盖object共享占位()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listObject = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var destination = new LocalVariable("destination", new Register(null, "X19", 8), listObject);
+        var first = new LocalVariable("first", new Register(null, "X0", 5), listString);
+        var second = new LocalVariable("second", new Register(null, "X19", 6), listString);
+        var phi = new Instruction(-1, OpCode.Phi, destination, first, second);
+
+        var changed = LocalVariables.PropagatePhi(phi);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(GenericCallRebinder.TypesEquivalent(destination.Type, listString), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi不同具体泛型不得覆盖既有业务类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var listInt = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemInt32Type]);
+        var destination = new LocalVariable("destination", new Register(null, "X19", 8), listString);
+        var first = new LocalVariable("first", new Register(null, "X0", 5), listInt);
+        var second = new LocalVariable("second", new Register(null, "X19", 6), listInt);
+        var phi = new Instruction(-1, OpCode.Phi, destination, first, second);
+
+        var changed = LocalVariables.PropagatePhi(phi);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(GenericCallRebinder.TypesEquivalent(destination.Type, listString), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 退SSA为相同单精度类型保留Phi复制()
+    {
+        var singleType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType;
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8), singleType);
+        var source = new LocalVariable("source", new Register(null, "V0", 5), singleType);
+
+        Assert.That(SsaForm.ShouldEmitPhiCopy(destination, source), Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 退SSA允许引用实例流入目标基类()
+    {
+        var systemTypes = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X0", 8),
+            systemTypes.SystemObjectType);
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0", 5),
+            systemTypes.SystemStringType);
+
+        Assert.That(SsaForm.ShouldEmitPhiCopy(destination, source), Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 退SSA拒绝Enumerator流入单精度目标()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var enumeratorType = enumeratorDefinition.MakeGenericInstanceType(
+            [appContext.SystemTypes.SystemObjectType]);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "V0", 8),
+            appContext.SystemTypes.SystemSingleType);
+        var source = new LocalVariable("source", new Register(null, "V0", 4), enumeratorType);
+
+        Assert.That(SsaForm.ShouldEmitPhiCopy(destination, source), Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 单精度字面量驱动乘法目标与局部源定型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8));
+        var source = new LocalVariable("source", new Register(null, "V1", 5));
+        var multiply = new Instruction(
+            0,
+            OpCode.Multiply,
+            destination,
+            source,
+            new FloatLiteral(8f));
+
+        var changed = LocalVariables.BindFloatingArithmeticTypes(multiply, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemSingleType));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemSingleType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 双精度字面量保持六十四位算术域()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8));
+        var source = new LocalVariable("source", new Register(null, "V1", 5));
+        var add = new Instruction(0, OpCode.Add, destination, source, new DoubleLiteral(double.MaxValue));
+
+        var changed = LocalVariables.BindFloatingArithmeticTypes(add, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemDoubleType));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemDoubleType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 混合单双精度源保持开放而不猜测转换方向()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(null, "V0", 8));
+        var add = new Instruction(
+            0,
+            OpCode.Add,
+            destination,
+            new FloatLiteral(1f),
+            new DoubleLiteral(1d));
+
+        var changed = LocalVariables.BindFloatingArithmeticTypes(add, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 已解析字段加载覆盖先到的Object宽类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
@@ -1560,6 +1823,169 @@ public class LocalVariablesTests
         LocalVariables.ResolveLateCallTypesAndAddressCarriers(method);
 
         Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 后置Newobj精确类型覆盖共享Object实例并重绑定构造器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listObject = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var baseConstructor = listDefinition.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
+        var objectConstructor = new ConcreteGenericMethodAnalysisContext(
+            baseConstructor,
+            [appContext.SystemTypes.SystemObjectType],
+            []);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), listObject);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, listString);
+        var call = new Instruction(1, OpCode.CallVoid, objectConstructor, receiver);
+        var method = CreateConstructorFixture(listDefinition, "RefreshConcreteAllocation", [allocation, call], [receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(receiver.Type, Is.SameAs(listString));
+            Assert.That(call.Operands[0], Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+            var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+            Assert.That(rebound.TypeGenericParameters.Single(), Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 后置Newobj类型已精确时保持不变()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemStringType);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, appContext.SystemTypes.SystemStringType);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemStringType,
+            "PreserveResolvedAllocation",
+            [allocation],
+            [receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通Move携带类型操作数不得冒充分配结果()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var move = new Instruction(0, OpCode.Move, receiver, appContext.SystemTypes.SystemStringType);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RejectNonAllocation",
+            [move],
+            [receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 三十二位状态掩码覆盖退SSA留下的布尔占位类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var state = new LocalVariable("state", new Register(null, "X27", 1));
+        var combined = new LocalVariable(
+            "combined",
+            new Register(null, "X8", 1),
+            appContext.SystemTypes.SystemBooleanType);
+        var instruction = new Instruction(0, OpCode.Or, combined, state, new Immediate(8))
+        {
+            IntegerWidthBits = 32,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(state.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+            Assert.That(combined.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 六十四位循环增量沿已定型比较载体保持长整数()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var counter = new LocalVariable("counter", new Register(null, "X22", 1));
+        var limit = new LocalVariable(
+            "limit",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemInt64Type);
+        var comparison = new Instruction(
+            0,
+            OpCode.CheckEqual,
+            new LocalVariable("equal", new Register(null, "Z", 1)),
+            counter,
+            limit);
+        var increment = new Instruction(1, OpCode.Add, counter, counter, new Immediate(1))
+        {
+            IntegerWidthBits = 64,
+        };
+
+        var comparisonChanged = LocalVariables.BindFinalComparisonOperandTypes(comparison);
+        var incrementChanged = LocalVariables.BindSizedIntegerOperationTypes(increment, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(comparisonChanged, Is.True);
+            Assert.That(incrementChanged, Is.False);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 带位宽的整数运算不得覆盖引用载体()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var reference = new LocalVariable(
+            "reference",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemStringType);
+        var destination = new LocalVariable("destination", new Register(null, "X1", 1));
+        var instruction = new Instruction(0, OpCode.Or, destination, reference, new Immediate(8))
+        {
+            IntegerWidthBits = 64,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(reference.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+            Assert.That(destination.Type, Is.Null);
+        });
     }
 
     private static InjectedMethodAnalysisContext CreateConstructorFixture(

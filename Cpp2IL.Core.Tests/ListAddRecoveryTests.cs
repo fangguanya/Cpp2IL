@@ -94,6 +94,77 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 精确List接收者把共享Object扩容调用重绑定到元素类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listString = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var openTarget = CreateOpenAddWithResizeTarget();
+        var objectTarget = new ConcreteGenericMethodAnalysisContext(
+            openTarget.BaseMethodContext,
+            [app.SystemTypes.SystemObjectType],
+            []);
+        var receiver = Local("receiver", listString);
+        var value = Local("value", app.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, objectTarget, receiver, value);
+        var graph = new ISILControlFlowGraph([call, new Instruction(1, OpCode.Return)]);
+
+        var rebound = ListAddRecovery.RebindAddWithResizeCallsFromReceivers(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rebound, Is.EqualTo(1));
+            var target = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+            Assert.That(target.TypeGenericParameters.Single(), Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已匹配接收者的扩容调用保持稳定()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listString = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var openTarget = CreateOpenAddWithResizeTarget();
+        var stringTarget = new ConcreteGenericMethodAnalysisContext(
+            openTarget.BaseMethodContext,
+            [app.SystemTypes.SystemStringType],
+            []);
+        var receiver = Local("receiver", listString);
+        var value = Local("value", app.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, stringTarget, receiver, value);
+        var graph = new ISILControlFlowGraph([call, new Instruction(1, OpCode.Return)]);
+
+        var rebound = ListAddRecovery.RebindAddWithResizeCallsFromReceivers(graph);
+
+        Assert.That(rebound, Is.Zero);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非List接收者不驱动扩容调用重绑定()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var openTarget = CreateOpenAddWithResizeTarget();
+        var objectTarget = new ConcreteGenericMethodAnalysisContext(
+            openTarget.BaseMethodContext,
+            [app.SystemTypes.SystemObjectType],
+            []);
+        var receiver = Local("receiver", app.SystemTypes.SystemStringType);
+        var value = Local("value", app.SystemTypes.SystemStringType);
+        var call = new Instruction(0, OpCode.CallVoid, objectTarget, receiver, value);
+        var graph = new ISILControlFlowGraph([call, new Instruction(1, OpCode.Return)]);
+
+        var rebound = ListAddRecovery.RebindAddWithResizeCallsFromReceivers(graph);
+
+        Assert.That(rebound, Is.Zero);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 完整引用类型容量菱形恢复为公开Add调用()
     {
         var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);

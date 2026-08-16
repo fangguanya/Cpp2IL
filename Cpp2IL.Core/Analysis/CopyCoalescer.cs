@@ -49,6 +49,117 @@ public static class CopyCoalescer
         Rewrite(cfg, groups);
     }
 
+    /// <summary>
+    /// 删除退 SSA 后由晚期聚合/地址恢复最终证明为跨语义类型的 Phi 复制。该门必须位于
+    /// 所有局部类型和栈槽重写完成之后；指令索引 -1 精确限定 Phi 生成物，不触碰原生 Move。
+    /// </summary>
+    internal static void PruneIncompatiblePhiCopies(ISILControlFlowGraph cfg)
+    {
+        foreach (var instruction in cfg.Instructions.Where(instruction =>
+                     instruction is
+                     {
+                         Index: < 0,
+                         OpCode: OpCode.Move,
+                         Operands: [LocalVariable destination, LocalVariable source]
+                     }
+                     && !SsaForm.ShouldEmitPhiCopy(destination, source)))
+        {
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+        }
+    }
+
+    /// <summary>
+    /// 退 SSA 后，引用 Phi 的空入边已经被常量传播为整数零。若同一目标的其余入边全部是
+    /// 同一个具体引用类型，则把零解释为 null 并恢复目标类型；这样后续字段偏移解析可以把
+    /// 上一节点到当前节点的原生内存写入还原成真实托管字段赋值。
+    /// </summary>
+    internal static bool ResolveNullReferencePhiCopyTypes(ISILControlFlowGraph cfg)
+    {
+        var changed = false;
+        var groups = cfg.Instructions
+            .Where(instruction => instruction is
+            {
+                Index: < 0,
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable, _]
+            })
+            .GroupBy(instruction => (LocalVariable)instruction.Operands[0]);
+
+        foreach (var group in groups)
+        {
+            var sources = group.Select(instruction => instruction.Operands[1]).ToArray();
+            if (sources.Length < 2
+                || !sources.Any(source => source is Immediate { Value: 0 })
+                || sources.Any(source => source is not LocalVariable
+                    && source is not Immediate { Value: 0 }))
+                continue;
+
+            var referenceSources = sources.OfType<LocalVariable>().ToArray();
+            if (referenceSources.Length == 0
+                || referenceSources.Any(source => source.Type is not { IsValueType: false }))
+                continue;
+
+            var consensusType = referenceSources[0].Type!;
+            if (referenceSources.Skip(1).Any(source =>
+                    !GenericCallRebinder.TypesEquivalent(source.Type, consensusType)))
+                continue;
+
+            var destination = group.Key;
+            if (destination.Type != null
+                && !GenericCallRebinder.TypesEquivalent(destination.Type, consensusType)
+                && !GenericCallRebinder.IsSharedObjectPlaceholder(destination.Type, consensusType))
+                continue;
+
+            if (!GenericCallRebinder.TypesEquivalent(destination.Type, consensusType))
+            {
+                destination.Type = consensusType;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 删除“已有真实定义的托管目标 &lt;- 无任何来源的未定型局部”退 SSA 复制。该形态来自
+    /// 异常清理边合并 X0 返回寄存器；源值既非参数也无定义，保留它只会把 object/I4 伪值
+    /// 写入真实调用结果。目标必须另有定义，避免把唯一业务赋值误删。
+    /// </summary>
+    internal static int PruneUndefinedSourcePhiCopies(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitionCounts = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var definedLocals = definitionCounts.Keys.ToHashSet();
+        var pruned = 0;
+
+        foreach (var instruction in instructions.Where(instruction => instruction is
+                 {
+                     Index: < 0,
+                     OpCode: OpCode.Move,
+                     Operands: [LocalVariable, LocalVariable]
+                 }))
+        {
+            var destination = (LocalVariable)instruction.Operands[0];
+            var source = (LocalVariable)instruction.Operands[1];
+            if (destination.Type == null
+                || source.Type != null
+                || definitionCounts.GetValueOrDefault(destination) < 2
+                || definedLocals.Contains(source)
+                || method.ParameterLocals.Contains(source))
+                continue;
+
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+            pruned++;
+        }
+
+        return pruned;
+    }
+
     private static List<(LocalVariable Destination, LocalVariable Source, Instruction Instruction)> FindSameSlotCopies(ISILControlFlowGraph cfg)
     {
         var copies = new List<(LocalVariable, LocalVariable, Instruction)>();

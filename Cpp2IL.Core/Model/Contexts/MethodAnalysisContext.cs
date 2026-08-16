@@ -402,10 +402,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 后续只把该不可变证据用于清理同一方法内的隐藏元数据读取。
         var initializedRuntimeMetadataSlots = RuntimeMetadataSlotResolver.CaptureInitializedSlotAddresses(this);
 
-        // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
-        MetadataInitGuardRemover.Run(this);
-
         InjectedCheckRemover.Run(this);
+        // 中文注释：类初始化分支内部常带编译器注入的空引用检查；必须先删除注入异常边，
+        // 再一次性裁除元数据与类初始化保护区，避免对同一 CFG 做重复保护区扫描。
+        MetadataInitGuardRemover.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
         // 初始化保护和注入异常边已经裁除，字符串目标类型也已收敛；此时闭合post-27
@@ -439,6 +439,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 可把唯一零偏移读取闭合为 unbox.any，而无需重复运行早期装箱分析。
         KeyFunctionRecovery.RewriteUnboxing(this);
         RuntimeMetadataSlotResolver.Run(this, initializedRuntimeMetadataSlots);
+        // 中文注释：运行时类型槽到此才全部闭合；按最终 Newobj 类型一次性校准分配结果及其直接泛型调用。
+        LocalVariables.RefreshResolvedNewobjTypesAndCalls(this);
         // 泛型方法的 rgctx 初始化函数可能与托管方法共享地址；只有在
         // 真实 rgctx 尾调用已绑定后，才能从同一 CFG 排除该伪递归初始化分支。
         MetadataInitGuardRemover.RunMethodRgctxInitGuards(this);
@@ -475,34 +477,52 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 
-        // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
+        // 中文注释：异常清理路径先把引用取址折回直接访问，再一次性确定所有取址槽位类型；
+        // out 数组只有在此阶段才具备精确 SzArray 身份，必须先于数组布局与集合内联恢复。
+        ManagedReferenceAddressRecovery.Run(this);
+        LocalVariables.TypeAddressedLocals(this);
+
+        // 浮点槽位类型到此已稳定；把只读 ELF 段的绝对标量加载恢复为源码字面量，
+        // 可写静态存储仍保留为内存访问，不冻结其运行时状态。
+        ReadOnlyScalarLiteralRecovery.Run(this);
+
+        // 退SSA后的比较边与原生整数位宽此时同时可见；据此恢复循环计数器和状态掩码，
+        // 避免同一物理寄存器的布尔返回值把32位整数载体污染成object。
+        LocalVariables.ResolveFinalScalarCarrierTypes(this);
+
+        // 中文注释：真实调用结果已有定义时，异常清理 Phi 中无参数身份、无生产者的 X0
+        // 旧值不属于托管数据流；先删除该伪复制，避免它污染布尔值或引用返回值。
+        CopyCoalescer.PruneUndefinedSourcePhiCopies(this);
+
+        // 中文注释：退 SSA 的引用 Phi 此时已表现为“零或具体引用”的边复制。先把零恢复为
+        // null 并定型目标，再运行字段偏移解析，才能识别上一 Scenario 的链式字段写入。
+        CopyCoalescer.ResolveNullReferencePhiCopyTypes(ControlFlowGraph);
+        MetadataResolver.ResolveFieldOffsets(this);
+
+        // 中文注释：异常清理 Phi 可能仅留下未定义的 X19-X28 接收者；以此前唯一相容的
+        // 托管生产值恢复 List<T> 与 IEnumerator<T> 的跨调用保存身份，并同步泛型签名。
+        CalleeSavedManagedReceiverRecovery.Run(this);
+
+        // 中文注释：集合快慢边比较前先删除终态已证明跨值域的 Phi 复制；否则布尔返回槽
+        // 会分别承载元素与集合引用，阻断原本完全等价的 List<T>.Add 容量菱形。
+        CopyCoalescer.PruneIncompatiblePhiCopies(ControlFlowGraph);
+
+        // 中文注释：数值和取址槽位均已终态定型后再执行一次布局恢复链；数组元素类型先闭合，
+        // 随后的 List 快速路径才可用同一具体 T 生成公开 Add/Clear/Count 调用。
         ArrayRecovery.Run(this);
-
-        // 数组布局恢复后，List<T>.Add 快速路径的 items.Length 与元素地址已经可被严格识别；
-        // 此处把完整容量菱形闭合为公开 Add 调用，避免输出运行库私有字段和 AddWithResize。
         ListAddRecovery.Run(this);
-
-        // List<T>.Clear 的原生内联会先清零字段再按旧大小清理数组；字段不是SSA值，
-        // 必须在最终控制流上把完整版本递增、清零和Array.Clear分支闭合为公开Clear调用。
         ListClearRecovery.Run(this);
-
-        // Add/Clear等完整写路径优先闭合；其余精确的List<T>._size读取在此恢复为公开Count属性。
-        // 只读恢复不掩盖未闭合的私有字段写入，后者仍会在源码编译阶段形成可量化红门。
         ListCountRecovery.Run(this);
-
-        // IL2CPP会把String.Length内联为私有布局字段读取；完整类型与读方向在这里已经稳定，
-        // 此时恢复公开属性可避免输出运行库私有_stringLength字段。
         StringLengthRecovery.Run(this);
-
-        // 跨类型属性访问被IL2CPP内联后会表现为私有字段读写；公开非虚访问器与唯一字段身份
-        // 都已在此稳定，把该原生布局操作恢复成合法的属性调用，避免输出跨类型私有字段。
         PropertyBackingFieldRecovery.Run(this);
 
-        // 异常清理路径会把IEnumerator等引用槽先取址再按零偏移读取；在最终类型已稳定后
-        // 折回直接引用访问，避免把托管地址写入object局部并生成不可编译的指针转换。
-        ManagedReferenceAddressRecovery.Run(this);
+        // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
+        // 此时裁掉其不可达返回/抛出边，避免异常 ABI 状态值进入托管返回类型。
+        ConstantControlFlowRecovery.Run(ControlFlowGraph);
 
-        LocalVariables.TypeAddressedLocals(this);
+        // 中文注释：固定异常边裁除后，正常返回路径重新成为唯一链；把同一 X0 上紧邻的
+        // 托管调用结果接回 Return，避免正确 ToArray 结果被无定义返回局部替换成 default。
+        ManagedReturnValueRecovery.Run(this);
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);

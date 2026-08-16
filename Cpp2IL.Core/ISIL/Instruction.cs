@@ -11,6 +11,11 @@ public class Instruction : IOperand
 {
     public int Index;
 
+    /// <summary>
+    /// 原生整数标量运算的精确位宽；零表示该指令没有携带可验证的整数位宽证据。
+    /// </summary>
+    public int IntegerWidthBits { get; set; }
+
     public OpCode OpCode
     {
         get;
@@ -102,6 +107,9 @@ public class Instruction : IOperand
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.AbsoluteNumber:
+            case OpCode.AbsoluteDifference:
+            case OpCode.MaximumNumber:
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
@@ -178,6 +186,7 @@ public class Instruction : IOperand
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
                 or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
+                or OpCode.AbsoluteNumber
                 or OpCode.Newobj or OpCode.Box or OpCode.Unbox or OpCode.CastClass or OpCode.IsInst
                 => [_operands[1]],
 
@@ -199,6 +208,7 @@ public class Instruction : IOperand
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
+                or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 => [_operands[2], _operands[1]],
 
             OpCode.Call => _operands.Skip(2).ToList(),

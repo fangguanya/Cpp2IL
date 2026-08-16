@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -79,6 +80,169 @@ public class CopyCoalescerTests
         Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move));
     }
 
+    [Test]
+    [Category("异常输入")]
+    public void 退SSA生成的Enumerator到单精度伪复制被删除()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = Local(
+            "source",
+            CreateEnumerator(appContext.SystemTypes.SystemStringType),
+            6);
+        var destination = Local("destination", appContext.SystemTypes.SystemSingleType, 7);
+        var copy = new Instruction(-1, OpCode.Move, destination, source);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            copy,
+            new(1, OpCode.Return, destination),
+        });
+
+        CopyCoalescer.PruneIncompatiblePhiCopies(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(copy.Operands, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 退SSA的零与同型引用入边恢复为可空引用类型()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var destination = new LocalVariable("destination", new Register(28, "X28"));
+        var current = Local("current", stringType, 0);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(-1, OpCode.Move, destination, new Immediate(0)),
+            new(-1, OpCode.Move, destination, current),
+            new(1, OpCode.Return, destination),
+        });
+
+        var changed = CopyCoalescer.ResolveNullReferencePhiCopyTypes(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(stringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 退SSA的零与不同引用类型入边不建立伪共识()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(28, "X28"));
+        var first = Local("first", appContext.SystemTypes.SystemStringType, 0);
+        var second = Local("second", appContext.SystemTypes.SystemObjectType, 1);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(-1, OpCode.Move, destination, new Immediate(0)),
+            new(-1, OpCode.Move, destination, first),
+            new(-1, OpCode.Move, destination, second),
+            new(1, OpCode.Return, destination),
+        });
+
+        var changed = CopyCoalescer.ResolveNullReferencePhiCopyTypes(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 退SSA含非零常量入边时拒绝引用推断()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var destination = new LocalVariable("destination", new Register(28, "X28"));
+        var current = Local("current", stringType, 0);
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(-1, OpCode.Move, destination, new Immediate(1)),
+            new(-1, OpCode.Move, destination, current),
+            new(1, OpCode.Return, destination),
+        });
+
+        var changed = CopyCoalescer.ResolveNullReferencePhiCopyTypes(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 多定义目标上的无来源Phi复制被删除()
+    {
+        var boolType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType;
+        var destination = Local("destination", boolType, 0);
+        var unresolved = new LocalVariable("unresolved", new Register(null, "X0", 21));
+        var realSource = Local("real", boolType, 1);
+        var realDefinition = new Instruction(0, OpCode.Move, destination, realSource);
+        var phiCopy = new Instruction(-1, OpCode.Move, destination, unresolved);
+        var method = Method(realDefinition, phiCopy, new Instruction(2, OpCode.Return, destination));
+
+        var pruned = CopyCoalescer.PruneUndefinedSourcePhiCopies(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(pruned, Is.EqualTo(1));
+            Assert.That(phiCopy.OpCode, Is.EqualTo(OpCode.Nop));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 唯一定义即使源未定型也保持为恢复红门()
+    {
+        var boolType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType;
+        var destination = Local("destination", boolType, 0);
+        var unresolved = new LocalVariable("unresolved", new Register(null, "X0", 21));
+        var phiCopy = new Instruction(-1, OpCode.Move, destination, unresolved);
+        var method = Method(phiCopy, new Instruction(2, OpCode.Return, destination));
+
+        var pruned = CopyCoalescer.PruneUndefinedSourcePhiCopies(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(pruned, Is.Zero);
+            Assert.That(phiCopy.OpCode, Is.EqualTo(OpCode.Move));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi源具有真实定义时禁止删除复制()
+    {
+        var boolType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType;
+        var destination = Local("destination", boolType, 0);
+        var source = new LocalVariable("source", new Register(null, "X0", 21));
+        var realSource = Local("real", boolType, 1);
+        var sourceDefinition = new Instruction(0, OpCode.Move, source, new Immediate(0));
+        var realDefinition = new Instruction(1, OpCode.Move, destination, realSource);
+        var phiCopy = new Instruction(-1, OpCode.Move, destination, source);
+        var method = Method(
+            sourceDefinition,
+            realDefinition,
+            phiCopy,
+            new Instruction(3, OpCode.Return, destination));
+
+        var pruned = CopyCoalescer.PruneUndefinedSourcePhiCopies(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(pruned, Is.Zero);
+            Assert.That(phiCopy.OpCode, Is.EqualTo(OpCode.Move));
+        });
+    }
+
     private static GenericInstanceTypeAnalysisContext CreateEnumerator(TypeAnalysisContext elementType)
     {
         var definition = Cpp2IlApi.CurrentAppContext!
@@ -89,4 +253,12 @@ public class CopyCoalescerTests
 
     private static LocalVariable Local(string name, TypeAnalysisContext type, int number)
         => new(name, new Register(number, name), type);
+
+    private static MethodAnalysisContext Method(params Instruction[] instructions)
+    {
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = new ISILControlFlowGraph([.. instructions]);
+        method.ParameterLocals = [];
+        return method;
+    }
 }

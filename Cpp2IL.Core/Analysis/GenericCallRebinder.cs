@@ -116,6 +116,18 @@ public static class GenericCallRebinder
             && (destination.Type == null || TypesEquivalent(destination.Type, current.ReturnType)))
             destination.Type = rebound.ReturnType;
 
+        // 中文注释：共享泛型目标曾传播到实参局部的旧 object 签名属于弱证据；目标重绑定后，
+        // 仅当局部仍精确等于旧参数类型时同步新签名，真实业务侧的独立具体类型保持不动。
+        var parameterStart = firstArgument + (current.IsStatic ? 0 : 1);
+        for (var parameterIndex = 0; parameterIndex < current.Parameters.Count; parameterIndex++)
+        {
+            var operandIndex = parameterStart + parameterIndex;
+            if (operandIndex < call.Operands.Count
+                && call.Operands[operandIndex] is LocalVariable parameterLocal
+                && TypesEquivalent(parameterLocal.Type, current.Parameters[parameterIndex].ParameterType))
+                parameterLocal.Type = rebound.Parameters[parameterIndex].ParameterType;
+        }
+
         return true;
     }
 
@@ -162,6 +174,9 @@ public static class GenericCallRebinder
         inferred = new TypeAnalysisContext[genericParameterCount];
         var parameterStart = firstArgument + (baseMethod.IsStatic ? 0 : 1);
         var matchedAny = false;
+        // 中文注释：Enumerable 共享体常把委托中的 TSource 擦除成 object，而首个序列实参仍保留
+        // 精确 IEnumerable<TSource>；只在该标准库声明类型内把后续 object 视为弱占位。
+        var allowObjectFallback = baseMethod.DeclaringType?.FullName == "System.Linq.Enumerable";
 
         for (var parameterIndex = 0; parameterIndex < baseMethod.Parameters.Count; parameterIndex++)
         {
@@ -175,7 +190,8 @@ public static class GenericCallRebinder
                     actual,
                     genericParameterKind,
                     inferred,
-                    ref matchedAny))
+                    ref matchedAny,
+                    allowObjectFallback))
                 return false;
         }
 
@@ -187,7 +203,8 @@ public static class GenericCallRebinder
         TypeAnalysisContext actual,
         Il2CppTypeEnum genericParameterKind,
         TypeAnalysisContext[] inferred,
-        ref bool matchedAny)
+        ref bool matchedAny,
+        bool allowObjectFallback)
     {
         if (pattern is GenericParameterTypeAnalysisContext
             {
@@ -200,7 +217,9 @@ public static class GenericCallRebinder
                 return false;
 
             if (inferred[index] != null && !TypesEquivalent(inferred[index], actual))
-                return false;
+                return allowObjectFallback
+                       && actual.FullName == "System.Object"
+                       && inferred[index].FullName != "System.Object";
 
             inferred[index] = actual;
             matchedAny = true;
@@ -220,7 +239,8 @@ public static class GenericCallRebinder
                         projected.GenericArguments[argumentIndex],
                         genericParameterKind,
                         inferred,
-                        ref matchedAny))
+                        ref matchedAny,
+                        allowObjectFallback))
                     return false;
             }
 
@@ -234,7 +254,8 @@ public static class GenericCallRebinder
                 actualArray.ElementType,
                 genericParameterKind,
                 inferred,
-                ref matchedAny);
+                ref matchedAny,
+                allowObjectFallback);
 
         if (pattern is ByRefTypeAnalysisContext patternByRef
             && actual is ByRefTypeAnalysisContext actualByRef)
@@ -243,7 +264,8 @@ public static class GenericCallRebinder
                 actualByRef.ElementType,
                 genericParameterKind,
                 inferred,
-                ref matchedAny);
+                ref matchedAny,
+                allowObjectFallback);
 
         return TypesEquivalent(pattern, actual);
     }
@@ -348,6 +370,39 @@ public static class GenericCallRebinder
             return TypesEquivalent(leftByRef.ElementType, rightByRef.ElementType);
 
         return SameTypeDefinition(left, right) || left.FullName == right.FullName;
+    }
+
+    /// <summary>
+    /// 判断现有类型是否只是同一泛型定义的 object 共享实例，而候选类型已经给出更具体的实参。
+    /// IL2CPP 共享泛型方法体会把 Func&lt;T,...&gt;、List&lt;T&gt; 等寄存器先登记为 object 实例；
+    /// 该类型仅是 ABI 占位，不能压过来自全部 Phi 入边的具体类型共识。
+    /// </summary>
+    internal static bool IsSharedObjectPlaceholder(
+        TypeAnalysisContext? existing,
+        TypeAnalysisContext? concrete)
+    {
+        if (existing is not GenericInstanceTypeAnalysisContext existingGeneric
+            || concrete is not GenericInstanceTypeAnalysisContext concreteGeneric
+            || !SameTypeDefinition(existingGeneric.GenericType, concreteGeneric.GenericType)
+            || existingGeneric.GenericArguments.Count != concreteGeneric.GenericArguments.Count)
+            return false;
+
+        var replacedObject = false;
+        for (var index = 0; index < existingGeneric.GenericArguments.Count; index++)
+        {
+            var existingArgument = existingGeneric.GenericArguments[index];
+            var concreteArgument = concreteGeneric.GenericArguments[index];
+            if (TypesEquivalent(existingArgument, concreteArgument))
+                continue;
+
+            if (existingArgument.FullName != "System.Object"
+                || concreteArgument.FullName == "System.Object")
+                return false;
+
+            replacedObject = true;
+        }
+
+        return replacedObject;
     }
 
     private static bool TypeListsEquivalent(

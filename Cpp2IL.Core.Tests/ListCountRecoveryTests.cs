@@ -56,6 +56,39 @@ public class ListCountRecoveryTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 共享object字段上下文由具体接收者覆盖泛型实参()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var objectList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemObjectType]);
+        var stringList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var baseField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private,
+            listDefinition,
+            offset: 24);
+        var sharedField = new ConcreteGenericFieldAnalysisContext(baseField, objectList);
+        var receiver = new LocalVariable("items", new Register(null, "X19"), stringList);
+        var count = new LocalVariable("count", new Register(null, "W8"), app.SystemTypes.SystemInt32Type);
+        var read = new Instruction(0, OpCode.Move, count, new FieldReference(sharedField, receiver, 24));
+        var graph = new ISILControlFlowGraph([read, new Instruction(1, OpCode.Return, count)]);
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+
+        var recovered = ListCountRecovery.Run(method);
+        var listCount = (ListCount)read.Operands[1];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(listCount.ListType.FullName, Is.EqualTo("System.Collections.Generic.List`1<System.String>"));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 相似名称业务字段不改写()
     {

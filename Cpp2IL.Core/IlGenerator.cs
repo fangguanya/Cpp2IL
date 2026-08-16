@@ -567,6 +567,25 @@ public static class IlGenerator
                     stringCtor);
                 break;
 
+            case OpCode.MaximumNumber:
+                EmitMaximumNumber(
+                    instruction,
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor);
+                break;
+
+            case OpCode.AbsoluteNumber:
+            case OpCode.AbsoluteDifference:
+                EmitFloatingAbsolute(
+                    instruction,
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor);
+                break;
+
             case OpCode.IndirectJump:
                 instructions.Add(CilOpCodes.Ldstr, $"Indirect jump: {instruction} (should have been resolved before IL gen)");
                 instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
@@ -928,6 +947,18 @@ public static class IlGenerator
             return;
         }
 
+        // ARM64的FCMP允许直接使用浮点零，ISIL仍以整数Immediate保存该编码值；
+        // 二元运算另一侧已给出Single/Double时，必须按同一浮点域入栈，而不是发射I4零。
+        if (operand is Immediate floatingImmediate
+            && expectedType?.FullName is "System.Single" or "System.Double")
+        {
+            if (expectedType.FullName == "System.Single")
+                instructions.Add(CilOpCodes.Ldc_R4, (float)floatingImmediate.Value);
+            else
+                instructions.Add(CilOpCodes.Ldc_R8, (double)floatingImmediate.Value);
+            return;
+        }
+
         switch (operand)
         {
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
@@ -1175,6 +1206,128 @@ public static class IlGenerator
         instructions.Add(endLabel);
     }
 
+    /// <summary>
+    /// 生成 ARM64 FMAXNM 对应的 IEEE-754 maximumNumber 控制流。单边 NaN 返回数值端；
+    /// 有序值返回较大端；相等零值用浮点相加合并符号，从而得到 +0/-0 的精确结果。
+    /// </summary>
+    private static void EmitMaximumNumber(
+        Instruction instruction,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals,
+        MemberReference writeLine,
+        MemberReference stringCtor)
+    {
+        if (instruction.Operands is not [var destination, var left, var right, Immediate width]
+            || width.Value is not (32 or 64))
+            throw new DecompilerException($"maximumNumber 操作数无效：{instruction}");
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var leftIsNumber = new CilInstruction(CilOpCodes.Nop);
+        var bothAreNumbers = new CilInstruction(CilOpCodes.Nop);
+        var selectLeft = new CilInstruction(CilOpCodes.Nop);
+        var selectRight = new CilInstruction(CilOpCodes.Nop);
+        var end = new CilInstruction(CilOpCodes.Nop);
+        var conversion = width.Value == 32 ? CilOpCodes.Conv_R4 : CilOpCodes.Conv_R8;
+
+        void LoadFloating(IOperand operand)
+        {
+            LoadOperand(operand, method, locals, writeLine, stringCtor);
+            instructions.Add(conversion);
+        }
+
+        void StoreAndFinish(IOperand operand)
+        {
+            LoadFloating(operand);
+            StoreToOperand(destination, method, locals, writeLine);
+            instructions.Add(CilOpCodes.Br, new CilInstructionLabel(end));
+        }
+
+        // left == left 仅在 left 不是 NaN 时成立。
+        LoadFloating(left);
+        LoadFloating(left);
+        instructions.Add(CilOpCodes.Ceq);
+        instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel(leftIsNumber));
+        StoreAndFinish(right);
+
+        instructions.Add(leftIsNumber);
+        LoadFloating(right);
+        LoadFloating(right);
+        instructions.Add(CilOpCodes.Ceq);
+        instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel(bothAreNumbers));
+        StoreAndFinish(left);
+
+        instructions.Add(bothAreNumbers);
+        LoadFloating(left);
+        LoadFloating(right);
+        instructions.Add(CilOpCodes.Cgt);
+        instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel(selectLeft));
+        LoadFloating(left);
+        LoadFloating(right);
+        instructions.Add(CilOpCodes.Clt);
+        instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel(selectRight));
+
+        // 相等的非零值直接取左端；只有正负零组合需要相加以确定结果符号。
+        LoadFloating(left);
+        if (width.Value == 32)
+            instructions.Add(CilOpCodes.Ldc_R4, 0f);
+        else
+            instructions.Add(CilOpCodes.Ldc_R8, 0d);
+        instructions.Add(CilOpCodes.Ceq);
+        instructions.Add(CilOpCodes.Brfalse, new CilInstructionLabel(selectLeft));
+        LoadFloating(left);
+        LoadFloating(right);
+        instructions.Add(CilOpCodes.Add);
+        StoreToOperand(destination, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Br, new CilInstructionLabel(end));
+
+        instructions.Add(selectLeft);
+        StoreAndFinish(left);
+        instructions.Add(selectRight);
+        StoreAndFinish(right);
+        instructions.Add(end);
+    }
+
+    /// <summary>
+    /// 生成 FABS/FABD 的标量浮点 CIL。位宽由原生指令携带，常量传播后的整数零也会先
+    /// 转为 r4/r8；Math.Abs 负责清除符号位并保留 IEEE-754 零、无穷与 NaN 语义。
+    /// </summary>
+    private static void EmitFloatingAbsolute(
+        Instruction instruction,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals,
+        MemberReference writeLine,
+        MemberReference stringCtor)
+    {
+        if (instruction.Operands.Count < 3
+            || instruction.Operands[^1] is not Immediate { Value: 32 or 64 } width)
+            throw new DecompilerException($"浮点绝对值操作数无效：{instruction}");
+
+        var module = method.DeclaringModule!;
+        var factory = module.CorLibTypeFactory;
+        var importer = module.DefaultImporter!;
+        var instructions = method.CilMethodBody!.Instructions;
+        var conversion = width.Value == 32 ? CilOpCodes.Conv_R4 : CilOpCodes.Conv_R8;
+
+        LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
+        instructions.Add(conversion);
+        if (instruction.OpCode == OpCode.AbsoluteDifference)
+        {
+            LoadOperand(instruction.Operands[2], method, locals, writeLine, stringCtor);
+            instructions.Add(conversion);
+            instructions.Add(CilOpCodes.Sub);
+        }
+
+        var floatingType = width.Value == 32 ? factory.Single : factory.Double;
+        var absMethod = factory.CorLibScope
+            .CreateTypeReference("System", "Math")
+            .CreateMemberReference(
+                "Abs",
+                MethodSignature.CreateStatic(floatingType, [floatingType]))
+            .ImportWith(importer);
+        instructions.Add(CilOpCodes.Call, absMethod);
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+    }
+
     private static void EmitHomogeneousFloatingAggregateArgument(
         HomogeneousFloatingAggregateArgument aggregate,
         MethodDefinition method,
@@ -1410,6 +1563,15 @@ public static class IlGenerator
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            // 中文注释：零偏移 [ref/out] 写入的目标是引用元素本身，而非 ByRef 地址。
+            // 该元素类型同时决定整数零应发射为 ldnull 还是数值零。
+            MemoryOperand
+            {
+                Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } elementType } },
+                Index: null,
+                Addend: 0,
+                Scale: 0
+            } => elementType,
             _ => null
         };
 

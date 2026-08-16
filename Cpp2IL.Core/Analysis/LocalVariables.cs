@@ -285,6 +285,9 @@ public static class LocalVariables
         SeedPackedHalfwordPredicateTypes(method);
         SeedPackedVectorExtractionTypes(method);
         SeedNullablePresenceTestResults(method);
+        SeedNumericConversionTypes(method);
+        SeedScalarFloatingMathTypes(method);
+        SeedFloatingArithmeticTypes(method);
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
         MetadataResolver.ResolveConstructorCalls(method);
@@ -515,6 +518,46 @@ public static class LocalVariables
             if (instruction.Operands[0] is LocalVariable destination && InstantiatedType(instruction.Operands[1]) is { } type)
                 destination.Type = type;
         }
+    }
+
+    /// <summary>
+    /// 元数据槽闭合后，以 Newobj 的最终类型操作数重新校准分配结果，并且只重绑定直接使用
+    /// 这些结果的共享泛型调用。早期类型传播看到的运行时类可能仍是 List&lt;object&gt;，
+    /// 而后期 typeof(List&lt;T&gt;) 已经精确；分配指令是该实例类型的最终权威证据。
+    /// </summary>
+    internal static bool RefreshResolvedNewobjTypesAndCalls(MethodAnalysisContext method)
+    {
+        var changedAllocations = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Newobj
+                || instruction.Operands.Count < 2
+                || instruction.Operands[0] is not LocalVariable destination
+                || InstantiatedType(instruction.Operands[1]) is not { } instantiatedType
+                || GenericCallRebinder.TypesEquivalent(destination.Type, instantiatedType))
+                continue;
+
+            destination.Type = instantiatedType;
+            changedAllocations.Add(destination);
+        }
+
+        if (changedAllocations.Count == 0)
+            return false;
+
+        var changed = true;
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (!instruction.IsCall)
+                continue;
+
+            var receiverIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+            if (receiverIndex < instruction.Operands.Count
+                && instruction.Operands[receiverIndex] is LocalVariable receiver
+                && changedAllocations.Contains(receiver))
+                changed |= GenericCallRebinder.TryRebind(instruction);
+        }
+
+        return changed;
     }
 
     private static TypeAnalysisContext? InstantiatedType(IOperand classOperand) =>
@@ -970,6 +1013,17 @@ public static class LocalVariables
                 case OpCode.RoundFloatTowardNegativeInfinity:
                     instructionChanged = PropagateNumericConversion(instruction, method);
                     break;
+                case OpCode.AbsoluteNumber:
+                case OpCode.AbsoluteDifference:
+                case OpCode.MaximumNumber:
+                    instructionChanged = BindScalarFloatingMathTypes(instruction, method.AppContext);
+                    break;
+                case OpCode.Add:
+                case OpCode.Subtract:
+                case OpCode.Multiply:
+                case OpCode.Divide:
+                    instructionChanged = BindFloatingArithmeticTypes(instruction, method.AppContext);
+                    break;
             }
 
             changed |= instructionChanged;
@@ -1077,6 +1131,16 @@ public static class LocalVariables
     private static bool PropagateNumericConversion(
         Instruction instruction,
         MethodAnalysisContext method)
+        => BindNumericConversionTypes(instruction, method.AppContext);
+
+    /// <summary>
+    /// 数值转换操作码精确规定目标位宽和数值域，因此目标类型是权威定义，而不是可被
+    /// 先到 Phi 或聚合寄存器复用占位抢占的弱推断。源操作数仍只填补空类型，避免覆盖
+    /// 调用返回值、字段读取等更具体的已有证据。
+    /// </summary>
+    internal static bool BindNumericConversionTypes(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
     {
         if (instruction.Operands.Count < 3 ||
             instruction.Operands[0] is not LocalVariable destination ||
@@ -1084,7 +1148,7 @@ public static class LocalVariables
             instruction.Operands[2] is not Immediate destinationWidth)
             return false;
 
-        var systemTypes = method.AppContext.SystemTypes;
+        var systemTypes = appContext.SystemTypes;
         var destinationType = instruction.OpCode == OpCode.ConvertFloatToSignedInteger
             ? destinationWidth.Value switch
             {
@@ -1134,9 +1198,231 @@ public static class LocalVariables
             };
         }
 
-        var changed = SetTypeIfUnknown(destination, destinationType);
+        var changed = false;
+        if (destinationType != null
+            && !GenericCallRebinder.TypesEquivalent(destination.Type, destinationType))
+        {
+            destination.Type = destinationType;
+            changed = true;
+        }
         changed |= SetTypeIfUnknown(source, sourceType);
         return changed;
+    }
+
+    /// <summary>
+    /// 在任何 Phi 双向传播前固定全部数值转换定义。ARM64 的 V0 等物理寄存器会在结构
+    /// Enumerator 搬运和浮点运算之间复用；若等到顺序扫描转换指令，前面的 Phi 已可能
+    /// 把 Enumerator 类型反向扩散到浮点定义，随后单调传播便失去纠正机会。
+    /// </summary>
+    private static void SeedNumericConversionTypes(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode is not (
+                    OpCode.ConvertFloatingPointPrecision
+                    or OpCode.ConvertFloatToSignedInteger
+                    or OpCode.ConvertSignedIntegerToFloat
+                    or OpCode.ReinterpretIntegerBitsAsFloat
+                    or OpCode.ReinterpretFloatBitsAsInteger
+                    or OpCode.RoundFloatTowardPositiveInfinity
+                    or OpCode.RoundFloatTowardNegativeInfinity))
+                continue;
+
+            BindNumericConversionTypes(instruction, method.AppContext);
+        }
+    }
+
+    /// <summary>
+    /// FMAXNM 操作码携带原生标量精度，三个局部操作数均属于同一浮点域；该证据在 Phi
+    /// 传播前落定，避免零寄存器或旧生命期类型抢占输入和目标类型。
+    /// </summary>
+    internal static bool BindScalarFloatingMathTypes(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.Operands.Count < 3
+            || instruction.Operands[0] is not LocalVariable destination
+            || instruction.Operands[^1] is not Immediate width)
+            return false;
+
+        var floatingType = width.Value switch
+        {
+            32 => appContext.SystemTypes.SystemSingleType,
+            64 => appContext.SystemTypes.SystemDoubleType,
+            _ => null,
+        };
+        if (floatingType == null)
+            return false;
+
+        var changed = SetExactType(destination, floatingType);
+        for (var operandIndex = 1; operandIndex < instruction.Operands.Count - 1; operandIndex++)
+            if (instruction.Operands[operandIndex] is LocalVariable sourceLocal)
+                changed |= SetExactType(sourceLocal, floatingType);
+        return changed;
+    }
+
+    private static void SeedScalarFloatingMathTypes(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.OpCode is
+                OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber)
+                BindScalarFloatingMathTypes(instruction, method.AppContext);
+    }
+
+    private static bool SetExactType(LocalVariable local, TypeAnalysisContext type)
+    {
+        if (GenericCallRebinder.TypesEquivalent(local.Type, type))
+            return false;
+
+        local.Type = type;
+        return true;
+    }
+
+    /// <summary>
+    /// 以二元算术源操作数中的唯一 Single/Double 证据绑定完整算术结果。字段、字面量和
+    /// 已定型局部均可提供证据；混合精度保持开放，避免猜测隐式转换方向。
+    /// </summary>
+    internal static bool BindFloatingArithmeticTypes(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.Operands.Count != 3
+            || instruction.Operands[0] is not LocalVariable destination)
+            return false;
+
+        var sourceKinds = instruction.Operands
+            .Skip(1)
+            .Select(FloatingKind)
+            .Where(kind => kind != 0)
+            .Distinct()
+            .ToArray();
+        if (sourceKinds.Length != 1)
+            return false;
+
+        var floatingType = sourceKinds[0] == 32
+            ? appContext.SystemTypes.SystemSingleType
+            : appContext.SystemTypes.SystemDoubleType;
+        var changed = SetExactType(destination, floatingType);
+        for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
+            if (instruction.Operands[operandIndex] is LocalVariable sourceLocal)
+                changed |= SetExactType(sourceLocal, floatingType);
+        return changed;
+    }
+
+    private static int FloatingKind(IOperand operand) => operand switch
+    {
+        FloatLiteral => 32,
+        DoubleLiteral => 64,
+        LocalVariable { Type.FullName: "System.Single" } => 32,
+        LocalVariable { Type.FullName: "System.Double" } => 64,
+        FieldReference { Field.FieldType.FullName: "System.Single" } => 32,
+        FieldReference { Field.FieldType.FullName: "System.Double" } => 64,
+        _ => 0,
+    };
+
+    private static void SeedFloatingArithmeticTypes(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide)
+                BindFloatingArithmeticTypes(instruction, method.AppContext);
+    }
+
+    /// <summary>
+    /// 退SSA与复制合并会引入新的边复制，并把同一物理寄存器的多个控制流值汇合到一个局部量。
+    /// 这里仅使用已定型比较操作数和ARM64指令携带的精确整数位宽恢复最终标量载体；引用、地址、
+    /// 运行时元数据和没有位宽证据的运算均保持原类型。
+    /// </summary>
+    public static bool ResolveFinalScalarCarrierTypes(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var instructions = method.ControlFlowGraph!.Instructions;
+
+        // 比较的一侧若已有精确标量类型，另一侧局部量必处于同一数值域；先恢复循环计数器等载体。
+        foreach (var instruction in instructions)
+            changed |= BindFinalComparisonOperandTypes(instruction);
+
+        // 原生目标寄存器位宽随后裁决算术结果；该顺序避免仅凭小立即数猜测32/64位。
+        foreach (var instruction in instructions)
+            changed |= BindSizedIntegerOperationTypes(instruction, method.AppContext);
+
+        return changed;
+    }
+
+    internal static bool BindFinalComparisonOperandTypes(Instruction instruction)
+    {
+        if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
+            || instruction.Operands.Count != 3)
+            return false;
+
+        var left = instruction.Operands[1] as LocalVariable;
+        var right = instruction.Operands[2] as LocalVariable;
+        if (left == null || right == null)
+            return false;
+
+        var leftScalar = IsFinalScalarType(left.Type) ? left.Type : null;
+        var rightScalar = IsFinalScalarType(right.Type) ? right.Type : null;
+        if (leftScalar != null && right.Type == null)
+        {
+            right.Type = leftScalar;
+            return true;
+        }
+
+        if (rightScalar != null && left.Type == null)
+        {
+            left.Type = rightScalar;
+            return true;
+        }
+
+        return false;
+    }
+
+    internal static bool BindSizedIntegerOperationTypes(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.IntegerWidthBits is not (32 or 64)
+            || instruction.OpCode is not (
+                OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.And or OpCode.Or or OpCode.Xor)
+            || instruction.Operands.Count != 3
+            || instruction.Operands[0] is not LocalVariable destination)
+            return false;
+
+        var targetType = instruction.IntegerWidthBits == 32
+            ? appContext.SystemTypes.SystemInt32Type
+            : appContext.SystemTypes.SystemInt64Type;
+        var locals = instruction.Operands.OfType<LocalVariable>().Distinct().ToArray();
+        if (locals.Any(local => !IsReplaceableFinalIntegerCarrier(local.Type, targetType, appContext)))
+            return false;
+
+        var hasExactIntegerEvidence = locals.Any(local =>
+            GenericCallRebinder.TypesEquivalent(local.Type, targetType));
+        var hasNonBooleanMask = instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
+            && instruction.Operands.OfType<Immediate>().Any(immediate => immediate.Value is < 0 or > 1);
+        if (!hasExactIntegerEvidence && !hasNonBooleanMask)
+            return false;
+
+        var changed = false;
+        foreach (var local in locals)
+            changed |= SetExactType(local, targetType);
+        return changed;
+    }
+
+    private static bool IsFinalScalarType(TypeAnalysisContext? type) => type?.FullName is
+        "System.SByte" or "System.Byte" or "System.Int16" or "System.UInt16"
+        or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64"
+        or "System.Single" or "System.Double";
+
+    private static bool IsReplaceableFinalIntegerCarrier(
+        TypeAnalysisContext? type,
+        TypeAnalysisContext targetType,
+        ApplicationAnalysisContext appContext)
+    {
+        return type == null
+            || GenericCallRebinder.TypesEquivalent(type, targetType)
+            || GenericCallRebinder.TypesEquivalent(type, appContext.SystemTypes.SystemBooleanType)
+            || GenericCallRebinder.TypesEquivalent(type, appContext.SystemTypes.SystemObjectType);
     }
 
     private static bool PropagateConditionalSelect(Instruction select)
@@ -1370,37 +1656,38 @@ public static class LocalVariables
 
     // A phi is a copy from each predecessor's value, so types flow both ways across it - mirroring
     // the bidirectional Move copies it decays into once SSA is destroyed.
-    private static bool PropagatePhi(Instruction phi)
+    internal static bool PropagatePhi(Instruction phi)
     {
         if (phi.Operands[0] is not LocalVariable destination)
             return false;
 
-        var changed = false;
+        var inputs = phi.Operands
+            .Skip(1)
+            .OfType<LocalVariable>()
+            .ToArray();
+        if (inputs.Length == 0 || inputs.Any(input => input.Type == null))
+            return false;
 
-        // Forward: an untyped phi result takes the type of any typed input.
-        if (destination.Type == null)
+        var consensusType = inputs[0].Type!;
+        if (inputs.Skip(1).Any(input =>
+                !GenericCallRebinder.TypesEquivalent(input.Type, consensusType)))
+            return false;
+
+        // Phi 只表达同一个托管值在控制流汇合处的选择。若已知目标类型与完整入边共识
+        // 冲突，该 Phi 来自物理寄存器复用，保持各自类型而不再双向污染。
+        if (destination.Type != null
+            && !GenericCallRebinder.TypesEquivalent(destination.Type, consensusType))
         {
-            for (var i = 1; i < phi.Operands.Count; i++)
-            {
-                if (phi.Operands[i] is LocalVariable { Type: { } inputType })
-                {
-                    changed = SetTypeIfUnknown(destination, inputType);
-                    break;
-                }
-            }
+            // 中文注释：共享泛型登记的 object 实例只是 ABI 占位；全部入边已经形成同一具体
+            // 泛型类型时，以入边共识覆盖占位，恢复委托缓存和集合在分支汇合处的真实类型。
+            if (!GenericCallRebinder.IsSharedObjectPlaceholder(destination.Type, consensusType))
+                return false;
+
+            destination.Type = consensusType;
+            return true;
         }
 
-        // Backward: a typed phi result types each of its still-untyped inputs.
-        if (destination.Type != null)
-        {
-            for (var i = 1; i < phi.Operands.Count; i++)
-            {
-                if (phi.Operands[i] is LocalVariable input)
-                    changed |= SetTypeIfUnknown(input, destination.Type);
-            }
-        }
-
-        return changed;
+        return SetTypeIfUnknown(destination, consensusType);
     }
 
     private static bool PropagateFromCallParameters(MethodAnalysisContext method)

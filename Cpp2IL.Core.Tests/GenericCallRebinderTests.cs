@@ -140,6 +140,47 @@ public class GenericCallRebinderTests
 
     [Test]
     [Category("基本功能")]
+    public void Enumerable序列实参覆盖共享委托中的Object占位并同步参数()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.GetAssemblyByName("mscorlib")!;
+        var enumerableType = mscorlib.GetTypeByFullName("System.Collections.Generic.IEnumerable`1")!;
+        var funcType = mscorlib.GetTypeByFullName("System.Func`2")!;
+        var enumerable = app.GetAssemblyByName("System.Core")!
+            .GetTypeByFullName("System.Linq.Enumerable")!;
+        var orderBy = enumerable.Methods.Single(method =>
+            method.Name == "OrderBy"
+            && method.Parameters.Count == 2
+            && method.GenericParameters.Count == 2);
+        var objectType = app.SystemTypes.SystemObjectType;
+        var stringType = app.SystemTypes.SystemStringType;
+        var intType = app.SystemTypes.SystemInt32Type;
+        var oldTarget = new ConcreteGenericMethodAnalysisContext(orderBy, [], [objectType, intType]);
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0"),
+            enumerableType.MakeGenericInstanceType([stringType]));
+        var selector = new LocalVariable(
+            "selector",
+            new Register(null, "X1"),
+            funcType.MakeGenericInstanceType([objectType, intType]));
+        var result = new LocalVariable("result", new Register(null, "X0", 2), oldTarget.ReturnType);
+        var call = new Instruction(0, OpCode.Call, oldTarget, result, source, selector);
+
+        var changed = GenericCallRebinder.TryRebind(call);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(rebound.MethodGenericParameters, Is.EqualTo(new[] { stringType, intType }));
+            Assert.That(rebound.ReturnType.FullName, Does.Contain("System.String"));
+            Assert.That(selector.Type!.FullName, Does.Contain("System.String"));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 开放List成员从具体值参数闭合声明类型实参()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

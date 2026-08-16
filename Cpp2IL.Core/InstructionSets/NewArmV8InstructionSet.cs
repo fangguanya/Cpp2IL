@@ -1024,6 +1024,33 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return destinationBits == sourceBits;
     }
 
+    /// <summary>
+    /// 验证一组 ARM64 标量浮点操作数均为寄存器且精度完全一致。FABS、FABD 与 FMAXNM
+    /// 共用该门，避免每条指令分别实现并逐渐产生不同的宽度判定规则。
+    /// </summary>
+    internal static bool TryGetMatchingScalarFloatingWidth(
+        IReadOnlyList<(Arm64OperandKind Kind, Arm64Register Register)> operands,
+        out int widthBits)
+    {
+        widthBits = 0;
+        if (operands.Count == 0)
+            return false;
+
+        foreach (var (kind, register) in operands)
+        {
+            if (kind != Arm64OperandKind.Register
+                || !TryGetFloatingPointPrecisionBits(register, out var operandWidth))
+                return false;
+
+            if (widthBits == 0)
+                widthBits = operandWidth;
+            else if (widthBits != operandWidth)
+                return false;
+        }
+
+        return true;
+    }
+
     internal static bool IsUnconditionalBranchCode(Arm64ConditionCode conditionCode)
     {
         return conditionCode is Arm64ConditionCode.NONE
@@ -1565,7 +1592,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             instructions.Add(newInstruction);
             return newInstruction;
         }
-        
+
+        Instruction AddInteger(ulong address, OpCode opCode, params List<IOperand> operands)
+        {
+            var emitted = Add(address, opCode, operands);
+            if (TryGetSignedIntegerWidthBits(instruction.Op0Reg, out var widthBits))
+                emitted.IntegerWidthBits = widthBits;
+            return emitted;
+        }
+
         void AddCall(MethodAnalysisContext context, ulong address, ulong target)
         {
             var hasObservedIndirectReturnBuffer =
@@ -1979,14 +2014,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var machineCode = ReadMachineCodeAtAddress(context, address);
                     if (!TryDecodeScalarFloatingPointImmediate(
                             machineCode,
-                            out _,
+                            out var precisionBits,
                             out var floatingImmediate))
                     {
                         throw new InvalidOperationException(
                             $"FMOV浮点立即数原始编码无效：0x{machineCode:X8} @ 0x{address:X}");
                     }
 
-                    moveSource = new DoubleLiteral(floatingImmediate);
+                    // FMOV S 与 FMOV D 的立即数编码都由解码器返回 double 承载，但 ISIL
+                    // 字面量必须保持目标原生精度，避免 S 寄存器先被错误定型为 System.Double。
+                    moveSource = precisionBits == 32
+                        ? new FloatLiteral((float)floatingImmediate)
+                        : new DoubleLiteral(floatingImmediate);
                 }
                 else
                 {
@@ -2522,7 +2561,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var preservedSource = new Register(null, "CINC_SOURCE");
                     var incrementedSource = new Register(null, "CINC_INCREMENTED");
                     Add(address, OpCode.Move, preservedSource, ConvertOperand(instruction, 1));
-                    Add(address, OpCode.Add, incrementedSource, preservedSource, Imm(1));
+                    AddInteger(address, OpCode.Add, incrementedSource, preservedSource, Imm(1));
                     Add(address, OpCode.Move, destination, incrementedSource);
                     Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
                     Add(address, OpCode.Move, destination, preservedSource);
@@ -2562,14 +2601,86 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
 
             case Arm64Mnemonic.MUL:
+                // 整数乘法保留目标寄存器位宽，供退SSA后的标量载体定型。
+                AddInteger(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
             case Arm64Mnemonic.FMUL:
-                //Multiply is (dest, src1, src2)
                 Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
             case Arm64Mnemonic.FDIV:
                 Add(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
+
+            case Arm64Mnemonic.FABS:
+                {
+                    if (!TryGetMatchingScalarFloatingWidth(
+                            [
+                                (instruction.Op0Kind, instruction.Op0Reg),
+                                (instruction.Op1Kind, instruction.Op1Reg),
+                            ],
+                            out var widthBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABS register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.AbsoluteNumber,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(widthBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FABD:
+                {
+                    if (!TryGetMatchingScalarFloatingWidth(
+                            [
+                                (instruction.Op0Kind, instruction.Op0Reg),
+                                (instruction.Op1Kind, instruction.Op1Reg),
+                                (instruction.Op2Kind, instruction.Op2Reg),
+                            ],
+                            out var widthBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABD register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.AbsoluteDifference,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        ConvertOperand(instruction, 2),
+                        Imm(widthBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FMAXNM:
+                {
+                    if (!TryGetMatchingScalarFloatingWidth(
+                            [
+                                (instruction.Op0Kind, instruction.Op0Reg),
+                                (instruction.Op1Kind, instruction.Op1Reg),
+                                (instruction.Op2Kind, instruction.Op2Reg),
+                            ],
+                            out var widthBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FMAXNM register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.MaximumNumber,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        ConvertOperand(instruction, 2),
+                        Imm(widthBits));
+                    break;
+                }
 
             case Arm64Mnemonic.FNEG:
                 {
@@ -2639,7 +2750,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), addRight);
+                AddInteger(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), addRight);
                 break;
             case Arm64Mnemonic.FADD:
                 // 浮点加法没有整数扩展寄存器格式。
@@ -2661,7 +2772,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.FSUB:
                 //Sub is (dest, src1, src2)
@@ -2670,7 +2781,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.AND:
                 //And is (dest, src1, src2)
-                Add(address, OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
             case Arm64Mnemonic.ADDS:
@@ -2718,13 +2829,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         var subsCompareRight = new Register(null, "FLAG_COMPARE_RIGHT");
                         Add(address, OpCode.Move, subsCompareLeft, src1);
                         Add(address, OpCode.Move, subsCompareRight, src2);
-                        Add(address, opCode, dest, subsCompareLeft, subsCompareRight);
+                        AddInteger(address, opCode, dest, subsCompareLeft, subsCompareRight);
                         Add(address, OpCode.CheckLess, new Register(null, "N"), dest, Imm(0));
                         flagState = Arm64FlagState.Comparison;
                     }
                     else
                     {
-                        Add(address, opCode, dest, src1, src2);
+                        AddInteger(address, opCode, dest, src1, src2);
                         flagState = Arm64FlagState.ZeroOnly;
                     }
 
@@ -2734,12 +2845,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.ORR:
                 //Orr is (dest, src1, src2)
-                Add(address, OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
             case Arm64Mnemonic.EOR:
                 //Eor (aka xor) is (dest, src1, src2)
-                Add(address, OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
             case Arm64Mnemonic.INVALID:

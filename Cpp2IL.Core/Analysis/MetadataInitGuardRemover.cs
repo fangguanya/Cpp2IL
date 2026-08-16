@@ -91,13 +91,19 @@ public static class MetadataInitGuardRemover
         {
             if (!cfg.Blocks.Contains(guard))
                 continue;
-            if (!TryGetMethodRgctxGuardCarrier(method, guard, methodRgctxOffset, definitions, out var guardCarrier))
+            if (!TryGetMethodRgctxGuardCarrier(
+                    method,
+                    guard,
+                    methodRgctxOffset,
+                    definitions,
+                    out var guardCarrier,
+                    out var guardedMethod))
                 continue;
 
             var first = guard.Successors[0];
             var second = guard.Successors[1];
-            if (TryExciseMethodRgctxGuard(method, cfg, guard, first, second, guardCarrier, definitions)
-                || TryExciseMethodRgctxGuard(method, cfg, guard, second, first, guardCarrier, definitions))
+            if (TryExciseMethodRgctxGuard(method, cfg, guard, first, second, guardCarrier, guardedMethod, definitions)
+                || TryExciseMethodRgctxGuard(method, cfg, guard, second, first, guardCarrier, guardedMethod, definitions))
                 removedAny = true;
         }
 
@@ -130,9 +136,11 @@ public static class MetadataInitGuardRemover
         Block guard,
         long methodRgctxOffset,
         ILookup<LocalVariable, Instruction> definitions,
-        out LocalVariable carrier)
+        out LocalVariable carrier,
+        out MethodAnalysisContext guardedMethod)
     {
         carrier = null!;
+        guardedMethod = null!;
         if (guard.BlockType != BlockType.TwoWay
             || guard.Successors.Count != 2
             || guard.Instructions.LastOrDefault() is not
@@ -197,16 +205,8 @@ public static class MetadataInitGuardRemover
             return false;
         }
 
-        if (!SameMethod(represented.RepresentedMethod, method))
-        {
-            Logger.VerboseNewline(
-                $"方法 rgctx 守卫跳过：method={method.FullName}，guard=b{guard.ID}，" +
-                $"represented={represented.RepresentedMethod.FullName}，reason=方法身份不一致",
-                nameof(MetadataInitGuardRemover));
-            return false;
-        }
-
         carrier = methodInfo;
+        guardedMethod = represented.RepresentedMethod;
         return true;
     }
 
@@ -217,6 +217,7 @@ public static class MetadataInitGuardRemover
         Block initEntry,
         Block merge,
         LocalVariable guardCarrier,
+        MethodAnalysisContext guardedMethod,
         ILookup<LocalVariable, Instruction> definitions)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock
@@ -224,11 +225,12 @@ public static class MetadataInitGuardRemover
                 method,
                 cfg,
                 guard,
-                initEntry,
-                merge,
-                guardCarrier,
-                definitions,
-                out var region))
+                 initEntry,
+                 merge,
+                 guardCarrier,
+                 guardedMethod,
+                 definitions,
+                 out var region))
             return false;
 
         Logger.VerboseNewline(
@@ -245,6 +247,7 @@ public static class MetadataInitGuardRemover
         Block initEntry,
         Block merge,
         LocalVariable guardCarrier,
+        MethodAnalysisContext guardedMethod,
         ILookup<LocalVariable, Instruction> definitions,
         out HashSet<Block> region)
     {
@@ -290,7 +293,7 @@ public static class MetadataInitGuardRemover
                 if (IsSideEffectFree(instruction))
                     continue;
 
-                if (!IsMethodRgctxInitCall(method, instruction, guardCarrier, definitions)
+                if (!IsMethodRgctxInitCall(method, instruction, guardCarrier, guardedMethod, definitions)
                     || ++initCallCount != 1)
                 {
                     Logger.VerboseNewline(
@@ -326,9 +329,10 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool IsMethodRgctxInitCall(
-        MethodAnalysisContext method,
+        MethodAnalysisContext containingMethod,
         Instruction instruction,
         LocalVariable guardCarrier,
+        MethodAnalysisContext guardedMethod,
         ILookup<LocalVariable, Instruction> definitions)
     {
         if (!instruction.IsCall)
@@ -344,15 +348,30 @@ public static class MetadataInitGuardRemover
             return true;
 
         if (instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
-            || !SameMethod(called, method)
-            || instruction.Sources.FirstOrDefault() is not LocalVariable callCarrier
-            || ResolveRuntimeMethodInfo(callCarrier, definitions) is not { } represented
-            || !SameMethod(represented.RepresentedMethod, method))
+            || !SameMethod(called, guardedMethod))
             return false;
 
-        return ReferenceEquals(
-            ResolveUniqueMoveRoot(callCarrier, definitions),
-            ResolveUniqueMoveRoot(guardCarrier, definitions));
+        if (instruction.Sources.FirstOrDefault() is LocalVariable callCarrier
+            && ResolveRuntimeMethodInfo(callCarrier, definitions) is { } represented
+            && SameMethod(represented.RepresentedMethod, guardedMethod))
+        {
+            return ReferenceEquals(
+                ResolveUniqueMoveRoot(callCarrier, definitions),
+                ResolveUniqueMoveRoot(guardCarrier, definitions));
+        }
+
+        // 某些共享泛型零参方法把“rgctx初始化入口”误绑定为该方法自身，但调用只携带
+        // 被丢弃的返回值，没有可见MethodInfo实参。零显式参数、静态目标、无调用源且
+        // 返回局部在整个方法中零消费，联合守卫中已证明的MethodInfo身份后才能闭合。
+        if (!called.IsStatic
+            || called.Parameters.Count != 0
+            || instruction.Sources.Count != 0
+            || instruction.Destination is not LocalVariable discardedResult)
+            return false;
+
+        return containingMethod.ControlFlowGraph!.Instructions.All(candidate =>
+            ReferenceEquals(candidate, instruction)
+            || candidate.Sources.All(source => !ReferenceEquals(source, discardedResult)));
     }
 
     private static RuntimeMethodInfoAnalysisContext? ResolveRuntimeMethodInfo(
@@ -417,7 +436,72 @@ public static class MetadataInitGuardRemover
         var second = guard.Successors[1];
 
         return TryExcise(cfg, guard, first, second, initialisedFlagTest, constantMetadataFlagTest)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest, constantMetadataFlagTest);
+            || TryExcise(cfg, guard, second, first, initialisedFlagTest, constantMetadataFlagTest)
+            || TryExciseThroughTrivialBypass(
+                cfg,
+                guard,
+                first,
+                second,
+                initialisedFlagTest,
+                constantMetadataFlagTest)
+            || TryExciseThroughTrivialBypass(
+                cfg,
+                guard,
+                second,
+                first,
+                initialisedFlagTest,
+                constantMetadataFlagTest);
+    }
+
+    /// <summary>
+    /// ARM64 的条件跳转经常先落到只含无条件跳转的代理块，再与初始化分支合流。
+    /// 此处只接受由当前保护块独占、且仅含 Nop/Jump 的单后继代理块；这样既能恢复
+    /// 原始类初始化菱形，也不会越过带业务计算或共享入口的真实控制流。
+    /// </summary>
+    private static bool TryExciseThroughTrivialBypass(
+        ISILControlFlowGraph cfg,
+        Block guard,
+        Block initEntry,
+        Block bypass,
+        bool initialisedFlagTest,
+        bool constantMetadataFlagTest)
+    {
+        if (!TryGetTrivialBypassMerge(guard, bypass, out var merge)
+            || merge == cfg.EntryBlock
+            || merge == cfg.ExitBlock
+            || !TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region))
+            return false;
+
+        var guardSuccessorIndex = guard.Successors.IndexOf(bypass);
+        var mergePredecessorIndex = merge.Predecessors.IndexOf(bypass);
+        if (guardSuccessorIndex < 0 || mergePredecessorIndex < 0)
+            return false;
+
+        // 中文注释：用保护块替换代理块在合流点的位置，保持 Phi 输入与前驱索引一一对应。
+        guard.Successors[guardSuccessorIndex] = merge;
+        merge.Predecessors[mergePredecessorIndex] = guard;
+        bypass.Predecessors.Clear();
+        bypass.Successors.Clear();
+        cfg.Blocks.Remove(bypass);
+
+        Excise(cfg, guard, initEntry, merge, region, constantMetadataFlagTest);
+        return true;
+    }
+
+    private static bool TryGetTrivialBypassMerge(Block guard, Block bypass, out Block merge)
+    {
+        merge = null!;
+        if (bypass == guard
+            || bypass.Predecessors.Count != 1
+            || bypass.Predecessors[0] != guard
+            || bypass.Successors.Count != 1
+            || bypass.Instructions.Count == 0
+            || bypass.Instructions.Any(instruction => instruction.OpCode is not (OpCode.Nop or OpCode.Jump))
+            || bypass.Instructions[^1].OpCode != OpCode.Jump)
+            return false;
+
+        merge = bypass.Successors[0];
+        return merge != bypass && merge != guard;
     }
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
