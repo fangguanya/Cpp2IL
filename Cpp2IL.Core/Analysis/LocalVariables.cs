@@ -1416,8 +1416,7 @@ public static class LocalVariables
         Instruction instruction,
         ApplicationAnalysisContext appContext)
     {
-        if (instruction.IntegerWidthBits is not (32 or 64)
-            || instruction.OpCode is not (
+        if (instruction.OpCode is not (
                 OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor)
@@ -1425,9 +1424,14 @@ public static class LocalVariables
             || instruction.Operands[0] is not LocalVariable destination)
             return false;
 
-        var targetType = instruction.IntegerWidthBits == 32
-            ? appContext.SystemTypes.SystemInt32Type
-            : appContext.SystemTypes.SystemInt64Type;
+        var targetType = instruction.IntegerWidthBits switch
+        {
+            32 => appContext.SystemTypes.SystemInt32Type,
+            64 => appContext.SystemTypes.SystemInt64Type,
+            _ => ExactIntegerDestinationType(instruction, destination, appContext),
+        };
+        if (targetType == null)
+            return false;
         var locals = instruction.Operands.OfType<LocalVariable>().Distinct().ToArray();
         if (locals.Any(local => !IsReplaceableFinalIntegerCarrier(local.Type, targetType, appContext)))
             return false;
@@ -1443,6 +1447,26 @@ public static class LocalVariables
         foreach (var local in locals)
             changed |= SetExactType(local, targetType);
         return changed;
+    }
+
+    /// <summary>
+    /// CFG 重写偶尔会丢失原生 W/X 位宽；此时只允许非布尔位掩码从已经精确定型的目标
+    /// 反向约束同一条位运算，避免把普通引用算术猜成整数。
+    /// </summary>
+    private static TypeAnalysisContext? ExactIntegerDestinationType(
+        Instruction instruction,
+        LocalVariable destination,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.OpCode is not (OpCode.And or OpCode.Or or OpCode.Xor)
+            || !instruction.Operands.OfType<Immediate>().Any(immediate => immediate.Value is < 0 or > 1))
+            return null;
+
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, appContext.SystemTypes.SystemInt32Type))
+            return appContext.SystemTypes.SystemInt32Type;
+        if (GenericCallRebinder.TypesEquivalent(destination.Type, appContext.SystemTypes.SystemInt64Type))
+            return appContext.SystemTypes.SystemInt64Type;
+        return null;
     }
 
     private static bool IsFinalScalarType(TypeAnalysisContext? type) => type?.FullName is

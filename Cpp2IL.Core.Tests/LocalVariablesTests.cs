@@ -2108,6 +2108,74 @@ public class LocalVariablesTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 丢失位宽的非布尔掩码从精确整型目标反向恢复源类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var masked = new LocalVariable(
+            "masked",
+            new Register(null, "X1", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var maximum = new LocalVariable(
+            "maximum",
+            new Register(null, "X2", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var instruction = new Instruction(0, OpCode.Or, maximum, masked, new Immediate(0x10000));
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(masked.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+            Assert.That(maximum.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 丢失位宽的一位布尔掩码不触发整型反向传播()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var flag = new LocalVariable("flag", new Register(null, "X1", 1));
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X2", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var instruction = new Instruction(0, OpCode.And, destination, flag, new Immediate(1));
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(flag.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 丢失位宽且目标为引用类型时保留原类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable("source", new Register(null, "X1", 1));
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X2", 1),
+            appContext.SystemTypes.SystemStringType);
+        var instruction = new Instruction(0, OpCode.Or, destination, source, new Immediate(8));
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(source.Type, Is.Null);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
     private static InjectedMethodAnalysisContext CreateConstructorFixture(
         TypeAnalysisContext declaringType,
         string name,
