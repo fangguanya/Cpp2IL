@@ -29,6 +29,17 @@ public static class Simplifier
         private readonly Dictionary<Block, Dictionary<Instruction, OperandList>> _sourceCache = [];
         private readonly MethodAnalysisContext _method = method;
         private readonly ISILControlFlowGraph _graph = method.ControlFlowGraph!;
+        // SSA 移除后同一原生 ref/out 槽的各版本会成为不同 LocalVariable 对象；按忽略版本的
+        // 物理存储身份冻结取址目录，避免后置常量传播把调用写回值重新替换成调用前零值。
+        private readonly HashSet<(int Number, string Name)> _addressTakenStorage = method.ControlFlowGraph!
+            .Blocks
+            .SelectMany(block => block.Instructions)
+            .SelectMany(instruction => instruction.Operands)
+            .OfType<AddressOf>()
+            .Select(address => address.Target)
+            .OfType<LocalVariable>()
+            .Select(StorageIdentity)
+            .ToHashSet();
 
         public void Process()
         {
@@ -95,6 +106,10 @@ public static class Simplifier
                     // If it's move and it moves something to local, replace and remove it
                     if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
                     {
+                        if (_addressTakenStorage.Contains(StorageIdentity(local))
+                            && instruction.Operands[1] is not LocalVariable)
+                            continue;
+
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
                             // This can't be inlined into memory operand
@@ -381,5 +396,8 @@ public static class Simplifier
 
             return false;
         }
+
+        private static (int Number, string Name) StorageIdentity(LocalVariable local) =>
+            (local.Register.Number, local.Register.Name);
     }
 }

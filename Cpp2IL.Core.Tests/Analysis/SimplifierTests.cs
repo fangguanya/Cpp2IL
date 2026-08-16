@@ -128,4 +128,90 @@ public class SimplifierTests
         Assert.That(live.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Operands[0], x)), Is.False,
             "the now-dead copy is removed");
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void Ref出参槽的SSA版本在后置简化中保留写回值()
+    {
+        var addressedSlot = new LocalVariable("slotAddress", new Register(28, "stack_-28", 0));
+        var initializedSlot = new LocalVariable("slotValue", new Register(28, "stack_-28", 1));
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, initializedSlot, Imm(0)),
+            new(1, OpCode.CallVoid, Str("WriteRef"), new AddressOf(addressedSlot)),
+            new(2, OpCode.CallVoid, Str("Use"), initializedSlot),
+            new(3, OpCode.Return),
+        };
+        var graph = new ISILControlFlowGraph(instructions);
+        var method = CreateMethod(graph, addressedSlot, initializedSlot);
+
+        Simplifier.Simplify(method);
+
+        var use = graph.Blocks.SelectMany(block => block.Instructions)
+            .Single(instruction => instruction.OpCode == OpCode.CallVoid
+                                   && instruction.Operands[0] is StringLiteral { Value: "Use" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(use.Operands[1], Is.SameAs(initializedSlot));
+            Assert.That(graph.Instructions.Any(instruction => instruction.OpCode == OpCode.Move
+                                                              && ReferenceEquals(instruction.Destination, initializedSlot)),
+                Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一取址槽的多个SSA版本均阻断旧常量传播()
+    {
+        var addressedSlot = new LocalVariable("slotAddress", new Register(28, "stack_-28", 0));
+        var firstVersion = new LocalVariable("firstVersion", new Register(28, "stack_-28", 1));
+        var secondVersion = new LocalVariable("secondVersion", new Register(28, "stack_-28", 2));
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, firstVersion, Imm(0)),
+            new(1, OpCode.Move, secondVersion, Imm(0)),
+            new(2, OpCode.CallVoid, Str("WriteRef"), new AddressOf(addressedSlot)),
+            new(3, OpCode.CallVoid, Str("UseFirst"), firstVersion),
+            new(4, OpCode.CallVoid, Str("UseSecond"), secondVersion),
+            new(5, OpCode.Return),
+        };
+        var graph = new ISILControlFlowGraph(instructions);
+        var method = CreateMethod(graph, addressedSlot, firstVersion, secondVersion);
+
+        Simplifier.Simplify(method);
+
+        var calls = graph.Blocks.SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.OpCode == OpCode.CallVoid)
+            .ToDictionary(instruction => ((StringLiteral)instruction.Operands[0]).Value);
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls["UseFirst"].Operands[1], Is.SameAs(firstVersion));
+            Assert.That(calls["UseSecond"].Operands[1], Is.SameAs(secondVersion));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 同名但不同编号的物理槽仍独立传播常量()
+    {
+        var addressedSlot = new LocalVariable("addressed", new Register(28, "stack_slot", 0));
+        var unrelatedSlot = new LocalVariable("unrelated", new Register(30, "stack_slot", 1));
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, unrelatedSlot, Imm(0)),
+            new(1, OpCode.CallVoid, Str("WriteRef"), new AddressOf(addressedSlot)),
+            new(2, OpCode.CallVoid, Str("Use"), unrelatedSlot),
+            new(3, OpCode.Return),
+        };
+        var graph = new ISILControlFlowGraph(instructions);
+        var method = CreateMethod(graph, addressedSlot, unrelatedSlot);
+
+        Simplifier.Simplify(method);
+
+        var use = graph.Blocks.SelectMany(block => block.Instructions)
+            .Single(instruction => instruction.OpCode == OpCode.CallVoid
+                                   && instruction.Operands[0] is StringLiteral { Value: "Use" });
+        Assert.That(use.Operands[1], Is.TypeOf<Immediate>());
+        Assert.That(((Immediate)use.Operands[1]).Value, Is.Zero);
+    }
 }

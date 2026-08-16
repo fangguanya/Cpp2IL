@@ -683,4 +683,80 @@ public class SsaAndDominators
             Assert.That(laterRead.Version, Is.EqualTo(addressed.Version));
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 紧邻调用的地址载体折回并生成Ref写回版本()
+    {
+        var stack = new Register(null, "stack_-28");
+        var pointer = new Register(null, "X0");
+        var result = new Register(null, "X0");
+        var use = new Register(null, "X19");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, pointer, new AddressOf(stack)),
+            new(1, OpCode.Move, stack, new Immediate(0)),
+            new(2, OpCode.Call, new Immediate(0x123456), result, pointer),
+            new(3, OpCode.Move, use, stack),
+            new(4, OpCode.Return, use),
+        };
+        var graph = BuildGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        var initialized = (Register)instructions[1].Operands[0];
+        var addressed = (Register)((AddressOf)instructions[2].Operands[2]).Target;
+        var readAfterCall = (Register)instructions[3].Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(addressed.Version, Is.Not.EqualTo(initialized.Version));
+            Assert.That(readAfterCall.Version, Is.EqualTo(addressed.Version));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 地址载体在调用前重定义时保持寄存器参数()
+    {
+        var stack = new Register(null, "stack_-28");
+        var pointer = new Register(null, "X0");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, pointer, new AddressOf(stack)),
+            new(1, OpCode.Move, pointer, new Immediate(7)),
+            new(2, OpCode.CallVoid, new StringLiteral("consume"), pointer),
+            new(3, OpCode.Return),
+        };
+        var graph = BuildGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.That(instructions[2].Operands[1], Is.TypeOf<Register>());
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 装箱只读数据的地址载体保持非写回语义()
+    {
+        const ulong boxTarget = 0x2162514;
+        var stack = new Register(null, "stack_-24");
+        var pointer = new Register(null, "X2");
+        var result = new Register(null, "X0");
+        var klass = new Register(null, "X1");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, stack, new Immediate(1)),
+            new(1, OpCode.Move, pointer, new AddressOf(stack)),
+            new(2, OpCode.Call, new Immediate((long)boxTarget), result, klass, pointer),
+            new(3, OpCode.Return, result),
+        };
+        var graph = BuildGraph(instructions);
+
+        var rewritten = SsaForm.RewriteImmediateAddressCarriers(
+            graph,
+            new HashSet<ulong> { boxTarget });
+
+        Assert.That(rewritten, Is.Zero);
+        Assert.That(instructions[2].Operands[3], Is.TypeOf<Register>());
+    }
 }

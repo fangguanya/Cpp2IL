@@ -139,6 +139,8 @@ public class SsaForm
         ISILControlFlowGraph graph,
         ISet<ulong> readOnlyBoxTargets)
     {
+        RewriteImmediateAddressCarriers(graph, readOnlyBoxTargets);
+
         foreach (var block in graph.Blocks)
         {
             for (var i = 0; i < block.Instructions.Count; i++)
@@ -163,6 +165,66 @@ public class SsaForm
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// 把同一基本块内紧邻调用的地址载体折回直接取址参数。ARM64 会先以
+    /// <c>ADD Xn, SP, #offset</c> 计算 ref/out 槽地址，再经过若干不改写 Xn 的初始化指令
+    /// 才调用；若 SSA 只看到载体寄存器，调用写回就不会为底层槽位生成新版本。
+    /// 最近定义不是纯取址时保持原图，避免跨重定义猜测地址来源。
+    /// </summary>
+    internal static int RewriteImmediateAddressCarriers(
+        ISILControlFlowGraph graph,
+        ISet<ulong> readOnlyBoxTargets)
+    {
+        var rewritten = 0;
+
+        foreach (var block in graph.Blocks)
+        {
+            for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
+            {
+                var instruction = block.Instructions[instructionIndex];
+                if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall))
+                    continue;
+
+                var destinationIndex = instruction.OpCode is OpCode.Call or OpCode.IndirectCall ? 1 : -1;
+                for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    if (operandIndex == destinationIndex
+                        || instruction.Operands[operandIndex] is not Register carrier
+                        || IsReadOnlyBoxDataAddress(instruction, operandIndex, readOnlyBoxTargets)
+                        || FindNearestAddressDefinition(block, instructionIndex, carrier) is not { } addressed)
+                        continue;
+
+                    instruction.SetOperand(operandIndex, new AddressOf(addressed));
+                    rewritten++;
+                }
+            }
+        }
+
+        return rewritten;
+    }
+
+    private static Register? FindNearestAddressDefinition(Block block, int beforeIndex, Register carrier)
+    {
+        for (var index = beforeIndex - 1; index >= 0; index--)
+        {
+            var candidate = block.Instructions[index];
+            if (candidate.Destination is not Register destination
+                || destination.Number != carrier.Number
+                || destination.Name != carrier.Name)
+                continue;
+
+            return candidate is
+            {
+                OpCode: OpCode.Move,
+                Operands: [Register, AddressOf { Target: Register addressed }]
+            }
+                ? addressed
+                : null;
+        }
+
+        return null;
     }
 
     internal static bool IsReadOnlyBoxDataAddress(
