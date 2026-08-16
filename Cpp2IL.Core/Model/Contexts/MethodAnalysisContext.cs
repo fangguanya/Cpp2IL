@@ -494,6 +494,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 此时恢复公开属性可避免输出运行库私有_stringLength字段。
         StringLengthRecovery.Run(this);
 
+        // 跨类型属性访问被IL2CPP内联后会表现为私有字段读写；公开非虚访问器与唯一字段身份
+        // 都已在此稳定，把该原生布局操作恢复成合法的属性调用，避免输出跨类型私有字段。
+        PropertyBackingFieldRecovery.Run(this);
+
         // 异常清理路径会把IEnumerator等引用槽先取址再按零偏移读取；在最终类型已稳定后
         // 折回直接引用访问，避免把托管地址写入object局部并生成不可编译的指针转换。
         ManagedReferenceAddressRecovery.Run(this);
