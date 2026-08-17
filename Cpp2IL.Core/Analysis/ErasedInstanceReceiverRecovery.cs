@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.ISIL;
@@ -15,12 +16,15 @@ public static class ErasedInstanceReceiverRecovery
         if (method.IsStatic || method.DeclaringType == null || method.ControlFlowGraph == null)
             return 0;
 
-        // 中文注释：一次构建唯一SSA定义目录，供所有调用共同判定隐藏元数据复制闭包。
-        var uniqueDefinitions = method.ControlFlowGraph.Instructions
+        // 中文注释：退SSA后同一合流局部会有多条边Move；一次构建完整定义目录，既供标量
+        // 值图审计复用，也派生唯一目录保护运行时元数据复制闭包。
+        var allDefinitions = method.ControlFlowGraph.Instructions
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
-            .Where(group => group.Count() == 1)
-            .ToDictionary(group => group.Key, group => group.Single());
+            .ToDictionary(group => group.Key, group => group.ToList());
+        var uniqueDefinitions = allDefinitions
+            .Where(pair => pair.Value.Count == 1)
+            .ToDictionary(pair => pair.Key, pair => pair.Value[0]);
         LocalVariable? thisLocal = null;
         var rewrittenCount = 0;
         foreach (var instruction in method.ControlFlowGraph.Instructions)
@@ -52,8 +56,11 @@ public static class ErasedInstanceReceiverRecovery
             if (LocalVariables.ContainsRuntimeMetadataCarrier(receiver, uniqueDefinitions))
                 continue;
 
-            // 已经可赋值的接收者保留原身份；只有原生寄存器值与托管签名矛盾时才恢复入口this。
-            if (receiverType.IsAssignableTo(targetType)
+            // 类型传播会依据被调签名把合流结果强制标成目标类型，但它的真实原生入边仍可能只是
+            // 调用前遗留的整数参数。除显式类型冲突外，仅接受“全部Move/Phi闭包全为标量常量，
+            // 且至少含一个非零值”的擦除证据；单独的零值仍可能是源码显式空接收者，保持原样。
+            var hasErasedScalarValueGraph = HasErasedScalarValueGraph(receiver, allDefinitions);
+            if ((receiverType.IsAssignableTo(targetType) && !hasErasedScalarValueGraph)
                 || !method.DeclaringType.IsAssignableTo(targetType))
                 continue;
 
@@ -66,6 +73,64 @@ public static class ErasedInstanceReceiverRecovery
         }
 
         return rewrittenCount;
+    }
+
+    private static bool HasErasedScalarValueGraph(
+        LocalVariable receiver,
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions)
+    {
+        var visiting = new HashSet<LocalVariable>();
+        var sawNonZero = false;
+        return ContainsOnlyScalarConstants(receiver, allDefinitions, visiting, ref sawNonZero)
+               && sawNonZero;
+    }
+
+    private static bool ContainsOnlyScalarConstants(
+        IOperand value,
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions,
+        ISet<LocalVariable> visiting,
+        ref bool sawNonZero)
+    {
+        if (value is Immediate immediate)
+        {
+            sawNonZero |= immediate.Value != 0;
+            return true;
+        }
+
+        if (value is not LocalVariable local
+            || !visiting.Add(local)
+            || !allDefinitions.TryGetValue(local, out var definitions)
+            || definitions.Count == 0)
+            return false;
+
+        foreach (var definition in definitions)
+        {
+            var sources = definition.OpCode switch
+            {
+                OpCode.Move when definition.Operands.Count >= 2 => definition.Operands.Skip(1),
+                OpCode.Phi when definition.Operands.Count >= 2 => definition.Operands.Skip(1),
+                _ => [],
+            };
+            var hasSource = false;
+            foreach (var source in sources)
+            {
+                hasSource = true;
+                if (!ContainsOnlyScalarConstants(source, allDefinitions, visiting, ref sawNonZero))
+                {
+                    visiting.Remove(local);
+                    return false;
+                }
+            }
+
+            if (!hasSource)
+            {
+                visiting.Remove(local);
+                return false;
+            }
+        }
+
+        visiting.Remove(local);
+        return true;
     }
 
     private static LocalVariable? GetOrCreateThisLocal(MethodAnalysisContext method)

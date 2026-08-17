@@ -88,6 +88,109 @@ public class ErasedInstanceReceiverRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 已定型同类接收者的非零常量定义恢复为入口This()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("typedScalar", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var scalarDefinition = new Instruction(0, OpCode.Move, receiver, new Immediate(2));
+        var call = new Instruction(1, OpCode.Call, target, result, receiver);
+        Prepare(caller, scalarDefinition, call, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(call.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
+            Assert.That(caller.ParameterLocals.Single().IsThis, Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已定型同类接收者的零和非零Phi恢复为入口This()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("typedScalarPhi", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var phi = new Instruction(-1, OpCode.Phi, receiver, new Immediate(2), new Immediate(0));
+        var call = new Instruction(1, OpCode.Call, target, result, receiver);
+        Prepare(caller, phi, call, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(call.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 退SSA后的零和非零多定义接收者恢复为入口This()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("loweredScalarPhi", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var nonZeroEdge = new Instruction(-1, OpCode.Move, receiver, new Immediate(2));
+        var zeroEdge = new Instruction(-1, OpCode.Move, receiver, new Immediate(0));
+        var call = new Instruction(1, OpCode.Call, target, result, receiver);
+        caller.ParameterOperands = [new Register(null, "X0")];
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            nonZeroEdge,
+            zeroEdge,
+            call,
+            new Instruction(2, OpCode.Return),
+        ]);
+        caller.Locals = [receiver, result];
+        caller.ParameterLocals = [];
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(call.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 已定型同类接收者仅有空常量时保持原身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("explicitNull", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var nullDefinition = new Instruction(0, OpCode.Move, receiver, new Immediate(0));
+        var call = new Instruction(1, OpCode.Call, target, result, receiver);
+        Prepare(caller, nullDefinition, call, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.Operands[2], Is.SameAs(receiver));
+            Assert.That(caller.ParameterLocals, Is.Empty);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 开放泛型接收者调用Object方法时保持原身份()
     {
@@ -258,6 +361,22 @@ public class ErasedInstanceReceiverRecoveryTests
         method.ControlFlowGraph = new ISILControlFlowGraph([
             call,
             new Instruction(1, OpCode.Return),
+        ]);
+        method.Locals = [.. locals];
+        method.ParameterLocals = [];
+    }
+
+    private static void Prepare(
+        MethodAnalysisContext method,
+        Instruction definition,
+        Instruction call,
+        params LocalVariable[] locals)
+    {
+        method.ParameterOperands = [new Register(null, "X0")];
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            definition,
+            call,
+            new Instruction(call.Index + 1, OpCode.Return),
         ]);
         method.Locals = [.. locals];
         method.ParameterLocals = [];
