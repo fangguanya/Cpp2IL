@@ -436,6 +436,52 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
+    /// 将 ARM64 SMADDL/SMULL 精确展开为两个有符号拓宽、一次64位乘法和一次64位加法。
+    /// W 源必须先按 int32 符号扩展，禁止把负数当作 uint32 零扩展后参与乘法。
+    /// </summary>
+    internal static bool TryCreateSignedMultiplyAddLongInstructions(
+        Arm64Instruction instruction,
+        ulong address,
+        out Instruction[] recovered)
+    {
+        recovered = [];
+        if (instruction.Mnemonic != Arm64Mnemonic.SMADDL
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || instruction.Op2Kind != Arm64OperandKind.Register
+            || instruction.Op3Kind != Arm64OperandKind.Register
+            || instruction.Op0Reg is < Arm64Register.X0 or > Arm64Register.X30
+            // Disarm 会把 SMADDL 编码中的 Wn/Wm 规范化报告为同槽位 Xn/Xm；
+            // 32位有符号源宽度由 SMADDL 操作码本身保证，不能再按枚举名称误拒绝。
+            || instruction.Op1Reg is < Arm64Register.X0 or > Arm64Register.X31
+            || instruction.Op2Reg is < Arm64Register.X0 or > Arm64Register.X31
+            || instruction.Op3Reg is < Arm64Register.X0 or > Arm64Register.X31)
+            return false;
+
+        static IOperand RegisterOrZero(Arm64Register register)
+            => Arm64RegisterHelper.IsZeroRegister(register)
+                ? Imm(0)
+                : new Register(null, Arm64RegisterHelper.CanonicalName(register));
+
+        var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
+        var left64 = new Register(null, $"SMADDL_LEFT_SIGNED64_{address:X}");
+        var right64 = new Register(null, $"SMADDL_RIGHT_SIGNED64_{address:X}");
+        var product = new Register(null, $"SMADDL_PRODUCT64_{address:X}");
+        var leftSource = RegisterOrZero(instruction.Op1Reg);
+        var rightSource = RegisterOrZero(instruction.Op2Reg);
+        var accumulator = RegisterOrZero(instruction.Op3Reg);
+
+        recovered =
+        [
+            new Instruction(0, OpCode.ConvertSignedIntegerWidth, left64, leftSource, Imm(64), Imm(32)),
+            new Instruction(1, OpCode.ConvertSignedIntegerWidth, right64, rightSource, Imm(64), Imm(32)),
+            new Instruction(2, OpCode.Multiply, product, left64, right64) { IntegerWidthBits = 64 },
+            new Instruction(3, OpCode.Add, destination, accumulator, product) { IntegerWidthBits = 64 },
+        ];
+        return true;
+    }
+
+    /// <summary>
     /// 识别 FMOV 在通用寄存器与标量浮点寄存器之间的同宽位复制。
     /// 该指令不执行数值转换，必须保留 IEEE-754 原始位模式。
     /// </summary>
@@ -1556,7 +1602,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
             or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
             or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
-            or OpCode.ConvertSignedIntegerToFloat or OpCode.ReinterpretIntegerBitsAsFloat
+            or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+            or OpCode.ReinterpretIntegerBitsAsFloat
             or OpCode.ReinterpretFloatBitsAsInteger or OpCode.RoundFloatTowardPositiveInfinity
             or OpCode.RoundFloatTowardNegativeInfinity
             or >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned;
@@ -1614,7 +1661,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.AbsoluteNumber
                 or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
-                or OpCode.ConvertSignedIntegerToFloat or OpCode.ReinterpretIntegerBitsAsFloat
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+                or OpCode.ReinterpretIntegerBitsAsFloat
                 or OpCode.ReinterpretFloatBitsAsInteger or OpCode.VectorDuplicate
                 or OpCode.VectorWidenUnsignedInt16ToInt32 or OpCode.VectorShiftLeft
                 or OpCode.VectorCompareLessThanZero or OpCode.VectorBitwiseSelect
@@ -3007,6 +3055,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 // 整数乘法保留目标寄存器位宽，供退SSA后的标量载体定型。
                 AddInteger(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
+            case Arm64Mnemonic.SMADDL:
+                {
+                    if (!TryCreateSignedMultiplyAddLongInstructions(instruction, address, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction SMADDL operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                    break;
+                }
             case Arm64Mnemonic.FMUL:
                 Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;

@@ -119,6 +119,7 @@ public class Instruction : IOperand
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ConvertSignedIntegerWidth:
             case OpCode.ReinterpretIntegerBitsAsFloat:
             case OpCode.ReinterpretFloatBitsAsInteger:
             case OpCode.VectorDuplicate:
@@ -187,7 +188,7 @@ public class Instruction : IOperand
             OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
-                or OpCode.ConvertSignedIntegerToFloat
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
                 or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
                 or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero

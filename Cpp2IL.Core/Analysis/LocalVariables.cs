@@ -1033,6 +1033,7 @@ public static class LocalVariables
                 case OpCode.ConvertFloatingPointPrecision:
                 case OpCode.ConvertFloatToSignedInteger:
                 case OpCode.ConvertSignedIntegerToFloat:
+                case OpCode.ConvertSignedIntegerWidth:
                 case OpCode.ReinterpretIntegerBitsAsFloat:
                 case OpCode.ReinterpretFloatBitsAsInteger:
                 case OpCode.RoundFloatTowardPositiveInfinity:
@@ -1175,7 +1176,8 @@ public static class LocalVariables
             return false;
 
         var systemTypes = appContext.SystemTypes;
-        var destinationType = instruction.OpCode == OpCode.ConvertFloatToSignedInteger
+        var destinationType = instruction.OpCode is OpCode.ConvertFloatToSignedInteger
+            or OpCode.ConvertSignedIntegerWidth
             ? destinationWidth.Value switch
             {
                 32 => systemTypes.SystemInt32Type,
@@ -1193,6 +1195,7 @@ public static class LocalVariables
             ? explicitSourceWidth.Value
             : destinationWidth.Value;
         var sourceType = instruction.OpCode is OpCode.ConvertSignedIntegerToFloat
+            or OpCode.ConvertSignedIntegerWidth
             or OpCode.ReinterpretIntegerBitsAsFloat
             ? sourceWidth switch
             {
@@ -1243,6 +1246,7 @@ public static class LocalVariables
                     OpCode.ConvertFloatingPointPrecision
                     or OpCode.ConvertFloatToSignedInteger
                     or OpCode.ConvertSignedIntegerToFloat
+                    or OpCode.ConvertSignedIntegerWidth
                     or OpCode.ReinterpretIntegerBitsAsFloat
                     or OpCode.ReinterpretFloatBitsAsInteger
                     or OpCode.RoundFloatTowardPositiveInfinity

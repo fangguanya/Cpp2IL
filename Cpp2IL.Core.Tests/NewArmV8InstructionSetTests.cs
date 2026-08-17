@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Disarm;
@@ -9,6 +10,21 @@ namespace Cpp2IL.Core.Tests;
 
 public class NewArmV8InstructionSetTests
 {
+    /// <summary>
+    /// 将四字节夹具解码成唯一 ARM64 指令；测试输入若不是单指令必须立即失败。
+    /// </summary>
+    private static Arm64Instruction DecodeSingleInstruction(byte[] machineCode, ulong address)
+    {
+        var decoded = new List<Arm64Instruction>();
+        foreach (var instruction in Disassembler.Disassemble(
+                     machineCode,
+                     address,
+                     new Disassembler.Options(true, true, false)))
+            decoded.Add(instruction);
+
+        return decoded.Single();
+    }
+
     [TestCase(Arm64Mnemonic.STRB, Arm64Register.W0, 8, TestName = "基本_字节存储保留8位覆盖宽度")]
     [TestCase(Arm64Mnemonic.STURH, Arm64Register.W0, 16, TestName = "边界_无符号半字节存储保留16位覆盖宽度")]
     [TestCase(Arm64Mnemonic.STUR, Arm64Register.X0, 64, TestName = "边界_64位寄存器存储保留64位覆盖宽度")]
@@ -1039,6 +1055,88 @@ public class NewArmV8InstructionSetTests
                 Is.True);
             Assert.That(wideBits, Is.EqualTo(64));
         }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void SmullAliasExpandsToSignedWordMultiplyAndWideAdd()
+    {
+        // 真实出生地方法指令：SMULL X8, W10, W8，即 SMADDL X8, W10, W8, XZR。
+        var native = DecodeSingleInstruction([0x48, 0x7D, 0x28, 0x9B], 0x0271BCA8);
+
+        var recognized = NewArmV8InstructionSet.TryCreateSignedMultiplyAddLongInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.That(
+            recognized,
+            Is.True,
+            $"解码形态：{native.Mnemonic} {native.Op0Kind}/{native.Op0Reg} "
+            + $"{native.Op1Kind}/{native.Op1Reg} {native.Op2Kind}/{native.Op2Reg} "
+            + $"{native.Op3Kind}/{native.Op3Reg}");
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.ConvertSignedIntegerWidth,
+                OpCode.ConvertSignedIntegerWidth,
+                OpCode.Multiply,
+                OpCode.Add,
+            }));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, "X10")));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(64)));
+            Assert.That(recovered[0].Operands[3], Is.EqualTo(new Immediate(32)));
+            Assert.That(recovered[1].Operands[1], Is.EqualTo(new Register(null, "X8")));
+            Assert.That(recovered[2].IntegerWidthBits, Is.EqualTo(64));
+            Assert.That(recovered[3].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered[3].IntegerWidthBits, Is.EqualTo(64));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void SmaddlPreservesNonZeroWideAccumulatorAsFirstAddend()
+    {
+        // SMADDL X8, W10, W8, X9；累加器必须保持为64位 X9，且不能与乘数换槽。
+        var native = DecodeSingleInstruction([0x48, 0x25, 0x28, 0x9B], 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateSignedMultiplyAddLongInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.That(
+            recognized,
+            Is.True,
+            $"解码形态：{native.Mnemonic} {native.Op0Kind}/{native.Op0Reg} "
+            + $"{native.Op1Kind}/{native.Op1Reg} {native.Op2Kind}/{native.Op2Reg} "
+            + $"{native.Op3Kind}/{native.Op3Reg}");
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(recovered[3].OpCode, Is.EqualTo(OpCode.Add));
+            Assert.That(recovered[3].Operands[0], Is.EqualTo(new Register(null, "X8")));
+            Assert.That(recovered[3].Operands[1], Is.EqualTo(new Register(null, "X9")));
+            Assert.That(recovered[3].Operands[2], Is.EqualTo(recovered[2].Operands[0]));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void OrdinaryWideMaddIsNotMisclassifiedAsSignedWordMultiplyAdd()
+    {
+        // MADD X8, X10, X8, X9 使用64位乘数，不属于 SMADDL 的 W×W 符号拓宽语义。
+        var native = DecodeSingleInstruction([0x48, 0x25, 0x08, 0x9B], 0x1000);
+
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateSignedMultiplyAddLongInstructions(
+                native,
+                native.Address,
+                out var recovered),
+            Is.False);
+        Assert.That(recovered, Is.Empty);
     }
 
     [Test]

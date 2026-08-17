@@ -727,11 +727,16 @@ public static class IlGenerator
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ConvertSignedIntegerWidth:
             case OpCode.RoundFloatTowardPositiveInfinity:
             case OpCode.RoundFloatTowardNegativeInfinity:
                 {
                     if (instruction.Operands.Count < 3 || instruction.Operands[2] is not Immediate destinationWidth)
                         throw new InvalidOperationException($"数值转换指令缺少目标位宽：{instruction}");
+                    if (instruction.OpCode == OpCode.ConvertSignedIntegerWidth
+                        && (instruction.Operands.Count != 4
+                            || instruction.Operands[3] is not Immediate { Value: 32 or 64 }))
+                        throw new InvalidOperationException($"有符号整数位宽转换缺少有效源位宽：{instruction}");
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
                     switch (instruction.OpCode)
@@ -760,6 +765,16 @@ public static class IlGenerator
                                 32 => CilOpCodes.Conv_R4,
                                 64 => CilOpCodes.Conv_R8,
                                 _ => throw new InvalidOperationException($"浮点目标位宽无效：{destinationWidth.Value}"),
+                            });
+                            break;
+
+                        case OpCode.ConvertSignedIntegerWidth:
+                            // CIL 的 conv.i8 对 int32 执行有符号扩展，正好对应 ARM64 SMADDL/SMULL 的 W 源语义。
+                            instructions.Add(destinationWidth.Value switch
+                            {
+                                32 => CilOpCodes.Conv_I4,
+                                64 => CilOpCodes.Conv_I8,
+                                _ => throw new InvalidOperationException($"有符号整数目标位宽无效：{destinationWidth.Value}"),
                             });
                             break;
 

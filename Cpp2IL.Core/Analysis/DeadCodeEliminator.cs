@@ -179,7 +179,7 @@ public static class DeadCodeEliminator
                 or OpCode.Not or OpCode.Negate
                 or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
-                or OpCode.ConvertSignedIntegerToFloat
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
                 or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity => true,
             >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned => true,

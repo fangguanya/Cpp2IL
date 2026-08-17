@@ -107,6 +107,9 @@ public enum OpCode
     /// <summary>把 op 2 的有符号整数按 op 3 目标浮点位宽和 op 4 源整数位宽转换，并写入 op 1</summary>
     ConvertSignedIntegerToFloat,
 
+    /// <summary>把 op 2 的有符号整数从 op 4 源位宽转换到 op 3 目标位宽，并写入 op 1</summary>
+    ConvertSignedIntegerWidth,
+
     /// <summary>把 op 2 的整数位模式按 op 3 指定位宽原样解释为浮点值，并写入 op 1</summary>
     ReinterpretIntegerBitsAsFloat,
 

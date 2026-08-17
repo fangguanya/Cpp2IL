@@ -53,6 +53,33 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Smaddl有符号拓宽把W源定型为Int32并把临时结果定型为Int64()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "SMADDL_LEFT_SIGNED64_271BCA8", 0));
+        var source = new LocalVariable("source", new Register(null, "X10", 3));
+        var conversion = new Instruction(
+            0,
+            OpCode.ConvertSignedIntegerWidth,
+            destination,
+            source,
+            new Immediate(64),
+            new Immediate(32));
+
+        var changed = LocalVariables.BindNumericConversionTypes(conversion, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void Phi全部局部入边类型一致时才建立目标类型共识()
     {
