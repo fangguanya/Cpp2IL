@@ -2228,6 +2228,84 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 后期属性Getter比较恢复对象占位循环计数器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            appContext.GetAssemblyByName("mscorlib")!,
+            "Fixture",
+            "CounterOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var getter = owner.InjectMethodContext(
+            "get_CommonnessScore",
+            appContext.SystemTypes.SystemInt32Type,
+            MethodAttributes.Public);
+        var receiver = new LocalVariable("owner", new Register(null, "X0"), owner);
+        var limit = new LocalVariable("limit", new Register(null, "W8"), appContext.SystemTypes.SystemInt32Type);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X24"),
+            appContext.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable("condition", new Register(null, "Z"), appContext.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, getter, limit, receiver);
+        var comparison = new Instruction(1, OpCode.CheckLess, condition, counter, limit);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RecoverPropertyCounter",
+            [call, comparison],
+            [receiver, limit, counter, condition]);
+
+        var changed = LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通方法结果比较不得冒充后期属性证据()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            appContext.GetAssemblyByName("mscorlib")!,
+            "Fixture",
+            "CounterOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var methodTarget = owner.InjectMethodContext(
+            "ReadLimit",
+            appContext.SystemTypes.SystemInt32Type,
+            MethodAttributes.Public);
+        var receiver = new LocalVariable("owner", new Register(null, "X0"), owner);
+        var limit = new LocalVariable("limit", new Register(null, "W8"), appContext.SystemTypes.SystemInt32Type);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X24"),
+            appContext.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable("condition", new Register(null, "Z"), appContext.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, methodTarget, limit, receiver);
+        var comparison = new Instruction(1, OpCode.CheckLess, condition, counter, limit);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RejectOrdinaryCall",
+            [call, comparison],
+            [receiver, limit, counter, condition]);
+
+        var changed = LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 单精度字段比较恢复对象占位浮点载体()
     {

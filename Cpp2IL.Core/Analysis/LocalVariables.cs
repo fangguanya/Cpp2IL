@@ -1396,6 +1396,37 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// 私有字段在布局恢复后可能被重新物化为公开属性getter；仅消费这些新产生的精确标量结果，
+    /// 为同一比较中的退SSA占位局部补回数值类型，不重复早期原生位宽与字段推导。
+    /// </summary>
+    public static bool ResolveRecoveredPropertyComparisonCarrierTypes(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var getterResults = instructions
+            .Where(instruction => instruction is
+            {
+                OpCode: OpCode.Call,
+                Operands: [MethodAnalysisContext { Name: var name }, LocalVariable { Type: { } type }, ..]
+            } && name.StartsWith("get_", StringComparison.Ordinal)
+              && IsFinalScalarType(type))
+            .Select(instruction => (LocalVariable)instruction.Operands[1])
+            .ToHashSet();
+        if (getterResults.Count == 0)
+            return false;
+
+        var changed = false;
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
+                || instruction.Operands.Count != 3
+                || !instruction.Operands.Skip(1).OfType<LocalVariable>().Any(getterResults.Contains))
+                continue;
+            changed |= BindFinalComparisonOperandTypes(instruction, method.AppContext);
+        }
+        return changed;
+    }
+
     internal static bool BindFinalComparisonOperandTypes(
         Instruction instruction,
         ApplicationAnalysisContext? appContext = null)

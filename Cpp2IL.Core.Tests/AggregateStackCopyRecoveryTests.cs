@@ -85,6 +85,97 @@ public class AggregateStackCopyRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 标量尾字段先读取时仍恢复完整Enumerator复制()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var concreteEnumerator = CreateEnumerator(app.SystemTypes.SystemStringType);
+        var sourceBase = Local("stack_-98", concreteEnumerator);
+        var sourceTail = Local("stack_-88", app.SystemTypes.SystemStringType);
+        var scalar = Local("X8", app.SystemTypes.SystemObjectType);
+        var vector = Local("V0", null);
+        var destinationBase = Local("stack_-80", null);
+        var destinationTail = Local("stack_-70", app.SystemTypes.SystemObjectType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, scalar, sourceTail),
+            new(1, OpCode.Move, vector, sourceBase),
+            new(2, OpCode.Move, destinationBase, vector),
+            new(3, OpCode.Move, destinationTail, scalar),
+        };
+
+        var changed = AggregateStackCopyRecovery.RecoverBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(GenericCallRebinder.TypesEquivalent(destinationBase.Type, concreteEnumerator), Is.True);
+            Assert.That(scalar.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+            Assert.That(destinationTail.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 标量尾字段先写入时仍恢复互不重叠的完整复制()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var concreteEnumerator = CreateEnumerator(app.SystemTypes.SystemStringType);
+        var sourceBase = Local("stack_-98", concreteEnumerator);
+        var sourceTail = Local("stack_-88", app.SystemTypes.SystemStringType);
+        var scalar = Local("X8", null);
+        var vector = Local("V0", null);
+        var destinationBase = Local("stack_-80", null);
+        var destinationTail = Local("stack_-70", null);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, vector, sourceBase),
+            new(1, OpCode.Move, scalar, sourceTail),
+            new(2, OpCode.Move, destinationTail, scalar),
+            new(3, OpCode.Move, destinationBase, vector),
+        };
+
+        var changed = AggregateStackCopyRecovery.RecoverBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(GenericCallRebinder.TypesEquivalent(destinationBase.Type, concreteEnumerator), Is.True);
+            Assert.That(destinationTail.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 任一目标写入早于第二次读取时拒绝聚合复制()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var concreteEnumerator = CreateEnumerator(app.SystemTypes.SystemStringType);
+        var sourceBase = Local("stack_-98", concreteEnumerator);
+        var sourceTail = Local("stack_-88", app.SystemTypes.SystemStringType);
+        var scalar = Local("X8", app.SystemTypes.SystemObjectType);
+        var vector = Local("V0", app.SystemTypes.SystemObjectType);
+        var destinationBase = Local("stack_-80", app.SystemTypes.SystemObjectType);
+        var destinationTail = Local("stack_-70", app.SystemTypes.SystemObjectType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, scalar, sourceTail),
+            new(1, OpCode.Move, destinationTail, scalar),
+            new(2, OpCode.Move, vector, sourceBase),
+            new(3, OpCode.Move, destinationBase, vector),
+        };
+
+        var changed = AggregateStackCopyRecovery.RecoverBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destinationBase.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+            Assert.That(destinationTail.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+        });
+    }
+
     [TestCase("stack_-10", -0x10)]
     [TestCase("stack_0", 0)]
     [TestCase("stack_2A", 0x2A)]
