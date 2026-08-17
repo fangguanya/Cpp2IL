@@ -883,7 +883,7 @@ public static class KeyFunctionRecovery
         {
             Logger.VerboseNewline(
                 $"类型测试元数据槽未在初始化目录：slot=0x{address:X}，" +
-                $"initialized={string.Join(',', initializedRuntimeMetadataSlots.Select(slot => $"0x{slot:X}"))}",
+                $"initialized={string.Join(",", initializedRuntimeMetadataSlots.Select(slot => $"0x{slot:X}"))}",
                 "KeyFunctionRecovery");
             return null;
         }
@@ -1493,6 +1493,39 @@ public static class KeyFunctionRecovery
             addressTakenIndex = definition.Index;
             operand = definition.Operands[1];
         }
+    }
+
+    /// <summary>
+    /// 依据 IL2CPP 内部调用名称解析唯一的托管方法；重载只在参数数量唯一时接受。
+    /// </summary>
+    internal static MethodAnalysisContext? ResolveInternalCallName(
+        ApplicationAnalysisContext appContext,
+        string name)
+    {
+        var separator = name.IndexOf("::", StringComparison.Ordinal);
+        if (separator < 0)
+            return null;
+
+        var typeName = name[..separator];
+        var signature = name[(separator + 2)..];
+        var parenthesis = signature.IndexOf('(');
+        var methodName = parenthesis < 0 ? signature : signature[..parenthesis];
+
+        if (appContext.LibCpp2IlContext.ReflectionCache.GetTypeByFullName(typeName) is not { } typeDefinition
+            || appContext.ResolveContextForType(typeDefinition) is not { } type)
+            return null;
+
+        var candidates = type.Methods.Where(method => method.Name == methodName).ToList();
+        if (candidates.Count <= 1)
+            return candidates.FirstOrDefault();
+
+        var parameters = parenthesis < 0 ? string.Empty : signature[(parenthesis + 1)..].TrimEnd(')');
+        var parameterCount = parameters.Length == 0 ? 0 : parameters.Split(',').Length;
+        var matchingCandidates = candidates
+            .Where(method => method.Parameters.Count == parameterCount)
+            .ToList();
+
+        return matchingCandidates.Count == 1 ? matchingCandidates[0] : null;
     }
 
     private sealed record AddressedValue(LocalVariable Slot, int AddressTakenIndex);

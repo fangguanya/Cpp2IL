@@ -262,12 +262,11 @@ public static class PackedFieldStoreRecovery
         IReadOnlyCollection<FieldLayout> fields,
         LocalVariable receiver)
     {
-        var candidateInstructions = candidates
-            .Select(candidate => candidate.Instruction)
-            .ToHashSet();
+        var candidateInstructions = new HashSet<Instruction>(candidates
+            .Select(candidate => candidate.Instruction));
         var first = candidates.Min(candidate => block.Instructions.IndexOf(candidate.Instruction));
         var last = candidates.Max(candidate => block.Instructions.IndexOf(candidate.Instruction));
-        var affectedFields = fields.Select(field => field.Field).ToHashSet();
+        var affectedFields = new HashSet<FieldAnalysisContext>(fields.Select(field => field.Field));
 
         for (var index = first; index <= last; index++)
         {

@@ -80,6 +80,11 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     internal readonly ThrowHelperNameCache ThrowHelperNamesByAddress = new();
 
     /// <summary>
+    /// Dict of address to "is this method analogue to il2cpp::vm::Exception::Raise"
+    /// </summary>
+    public readonly ConcurrentDictionary<ulong, bool> ExceptionRaisersByAddress = new();
+
+    /// <summary>
     /// A dictionary of all the generic method variants to their corresponding analysis contexts.
     /// </summary>
     public readonly Dictionary<Cpp2IlMethodRef, ConcreteGenericMethodAnalysisContext> ConcreteGenericMethodsByRef = new();
@@ -139,7 +144,9 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// </summary>
     private void PopulateMethodsByAddressTable()
     {
-        Assemblies.SelectMany(a => a.Types).SelectMany(t => t.Methods).ToList().ForEach(m =>
+        var allMethods = Assemblies.SelectMany(a => a.Types).SelectMany(t => t.Methods).ToList();
+
+        allMethods.ForEach(m =>
         {
             m.EnsureRawBytes();
             var ptr = InstructionSet.GetPointerForMethod(m);
@@ -149,6 +156,9 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
 
             MethodsByAddress[ptr].Add(m);
         });
+
+        Logger.VerboseNewline("\tProcessing internal calls...");
+        RegisterInternalCallTargets(allMethods);
 
         Logger.VerboseNewline("\tProcessing concrete generic methods...");
         foreach (var methodRef in Binary.ConcreteGenericMethods.Values.SelectMany(v => v))
@@ -166,6 +176,16 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
 
             MethodsByAddress[ptr].Add(gm);
             ConcreteGenericMethodsByRef[methodRef] = gm;
+
+            if (methodRef.AdjustorThunkPtr != 0
+                && InstructionSet.GetThunkTarget(this, methodRef.AdjustorThunkPtr) is not 0 and var thunkTarget
+                && thunkTarget != ptr)
+            {
+                if (!MethodsByAddress.TryGetValue(thunkTarget, out var atTarget))
+                    MethodsByAddress[thunkTarget] = atTarget = [];
+
+                atTarget.Add(gm);
+            }
 #if !DEBUG
             }
             catch (Exception e)
@@ -174,6 +194,36 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
             }
 #endif
         }
+    }
+
+    // ICalls are implemented as a stub that tail-jumps into the runtime (e.g. Math.Ceiling => the c runtime's
+    // ceil, Monitor.Enter => il2cpp::vm::Monitor::TryEnter). Many callers get inlined straight to that runtime
+    // 同一方法定义可能在不同泛型实例中具有多个地址，因此预先建立地址映射供后续解析。
+    private void RegisterInternalCallTargets(List<MethodAnalysisContext> allMethods)
+    {
+        var byTarget = new Dictionary<ulong, List<MethodAnalysisContext>>();
+
+        foreach (var method in allMethods)
+        {
+            // Il2CppMethodDefinition.MethodImplAttributes masks this bit out, check directly against iflags
+            if (method.Definition is not { } definition || (definition.iflags & (ushort)MethodImplAttributes.InternalCall) == 0)
+                continue;
+
+            var target = InstructionSet.GetInternalCallTarget(method);
+
+            if (target == 0 || MethodsByAddress.ContainsKey(target))
+                continue;
+
+            if (!byTarget.TryGetValue(target, out var methods))
+                byTarget[target] = methods = [];
+
+            methods.Add(method);
+        }
+
+        foreach (var (target, methods) in byTarget)
+            MethodsByAddress[target] = methods;
+
+        Logger.VerboseNewline($"\t\tRegistered {byTarget.Count} internal call targets, of which {byTarget.Count(t => t.Value.Count > 1)} are ambiguous");
     }
 
     /// <summary>

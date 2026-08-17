@@ -9,33 +9,35 @@ namespace Cpp2IL.Core.Utils;
 /// </summary>
 public static class CallingConventionResolver
 {
+    private static readonly X64CallingConventionResolver X64 = new();
+
     public static bool HasRawArgumentLayout(Instruction call, ApplicationAnalysisContext app)
         => IsArm64(app)
             ? Arm64CallingConventionResolver.HasRawArgumentLayout(call)
-            : X64CallingConventionResolver.HasRawArgumentLayout(call, app);
+            : X64.HasRawArgumentLayout(call, app);
 
     public static void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
     {
         if (IsArm64(resolved.AppContext))
             Arm64CallingConventionResolver.RemapRawArguments(call, resolved);
         else
-            X64CallingConventionResolver.RemapRawArguments(call, resolved);
+            X64.RemapRawArguments(call, resolved);
     }
 
     public static bool ReturnsViaHiddenBuffer(MethodAnalysisContext method)
         => IsArm64(method.AppContext)
             ? Arm64CallingConventionResolver.ReturnsViaHiddenBuffer(method)
-            : X64CallingConventionResolver.ReturnsViaHiddenBuffer(method);
+            : X64.ReturnsViaHiddenBuffer(method);
 
     public static Register? HiddenReturnBufferRegister(MethodAnalysisContext method)
         => IsArm64(method.AppContext)
             ? Arm64CallingConventionResolver.HiddenReturnBufferRegister(method)
-            : X64CallingConventionResolver.HiddenReturnBufferRegister(method);
+            : X64.HiddenReturnBufferRegister(method);
 
     public static Register ReturnRegister(MethodAnalysisContext method)
         => IsArm64(method.AppContext)
             ? Arm64CallingConventionResolver.ReturnRegister(method)
-            : X64CallingConventionResolver.ReturnRegister(method);
+            : X64.ReturnRegister(method);
 
     private static bool IsArm64(ApplicationAnalysisContext app)
         => app.InstructionSet is NewArmV8InstructionSet;

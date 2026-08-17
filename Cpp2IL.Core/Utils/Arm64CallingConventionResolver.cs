@@ -24,6 +24,12 @@ public static class Arm64CallingConventionResolver
     internal static IReadOnlyList<string> RawArgumentRegisterNames =>
         IntegerRegisters.Concat(FloatingRegisters).ToArray();
 
+    /// <summary>
+    /// 向统一调用约定基类公开 ARM64 的两组独立参数寄存器。
+    /// </summary>
+    internal static (string[] Integer, string[] Float) GetRawRegisters()
+        => (IntegerRegisters, FloatingRegisters);
+
     public static IOperand[] ResolveForUnmanaged()
         => RawArgumentRegisterNames
             .Select(name => (IOperand)new Register(null, name))
@@ -339,4 +345,27 @@ public static class Arm64CallingConventionResolver
     private static bool TypesExactlyMatch(TypeAnalysisContext left, TypeAnalysisContext right)
         => ReferenceEquals(left, right)
            || left.Namespace == right.Namespace && left.Name == right.Name;
+}
+
+/// <summary>
+/// 把完整的 AAPCS64 规则接入跨指令集分析接口。
+/// </summary>
+internal sealed class Arm64CallingConventionAdapter : BaseCallingConventionResolver
+{
+    public override Register ReturnRegister(MethodAnalysisContext ctx)
+        => Arm64CallingConventionResolver.ReturnRegister(ctx);
+
+    public override bool ReturnsViaHiddenBuffer(MethodAnalysisContext ctx)
+        => Arm64CallingConventionResolver.ReturnsViaHiddenBuffer(ctx);
+
+    public override Register? HiddenReturnBufferRegister(MethodAnalysisContext ctx)
+        => Arm64CallingConventionResolver.HiddenReturnBufferRegister(ctx);
+
+    public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
+        => Arm64CallingConventionResolver.ArgumentOperands(ctx).ToArray();
+
+    protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)
+        => Arm64CallingConventionResolver.GetRawRegisters();
+
+    protected override bool HiddenBufferConsumesArgumentSlot => false;
 }

@@ -1664,11 +1664,10 @@ public static class LocalVariables
         // SSA局部量通常只有一个定义，但内联类型检查恢复会在原复制局部量上追加CastClass等
         // 语义定义。此类定义会结束原来的地址别名；若仍沿旧Move边传播，地址绑定与强制转换
         // 会在每轮类型分析中互相覆盖，最终使大型方法无法达到不动点。
-        var semanticallyDefinedLocals = instructions
+        var semanticallyDefinedLocals = new HashSet<LocalVariable>(instructions
             .Where(instruction => instruction.OpCode != OpCode.Move
                 && instruction.Destination is LocalVariable)
-            .Select(instruction => (LocalVariable)instruction.Destination!)
-            .ToHashSet();
+            .Select(instruction => (LocalVariable)instruction.Destination!));
 
         // 一次扫描同时建立直接取址根和局部量复制邻接表，后续用队列沿源到目标方向传播。
         foreach (var instruction in instructions)

@@ -20,13 +20,12 @@ public static class SsaSimplifier
         var forwarded = new Dictionary<LocalVariable, IOperand>();
         // ref/out 调用可在原生栈槽地址上写回新值；即使槽在进入调用前由零常量初始化，
         // 也不得把调用后的读取全局替换成旧常量。地址目录一次建立，后续传播统一复用。
-        var addressTaken = cfg.Blocks
+        var addressTaken = new HashSet<LocalVariable>(cfg.Blocks
             .SelectMany(block => block.Instructions)
             .SelectMany(instruction => instruction.Operands)
             .OfType<AddressOf>()
             .Select(address => address.Target)
-            .OfType<LocalVariable>()
-            .ToHashSet();
+            .OfType<LocalVariable>());
 
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)

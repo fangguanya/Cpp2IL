@@ -131,7 +131,8 @@ public static class PropertyBackingFieldRecovery
     {
         var names = new HashSet<string>(StringComparer.Ordinal);
         const string compilerSuffix = ">k__BackingField";
-        if (fieldName.StartsWith('<') && fieldName.EndsWith(compilerSuffix, StringComparison.Ordinal))
+        if (fieldName.Length > 0 && fieldName[0] == '<'
+            && fieldName.EndsWith(compilerSuffix, StringComparison.Ordinal))
             names.Add(fieldName[1..^compilerSuffix.Length]);
 
         const string recoveredPrefix = "__cg_";

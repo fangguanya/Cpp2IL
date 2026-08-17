@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using LibCpp2IL.Elf;
 
 namespace Cpp2IL.Core.Analysis;
@@ -71,7 +72,7 @@ public static class ReadOnlyScalarLiteralRecovery
             var bits = isBigEndian
                 ? BinaryPrimitives.ReadInt32BigEndian(raw)
                 : BinaryPrimitives.ReadInt32LittleEndian(raw);
-            literal = new FloatLiteral(BitConverter.Int32BitsToSingle(bits));
+            literal = new FloatLiteral(FloatingPointBitHelper.Int32BitsToSingle(bits));
             return true;
         }
 
@@ -98,7 +99,8 @@ public static class ReadOnlyScalarLiteralRecovery
             .OfType<LocalVariable>()
             .Select(local => local.Type)
             .Where(type => type?.FullName is "System.Single" or "System.Double")
-            .DistinctBy(type => type!.FullName)
+            .GroupBy(type => type!.FullName)
+            .Select(group => group.First())
             .ToArray();
         if (types.Length != 1)
         {

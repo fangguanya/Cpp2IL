@@ -287,7 +287,9 @@ public static class InlineConstructorRecovery
                 && candidate.Parameters.Count == stores.Count)
             .Where(candidate => candidate.Parameters
                 .Select(parameter => parameter.ParameterType)
-                .Zip(stores.Select(store => store.Field.FieldType))
+                .Zip(
+                    stores.Select(store => store.Field.FieldType),
+                    (parameterType, fieldType) => (First: parameterType, Second: fieldType))
                 .All(pair => GenericCallRebinder.TypesEquivalent(pair.First, pair.Second)))
             .ToArray();
         if (candidates.Length != 1)

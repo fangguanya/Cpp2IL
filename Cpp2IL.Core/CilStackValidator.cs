@@ -219,11 +219,11 @@ internal static class CilStackValidator
 
             var sourceEntry = FindSequenceEntryInstruction(body, instruction.Offset);
             var sourceEntryDepths = sourceEntry != null && depths.TryGetValue(sourceEntry, out var values)
-                ? string.Join(',', values)
+                ? string.Join(",", values)
                 : "UNREACHABLE";
             var sourceEntryOffset = sourceEntry?.Offset ?? -1;
             edges.Add(
-                $"IL_{instruction.Offset:X4}:{string.Join(',', resultingDepths)};" +
+                $"IL_{instruction.Offset:X4}:{string.Join(",", resultingDepths)};" +
                 $"sourceEntry=IL_{sourceEntryOffset:X4};sourceEntryDepths={sourceEntryDepths};" +
                 $"sourceEntryEdges={FormatIncomingEdgesWithDepths(body, sourceEntryOffset, depths)};" +
                 $"sourceWindow={FormatInstructionWindow(body, instruction.Offset)}");
@@ -304,7 +304,7 @@ internal static class CilStackValidator
             }
 
             edges.Add(
-                $"IL_{instruction.Offset:X4}:{string.Join(',', resultingDepths)};" +
+                $"IL_{instruction.Offset:X4}:{string.Join(",", resultingDepths)};" +
                 $"window={FormatInstructionWindow(body, instruction.Offset)}");
         }
 
@@ -316,13 +316,15 @@ internal static class CilStackValidator
         IReadOnlyDictionary<CilInstruction, SortedSet<int>> depths)
     {
         var conflicts = new List<string>();
-        foreach (var (instruction, instructionDepths) in depths.OrderBy(pair => pair.Key.Offset))
+        foreach (var pair in depths.OrderBy(candidate => candidate.Key.Offset))
         {
+            var instruction = pair.Key;
+            var instructionDepths = pair.Value;
             if (instructionDepths.Count < 2)
                 continue;
 
             conflicts.Add(
-                $"IL_{instruction.Offset:X4}:{instruction.OpCode.Code}:{string.Join(',', instructionDepths)};" +
+                $"IL_{instruction.Offset:X4}:{instruction.OpCode.Code}:{string.Join(",", instructionDepths)};" +
                 $"entry={FormatSequenceEntry(body, instruction.Offset)};" +
                 $"edges={FormatSequenceEntryEdgeDepths(body, instruction.Offset, depths)}");
             if (conflicts.Count == 12)

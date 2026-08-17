@@ -39,6 +39,11 @@ public class Instruction : IOperand
 
     public OperandList Operands => new(_operands);
 
+    /// <summary>
+    /// 指令语义隐式写入的寄存器；用于在显式操作数之外构建完整 SSA 定义关系。
+    /// </summary>
+    public Register? ImplicitDefinition;
+
     public bool IsFallThrough =>
         OpCode switch
         {

@@ -105,6 +105,10 @@ internal readonly struct Arm64PackedHalfwordPredicatePattern
 
 public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 {
+    private static readonly Arm64CallingConventionAdapter CallingConventions = new();
+
+    public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
+
     [ThreadStatic]
     private static Dictionary<Arm64Register, ulong> adrpOffsets = new();
 
@@ -1412,9 +1416,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if (IsCompleteHomogeneousFloatingAggregateStore(instructions, startIndex, projections))
             return false;
 
-        var activeRegisters = projections
-            .Select(projection => projection.Destination.Number)
-            .ToHashSet();
+        var activeRegisters = new HashSet<int>(projections
+            .Select(projection => projection.Destination.Number));
         var aggregateCarrier = ((Register)projections[^1].Source.Base!).Number;
 
         for (var instructionIndex = startIndex;
@@ -1422,9 +1425,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
              instructionIndex++)
         {
             var instruction = instructions[instructionIndex];
-            var readRegisters = EnumerateSourceRegisters(instruction)
-                .Select(register => register.Number)
-                .ToHashSet();
+            var readRegisters = new HashSet<int>(EnumerateSourceRegisters(instruction)
+                .Select(register => register.Number));
 
             if (readRegisters.Any(register =>
                     register != aggregateCarrier && activeRegisters.Contains(register))
@@ -1456,7 +1458,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var fieldOffsets = projections.ToDictionary(
             projection => projection.Destination.Number,
             projection => projection.Source.Addend);
-        var remaining = fieldOffsets.Keys.ToHashSet();
+        var remaining = new HashSet<int>(fieldOffsets.Keys);
         int? destinationBase = null;
         long? aggregateOffset = null;
 

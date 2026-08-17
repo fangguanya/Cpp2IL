@@ -1,6 +1,7 @@
 // #define VERBOSE_LOGGING
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -25,6 +26,23 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     private AssemblyDefinition? MostRecentCorLib { get; set; }
     protected int TotalMethodCount;
     protected int SuccessfulMethodCount;
+
+    private static readonly ConcurrentDictionary<ModuleDefinition, object> StubLocks = new();
+
+    /// <summary>
+    /// 按模块串行生成最小合法方法体，避免 AsmResolver 导入器并发访问同一模块。
+    /// </summary>
+    protected static void FillMethodBodyWithStub(MethodDefinition methodDefinition)
+    {
+        if (methodDefinition.DeclaringModule is not { } module)
+        {
+            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            return;
+        }
+
+        lock (StubLocks.GetOrAdd(module, _ => new object()))
+            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+    }
 
     public sealed override void DoOutput(ApplicationAnalysisContext context, string outputRoot)
     {

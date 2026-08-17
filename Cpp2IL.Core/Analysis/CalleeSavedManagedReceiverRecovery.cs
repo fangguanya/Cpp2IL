@@ -86,6 +86,6 @@ public static class CalleeSavedManagedReceiverRecovery
         if (name is not { Length: >= 3 } || name[0] != 'X')
             return false;
 
-        return int.TryParse(name.AsSpan(1), out var number) && number is >= 19 and <= 28;
+        return int.TryParse(name.Substring(1), out var number) && number is >= 19 and <= 28;
     }
 }

@@ -14,8 +14,9 @@ public static class CopyCoalescer
     public static void Run(ISILControlFlowGraph cfg)
     {
         var copies = FindSameSlotCopies(cfg);
+        var escapedSlots = FindEscapedSlotGroups(cfg);
 
-        if (copies.Count == 0)
+        if (copies.Count == 0 && escapedSlots.Count == 0)
             return;
 
         var candidates = new HashSet<LocalVariable>();
@@ -24,9 +25,25 @@ public static class CopyCoalescer
             candidates.Add(destination);
             candidates.Add(source);
         }
+        foreach (var group in escapedSlots)
+            candidates.UnionWith(group);
 
         var interference = BuildInterference(cfg, candidates);
         var groups = new DisjointSet(candidates);
+
+        foreach (var group in escapedSlots)
+        {
+            for (var i = 1; i < group.Count; i++)
+            {
+                var a = groups.Find(group[0]);
+                var b = groups.Find(group[i]);
+
+                if (a == b || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
+                    continue;
+
+                groups.Union(a, b);
+            }
+        }
 
         foreach (var (destination, source, _) in copies)
         {
@@ -133,7 +150,7 @@ public static class CopyCoalescer
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
             .ToDictionary(group => group.Key, group => group.Count());
-        var definedLocals = definitionCounts.Keys.ToHashSet();
+        var definedLocals = new HashSet<LocalVariable>(definitionCounts.Keys);
         var pruned = 0;
 
         foreach (var instruction in instructions.Where(instruction => instruction is
@@ -145,9 +162,10 @@ public static class CopyCoalescer
         {
             var destination = (LocalVariable)instruction.Operands[0];
             var source = (LocalVariable)instruction.Operands[1];
+            var destinationDefinitionCount = definitionCounts.TryGetValue(destination, out var count) ? count : 0;
             if (destination.Type == null
                 || source.Type != null
-                || definitionCounts.GetValueOrDefault(destination) < 2
+                || destinationDefinitionCount < 2
                 || definedLocals.Contains(source)
                 || method.ParameterLocals.Contains(source))
                 continue;
@@ -175,6 +193,38 @@ public static class CopyCoalescer
         }
 
         return copies;
+    }
+
+    private static List<List<LocalVariable>> FindEscapedSlotGroups(ISILControlFlowGraph cfg)
+    {
+        var escapedSlotNumbers = new HashSet<int>();
+        foreach (var instruction in cfg.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable addressed })
+                    escapedSlotNumbers.Add(addressed.Register.Number);
+
+        if (escapedSlotNumbers.Count == 0)
+            return [];
+
+        var bySlot = new Dictionary<int, List<LocalVariable>>();
+        var seen = new HashSet<LocalVariable>();
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            var locals = Used(instruction);
+            if (Defined(instruction) is { } defined)
+                locals = locals.Append(defined);
+
+            foreach (var local in locals)
+                if (escapedSlotNumbers.Contains(local.Register.Number) && seen.Add(local))
+                {
+                    if (!bySlot.TryGetValue(local.Register.Number, out var versions))
+                        bySlot[local.Register.Number] = versions = [];
+                    versions.Add(local);
+                }
+        }
+
+        return bySlot.Values.Where(versions => versions.Count > 1).ToList();
     }
 
     private static bool Interferes(Dictionary<LocalVariable, HashSet<LocalVariable>> interference, DisjointSet groups, LocalVariable a, LocalVariable b)

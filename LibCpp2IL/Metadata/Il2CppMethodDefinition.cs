@@ -73,6 +73,44 @@ public class Il2CppMethodDefinition : ReadableClass
         }
     }
 
+    // The method-level runtime generic context entries (for generic methods), analogous to Il2CppTypeDefinition.RgctXs
+    public Il2CppRGCTXDefinition[] RgctXs
+    {
+        get
+        {
+            if (MetadataVersion < 24.2f)
+                return OwningContext.Metadata.RgctxDefinitions!.Skip(rgctxStartIndex).Take(rgctxCount).ToArray();
+
+            if (MetadataVersion >= 108)
+            {
+                var metadata = OwningContext.Metadata;
+                var image = DeclaringType?.DeclaringAssembly;
+
+                if (image == null)
+                    return [];
+
+                var range = metadata.RgctxRanges!.Skip(image.rgctxRangesStart).Take((int)image.rgctxRangesCount).FirstOrDefault(r => r.token == token);
+
+                if (range == null)
+                    return [];
+
+                return metadata.RgctxValues!.SubArray(range.start, range.length);
+            }
+
+            var cgm = DeclaringType?.CodeGenModule;
+
+            if (cgm == null)
+                return [];
+
+            var rangePair = cgm.RGCTXRanges.FirstOrDefault(r => r.token == token);
+
+            if (rangePair == null)
+                return [];
+
+            return OwningContext.Binary.GetRgctxDataForPair(cgm, rangePair);
+        }
+    }
+
     public long MethodOffsetInFile => MethodPointer == 0 ? 0 : OwningContext.Binary.TryMapVirtualAddressToRaw(MethodPointer, out var ret) ? ret : 0;
 
     public ulong Rva => MethodPointer == 0 ? 0 : OwningContext.Binary.GetRva(MethodPointer);
@@ -136,33 +174,6 @@ public class Il2CppMethodDefinition : ReadableClass
 
     public Il2CppGenericContainer? GenericContainer => genericContainerIndex.IsNull ? null : OwningContext.Metadata.GetGenericContainerFromIndex(genericContainerIndex);
 
-    /// <summary>
-    /// 返回以当前方法token为键的运行时泛型上下文。类型和方法拥有各自独立的token范围，
-    /// 因而泛型共享方法读取MethodInfo::rgctx_data时必须查询这里，不能借用声明类型范围。
-    /// </summary>
-    public Il2CppRGCTXDefinition[] RgctXs
-    {
-        get
-        {
-            if (MetadataVersion < 24.2f)
-                return OwningContext.Metadata.RgctxDefinitions!
-                    .Skip(rgctxStartIndex)
-                    .Take(rgctxCount)
-                    .ToArray();
-
-            var module = DeclaringType?.CodeGenModule;
-            if (module == null)
-                return [];
-
-            var range = OwningContext.Binary
-                .GetRgctxRangePairsForModule(module)
-                .FirstOrDefault(candidate => candidate.token == token);
-            return range == null
-                ? []
-                : OwningContext.Binary.GetRgctxDataForPair(module, range);
-        }
-    }
-    
     public bool IsUnmanagedCallersOnly => (iflags & 0xF000) != 0;
     
     public MethodImplAttributes MethodImplAttributes => (MethodImplAttributes)(iflags & ~0xF000);

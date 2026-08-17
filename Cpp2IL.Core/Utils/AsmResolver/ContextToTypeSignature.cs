@@ -27,8 +27,8 @@ public static class ContextToTypeSignature
         WrappedTypeAnalysisContext wrappedTypeAnalysisContext => wrappedTypeAnalysisContext.ToTypeSignature(parentModule),
         SentinelTypeAnalysisContext => SentinelTypeSignature.Instance,
         // An Il2CppClass*/MethodInfo*/static storage runtime handle has no managed type; lower it to a raw pointer-sized value.
-        RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
-            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+        RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
             => parentModule.CorLibTypeFactory.IntPtr,
         _ => throw new ArgumentException($"Unknown referenced type context {context.GetType()}", nameof(context))
     };
@@ -112,4 +112,86 @@ public static class ContextToTypeSignature
     {
         return context.PropertyType.ToTypeSignature(parentModule);
     }
+
+    /// <summary>
+    /// 使用上下文已绑定的 AsmResolver 定义生成类型签名，适用于同一输出模块内的直接引用。
+    /// </summary>
+    public static TypeSignature ToTypeSignature(this TypeAnalysisContext context) => context switch
+    {
+        ReferencedTypeAnalysisContext referencedType => referencedType.ToTypeSignature(),
+        _ => context.GetTypeDefinition().ToTypeSignature(context.IsValueType)
+    };
+
+    public static TypeSignature ToTypeSignature(this ReferencedTypeAnalysisContext context) => context switch
+    {
+        GenericParameterTypeAnalysisContext genericParameterType => genericParameterType.ToTypeSignature(),
+        GenericInstanceTypeAnalysisContext genericInstanceType => genericInstanceType.ToTypeSignature(),
+        WrappedTypeAnalysisContext wrappedType => wrappedType.ToTypeSignature(),
+        SentinelTypeAnalysisContext => SentinelTypeSignature.Instance,
+        // 原生运行时句柄没有托管类型，统一降为指针宽度整数。
+        RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+            => context.AppContext.SystemTypes.SystemIntPtrType.ToTypeSignature(),
+        _ => throw new ArgumentException($"Unknown referenced type context {context.GetType()}", nameof(context))
+    };
+
+    public static GenericInstanceTypeSignature ToTypeSignature(this GenericInstanceTypeAnalysisContext context)
+    {
+        var genericType = context.GenericType.ToTypeSignature().ToTypeDefOrRef();
+        var genericArguments = context.GenericArguments.Select(argument => argument.ToTypeSignature());
+        return new GenericInstanceTypeSignature(genericType, context.IsValueType, genericArguments);
+    }
+
+    public static GenericParameterSignature ToTypeSignature(this GenericParameterTypeAnalysisContext context)
+    {
+        return new GenericParameterSignature(
+            context.Type == Il2CppTypeEnum.IL2CPP_TYPE_VAR ? GenericParameterType.Type : GenericParameterType.Method,
+            context.Index);
+    }
+
+    public static TypeSpecificationSignature ToTypeSignature(this WrappedTypeAnalysisContext context) => context switch
+    {
+        SzArrayTypeAnalysisContext arrayType => arrayType.ToTypeSignature(),
+        PointerTypeAnalysisContext pointerType => pointerType.ToTypeSignature(),
+        ByRefTypeAnalysisContext byReferenceType => byReferenceType.ToTypeSignature(),
+        ArrayTypeAnalysisContext multiDimensionalArrayType => multiDimensionalArrayType.ToTypeSignature(),
+        PinnedTypeAnalysisContext pinnedType => pinnedType.ToTypeSignature(),
+        BoxedTypeAnalysisContext boxedType => boxedType.ToTypeSignature(),
+        CustomModifierTypeAnalysisContext customModifierType => customModifierType.ToTypeSignature(),
+        _ => throw new ArgumentException($"Unknown wrapped type context {context.GetType()}", nameof(context))
+    };
+
+    public static SzArrayTypeSignature ToTypeSignature(this SzArrayTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakeSzArrayType();
+
+    public static PointerTypeSignature ToTypeSignature(this PointerTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakePointerType();
+
+    public static ByReferenceTypeSignature ToTypeSignature(this ByRefTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakeByReferenceType();
+
+    public static ArrayTypeSignature ToTypeSignature(this ArrayTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakeArrayTypeWithLowerBounds(context.Rank);
+
+    public static PinnedTypeSignature ToTypeSignature(this PinnedTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakePinnedType();
+
+    public static BoxedTypeSignature ToTypeSignature(this BoxedTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakeBoxedType();
+
+    public static CustomModifierTypeSignature ToTypeSignature(this CustomModifierTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature()
+            .MakeModifierType(context.ModifierType.ToTypeSignature().ToTypeDefOrRef(), context.Required);
+
+    public static TypeSignature ToTypeSignature(this ParameterAnalysisContext context)
+        => context.ParameterType.ToTypeSignature();
+
+    public static TypeSignature ToTypeSignature(this FieldAnalysisContext context)
+        => context.FieldType.ToTypeSignature();
+
+    public static TypeSignature ToTypeSignature(this EventAnalysisContext context)
+        => context.EventType.ToTypeSignature();
+
+    public static TypeSignature ToTypeSignature(this PropertyAnalysisContext context)
+        => context.PropertyType.ToTypeSignature();
 }

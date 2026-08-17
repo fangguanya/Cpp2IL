@@ -244,8 +244,11 @@ public static class ThrowHelperRecovery
         return null;
     }
 
-    //TODO didn't we have a helper for this somewhere? Can't find it. Maybe got deleted. Maybe it's just too late
-    private static string? ReadCStringAtVirtualAddress(ApplicationAnalysisContext appContext, ulong address)
+    // 在受控长度内读取原生只读区中的 ASCII 零结尾字符串。
+    internal static string? ReadCStringAtVirtualAddress(
+        ApplicationAnalysisContext appContext,
+        ulong address,
+        int maxLength = MaxStringLength)
     {
         long offset;
 
@@ -264,7 +267,7 @@ public static class ThrowHelperRecovery
         var content = appContext.Binary.GetRawBinaryContent();
         var end = offset;
 
-        while (end < content.Length && end - offset < MaxStringLength && content[(int)end] != 0)
+        while (end < content.Length && end - offset < maxLength && content[(int)end] != 0)
         {
             var c = content[(int)end];
 

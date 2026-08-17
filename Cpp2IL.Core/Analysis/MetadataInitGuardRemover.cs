@@ -97,7 +97,7 @@ public static class MetadataInitGuardRemover
         // 泛型方法常把“初始化运行时元数据”和“初始化当前 MethodInfo::rgctx_data”嵌套。
         // 深层守卫先折叠后，外层区域才只剩唯一初始化调用；深度目录只计算一次，避免重复扫描CFG。
         foreach (var guard in cfg.Blocks
-                     .OrderByDescending(block => blockDepths.GetValueOrDefault(block, -1))
+                     .OrderByDescending(block => blockDepths.TryGetValue(block, out var depth) ? depth : -1)
                      .ThenByDescending(block => block.ID)
                      .ToList())
         {
@@ -865,13 +865,13 @@ public static class MetadataInitGuardRemover
             _ => false,
         };
 
-    private static void Excise(
+    internal static void Excise(
         ISILControlFlowGraph cfg,
         Block guard,
         Block initEntry,
         Block merge,
         HashSet<Block> region,
-        bool constantMetadataFlagTest)
+        bool constantMetadataFlagTest = false)
     {
         // 1. Repair the merge's phis: drop the inputs from the region's back-edges.
         for (var i = merge.Predecessors.Count - 1; i >= 0; i--)

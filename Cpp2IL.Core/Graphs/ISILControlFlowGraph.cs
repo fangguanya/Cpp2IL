@@ -314,6 +314,9 @@ public class ISILControlFlowGraph
                 if (instruction.Destination != null && !def.Contains(instruction.Destination))
                     def.Add(instruction.Destination);
 
+                if (instruction.ImplicitDefinition is { } clobbered && !def.Contains(clobbered))
+                    def.Add(clobbered);
+
                 if (clobberingAddressTakes?.Contains(instruction) == true)
                 {
                     foreach (var operand in instruction.Operands)

@@ -8,6 +8,16 @@ namespace Cpp2IL.Core.Il2CppApiFunctions;
 
 public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 {
+    /// <summary>
+    /// 从ARM64方法体中返回首个BL直接调用目标，用于识别元数据初始化函数。
+    /// </summary>
+    protected override ulong FindFirstCallTargetInMethod(ulong methodVa)
+    {
+        var instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext.Binary, methodVa, false);
+        var call = instructions.FirstOrDefault(instruction => instruction.Mnemonic == Arm64Mnemonic.BL);
+        return call.Mnemonic == Arm64Mnemonic.BL ? call.BranchTarget : 0;
+    }
+
     private List<Arm64Instruction>? _cachedDisassembledBytes;
 
     private List<Arm64Instruction> DisassembleTextSection()
@@ -78,10 +88,15 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
                 currentAddress = previous.Address;
             }
 
-            var strongestCallerCount = candidates.Max(candidate =>
-                callerCounts.GetValueOrDefault(candidate));
-            var strongest = candidates
-                .Where(candidate => callerCounts.GetValueOrDefault(candidate) == strongestCallerCount)
+            var rankedCandidates = candidates
+                .Select(candidate => (
+                    Address: candidate,
+                    CallerCount: callerCounts.TryGetValue(candidate, out var count) ? count : 0))
+                .ToArray();
+            var strongestCallerCount = rankedCandidates.Max(candidate => candidate.CallerCount);
+            var strongest = rankedCandidates
+                .Where(candidate => candidate.CallerCount == strongestCallerCount)
+                .Select(candidate => candidate.Address)
                 .ToArray();
 
             // 零调用者或并列强度都不能证明入口边界，保持精确尾跳地址。

@@ -27,9 +27,8 @@ public static class ListAddRecovery
         // 容量菱形匹配前只校准 AddWithResize，使公开 Add 的元素类型直接继承真实接收者。
         RebindAddWithResizeCallsFromReceivers(graph);
         // 共享快尾会在逐项改写后只剩一个前驱，因此必须在任何图修改之前冻结其身份。
-        var originalSharedFastTails = graph.Blocks
-            .Where(block => block.Predecessors.Count >= 2)
-            .ToHashSet();
+        var originalSharedFastTails = new HashSet<Block>(graph.Blocks
+            .Where(block => block.Predecessors.Count >= 2));
         // 早期入口只处理原生内存路径和保留 1/1 地址证据的数组路径；末次死码
         // 删除后才出现的 0/0 紧凑数组形态由独立入口处理，避免改变既有候选顺序。
         var recovered = RunRecoveryPhase(
@@ -56,9 +55,8 @@ public static class ListAddRecovery
     public static int RunCompactArrayAccess(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
-        var originalSharedFastTails = graph.Blocks
-            .Where(block => block.Predecessors.Count >= 2)
-            .ToHashSet();
+        var originalSharedFastTails = new HashSet<Block>(graph.Blocks
+            .Where(block => block.Predecessors.Count >= 2));
         return RunRecoveryPhase(
             graph,
             originalSharedFastTails,
@@ -1042,14 +1040,16 @@ public static class ListAddRecovery
             var instructions = PatternInstructions(predecessor);
             if (instructions.Count < tail.Count)
                 return false;
-            var candidate = instructions.TakeLast(tail.Count).ToList();
+            var candidate = instructions.Skip(instructions.Count - tail.Count).ToList();
             if (!HaveIdenticalInstructionIdentity(candidate, tail))
                 return false;
             predecessorTails.Add(candidate);
         }
 
-        foreach (var (predecessor, candidate) in merge.Predecessors.Zip(predecessorTails))
+        for (var predecessorIndex = 0; predecessorIndex < merge.Predecessors.Count; predecessorIndex++)
         {
+            var predecessor = merge.Predecessors[predecessorIndex];
+            var candidate = predecessorTails[predecessorIndex];
             foreach (var instruction in candidate)
                 predecessor.Instructions.Remove(instruction);
             predecessor.CalculateBlockType();
@@ -1873,9 +1873,9 @@ public static class ListAddRecovery
         // 连续内联 Add 会在汇合块继续消费上一菱形的 size/version 载体。公开 Add 已经完成
         // 集合状态更新，因此只有在后续仍引用载体时，才把慢路径的字段回读搬到公开调用之后；
         // 最后一项追加没有后续引用，仍删除全部私有状态刷新。
-        var requiredStateRefreshes = slowStateRefreshes.Where(instruction =>
+        var requiredStateRefreshes = new HashSet<Instruction>(slowStateRefreshes.Where(instruction =>
             instruction.Destination is LocalVariable destination
-            && IsReferencedFromMerge(merge, destination)).ToHashSet();
+            && IsReferencedFromMerge(merge, destination)));
         preservedSlowTail = slowTail.Where(instruction =>
             !slowStateRefreshes.Contains(instruction)
             || requiredStateRefreshes.Contains(instruction)).ToList();
@@ -2130,7 +2130,7 @@ public static class ListAddRecovery
                 || BitConverter.ToUInt32(bytes, 0) != fastBits)
                 return false;
 
-            publicValue = new FloatLiteral(BitConverter.Int32BitsToSingle(unchecked((int)fastBits)));
+            publicValue = new FloatLiteral(FloatingPointBitHelper.Int32BitsToSingle(unchecked((int)fastBits)));
             valueConstruction = construction.Distinct().ToList();
             return true;
         }
@@ -2351,7 +2351,8 @@ public static class ListAddRecovery
             var same = left[index] switch
             {
                 FloatLiteral leftFloat when right[index] is FloatLiteral rightFloat =>
-                    BitConverter.SingleToInt32Bits(leftFloat.Value) == BitConverter.SingleToInt32Bits(rightFloat.Value),
+                    FloatingPointBitHelper.SingleToInt32Bits(leftFloat.Value)
+                    == FloatingPointBitHelper.SingleToInt32Bits(rightFloat.Value),
                 DoubleLiteral leftDouble when right[index] is DoubleLiteral rightDouble =>
                     BitConverter.DoubleToInt64Bits(leftDouble.Value) == BitConverter.DoubleToInt64Bits(rightDouble.Value),
                 _ => false,

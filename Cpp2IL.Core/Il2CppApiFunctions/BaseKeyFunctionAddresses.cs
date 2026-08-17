@@ -84,9 +84,8 @@ public abstract class BaseKeyFunctionAddresses
         Init(applicationAnalysisContext);
 
         //Try to find System.Exception (should always be there)
-        if (applicationAnalysisContext.Binary.InstructionSetId == DefaultInstructionSets.X86_32 || applicationAnalysisContext.Binary.InstructionSetId == DefaultInstructionSets.X86_64)
-            //TODO make this abstract and implement in subclasses.
-            TryGetInitMetadataFromException();
+        // 各指令集由自身实现提取首个直接调用目标；不再把元数据初始化发现限定为x86。
+        TryGetInitMetadataFromException();
 
         //New Object
         FindExport("il2cpp_object_new", out il2cpp_object_new);
@@ -142,10 +141,8 @@ public abstract class BaseKeyFunctionAddresses
         {
             Logger.VerboseNewline($"\t\tTarget Method Located at {targetMethod.MethodPointer}. Taking first CALL as the (version-specific) metadata initialization function...");
 
-            var disasm = X86Utils.GetMethodBodyAtVirtAddressNew(targetMethod.MethodPointer, false, _appContext.Binary);
-            var calls = disasm.Where(i => i.Mnemonic == Mnemonic.Call).ToList();
-
-            if (calls.Count == 0)
+            var target = FindFirstCallTargetInMethod(targetMethod.MethodPointer);
+            if (target == 0)
             {
                 Logger.WarnNewline("Couldn't find any call instructions in the method body. This is not expected. Will not have metadata initialization function.");
                 return;
@@ -153,16 +150,21 @@ public abstract class BaseKeyFunctionAddresses
 
             if (_appContext.MetadataVersion < 27)
             {
-                il2cpp_codegen_initialize_method = calls.First().NearBranchTarget;
+                il2cpp_codegen_initialize_method = target;
                 Logger.VerboseNewline($"\t\til2cpp_codegen_initialize_method => 0x{il2cpp_codegen_initialize_method:X}");
             }
             else
             {
-                il2cpp_codegen_initialize_runtime_metadata = calls.First().NearBranchTarget;
+                il2cpp_codegen_initialize_runtime_metadata = target;
                 Logger.VerboseNewline($"\t\til2cpp_codegen_initialize_runtime_metadata => 0x{il2cpp_codegen_initialize_runtime_metadata:X}");
             }
         }
     }
+
+    /// <summary>
+    /// 返回指定方法中首个直接调用的目标地址；不支持该分析或不存在直接调用时返回零。
+    /// </summary>
+    protected virtual ulong FindFirstCallTargetInMethod(ulong methodVa) => 0;
 
     protected virtual void AttemptInstructionAnalysisToFillGaps()
     {
