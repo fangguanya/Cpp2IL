@@ -10,6 +10,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils.AsmResolver;
 using ReflectionMethodAttributes = System.Reflection.MethodAttributes;
+using ReflectionTypeAttributes = System.Reflection.TypeAttributes;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -82,6 +83,33 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 逻辑右移唯一映射到ShrUn()
+    {
+        Assert.That(
+            IlGenerator.GetBinaryNumericCilOpCode(OpCode.ShiftRightUnsigned),
+            Is.EqualTo(CilOpCodes.Shr_Un));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 算术右移继续映射到Shr()
+    {
+        Assert.That(
+            IlGenerator.GetBinaryNumericCilOpCode(OpCode.ShiftRight),
+            Is.EqualTo(CilOpCodes.Shr));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非二元数值操作码拒绝进入Cil映射()
+    {
+        Assert.That(
+            () => IlGenerator.GetBinaryNumericCilOpCode(OpCode.Move),
+            Throws.TypeOf<ArgumentOutOfRangeException>());
+    }
+
+    [Test]
     public void Void方法尾部为普通调用时需要返回终结点()
     {
         var finalInstruction = new CilInstruction(CilOpCodes.Call, null);
@@ -100,6 +128,129 @@ public class IlGeneratorTests
         var receiver = new LocalVariable("receiver", new Register(null, "X0"), genericParameter);
 
         Assert.That(IlGenerator.ConstrainedReceiverType(receiver), Is.SameAs(genericParameter));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 值类型局部实例接收者生成Ldloca()
+    {
+        var instructions = 生成实例调用接收者指令(valueType: true, explicitAddress: false);
+        var callIndex = instructions.FindIndex(instruction => instruction.OpCode == CilOpCodes.Call);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(callIndex, Is.GreaterThan(0));
+            Assert.That(instructions[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(instructions.Count(instruction => instruction.OpCode == CilOpCodes.Ldloca), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 引用类型局部实例接收者保持Ldloc()
+    {
+        var instructions = 生成实例调用接收者指令(valueType: false, explicitAddress: false);
+        var callIndex = instructions.FindIndex(instruction => instruction.OpCode == CilOpCodes.Call);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(callIndex, Is.GreaterThan(0));
+            Assert.That(instructions[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == CilOpCodes.Ldloca), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 已显式取址的值类型接收者不得重复取址()
+    {
+        var instructions = 生成实例调用接收者指令(valueType: true, explicitAddress: true);
+        var callIndex = instructions.FindIndex(instruction => instruction.OpCode == CilOpCodes.Call);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(callIndex, Is.GreaterThan(0));
+            Assert.That(instructions[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(instructions.Count(instruction => instruction.OpCode == CilOpCodes.Ldloca), Is.EqualTo(1));
+        });
+    }
+
+    private static List<CilInstruction> 生成实例调用接收者指令(bool valueType, bool explicitAddress)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var baseType = valueType
+            ? assembly.GetTypeByFullName("System.ValueType")!
+            : app.SystemTypes.SystemObjectType;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            valueType ? "Counter" : "Holder",
+            baseType,
+            ReflectionTypeAttributes.Public
+            | (valueType
+                ? ReflectionTypeAttributes.Sealed | ReflectionTypeAttributes.SequentialLayout
+                : ReflectionTypeAttributes.Class));
+        var getter = owner.InjectMethodContext(
+            "GetValue",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public);
+        var callerType = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "Caller",
+            app.SystemTypes.SystemObjectType,
+            ReflectionTypeAttributes.Public | ReflectionTypeAttributes.Class);
+        var caller = callerType.InjectMethodContext(
+            "Read",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var result = new LocalVariable("result", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        IOperand receiverOperand = explicitAddress ? new AddressOf(receiver) : receiver;
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Call, getter, result, receiverOperand),
+            new Instruction(1, OpCode.Return, result),
+        ]);
+        caller.Locals = [receiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "ReceiverTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemObjectType, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemInt32Type, "Int32", TypeAttributes.Public | TypeAttributes.Sealed);
+        if (valueType)
+            绑定AsmResolver系统类型(module, baseType, "ValueType", TypeAttributes.Class | TypeAttributes.Public);
+
+        var ownerDefinition = new TypeDefinition(
+            "Fixture",
+            owner.Name,
+            TypeAttributes.Public
+            | (valueType
+                ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout
+                : TypeAttributes.Class));
+        var callerDefinition = new TypeDefinition("Fixture", "Caller", TypeAttributes.Public | TypeAttributes.Class);
+        module.TopLevelTypes.Add(ownerDefinition);
+        module.TopLevelTypes.Add(callerDefinition);
+        owner.PutExtraData("AsmResolverType", ownerDefinition);
+        callerType.PutExtraData("AsmResolverType", callerDefinition);
+        var getterDefinition = new MethodDefinition(
+            "GetValue",
+            MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
+        var callerMethodDefinition = new MethodDefinition(
+            "Read",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        ownerDefinition.Methods.Add(getterDefinition);
+        callerDefinition.Methods.Add(callerMethodDefinition);
+        getter.PutExtraData("AsmResolverMethod", getterDefinition);
+
+        IlGenerator.GenerateIl(caller, callerMethodDefinition);
+        CilStackValidator.Validate(callerMethodDefinition.CilMethodBody!, "Fixture.Caller::Read");
+        return callerMethodDefinition.CilMethodBody!.Instructions.ToList();
     }
 
     [Test]

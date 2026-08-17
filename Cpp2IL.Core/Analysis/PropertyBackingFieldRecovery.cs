@@ -88,7 +88,8 @@ public static class PropertyBackingFieldRecovery
         instruction.OpCode != OpCode.Move || operandIndex != 0;
 
     /// <summary>
-    /// 只接受跨私有访问边界、唯一命名匹配、同类型且公开非虚的访问器。
+    /// 只接受跨私有访问边界、唯一命名匹配、同类型且公开不可覆盖的访问器；
+    /// 接口实现产生的最终虚方法与普通非虚方法具有相同的确定分派语义。
     /// </summary>
     private static bool TryResolveAccessor(
         TypeAnalysisContext callerType,
@@ -117,7 +118,7 @@ public static class PropertyBackingFieldRecovery
         var selected = read ? properties[0].Getter : properties[0].Setter;
         if (selected is null
             || selected.Visibility != MethodAttributes.Public
-            || selected.IsVirtual)
+            || selected.IsVirtual && !selected.IsFinal)
             return false;
 
         accessor = InstantiateAccessor(selected, owner);

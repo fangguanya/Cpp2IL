@@ -170,8 +170,9 @@ public static class AggregateStackCopyRecovery
 
             foreach (var scalar in scalarTransfers)
             {
-                if (scalar.LoadIndex < vector.LoadIndex
-                    || scalar.StoreIndex < vector.StoreIndex
+                // ARM64可以先读取标量尾字段，再读取16字节向量主体；两次读取只需都发生在
+                // 两次写入之前，加载顺序和写入顺序本身不影响两个互不重叠栈区间的复制语义。
+                if (!FormsCompleteCopyWindow(vector, scalar)
                     || !TryGetStackOffset(scalar.SourceStack, out var sourceFieldOffset)
                     || !TryGetStackOffset(scalar.DestinationStack, out var destinationFieldOffset))
                     continue;
@@ -182,8 +183,7 @@ public static class AggregateStackCopyRecovery
                     continue;
 
                 var matchingVectors = vectorTransfers.Count(candidate =>
-                    candidate.LoadIndex <= scalar.LoadIndex
-                    && candidate.StoreIndex <= scalar.StoreIndex
+                    FormsCompleteCopyWindow(candidate, scalar)
                     && TryGetStackOffset(candidate.SourceStack, out var candidateSourceBase)
                     && TryGetStackOffset(candidate.DestinationStack, out var candidateDestinationBase)
                     && sourceFieldOffset - candidateSourceBase == destinationFieldOffset - candidateDestinationBase);
@@ -199,6 +199,12 @@ public static class AggregateStackCopyRecovery
 
         return copies;
     }
+
+    /// <summary>
+    /// 两个源块必须在任一目标块写入前全部读取，防止把交叠搬运或寄存器被覆盖的序列误判为聚合复制。
+    /// </summary>
+    private static bool FormsCompleteCopyWindow(StackTransfer vector, StackTransfer scalar)
+        => Math.Max(vector.LoadIndex, scalar.LoadIndex) < Math.Min(vector.StoreIndex, scalar.StoreIndex);
 
     private static List<StackTransfer> CollectTransfers(
         IReadOnlyList<Instruction> instructions,

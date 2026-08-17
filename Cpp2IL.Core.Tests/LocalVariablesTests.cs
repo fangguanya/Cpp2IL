@@ -53,6 +53,63 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Smaddl有符号拓宽把W源定型为Int32并把临时结果定型为Int64()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "SMADDL_LEFT_SIGNED64_271BCA8", 0));
+        var source = new LocalVariable("source", new Register(null, "X10", 3));
+        var conversion = new Instruction(
+            0,
+            OpCode.ConvertSignedIntegerWidth,
+            destination,
+            source,
+            new Immediate(64),
+            new Immediate(32));
+
+        var changed = LocalVariables.BindNumericConversionTypes(conversion, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Ubfm逻辑右移按X目标位宽传播Int64()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(null, "X9", 1));
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X8", 3),
+            appContext.SystemTypes.SystemInt64Type);
+        var shift = new Instruction(
+            0,
+            OpCode.ShiftRightUnsigned,
+            destination,
+            source,
+            new Immediate(63))
+        {
+            IntegerWidthBits = 64,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(shift, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void Phi全部局部入边类型一致时才建立目标类型共识()
     {
@@ -2224,6 +2281,84 @@ public class LocalVariablesTests
         {
             Assert.That(changed, Is.False);
             Assert.That(text.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 后期属性Getter比较恢复对象占位循环计数器()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            appContext.GetAssemblyByName("mscorlib")!,
+            "Fixture",
+            "CounterOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var getter = owner.InjectMethodContext(
+            "get_CommonnessScore",
+            appContext.SystemTypes.SystemInt32Type,
+            MethodAttributes.Public);
+        var receiver = new LocalVariable("owner", new Register(null, "X0"), owner);
+        var limit = new LocalVariable("limit", new Register(null, "W8"), appContext.SystemTypes.SystemInt32Type);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X24"),
+            appContext.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable("condition", new Register(null, "Z"), appContext.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, getter, limit, receiver);
+        var comparison = new Instruction(1, OpCode.CheckLess, condition, counter, limit);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RecoverPropertyCounter",
+            [call, comparison],
+            [receiver, limit, counter, condition]);
+
+        var changed = LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通方法结果比较不得冒充后期属性证据()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            appContext.GetAssemblyByName("mscorlib")!,
+            "Fixture",
+            "CounterOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var methodTarget = owner.InjectMethodContext(
+            "ReadLimit",
+            appContext.SystemTypes.SystemInt32Type,
+            MethodAttributes.Public);
+        var receiver = new LocalVariable("owner", new Register(null, "X0"), owner);
+        var limit = new LocalVariable("limit", new Register(null, "W8"), appContext.SystemTypes.SystemInt32Type);
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X24"),
+            appContext.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable("condition", new Register(null, "Z"), appContext.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, methodTarget, limit, receiver);
+        var comparison = new Instruction(1, OpCode.CheckLess, condition, counter, limit);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RejectOrdinaryCall",
+            [call, comparison],
+            [receiver, limit, counter, condition]);
+
+        var changed = LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
         });
     }
 

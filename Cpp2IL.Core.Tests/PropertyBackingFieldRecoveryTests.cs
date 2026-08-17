@@ -36,6 +36,45 @@ public class PropertyBackingFieldRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 最终虚Getter可恢复值类型Enumerator当前元素访问()
+    {
+        var fixture = CreateFixture(
+            "_current",
+            write: false,
+            propertyName: "Current",
+            finalVirtualAccessors: true);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Access.Operands[0], Is.SameAs(fixture.Getter));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 可覆盖虚Getter保持字段红门()
+    {
+        var fixture = CreateFixture(
+            "_current",
+            write: false,
+            propertyName: "Current",
+            virtualAccessors: true);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Move));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 嵌套调用接收者字段读取先物化为公开Getter()
     {
         var fixture = CreateFixture("<Value>k__BackingField", write: false);
@@ -121,7 +160,9 @@ public class PropertyBackingFieldRecoveryTests
         bool write,
         string propertyName = "Value",
         bool publicAccessors = true,
-        bool callerSharesOwner = false)
+        bool callerSharesOwner = false,
+        bool finalVirtualAccessors = false,
+        bool virtualAccessors = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var assembly = app.GetAssemblyByName("mscorlib")!;
@@ -132,6 +173,10 @@ public class PropertyBackingFieldRecoveryTests
             app.SystemTypes.SystemObjectType,
             TypeAttributes.Public);
         var visibility = publicAccessors ? MethodAttributes.Public : MethodAttributes.Private;
+        if (finalVirtualAccessors)
+            visibility |= MethodAttributes.Virtual | MethodAttributes.Final | MethodAttributes.NewSlot;
+        else if (virtualAccessors)
+            visibility |= MethodAttributes.Virtual | MethodAttributes.NewSlot;
         var getter = owner.InjectMethodContext(
             $"get_{propertyName}",
             app.SystemTypes.SystemInt32Type,

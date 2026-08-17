@@ -527,6 +527,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveRecoveredLengthComparisonCarrierTypes(this);
         EmptyArrayRecovery.Run(this);
         PropertyBackingFieldRecovery.Run(this);
+        // 中文注释：公开getter在上一行才替换跨类型私有字段；仅消费新getter的标量结果，
+        // 为循环归纳变量补回精确类型，避免再次扫描原生位宽、数组和集合恢复链。
+        LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(this);
 
         // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
         // 此时裁掉其不可达返回/抛出边，避免异常 ABI 状态值进入托管返回类型。

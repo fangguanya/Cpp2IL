@@ -16,6 +16,25 @@ namespace Cpp2IL.Core;
 
 public static class IlGenerator
 {
+    /// <summary>
+    /// 把二元数值 ISIL 操作码映射到唯一 CIL 操作码；逻辑右移必须使用 shr.un，
+    /// 防止最高位为1的 ARM64 位模式在托管层被算术补符号位。
+    /// </summary>
+    internal static CilOpCode GetBinaryNumericCilOpCode(OpCode opCode) => opCode switch
+    {
+        OpCode.Add => CilOpCodes.Add,
+        OpCode.Subtract => CilOpCodes.Sub,
+        OpCode.Multiply => CilOpCodes.Mul,
+        OpCode.Divide => CilOpCodes.Div,
+        OpCode.ShiftLeft => CilOpCodes.Shl,
+        OpCode.ShiftRight => CilOpCodes.Shr,
+        OpCode.ShiftRightUnsigned => CilOpCodes.Shr_Un,
+        OpCode.And => CilOpCodes.And,
+        OpCode.Or => CilOpCodes.Or,
+        OpCode.Xor => CilOpCodes.Xor,
+        _ => throw new ArgumentOutOfRangeException(nameof(opCode), opCode, "不是二元数值操作码。"),
+    };
+
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
         var assembly = context.DeclaringType!.DeclaringAssembly;
@@ -481,6 +500,13 @@ public static class IlGenerator
                         constrainedReceiver = ConstrainedReceiverType(receiverOperand);
                         if (constrainedReceiver != null && receiverOperand is LocalVariable receiverLocal)
                             LoadLocalAddress(receiverLocal, method, locals);
+                        else if (targetMethod.DeclaringType?.IsValueType == true
+                                 && receiverOperand is LocalVariable valueTypeReceiver)
+                        {
+                            // 中文注释：值类型实例方法的 this 是托管地址。直接 ldloc 虽可通过旧栈计数门，
+                            // 但 ILSpy 只能渲染为 Enumerator*；ldloca 才对应可编译的 receiver.Current。
+                            LoadLocalAddress(valueTypeReceiver, method, locals);
+                        }
                         else
                             LoadOperand(receiverOperand, method, locals, writeLine, stringCtor, targetMethod.DeclaringType);
                     }
@@ -614,6 +640,7 @@ public static class IlGenerator
 
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
+            case OpCode.ShiftRightUnsigned:
 
             case OpCode.And:
             case OpCode.Or:
@@ -684,17 +711,18 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Ceq);
                         break;
 
-                    case OpCode.Add: instructions.Add(CilOpCodes.Add); break;
-                    case OpCode.Subtract: instructions.Add(CilOpCodes.Sub); break;
-                    case OpCode.Multiply: instructions.Add(CilOpCodes.Mul); break;
-                    case OpCode.Divide: instructions.Add(CilOpCodes.Div); break;
-
-                    case OpCode.ShiftLeft: instructions.Add(CilOpCodes.Shl); break;
-                    case OpCode.ShiftRight: instructions.Add(CilOpCodes.Shr); break;
-
-                    case OpCode.And: instructions.Add(CilOpCodes.And); break;
-                    case OpCode.Or: instructions.Add(CilOpCodes.Or); break;
-                    case OpCode.Xor: instructions.Add(CilOpCodes.Xor); break;
+                    case OpCode.Add:
+                    case OpCode.Subtract:
+                    case OpCode.Multiply:
+                    case OpCode.Divide:
+                    case OpCode.ShiftLeft:
+                    case OpCode.ShiftRight:
+                    case OpCode.ShiftRightUnsigned:
+                    case OpCode.And:
+                    case OpCode.Or:
+                    case OpCode.Xor:
+                        instructions.Add(GetBinaryNumericCilOpCode(instruction.OpCode));
+                        break;
                 }
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
@@ -720,11 +748,16 @@ public static class IlGenerator
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ConvertSignedIntegerWidth:
             case OpCode.RoundFloatTowardPositiveInfinity:
             case OpCode.RoundFloatTowardNegativeInfinity:
                 {
                     if (instruction.Operands.Count < 3 || instruction.Operands[2] is not Immediate destinationWidth)
                         throw new InvalidOperationException($"数值转换指令缺少目标位宽：{instruction}");
+                    if (instruction.OpCode == OpCode.ConvertSignedIntegerWidth
+                        && (instruction.Operands.Count != 4
+                            || instruction.Operands[3] is not Immediate { Value: 32 or 64 }))
+                        throw new InvalidOperationException($"有符号整数位宽转换缺少有效源位宽：{instruction}");
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor);
                     switch (instruction.OpCode)
@@ -753,6 +786,16 @@ public static class IlGenerator
                                 32 => CilOpCodes.Conv_R4,
                                 64 => CilOpCodes.Conv_R8,
                                 _ => throw new InvalidOperationException($"浮点目标位宽无效：{destinationWidth.Value}"),
+                            });
+                            break;
+
+                        case OpCode.ConvertSignedIntegerWidth:
+                            // CIL 的 conv.i8 对 int32 执行有符号扩展，正好对应 ARM64 SMADDL/SMULL 的 W 源语义。
+                            instructions.Add(destinationWidth.Value switch
+                            {
+                                32 => CilOpCodes.Conv_I4,
+                                64 => CilOpCodes.Conv_I8,
+                                _ => throw new InvalidOperationException($"有符号整数目标位宽无效：{destinationWidth.Value}"),
                             });
                             break;
 

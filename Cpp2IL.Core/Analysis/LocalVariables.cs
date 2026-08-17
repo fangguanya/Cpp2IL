@@ -1033,6 +1033,7 @@ public static class LocalVariables
                 case OpCode.ConvertFloatingPointPrecision:
                 case OpCode.ConvertFloatToSignedInteger:
                 case OpCode.ConvertSignedIntegerToFloat:
+                case OpCode.ConvertSignedIntegerWidth:
                 case OpCode.ReinterpretIntegerBitsAsFloat:
                 case OpCode.ReinterpretFloatBitsAsInteger:
                 case OpCode.RoundFloatTowardPositiveInfinity:
@@ -1175,7 +1176,8 @@ public static class LocalVariables
             return false;
 
         var systemTypes = appContext.SystemTypes;
-        var destinationType = instruction.OpCode == OpCode.ConvertFloatToSignedInteger
+        var destinationType = instruction.OpCode is OpCode.ConvertFloatToSignedInteger
+            or OpCode.ConvertSignedIntegerWidth
             ? destinationWidth.Value switch
             {
                 32 => systemTypes.SystemInt32Type,
@@ -1193,6 +1195,7 @@ public static class LocalVariables
             ? explicitSourceWidth.Value
             : destinationWidth.Value;
         var sourceType = instruction.OpCode is OpCode.ConvertSignedIntegerToFloat
+            or OpCode.ConvertSignedIntegerWidth
             or OpCode.ReinterpretIntegerBitsAsFloat
             ? sourceWidth switch
             {
@@ -1243,6 +1246,7 @@ public static class LocalVariables
                     OpCode.ConvertFloatingPointPrecision
                     or OpCode.ConvertFloatToSignedInteger
                     or OpCode.ConvertSignedIntegerToFloat
+                    or OpCode.ConvertSignedIntegerWidth
                     or OpCode.ReinterpretIntegerBitsAsFloat
                     or OpCode.ReinterpretFloatBitsAsInteger
                     or OpCode.RoundFloatTowardPositiveInfinity
@@ -1396,6 +1400,37 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// 私有字段在布局恢复后可能被重新物化为公开属性getter；仅消费这些新产生的精确标量结果，
+    /// 为同一比较中的退SSA占位局部补回数值类型，不重复早期原生位宽与字段推导。
+    /// </summary>
+    public static bool ResolveRecoveredPropertyComparisonCarrierTypes(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var getterResults = instructions
+            .Where(instruction => instruction is
+            {
+                OpCode: OpCode.Call,
+                Operands: [MethodAnalysisContext { Name: var name }, LocalVariable { Type: { } type }, ..]
+            } && name.StartsWith("get_", StringComparison.Ordinal)
+              && IsFinalScalarType(type))
+            .Select(instruction => (LocalVariable)instruction.Operands[1])
+            .ToHashSet();
+        if (getterResults.Count == 0)
+            return false;
+
+        var changed = false;
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
+                || instruction.Operands.Count != 3
+                || !instruction.Operands.Skip(1).OfType<LocalVariable>().Any(getterResults.Contains))
+                continue;
+            changed |= BindFinalComparisonOperandTypes(instruction, method.AppContext);
+        }
+        return changed;
+    }
+
     internal static bool BindFinalComparisonOperandTypes(
         Instruction instruction,
         ApplicationAnalysisContext? appContext = null)
@@ -1475,7 +1510,7 @@ public static class LocalVariables
     {
         if (instruction.OpCode is not (
                 OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
-                or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor)
             || instruction.Operands.Count != 3
             || instruction.Operands[0] is not LocalVariable destination)

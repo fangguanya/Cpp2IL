@@ -113,6 +113,7 @@ public class Instruction : IOperand
             case OpCode.Divide:
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
+            case OpCode.ShiftRightUnsigned:
             case OpCode.And:
             case OpCode.Or:
             case OpCode.Xor:
@@ -124,6 +125,7 @@ public class Instruction : IOperand
             case OpCode.ConvertFloatingPointPrecision:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ConvertSignedIntegerWidth:
             case OpCode.ReinterpretIntegerBitsAsFloat:
             case OpCode.ReinterpretFloatBitsAsInteger:
             case OpCode.VectorDuplicate:
@@ -192,7 +194,7 @@ public class Instruction : IOperand
             OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
-                or OpCode.ConvertSignedIntegerToFloat
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
                 or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
                 or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
@@ -217,7 +219,7 @@ public class Instruction : IOperand
                 => [_operands[1]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
-                or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 => [_operands[2], _operands[1]],
