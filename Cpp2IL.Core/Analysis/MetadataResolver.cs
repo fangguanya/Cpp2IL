@@ -127,6 +127,87 @@ public static class MetadataResolver
     }
 
     /// <summary>
+    /// 初始化保护区裁除后，恢复仍经“绝对槽 -&gt; 元数据项”二级读取的类型句柄。
+    /// 该阶段只接受Type/TypeInfo用法，使后续内联强制转换可以取得精确目标类型。
+    /// </summary>
+    public static int ResolvePost27TypeLoads(
+        MethodAnalysisContext method,
+        ISet<ulong> initializedRuntimeMetadataSlots,
+        IReadOnlyDictionary<LocalVariable, Instruction>? definitions = null)
+    {
+        // 中文注释：二层类型表只可能来自本方法已执行初始化保护的槽；绝大多数方法没有
+        // 这类槽，必须在建立SSA定义索引前直接退出，避免全量恢复重复扫描所有内存读取。
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        var appContext = method.AppContext;
+        var libContext = appContext.LibCpp2IlContext;
+        var changed = ResolvePost27TypeLoads(
+            method.ControlFlowGraph!.Instructions,
+            initializedRuntimeMetadataSlots,
+            (address, offset) =>
+            {
+                var usage = libContext.CheckForPost27GlobalTableEntryAt(address, offset);
+                return usage?.Type is MetadataUsageType.Type or MetadataUsageType.TypeInfo
+                    ? appContext.ResolveIl2CppType(usage.AsType())
+                    : null;
+            },
+            definitions);
+
+        if (changed > 0)
+            Logger.VerboseNewline(
+                $"类型元数据二层槽：method={method.Name}，recovered={changed}",
+                "MetadataResolver");
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 只恢复内联类层级检查已经证明为目标类指针的单个SSA局部。该局部必须由唯一Move定义，
+    /// 其二层表基址必须收敛到本方法已初始化的元数据槽；成功后同时提交强类型操作数与
+    /// Il2CppClass运行时类型，供同一检查闭包继续匹配。
+    /// </summary>
+    internal static TypeAnalysisContext? ResolvePost27TypeLocal(
+        MethodAnalysisContext method,
+        LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        ISet<ulong> initializedRuntimeMetadataSlots)
+    {
+        if (local.Type is RuntimeClassTypeAnalysisContext { RepresentedType: var represented })
+            return represented;
+        if (!definitions.TryGetValue(local, out var definition)
+            || definition is not
+            {
+                OpCode: OpCode.Move,
+                Operands:
+                [
+                    LocalVariable,
+                    MemoryOperand
+                    {
+                        Base: LocalVariable tableBase,
+                        Index: null,
+                        Scale: 0,
+                        Addend: >= 0
+                    } entryMemory
+                ]
+            }
+            || ResolveAbsoluteSlotAddress(tableBase, definitions, []) is not { } tableGlobalAddress
+            || !initializedRuntimeMetadataSlots.Contains(tableGlobalAddress))
+            return null;
+
+        var usage = method.AppContext.LibCpp2IlContext.CheckForPost27GlobalTableEntryAt(
+            tableGlobalAddress,
+            entryMemory.Addend);
+        if (usage?.Type is not (MetadataUsageType.Type or MetadataUsageType.TypeInfo))
+            return null;
+
+        var type = method.AppContext.ResolveIl2CppType(usage.AsType());
+        definition.SetOperand(1, type);
+        local.Type = new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly);
+        return type;
+    }
+
+    /// <summary>
     /// 对已完成类型传播的指令执行可测试的二层字符串槽恢复。相同地址与偏移只解析一次，
     /// 避免多个返回分支共享默认字符串槽时重复读取二进制和元数据。
     /// </summary>
@@ -134,9 +215,57 @@ public static class MetadataResolver
         IReadOnlyList<Instruction> instructions,
         TypeAnalysisContext stringType,
         Func<ulong, long, StringLiteral?> post27StringEntryResolver)
+        => ResolvePost27TableLoads(
+            instructions,
+            destination => destination.Type == stringType,
+            (address, offset) => post27StringEntryResolver(address, offset) is { } literal
+                ? literal
+                : null);
+
+    /// <summary>
+    /// 对可测试指令集恢复post-27二层类型槽。目标局部可以尚未定型；元数据用法本身
+    /// 是类型身份的权威证据，调用方会在改写后执行一次类型收敛。
+    /// </summary>
+    internal static int ResolvePost27TypeLoads(
+        IReadOnlyList<Instruction> instructions,
+        ISet<ulong> initializedRuntimeMetadataSlots,
+        Func<ulong, long, TypeAnalysisContext?> post27TypeEntryResolver,
+        IReadOnlyDictionary<LocalVariable, Instruction>? definitions = null)
     {
-        var definitions = BuildUniqueDefinitions(instructions);
-        var resolvedEntries = new Dictionary<(ulong Address, long Offset), StringLiteral?>();
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        return ResolvePost27TableLoads(
+            instructions,
+            _ => true,
+            post27TypeEntryResolver,
+            initializedRuntimeMetadataSlots.Contains,
+            (destination, resolved) =>
+            {
+                // 中文注释：Type/TypeInfo元数据项表示Il2CppClass指针，不是该类型的对象实例；
+                // 在提交操作数的同一位置直接赋型，避免为每个命中方法再次执行全图类型不动点。
+                if (resolved is TypeAnalysisContext type)
+                    destination.Type = new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly);
+            },
+            definitions);
+    }
+
+    /// <summary>
+    /// 统一执行post-27二层元数据读取；地址链解析、同项缓存和原指令提交只实现一次，
+    /// 字符串与类型恢复仅提供各自的目标筛选及元数据解析器。
+    /// </summary>
+    private static int ResolvePost27TableLoads(
+        IReadOnlyList<Instruction> instructions,
+        Func<LocalVariable, bool> destinationFilter,
+        Func<ulong, long, IOperand?> entryResolver,
+        Func<ulong, bool>? tableAddressFilter = null,
+        Action<LocalVariable, IOperand>? onResolved = null,
+        IReadOnlyDictionary<LocalVariable, Instruction>? knownDefinitions = null)
+    {
+        // 中文注释：调用方若已为同一SSA指令快照建立唯一定义索引，必须复用该索引；
+        // 这避免内联类型检查和元数据解析对63,397个方法重复执行GroupBy全图计算。
+        var definitions = knownDefinitions ?? BuildUniqueDefinitions(instructions);
+        var resolvedEntries = new Dictionary<(ulong Address, long Offset), IOperand?>();
         var changed = 0;
 
         foreach (var load in instructions)
@@ -156,21 +285,23 @@ public static class MetadataResolver
                         } entryMemory
                     ]
                 }
-                || destination.Type != stringType
-                || ResolveAbsoluteSlotAddress(tableBase, definitions, []) is not { } tableGlobalAddress)
+                || !destinationFilter(destination)
+                || ResolveAbsoluteSlotAddress(tableBase, definitions, []) is not { } tableGlobalAddress
+                || tableAddressFilter != null && !tableAddressFilter(tableGlobalAddress))
                 continue;
 
             var key = (tableGlobalAddress, entryMemory.Addend);
-            if (!resolvedEntries.TryGetValue(key, out var literal))
+            if (!resolvedEntries.TryGetValue(key, out var resolved))
             {
-                literal = post27StringEntryResolver(key.Item1, key.Item2);
-                resolvedEntries[key] = literal;
+                resolved = entryResolver(key.Item1, key.Item2);
+                resolvedEntries[key] = resolved;
             }
 
-            if (literal == null)
+            if (resolved == null)
                 continue;
 
-            load.SetOperand(1, literal);
+            load.SetOperand(1, resolved);
+            onResolved?.Invoke(destination, resolved);
             changed++;
         }
 

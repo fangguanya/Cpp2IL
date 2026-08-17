@@ -419,8 +419,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 使成功值携带接口类型进入后续 vtable/BLR 识别。
         KeyFunctionRecovery.RewriteTypeTests(this, initializedRuntimeMetadataSlots);
         // IL2CPP把castclass展开成类深度与继承表比较；在字段解析前折回托管转换，
-        // 让成功路径以派生类型进入同一个类型不动点，同时保留InvalidCastException语义。
-        InlineTypeCheckRecovery.Run(this);
+        // 让成功路径以派生类型进入同一个类型不动点，同时保留InvalidCastException语义；
+        // post-27类型槽复用本阶段已经建立的SSA唯一定义索引，禁止重复计算整张方法图。
+        InlineTypeCheckRecovery.Run(this, initializedRuntimeMetadataSlots);
         AggregateStackCopyRecovery.RewriteResolvedCopies(this);
 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
