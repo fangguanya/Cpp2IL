@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -17,6 +18,10 @@ public static class ManagedReturnValueRecovery
     public static int Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
+        var definitions = graph.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .Select(instruction => (LocalVariable)instruction.Destination!)
+            .ToHashSet();
         var recovered = 0;
 
         foreach (var returnBlock in graph.Blocks.ToArray())
@@ -37,7 +42,7 @@ public static class ManagedReturnValueRecovery
 
                     if (candidateInstruction.OpCode is OpCode.Call or OpCode.Newobj
                         && candidateInstruction.Destination is LocalVariable candidate
-                        && candidate.Register.Number == returned.Register.Number
+                        && IsReturnCarrierCompatible(method, returned, candidate, definitions)
                         && GenericCallRebinder.TypesEquivalent(candidate.Type, method.ReturnType))
                     {
                         returnInstruction.SetOperand(0, candidate);
@@ -62,5 +67,22 @@ public static class ManagedReturnValueRecovery
         }
 
         return recovered;
+    }
+
+    private static bool IsReturnCarrierCompatible(
+        MethodAnalysisContext method,
+        LocalVariable returned,
+        LocalVariable candidate,
+        HashSet<LocalVariable> definitions)
+    {
+        if (candidate.Register.Number == returned.Register.Number)
+            return true;
+
+        // 中文注释：ARM64 托管引用先由调用返回到 X0，再保存到 X19-X28 跨清理调用存活。
+        // 只有返回局部无定义、不是参数且最近生产值仍在 X0 时，才恢复被异常 Phi 删除的保存复制。
+        return !definitions.Contains(returned)
+               && !method.ParameterLocals.Contains(returned)
+               && candidate.Register.Name == "X0"
+               && CalleeSavedManagedReceiverRecovery.IsCalleeSavedArm64Register(returned.Register.Name);
     }
 }

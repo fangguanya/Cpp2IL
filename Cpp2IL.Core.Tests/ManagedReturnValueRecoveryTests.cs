@@ -32,6 +32,21 @@ public class ManagedReturnValueRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 唯一路径X0调用结果接回未定义X19托管Return()
+    {
+        var fixture = CreateFixture(returnRegister: "X19");
+
+        var recovered = ManagedReturnValueRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.Produced));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 类型相同但物理返回寄存器不同时保持原返回值()
     {
@@ -67,7 +82,25 @@ public class ManagedReturnValueRecoveryTests
         });
     }
 
-    private static Fixture CreateFixture(string producerRegister = "X0")
+    [Test]
+    [Category("异常输入")]
+    public void X19返回局部已有定义时禁止覆盖真实数据流()
+    {
+        var fixture = CreateFixture(returnRegister: "X19", defineReturn: true);
+
+        var recovered = ManagedReturnValueRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.OriginalReturn));
+        });
+    }
+
+    private static Fixture CreateFixture(
+        string producerRegister = "X0",
+        string returnRegister = "X0",
+        bool defineReturn = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(
@@ -94,11 +127,15 @@ public class ManagedReturnValueRecoveryTests
             app.SystemTypes.SystemStringType);
         var originalReturn = new LocalVariable(
             "returnValue",
-            new Register(null, "X0", 2),
+            new Register(null, returnRegister, 2),
             app.SystemTypes.SystemStringType);
         var call = new Instruction(0, OpCode.Call, producer, produced);
         var returnInstruction = new Instruction(1, OpCode.Return, originalReturn);
-        caller.ControlFlowGraph = new ISILControlFlowGraph([call, returnInstruction]);
+        var instructions = new System.Collections.Generic.List<Instruction> { call };
+        if (defineReturn)
+            instructions.Add(new Instruction(1, OpCode.Move, originalReturn, produced));
+        instructions.Add(returnInstruction);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
         caller.Locals = [produced, originalReturn];
         caller.ParameterLocals = [];
 

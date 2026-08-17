@@ -85,6 +85,85 @@ public class CalleeSavedManagedReceiverRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 唯一具体List分配恢复未定义X19字段接收者()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var objectList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemObjectType]);
+        var stringList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var sizeField = CreateConcreteSizeField(listDefinition, objectList);
+        var produced = new LocalVariable("produced", new Register(null, "X0", 1), stringList);
+        var saved = new LocalVariable("saved", new Register(null, "X19", 2), objectList);
+        var count = new LocalVariable("count", new Register(null, "W0", 3), app.SystemTypes.SystemInt32Type);
+        var field = new FieldReference(sizeField, saved, 0x18);
+        var read = new Instruction(10, OpCode.Move, count, field);
+        var caller = CreateFieldFixture(produced, saved, count, read);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(field.Local, Is.SameAs(produced));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 两个相容List生产值存在时保持字段接收者红门()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var objectList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemObjectType]);
+        var stringList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var sizeField = CreateConcreteSizeField(listDefinition, objectList);
+        var first = new LocalVariable("first", new Register(null, "X0", 1), stringList);
+        var second = new LocalVariable("second", new Register(null, "X0", 2), stringList);
+        var saved = new LocalVariable("saved", new Register(null, "X19", 3), objectList);
+        var count = new LocalVariable("count", new Register(null, "W0", 4), app.SystemTypes.SystemInt32Type);
+        var field = new FieldReference(sizeField, saved, 0x18);
+        var read = new Instruction(10, OpCode.Move, count, field);
+        var caller = CreateFieldFixture(first, saved, count, read, second);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(field.Local, Is.SameAs(saved));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 字段接收者已有定义时禁止覆盖真实数据流()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var objectList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemObjectType]);
+        var stringList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var sizeField = CreateConcreteSizeField(listDefinition, objectList);
+        var produced = new LocalVariable("produced", new Register(null, "X0", 1), stringList);
+        var saved = new LocalVariable("saved", new Register(null, "X19", 2), objectList);
+        var count = new LocalVariable("count", new Register(null, "W0", 3), app.SystemTypes.SystemInt32Type);
+        var field = new FieldReference(sizeField, saved, 0x18);
+        var read = new Instruction(10, OpCode.Move, count, field);
+        var caller = CreateFieldFixture(produced, saved, count, read, definedReceiver: true);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(field.Local, Is.SameAs(saved));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 两个相容生产值存在时保持未定义接收者作为红门()
     {
@@ -160,6 +239,59 @@ public class CalleeSavedManagedReceiverRecoveryTests
         caller.ParameterLocals = [];
 
         return new Fixture(caller, call, receiver, firstCandidate, result);
+    }
+
+    private static MethodAnalysisContext CreateFieldFixture(
+        LocalVariable first,
+        LocalVariable receiver,
+        LocalVariable result,
+        Instruction read,
+        LocalVariable? second = null,
+        bool definedReceiver = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var instructions = new System.Collections.Generic.List<Instruction>
+        {
+            new(0, OpCode.Newobj, first, first.Type!),
+        };
+        if (second != null)
+            instructions.Add(new Instruction(1, OpCode.Newobj, second, second.Type!));
+        if (definedReceiver)
+            instructions.Add(new Instruction(2, OpCode.Move, receiver, first));
+        instructions.Add(read);
+        instructions.Add(new Instruction(11, OpCode.Return, result));
+        var owner = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "FieldCallerOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var caller = new InjectedMethodAnalysisContext(
+            owner,
+            "Caller",
+            result.Type!,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = second == null
+            ? [first, receiver, result]
+            : [first, second, receiver, result];
+        caller.ParameterLocals = [];
+        return caller;
+    }
+
+    private static FieldAnalysisContext CreateConcreteSizeField(
+        TypeAnalysisContext listDefinition,
+        GenericInstanceTypeAnalysisContext concreteList)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var baseField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private,
+            listDefinition,
+            offset: 24);
+        return new ConcreteGenericFieldAnalysisContext(baseField, concreteList);
     }
 
     private sealed record Fixture(

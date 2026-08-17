@@ -60,6 +60,35 @@ public static class CalleeSavedManagedReceiverRecovery
             recovered++;
         }
 
+        foreach (var instruction in instructions)
+        {
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (instruction.Operands[operandIndex] is not FieldReference field
+                    || definitions.ContainsKey(field.Local)
+                    || method.ParameterLocals.Contains(field.Local)
+                    || !IsCalleeSavedArm64Register(field.Local.Register.Name))
+                    continue;
+
+                var candidates = producers
+                    .Where(producer => producer.Index >= 0
+                                       && instruction.Index >= 0
+                                       && producer.Index < instruction.Index
+                                       && producer.Destination is LocalVariable candidate
+                                       && IsCompatible(candidate.Type, field.Local.Type ?? field.Field.DeclaringType))
+                    .Select(producer => (LocalVariable)producer.Destination!)
+                    .Distinct()
+                    .ToArray();
+                if (candidates.Length != 1)
+                    continue;
+
+                // 中文注释：异常 Phi 会丢掉 X19-X28 中保存的 List<T> 身份；字段读取尚未
+                // 转成 Count 前，唯一相容的托管生产值就是该布局读取的实例接收者。
+                field.Local = candidates[0];
+                recovered++;
+            }
+        }
+
         return recovered;
     }
 
@@ -81,7 +110,7 @@ public static class CalleeSavedManagedReceiverRecovery
            && candidate is GenericInstanceTypeAnalysisContext genericCandidate
            && genericCandidate.GenericType.FullName == "System.Collections.Generic.IEnumerator`1";
 
-    private static bool IsCalleeSavedArm64Register(string? name)
+    internal static bool IsCalleeSavedArm64Register(string? name)
     {
         if (name is not { Length: >= 3 } || name[0] != 'X')
             return false;
