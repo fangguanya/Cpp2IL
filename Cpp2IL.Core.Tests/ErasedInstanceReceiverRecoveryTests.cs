@@ -29,7 +29,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.Call, target, result, wrongReceiver);
         Prepare(caller, call, wrongReceiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -54,7 +54,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.Call, target, result, wrongReceiver);
         Prepare(caller, call, wrongReceiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -77,7 +77,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.Call, target, result, receiver);
         Prepare(caller, call, receiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -101,7 +101,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(1, OpCode.Call, target, result, receiver);
         Prepare(caller, scalarDefinition, call, receiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -125,7 +125,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(1, OpCode.Call, target, result, receiver);
         Prepare(caller, phi, call, receiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -157,7 +157,7 @@ public class ErasedInstanceReceiverRecoveryTests
         caller.Locals = [receiver, result];
         caller.ParameterLocals = [];
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -180,7 +180,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(1, OpCode.Call, target, result, receiver);
         Prepare(caller, nullDefinition, call, receiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -210,7 +210,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.Call, target, result, receiver, argument);
         Prepare(caller, call, receiver, argument, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -235,7 +235,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.CallVoid, target, receiver);
         Prepare(caller, call, receiver);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -272,7 +272,7 @@ public class ErasedInstanceReceiverRecoveryTests
         caller.Locals = [methodInfo, saved, receiver];
         caller.ParameterLocals = [];
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -296,7 +296,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.Call, target, result, receiver);
         Prepare(caller, call, receiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {
@@ -319,7 +319,7 @@ public class ErasedInstanceReceiverRecoveryTests
         var call = new Instruction(0, OpCode.Call, target, result, receiver);
         Prepare(caller, call, receiver, result);
 
-        var rewritten = ErasedInstanceReceiverRecovery.Run(caller);
+        var rewritten = ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(caller);
 
         Assert.Multiple(() =>
         {

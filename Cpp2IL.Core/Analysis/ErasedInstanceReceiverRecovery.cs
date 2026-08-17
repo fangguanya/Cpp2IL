@@ -11,23 +11,76 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class ErasedInstanceReceiverRecovery
 {
-    public static int Run(MethodAnalysisContext method)
+    public static int RunIncompatibleTypeReceivers(MethodAnalysisContext method)
     {
         if (method.IsStatic || method.DeclaringType == null || method.ControlFlowGraph == null)
             return 0;
 
-        // 中文注释：退SSA后同一合流局部会有多条边Move；一次构建完整定义目录，既供标量
-        // 值图审计复用，也派生唯一目录保护运行时元数据复制闭包。
+        // 中文注释：SSA阶段每个局部应有唯一定义；该目录只负责排除隐藏运行时元数据闭包。
+        var uniqueDefinitions = method.ControlFlowGraph.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+        var rewrites = new List<(Instruction Instruction, int ReceiverIndex)>();
+        foreach (var candidate in EnumerateCandidates(method))
+        {
+            // 泛型值T既可能是值类型，也可能是引用类型；它对Object实例方法的调用必须由
+            // constrained.callvirt保留真实接收者。IsAssignableTo在开放泛型上没有足够信息，
+            // 因此绝不能把T误判成原生残留寄存器并改写成当前方法的this。
+            if (candidate.ReceiverType is GenericParameterTypeAnalysisContext)
+                continue;
+
+            // 泛型方法的隐藏 MethodInfo 会被保存后搬入 X0 调用 rgctx 初始化入口；该原生
+            // 地址可能暂时绑定为当前托管实例方法。运行时元数据闭包必须保留给后续保护段
+            // 删除器，禁止恢复器把它改写成入口 this 并抹掉原始载体证据。
+            if (LocalVariables.ContainsRuntimeMetadataCarrier(candidate.Receiver, uniqueDefinitions))
+                continue;
+
+            if (candidate.ReceiverType.IsAssignableTo(candidate.TargetType)
+                || !method.DeclaringType.IsAssignableTo(candidate.TargetType))
+                continue;
+
+            rewrites.Add((candidate.Instruction, candidate.ReceiverIndex));
+        }
+
+        return RewriteToThis(method, rewrites);
+    }
+
+    public static int RunScalarValueReceivers(MethodAnalysisContext method)
+    {
+        if (method.IsStatic || method.DeclaringType == null || method.ControlFlowGraph == null)
+            return 0;
+
+        // 中文注释：退SSA后同一合流局部会有多条边Move；完整目录只服务于终态标量值图审计。
         var allDefinitions = method.ControlFlowGraph.Instructions
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
             .ToDictionary(group => group.Key, group => group.ToList());
-        var uniqueDefinitions = allDefinitions
-            .Where(pair => pair.Value.Count == 1)
-            .ToDictionary(pair => pair.Key, pair => pair.Value[0]);
-        LocalVariable? thisLocal = null;
-        var rewrittenCount = 0;
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        var rewrites = new List<(Instruction Instruction, int ReceiverIndex)>();
+        foreach (var candidate in EnumerateCandidates(method))
+        {
+            // 该阶段与早期类型冲突阶段互斥；只处理已被调用签名定型为相容类型的接收者。
+            if (candidate.ReceiverType is GenericParameterTypeAnalysisContext
+                || !candidate.ReceiverType.IsAssignableTo(candidate.TargetType)
+                || !method.DeclaringType.IsAssignableTo(candidate.TargetType)
+                || !HasErasedScalarValueGraph(candidate.Receiver, allDefinitions))
+                continue;
+
+            rewrites.Add((candidate.Instruction, candidate.ReceiverIndex));
+        }
+
+        return RewriteToThis(method, rewrites);
+    }
+
+    private static IEnumerable<(
+        Instruction Instruction,
+        int ReceiverIndex,
+        LocalVariable Receiver,
+        TypeAnalysisContext ReceiverType,
+        TypeAnalysisContext TargetType)> EnumerateCandidates(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (!instruction.IsCall
                 || instruction.Operands.Count == 0
@@ -44,35 +97,27 @@ public static class ErasedInstanceReceiverRecovery
                 || instruction.Operands[receiverIndex] is not LocalVariable { Type: { } receiverType } receiver)
                 continue;
 
-            // 泛型值T既可能是值类型，也可能是引用类型；它对Object实例方法的调用必须由
-            // constrained.callvirt保留真实接收者。IsAssignableTo在开放泛型上没有足够信息，
-            // 因此绝不能把T误判成原生残留寄存器并改写成当前方法的this。
-            if (receiverType is GenericParameterTypeAnalysisContext)
-                continue;
+            yield return (instruction, receiverIndex, receiver, receiverType, targetType);
+        }
+    }
 
-            // 泛型方法的隐藏 MethodInfo 会被保存后搬入 X0 调用 rgctx 初始化入口；该原生
-            // 地址可能暂时绑定为当前托管实例方法。运行时元数据闭包必须保留给后续保护段
-            // 删除器，禁止恢复器把它改写成入口 this 并抹掉原始载体证据。
-            if (LocalVariables.ContainsRuntimeMetadataCarrier(receiver, uniqueDefinitions))
-                continue;
+    private static int RewriteToThis(
+        MethodAnalysisContext method,
+        IReadOnlyList<(Instruction Instruction, int ReceiverIndex)> rewrites)
+    {
+        if (rewrites.Count == 0)
+            return 0;
 
-            // 类型传播会依据被调签名把合流结果强制标成目标类型，但它的真实原生入边仍可能只是
-            // 调用前遗留的整数参数。除显式类型冲突外，仅接受“全部Move/Phi闭包全为标量常量，
-            // 且至少含一个非零值”的擦除证据；单独的零值仍可能是源码显式空接收者，保持原样。
-            var hasErasedScalarValueGraph = HasErasedScalarValueGraph(receiver, allDefinitions);
-            if ((receiverType.IsAssignableTo(targetType) && !hasErasedScalarValueGraph)
-                || !method.DeclaringType.IsAssignableTo(targetType))
-                continue;
+        var thisLocal = GetOrCreateThisLocal(method);
+        if (thisLocal == null)
+            return 0;
 
-            thisLocal ??= GetOrCreateThisLocal(method);
-            if (thisLocal == null)
-                continue;
-
+        foreach (var (instruction, receiverIndex) in rewrites)
+        {
             instruction.SetOperand(receiverIndex, thisLocal);
-            rewrittenCount++;
         }
 
-        return rewrittenCount;
+        return rewrites.Count;
     }
 
     private static bool HasErasedScalarValueGraph(

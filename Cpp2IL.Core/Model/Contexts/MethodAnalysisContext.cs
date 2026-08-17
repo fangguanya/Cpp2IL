@@ -411,6 +411,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 初始化保护和注入异常边已经裁除，字符串目标类型也已收敛；此时闭合post-27
         // 二层字符串槽，既保留第一层地址载体证据，也避免把其他元数据指针误写为字符串。
         MetadataResolver.ResolveTypedPost27StringLoads(this);
+        // 类型仍处于SSA局部时修复与托管签名冲突的实例接收者，避免后续简化把它折成地址操作数。
+        ErasedInstanceReceiverRecovery.RunIncompatibleTypeReceivers(this);
         // 值类型通过主不动点到达取址栈槽后，再把Object::Box唯一恢复为托管box。
         KeyFunctionRecovery.RewriteBoxing(this);
         // 新版 ARM64 运行时把接口安全转换集中到 Object::IsInst 尾跳板；在接口分派前恢复，
@@ -492,8 +494,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveFinalScalarCarrierTypes(this);
 
         // 原生优化可省略从未被被调方法观察的this实参；退SSA边复制与终态标量类型现在同时
-        // 可见，只运行一次即可区分真实对象与由零/非零整数共同合流出的伪实例接收者。
-        ErasedInstanceReceiverRecovery.Run(this);
+        // 可见；该阶段只处理类型已相容的标量合流，与早期类型冲突规则互斥。
+        ErasedInstanceReceiverRecovery.RunScalarValueReceivers(this);
 
         // 中文注释：真实调用结果已有定义时，异常清理 Phi 中无参数身份、无生产者的 X0
         // 旧值不属于托管数据流；先删除该伪复制，避免它污染布尔值或引用返回值。
