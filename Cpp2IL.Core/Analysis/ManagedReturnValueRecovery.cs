@@ -18,10 +18,9 @@ public static class ManagedReturnValueRecovery
     public static int Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
-        var definitions = graph.Instructions
+        var definitions = new HashSet<LocalVariable>(graph.Instructions
             .Where(instruction => instruction.Destination is LocalVariable)
-            .Select(instruction => (LocalVariable)instruction.Destination!)
-            .ToHashSet();
+            .Select(instruction => (LocalVariable)instruction.Destination!));
         var recovered = 0;
 
         foreach (var returnBlock in graph.Blocks.ToArray())

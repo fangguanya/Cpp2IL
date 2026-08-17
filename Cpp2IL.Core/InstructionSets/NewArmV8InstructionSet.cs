@@ -449,18 +449,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         out Instruction[] recovered)
     {
         recovered = [];
-        if (instruction.Mnemonic != Arm64Mnemonic.SMADDL
+        var isMultiplyAlias = instruction.Mnemonic == Arm64Mnemonic.SMULL;
+        if (instruction.Mnemonic is not (Arm64Mnemonic.SMADDL or Arm64Mnemonic.SMULL)
             || instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
             || instruction.Op2Kind != Arm64OperandKind.Register
-            || instruction.Op3Kind != Arm64OperandKind.Register
             || instruction.Op0Reg is < Arm64Register.X0 or > Arm64Register.X30
-            // Disarm 会把 SMADDL 编码中的 Wn/Wm 规范化报告为同槽位 Xn/Xm；
-            // 32位有符号源宽度由 SMADDL 操作码本身保证，不能再按枚举名称误拒绝。
-            || instruction.Op1Reg is < Arm64Register.X0 or > Arm64Register.X31
-            || instruction.Op2Reg is < Arm64Register.X0 or > Arm64Register.X31
-            || instruction.Op3Reg is < Arm64Register.X0 or > Arm64Register.X31)
+            // Disarm 各版本可能把 Wn/Wm 保留为 W，也可能规范化为同槽位 X；
+            // 32位有符号源宽度由 SMADDL/SMULL 操作码本身保证。
+            || !IsWordSourceRegister(instruction.Op1Reg)
+            || !IsWordSourceRegister(instruction.Op2Reg)
+            || !isMultiplyAlias
+            && (instruction.Op3Kind != Arm64OperandKind.Register
+                || instruction.Op3Reg is < Arm64Register.X0 or > Arm64Register.X31))
             return false;
+
+        static bool IsWordSourceRegister(Arm64Register register)
+            => register is >= Arm64Register.W0 and <= Arm64Register.W31
+                or >= Arm64Register.X0 and <= Arm64Register.X31;
 
         static IOperand RegisterOrZero(Arm64Register register)
             => Arm64RegisterHelper.IsZeroRegister(register)
@@ -473,7 +479,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var product = new Register(null, $"SMADDL_PRODUCT64_{address:X}");
         var leftSource = RegisterOrZero(instruction.Op1Reg);
         var rightSource = RegisterOrZero(instruction.Op2Reg);
-        var accumulator = RegisterOrZero(instruction.Op3Reg);
+        var accumulator = isMultiplyAlias ? Imm(0) : RegisterOrZero(instruction.Op3Reg);
 
         recovered =
         [
@@ -494,21 +500,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         out Instruction[] recovered)
     {
         recovered = [];
-        if (instruction.Mnemonic != Arm64Mnemonic.UBFM
-            || instruction.Op0Kind != Arm64OperandKind.Register
+        if (instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
-            || instruction.Op2Kind != Arm64OperandKind.Immediate
-            || instruction.Op3Kind != Arm64OperandKind.Immediate
             || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
             || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
             || sourceWidthBits != widthBits
-            || instruction.Op2Imm is < 0 or >= 64
-            || instruction.Op3Imm is < 0 or >= 64)
-            return false;
-
-        var rotateRight = (int)instruction.Op2Imm;
-        var mostSignificantBit = (int)instruction.Op3Imm;
-        if (rotateRight >= widthBits || mostSignificantBit >= widthBits)
+            || !TryDecodeUnsignedBitfieldImmediates(
+                instruction,
+                widthBits,
+                out var rotateRight,
+                out var mostSignificantBit))
             return false;
 
         if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
@@ -548,6 +549,61 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         recovered = instructions.ToArray();
         return true;
+    }
+
+    /// <summary>
+    /// 将 Disarm 暴露的 UBFM、LSR 与 UBFIZ 别名统一还原为 UBFM 的 immr/imms。
+    /// </summary>
+    private static bool TryDecodeUnsignedBitfieldImmediates(
+        Arm64Instruction instruction,
+        int widthBits,
+        out int rotateRight,
+        out int mostSignificantBit)
+    {
+        rotateRight = 0;
+        mostSignificantBit = 0;
+
+        if (instruction.Op2Kind != Arm64OperandKind.Immediate)
+            return false;
+
+        switch (instruction.Mnemonic)
+        {
+            case Arm64Mnemonic.UBFM:
+                if (instruction.Op3Kind != Arm64OperandKind.Immediate
+                    || instruction.Op2Imm is < 0 or >= 64
+                    || instruction.Op3Imm is < 0 or >= 64)
+                    return false;
+
+                rotateRight = (int)instruction.Op2Imm;
+                mostSignificantBit = (int)instruction.Op3Imm;
+                return rotateRight < widthBits && mostSignificantBit < widthBits;
+
+            case Arm64Mnemonic.LSR:
+                if (instruction.Op2Imm < 0 || instruction.Op2Imm >= widthBits)
+                    return false;
+
+                rotateRight = (int)instruction.Op2Imm;
+                mostSignificantBit = widthBits - 1;
+                return true;
+
+            case Arm64Mnemonic.UBFIZ:
+                if (instruction.Op3Kind != Arm64OperandKind.Immediate)
+                    return false;
+
+                var leastSignificantBit = (int)instruction.Op2Imm;
+                var fieldWidth = (int)instruction.Op3Imm;
+                if (leastSignificantBit < 0
+                    || fieldWidth <= 0
+                    || leastSignificantBit + fieldWidth > widthBits)
+                    return false;
+
+                rotateRight = (widthBits - leastSignificantBit) % widthBits;
+                mostSignificantBit = fieldWidth - 1;
+                return true;
+
+            default:
+                return false;
+        }
     }
 
     /// <summary>识别 UBFM 可使用的同宽 W/X 通用寄存器，31号槽位按零寄存器处理。</summary>
@@ -3126,6 +3182,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
                 break;
             case Arm64Mnemonic.UBFM:
+            case Arm64Mnemonic.LSR:
+            case Arm64Mnemonic.UBFIZ:
                 {
                     if (!TryCreateUnsignedBitfieldMoveInstructions(instruction, out var recovered))
                     {
@@ -3146,6 +3204,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 AddInteger(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.SMADDL:
+            case Arm64Mnemonic.SMULL:
                 {
                     if (!TryCreateSignedMultiplyAddLongInstructions(instruction, address, out var recovered))
                     {

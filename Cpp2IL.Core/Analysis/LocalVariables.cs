@@ -1407,15 +1407,14 @@ public static class LocalVariables
     public static bool ResolveRecoveredPropertyComparisonCarrierTypes(MethodAnalysisContext method)
     {
         var instructions = method.ControlFlowGraph!.Instructions;
-        var getterResults = instructions
+        var getterResults = new HashSet<LocalVariable>(instructions
             .Where(instruction => instruction is
             {
                 OpCode: OpCode.Call,
                 Operands: [MethodAnalysisContext { Name: var name }, LocalVariable { Type: { } type }, ..]
             } && name.StartsWith("get_", StringComparison.Ordinal)
               && IsFinalScalarType(type))
-            .Select(instruction => (LocalVariable)instruction.Operands[1])
-            .ToHashSet();
+            .Select(instruction => (LocalVariable)instruction.Operands[1]));
         if (getterResults.Count == 0)
             return false;
 
