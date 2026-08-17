@@ -1174,6 +1174,24 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void BirthPlaceWordAddCarriesThirtyTwoBitDestinationEvidence()
+    {
+        // ADD W8, W8, W9；W 目标要求二元运算后按32位写回，不能把前序 LSR 的 I8 直接存入 Int32。
+        var native = DecodeSingleInstruction([0x08, 0x01, 0x09, 0x0B], 0x0271BCB4);
+
+        var recognized = NewArmV8InstructionSet.TryGetSignedIntegerWidthBits(native.Op0Reg, out var widthBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(native.Mnemonic, Is.EqualTo(Arm64Mnemonic.ADD));
+            Assert.That(native.Op0Reg, Is.EqualTo(Arm64Register.W8));
+            Assert.That(recognized, Is.True);
+            Assert.That(widthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void UbfizWrapAroundBitfieldMasksThenMovesIntoHighRange()
     {
