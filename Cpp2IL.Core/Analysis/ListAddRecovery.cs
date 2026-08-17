@@ -1649,7 +1649,7 @@ public static class ListAddRecovery
         publicValue = null!;
         preservedSlowTail = [];
         var instructions = fastPrefix.Concat(PatternInstructions(block)).ToList();
-        if (instructions.Count < 6
+        if (instructions.Count < 4
             || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
             || !ReferenceEquals(target, merge))
         {
@@ -1689,33 +1689,9 @@ public static class ListAddRecovery
             instruction is { OpCode: OpCode.Move, Operands: [FieldReference field, var source] }
             && IsField(field, receiver, "_size")
             && ReferenceEquals(source, newSize)).ToList();
-        var scales = instructions.Where(instruction =>
-            instruction is
-            {
-                OpCode: OpCode.ShiftLeft or OpCode.Multiply,
-                Operands: [LocalVariable, _, Immediate]
-            }).ToList();
-        if (sizeWrites.Count != 1
-            || scales.Count != 1
-            || scales[0].Operands[0] is not LocalVariable elementOffset)
+        if (sizeWrites.Count != 1)
         {
-            Logger.VerboseNewline($"ListAdd恢复拒绝：大小回写数={sizeWrites.Count}，索引缩放数={scales.Count}。");
-            return false;
-        }
-        var scaleSource = scales[0].Operands[1];
-
-        var addresses = instructions.Where(instruction =>
-            instruction is { OpCode: OpCode.Add, Operands: [LocalVariable destination, var left, var right] }
-            && (memory.HasValue && ReferenceEquals(destination, memory.Value.Base) || arrayAccess != null)
-            && ((IsItemsAddressBase(left, receiver, items) && ReferenceEquals(right, elementOffset))
-                || (IsItemsAddressBase(right, receiver, items) && ReferenceEquals(left, elementOffset)))).ToList();
-        if (addresses.Count != 1
-            || arrayAccess != null
-            && (!ReferenceEquals(arrayAccess.Array, items)
-                || !IsSameStateOperand(arrayAccess.Index, sizeState, receiver, "_size")))
-        {
-            Logger.VerboseNewline(
-                $"ListAdd恢复拒绝：元素地址证据数={addresses.Count}，数组访问匹配={arrayAccess != null}。");
+            Logger.VerboseNewline($"ListAdd恢复拒绝：大小回写数={sizeWrites.Count}。");
             return false;
         }
 
@@ -1724,22 +1700,67 @@ public static class ListAddRecovery
             stores[0],
             sizeAdds[0],
             sizeWrites[0],
-            scales[0],
-            addresses[0],
             instructions[^1],
         };
         allowed.AddRange(valueConstruction);
-        if (!IsSameStateOperand(scaleSource, sizeState, receiver, "_size")
-            && !CollectUInt32IndexNormalization(
-                instructions,
-                scales[0],
-                receiver,
-                sizeState,
-                scaleSource,
-                allowed))
+
+        if (arrayAccess != null)
         {
-            Logger.VerboseNewline("ListAdd恢复拒绝：索引归一化链未闭合。");
-            return false;
+            // ArrayRecovery 已经把原生的“缩放索引 + 基址加法 + 内存写入”折叠为
+            // items[index]。此时数组局部和集合大小状态就是完整的元素地址证据，原始
+            // 缩放与地址指令会被消除为 Nop，不再重复要求已经被归一化掉的证明。
+            if (!ReferenceEquals(arrayAccess.Array, items)
+                || !IsSameStateOperand(arrayAccess.Index, sizeState, receiver, "_size"))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd恢复拒绝：直接数组访问的数组或索引状态不匹配，访问={arrayAccess}。");
+                return false;
+            }
+        }
+        else
+        {
+            // 尚未归一化的原生内存写入继续要求唯一缩放和唯一地址合成，避免把普通
+            // 指针写入误判为 List<T>.Add 快路径。
+            var scales = instructions.Where(instruction =>
+                instruction is
+                {
+                    OpCode: OpCode.ShiftLeft or OpCode.Multiply,
+                    Operands: [LocalVariable, _, Immediate]
+                }).ToList();
+            if (scales.Count != 1
+                || scales[0].Operands[0] is not LocalVariable elementOffset)
+            {
+                Logger.VerboseNewline($"ListAdd恢复拒绝：原生内存路径索引缩放数={scales.Count}。");
+                return false;
+            }
+
+            var addresses = instructions.Where(instruction =>
+                instruction is { OpCode: OpCode.Add, Operands: [LocalVariable destination, var left, var right] }
+                && memory.HasValue
+                && ReferenceEquals(destination, memory.Value.Base)
+                && ((IsItemsAddressBase(left, receiver, items) && ReferenceEquals(right, elementOffset))
+                    || (IsItemsAddressBase(right, receiver, items) && ReferenceEquals(left, elementOffset)))).ToList();
+            if (addresses.Count != 1)
+            {
+                Logger.VerboseNewline($"ListAdd恢复拒绝：原生内存路径元素地址证据数={addresses.Count}。");
+                return false;
+            }
+
+            allowed.Add(scales[0]);
+            allowed.Add(addresses[0]);
+            var scaleSource = scales[0].Operands[1];
+            if (!IsSameStateOperand(scaleSource, sizeState, receiver, "_size")
+                && !CollectUInt32IndexNormalization(
+                    instructions,
+                    scales[0],
+                    receiver,
+                    sizeState,
+                    scaleSource,
+                    allowed))
+            {
+                Logger.VerboseNewline("ListAdd恢复拒绝：索引归一化链未闭合。");
+                return false;
+            }
         }
 
         var slowStateRefreshes = slowTail.Where(instruction =>

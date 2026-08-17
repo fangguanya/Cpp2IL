@@ -1344,6 +1344,73 @@ public class ListAddRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 已归一化数组元素写入恢复为公开Add调用()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已归一化数组写入夹带等价载体时保留载体并恢复Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            includeMatchingCarrierMove: true,
+            useDirectArrayAccess: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [var destination, _] }
+                && ReferenceEquals(destination, fixture.Carrier)), Is.True);
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [TestCase(true, false)]
+    [TestCase(false, true)]
+    [Category("异常输入")]
+    public void 已归一化数组写入的数组或索引不匹配时保留原控制流(
+        bool wrongItems,
+        bool wrongIndex)
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true,
+            directArrayWrongItems: wrongItems,
+            directArrayWrongIndex: wrongIndex);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
     private static Fixture CreateFixture(
         TypeAnalysisContext elementType,
         bool includeNops = false,
@@ -1363,7 +1430,10 @@ public class ListAddRecoveryTests
         bool includeMistypedRuntimeMethodCarrier = false,
         bool readMistypedRuntimeMethodCarrierFromMerge = false,
         bool slowPathExplicitJump = false,
-        bool includeTypeofRuntimeClassCarrier = false)
+        bool includeTypeofRuntimeClassCarrier = false,
+        bool useDirectArrayAccess = false,
+        bool directArrayWrongItems = false,
+        bool directArrayWrongIndex = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -1401,6 +1471,7 @@ public class ListAddRecoveryTests
         var value = Local("value", elementType);
         var otherValue = Local("otherValue", elementType);
         var items = Local("items", elementType.MakeSzArrayType());
+        var otherItems = Local("otherItems", elementType.MakeSzArrayType());
         var version = Local("version", app.SystemTypes.SystemInt32Type);
         var condition = Local("condition", app.SystemTypes.SystemBooleanType);
         var elementOffset = Local("elementOffset", app.SystemTypes.SystemIntPtrType);
@@ -1439,12 +1510,29 @@ public class ListAddRecoveryTests
             new(2, OpCode.Move, Field(versionField), version),
             new(3, OpCode.CheckGreaterOrEqualUnsigned, condition, SizeRead(), new ArrayLength(items)),
             new(4, OpCode.ConditionalJump, new Immediate(-1), condition),
-            new(5, OpCode.ShiftLeft, elementOffset, SizeRead(), new Immediate(3)),
-            new(6, OpCode.Add, elementAddress, useDirectItemsFieldForAddress ? Field(itemsField) : items, elementOffset),
-            new(7, OpCode.Add, newSize, SizeRead(), new Immediate(1)),
-            new(8, OpCode.Move, Field(sizeField), newSize),
-            new(9, OpCode.Move, new MemoryOperand(elementAddress, null, 0x20), mismatchStoredValue ? otherValue : fastValue),
         };
+        if (!useDirectArrayAccess)
+        {
+            instructions.Add(new Instruction(instructions.Count, OpCode.ShiftLeft, elementOffset, SizeRead(), new Immediate(3)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Add,
+                elementAddress,
+                useDirectItemsFieldForAddress ? Field(itemsField) : items,
+                elementOffset));
+        }
+        instructions.Add(new Instruction(instructions.Count, OpCode.Add, newSize, SizeRead(), new Immediate(1)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(sizeField), newSize));
+        IOperand elementWrite = useDirectArrayAccess
+            ? new ArrayAccess(
+                directArrayWrongItems ? otherItems : items,
+                directArrayWrongIndex ? new Immediate(99) : SizeRead())
+            : new MemoryOperand(elementAddress, null, 0x20);
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            elementWrite,
+            mismatchStoredValue ? otherValue : fastValue));
 
         if (includeMatchingCarrierMove)
             instructions.Add(new Instruction(instructions.Count, OpCode.Move, carrier, mismatchCarrierSource ? otherValue : value));
