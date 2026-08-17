@@ -66,7 +66,7 @@ public static class DeadCodeEliminator
         while (workList.Count > 0)
         {
             var instruction = workList.Pop();
-            foreach (var used in UsedLocals(instruction))
+            foreach (var used in EnumerateUsedLocals(instruction))
             {
                 if (!definitions.TryGetValue(used, out var localDefinitions))
                     continue;
@@ -91,30 +91,36 @@ public static class DeadCodeEliminator
     }
 
     /// <summary>
-    /// Every local read by the instruction. The single write position - a plain local destination -
-    /// is excluded. Memory and field operands always contribute their address/object locals as
-    /// reads, even when they are the destination of a store.
+    /// 枚举指令真正读取的全部局部量。只按“目标操作数的位置”排除一次写入，不能按
+    /// 对象身份排除目标局部；退 SSA 后的二地址指令允许同一物理局部同时出现在写目标
+    /// 和读取源中，例如 <c>Add X19, X19, 1</c>。这里直接遍历操作数还可覆盖尚未进入
+    /// 通用 Sources 表的间接跳转寄存器。
     /// </summary>
-    private static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
+    internal static IEnumerable<LocalVariable> EnumerateUsedLocals(Instruction instruction)
     {
-        var destination = instruction.Destination as LocalVariable;
+        var destinationIndex = instruction.Destination is LocalVariable
+            ? instruction.OpCode is OpCode.Call or OpCode.IndirectCall ? 1 : 0
+            : -1;
 
-        foreach (var operand in instruction.Operands)
-        foreach (var used in UsedLocals(operand, destination))
-            yield return used;
+        for (var index = 0; index < instruction.Operands.Count; index++)
+        {
+            if (index == destinationIndex)
+                continue;
+
+            foreach (var used in EnumerateUsedLocals(instruction.Operands[index]))
+                yield return used;
+        }
     }
 
     /// <summary>
     /// 递归枚举一个操作数读取的局部量。HFA在托管签名中是单个实参，但其每个分量都是
     /// 独立的数据流源；统一递归后，普通局部量、内存基址和索引都只在一个位置计算。
     /// </summary>
-    private static IEnumerable<LocalVariable> UsedLocals(
-        IOperand operand,
-        LocalVariable? destination)
+    private static IEnumerable<LocalVariable> EnumerateUsedLocals(IOperand operand)
     {
         switch (operand)
         {
-            case LocalVariable local when !ReferenceEquals(local, destination):
+            case LocalVariable local:
                 yield return local;
                 break;
             case MemoryOperand memory:
@@ -151,7 +157,7 @@ public static class DeadCodeEliminator
                 break;
             case HomogeneousFloatingAggregateArgument aggregate:
                 foreach (var component in aggregate.Components)
-                foreach (var used in UsedLocals(component, destination))
+                foreach (var used in EnumerateUsedLocals(component))
                     yield return used;
                 break;
         }
@@ -169,7 +175,7 @@ public static class DeadCodeEliminator
     /// Opcodes with no side effects, so removing a never-read result is safe. Calls, stores,
     /// returns and branches are intentionally excluded.
     /// </summary>
-    private static bool IsRemovable(OpCode opCode) =>
+    internal static bool IsRemovable(OpCode opCode) =>
         opCode switch
         {
             OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect

@@ -19,8 +19,7 @@ public static class ConstantControlFlowRecovery
         var definitions = graph.Instructions
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
-            .Where(group => group.Count() == 1)
-            .ToDictionary(group => group.Key, group => group.Single());
+            .ToDictionary(group => group.Key, group => (IReadOnlyList<Instruction>)group.ToArray());
         var rewritten = 0;
 
         foreach (var block in graph.Blocks.ToArray())
@@ -73,7 +72,7 @@ public static class ConstantControlFlowRecovery
 
     private static bool TryEvaluate(
         IOperand operand,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> definitions,
         HashSet<LocalVariable> visiting,
         out bool value)
     {
@@ -85,7 +84,8 @@ public static class ConstantControlFlowRecovery
 
         if (operand is not LocalVariable local
             || !visiting.Add(local)
-            || !definitions.TryGetValue(local, out var definition))
+            || !definitions.TryGetValue(local, out var localDefinitions)
+            || localDefinitions.Count == 0)
         {
             value = false;
             return false;
@@ -93,39 +93,21 @@ public static class ConstantControlFlowRecovery
 
         try
         {
-            if (definition is { OpCode: OpCode.Move, Operands: [_, var movedSource] })
-                return TryEvaluate(movedSource, definitions, visiting, out value);
-
-            if (definition is { OpCode: OpCode.Not, Operands: [_, var negatedSource] }
-                && TryEvaluate(negatedSource, definitions, visiting, out var sourceValue))
+            bool? consensus = null;
+            foreach (var definition in localDefinitions)
             {
-                value = !sourceValue;
-                return true;
-            }
-
-            if (definition.Operands.Count >= 3
-                && TryInteger(definition.Operands[1], out var left)
-                && TryInteger(definition.Operands[2], out var right))
-            {
-                value = definition.OpCode switch
+                if (!TryEvaluateDefinition(definition, definitions, visiting, out var candidate)
+                    || consensus.HasValue && consensus.Value != candidate)
                 {
-                    OpCode.CheckEqual => left == right,
-                    OpCode.CheckNotEqual => left != right,
-                    OpCode.CheckGreater => left > right,
-                    OpCode.CheckGreaterOrEqual => left >= right,
-                    OpCode.CheckLess => left < right,
-                    OpCode.CheckLessOrEqual => left <= right,
-                    OpCode.CheckGreaterUnsigned => (ulong)left > (ulong)right,
-                    OpCode.CheckGreaterOrEqualUnsigned => (ulong)left >= (ulong)right,
-                    OpCode.CheckLessUnsigned => (ulong)left < (ulong)right,
-                    OpCode.CheckLessOrEqualUnsigned => (ulong)left <= (ulong)right,
-                    _ => false,
-                };
-                return definition.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned;
+                    value = false;
+                    return false;
+                }
+
+                consensus = candidate;
             }
 
-            value = false;
-            return false;
+            value = consensus.GetValueOrDefault();
+            return consensus.HasValue;
         }
         finally
         {
@@ -133,7 +115,60 @@ public static class ConstantControlFlowRecovery
         }
     }
 
-    private static bool TryInteger(IOperand operand, out long value)
+    /// <summary>
+    /// 计算单条定义的布尔结果。多定义局部由调用方执行一致性裁决，避免把不同 Phi 入边
+    /// 当作同一个常量；整数比较会继续沿只读复制链读取各入边的精确常量。
+    /// </summary>
+    private static bool TryEvaluateDefinition(
+        Instruction definition,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> definitions,
+        HashSet<LocalVariable> visiting,
+        out bool value)
+    {
+        if (definition is { OpCode: OpCode.Move, Operands: [_, var movedSource] })
+            return TryEvaluate(movedSource, definitions, visiting, out value);
+
+        if (definition is { OpCode: OpCode.Not, Operands: [_, var negatedSource] }
+            && TryEvaluate(negatedSource, definitions, visiting, out var sourceValue))
+        {
+            value = !sourceValue;
+            return true;
+        }
+
+        if (definition.Operands.Count >= 3
+            && TryInteger(definition.Operands[1], definitions, visiting, out var left)
+            && TryInteger(definition.Operands[2], definitions, visiting, out var right))
+        {
+            value = definition.OpCode switch
+            {
+                OpCode.CheckEqual => left == right,
+                OpCode.CheckNotEqual => left != right,
+                OpCode.CheckGreater => left > right,
+                OpCode.CheckGreaterOrEqual => left >= right,
+                OpCode.CheckLess => left < right,
+                OpCode.CheckLessOrEqual => left <= right,
+                OpCode.CheckGreaterUnsigned => (ulong)left > (ulong)right,
+                OpCode.CheckGreaterOrEqualUnsigned => (ulong)left >= (ulong)right,
+                OpCode.CheckLessUnsigned => (ulong)left < (ulong)right,
+                OpCode.CheckLessOrEqualUnsigned => (ulong)left <= (ulong)right,
+                _ => false,
+            };
+            return definition.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned;
+        }
+
+        value = false;
+        return false;
+    }
+
+    /// <summary>
+    /// 沿 Move 定义求整数常量；多定义局部只有全部入边成功且值完全一致时才是常量。
+    /// 该规则覆盖退 SSA 后的零值 Phi，同时保留冲突入边和循环定义的原控制流。
+    /// </summary>
+    private static bool TryInteger(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> definitions,
+        HashSet<LocalVariable> visiting,
+        out long value)
     {
         if (operand is Immediate immediate)
         {
@@ -141,7 +176,37 @@ public static class ConstantControlFlowRecovery
             return true;
         }
 
-        value = 0;
-        return false;
+        if (operand is not LocalVariable local
+            || !visiting.Add(local)
+            || !definitions.TryGetValue(local, out var localDefinitions)
+            || localDefinitions.Count == 0)
+        {
+            value = 0;
+            return false;
+        }
+
+        try
+        {
+            long? consensus = null;
+            foreach (var definition in localDefinitions)
+            {
+                if (definition is not { OpCode: OpCode.Move, Operands: [_, var movedSource] }
+                    || !TryInteger(movedSource, definitions, visiting, out var candidate)
+                    || consensus.HasValue && consensus.Value != candidate)
+                {
+                    value = 0;
+                    return false;
+                }
+
+                consensus = candidate;
+            }
+
+            value = consensus.GetValueOrDefault();
+            return consensus.HasValue;
+        }
+        finally
+        {
+            visiting.Remove(local);
+        }
     }
 }

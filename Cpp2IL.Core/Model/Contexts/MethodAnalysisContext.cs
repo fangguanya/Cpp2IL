@@ -531,6 +531,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：公开getter在上一行才替换跨类型私有字段；仅消费新getter的标量结果，
         // 为循环归纳变量补回精确类型，避免再次扫描原生位宽、数组和集合恢复链。
         LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(this);
+        // 中文注释：集合长度与公开属性已提供最后一批精确标量种子；沿退 SSA Move 连通分量
+        // 一次性回填其上游 Not/Phi 载体，避免在 IL 生成阶段把 Int32 仍声明成 Object。
+        LocalVariables.ResolveFinalScalarCopyCarrierTypes(this);
 
         // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
         // 此时裁掉其不可达返回/抛出边，避免异常 ABI 状态值进入托管返回类型。
@@ -543,8 +546,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
-        // 清理数组与地址局部等后期重写留下的无用定义。
-        DeadCodeEliminator.Run(this);
+        // 中文注释：此处已经退出 SSA，同一物理局部可有多个定义；按跨块活跃性删除后期重写
+        // 留下的具体死写，禁止再用 SSA 全局定义标记保守保留最后一次读取之后的元数据槽。
+        PostSsaDeadStoreEliminator.Run(ControlFlowGraph);
         // 中文注释：末次死码删除刚把部分 List<T>.Add 快路的缩放和地址合成消为 Nop；
         // 此处只恢复 0/0 直接数组证据，不重复早期原生内存与 1/1 数组路径。
         ListAddRecovery.RunCompactArrayAccess(this);

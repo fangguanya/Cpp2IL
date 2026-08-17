@@ -2491,6 +2491,108 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 终态Int32沿Move反向恢复Not结果载体()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var notResult = new LocalVariable("notResult", new Register(null, "TEMP", 1));
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X19", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RecoverNotCarrier",
+            [
+                new Instruction(0, OpCode.Not, notResult, new Immediate(0)),
+                new Instruction(-1, OpCode.Move, counter, notResult),
+            ],
+            [notResult, counter]);
+
+        var changed = LocalVariables.ResolveFinalScalarCopyCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(notResult.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+            Assert.That(counter.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 终态Int64穿透多级Move连通分量()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var first = new LocalVariable("first", new Register(null, "X8", 1));
+        var second = new LocalVariable(
+            "second",
+            new Register(null, "X9", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var third = new LocalVariable(
+            "third",
+            new Register(null, "X10", 1),
+            appContext.SystemTypes.SystemInt64Type);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RecoverMoveChain",
+            [
+                new Instruction(-1, OpCode.Move, second, first),
+                new Instruction(-1, OpCode.Move, third, second),
+            ],
+            [first, second, third]);
+
+        var changed = LocalVariables.ResolveFinalScalarCopyCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(first.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+            Assert.That(second.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Move分量含引用或冲突数值域时拒绝标量覆盖()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var text = new LocalVariable(
+            "text",
+            new Register(null, "X8", 1),
+            appContext.SystemTypes.SystemStringType);
+        var int32Value = new LocalVariable(
+            "int32Value",
+            new Register(null, "W9", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var unknown = new LocalVariable("unknown", new Register(null, "X10", 1));
+        var int64Value = new LocalVariable(
+            "int64Value",
+            new Register(null, "X11", 1),
+            appContext.SystemTypes.SystemInt64Type);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RejectConflictingMoveComponents",
+            [
+                new Instruction(-1, OpCode.Move, int32Value, text),
+                new Instruction(-1, OpCode.Move, unknown, int32Value),
+                new Instruction(-1, OpCode.Move, int64Value, unknown),
+            ],
+            [text, int32Value, unknown, int64Value]);
+
+        var changed = LocalVariables.ResolveFinalScalarCopyCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(text.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+            Assert.That(unknown.Type, Is.Null);
+            Assert.That(int32Value.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+            Assert.That(int64Value.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 丢失位宽的非布尔掩码从精确整型目标反向恢复源类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
