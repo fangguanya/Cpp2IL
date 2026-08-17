@@ -1567,4 +1567,132 @@ public class IlGeneratorTests
             Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
         }
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 引用类型进入RuntimeTypeHandle形参生成Ldtoken()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var emitted = 生成类型实参加载Cil(
+            appContext.SystemTypes.SystemObjectType,
+            获取运行时类型句柄(appContext));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Ldtoken), Is.EqualTo(1));
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(emitted.Single(instruction => instruction.OpCode == CilOpCodes.Ldtoken).Operand!.ToString(),
+                Does.Contain("System.Object"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 值类型进入RuntimeTypeHandle形参仍生成Ldtoken()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var emitted = 生成类型实参加载Cil(
+            appContext.SystemTypes.SystemInt32Type,
+            获取运行时类型句柄(appContext));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Ldtoken), Is.EqualTo(1));
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(emitted.Single(instruction => instruction.OpCode == CilOpCodes.Ldtoken).Operand!.ToString(),
+                Does.Contain("System.Int32"));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 类型操作数进入IntPtr形参保持原生地址语义()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var emitted = 生成类型实参加载Cil(
+            appContext.SystemTypes.SystemObjectType,
+            appContext.SystemTypes.SystemIntPtrType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldtoken), Is.False);
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
+        });
+    }
+
+    private static TypeAnalysisContext 获取运行时类型句柄(ApplicationAnalysisContext appContext)
+        => appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.RuntimeTypeHandle")!;
+
+    private static CilInstruction[] 生成类型实参加载Cil(
+        TypeAnalysisContext operandType,
+        TypeAnalysisContext parameterType)
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var targetContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "ConsumeTypeOperand",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [parameterType]);
+        var callerContext = new InjectedMethodAnalysisContext(
+            systemObject,
+            "LoadTypeOperand",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        callerContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, targetContext, operandType),
+            new Instruction(1, OpCode.Return),
+        ]);
+        callerContext.Locals = [];
+        callerContext.ParameterLocals = [];
+        callerContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "RuntimeTypeHandleTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var boundTypes = new HashSet<TypeAnalysisContext>();
+        void BindSystemType(TypeAnalysisContext context)
+        {
+            if (!boundTypes.Add(context))
+                return;
+
+            var separator = context.FullName.LastIndexOf('.');
+            var name = separator >= 0 ? context.FullName[(separator + 1)..] : context.FullName;
+            var attributes = TypeAttributes.Public
+                             | (context.IsValueType
+                                 ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout
+                                 : TypeAttributes.Class);
+            绑定AsmResolver系统类型(module, context, name, attributes);
+        }
+
+        BindSystemType(systemObject);
+        BindSystemType(operandType);
+        BindSystemType(parameterType);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "RuntimeTypeHandleConsumer",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var targetDefinition = new MethodDefinition(
+            "ConsumeTypeOperand",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(
+                module.CorLibTypeFactory.Void,
+                [parameterType.ToTypeSignature(module)]));
+        var callerDefinition = new MethodDefinition(
+            "LoadTypeOperand",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(targetDefinition);
+        typeDefinition.Methods.Add(callerDefinition);
+        targetContext.PutExtraData("AsmResolverMethod", targetDefinition);
+
+        IlGenerator.GenerateIl(callerContext, callerDefinition);
+        return callerDefinition.CilMethodBody!.Instructions.ToArray();
+    }
 }

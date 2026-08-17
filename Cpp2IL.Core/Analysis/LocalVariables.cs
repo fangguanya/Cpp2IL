@@ -1481,7 +1481,8 @@ public static class LocalVariables
             || instruction.Operands[0] is not LocalVariable destination)
             return false;
 
-        var targetType = instruction.IntegerWidthBits switch
+        var nativeAddressType = NativeAddressArithmeticType(instruction, appContext);
+        var targetType = nativeAddressType ?? instruction.IntegerWidthBits switch
         {
             32 => appContext.SystemTypes.SystemInt32Type,
             64 => appContext.SystemTypes.SystemInt64Type,
@@ -1493,7 +1494,7 @@ public static class LocalVariables
         if (locals.Any(local => !IsReplaceableFinalIntegerCarrier(local.Type, targetType, appContext)))
             return false;
 
-        var hasExactIntegerEvidence = locals.Any(local =>
+        var hasExactIntegerEvidence = nativeAddressType != null || locals.Any(local =>
             GenericCallRebinder.TypesEquivalent(local.Type, targetType));
         var hasNonBooleanMask = instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
             && instruction.Operands.OfType<Immediate>().Any(immediate => immediate.Value is < 0 or > 1);
@@ -1504,6 +1505,42 @@ public static class LocalVariables
         foreach (var local in locals)
             changed |= SetExactType(local, targetType);
         return changed;
+    }
+
+    /// <summary>
+    /// IL2CPP 运行时元数据结构的字段读取仍是原生地址域的一部分。ARM64 X 寄存器上的移位与加减
+    /// 必须保持为 nint；若退化成 Int64，后续与类指针合并时仍会生成非法的整数/对象算术。
+    /// </summary>
+    private static TypeAnalysisContext? NativeAddressArithmeticType(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.IntegerWidthBits != appContext.Binary.PointerSizeBytes * 8)
+            return null;
+
+        return instruction.Operands.Skip(1).Any(IsNativeMetadataMemoryOperand)
+            ? appContext.SystemTypes.SystemIntPtrType
+            : null;
+    }
+
+    /// <summary>
+    /// 只接受无索引的 IL2CPP 元数据布局读取；托管对象字段、数组元素和带索引的数据访问不参与此推导。
+    /// </summary>
+    private static bool IsNativeMetadataMemoryOperand(IOperand operand)
+    {
+        if (operand is not MemoryOperand
+            {
+                Base: LocalVariable { Type: { } baseType },
+                Index: null,
+                Scale: 0,
+            })
+            return false;
+
+        return baseType is RuntimeClassTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext
+            or PointerTypeAnalysisContext;
     }
 
     /// <summary>

@@ -2422,6 +2422,112 @@ public class LocalVariablesTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 运行时类布局读取参与移位时恢复原生整数结果()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            appContext.SystemTypes.SystemObjectType,
+            appContext.SystemTypes.SystemObjectType.DeclaringAssembly);
+        var runtimeClass = new LocalVariable(
+            "runtimeClass",
+            new Register(null, "X8", 1),
+            runtimeClassType);
+        var shifted = new LocalVariable(
+            "shifted",
+            new Register(null, "X9", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var instruction = new Instruction(
+            0,
+            OpCode.ShiftLeft,
+            shifted,
+            new MemoryOperand(runtimeClass, addend: 0x130),
+            new Immediate(3))
+        {
+            IntegerWidthBits = appContext.Binary.PointerSizeBytes * 8,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(shifted.Type, Is.SameAs(appContext.SystemTypes.SystemIntPtrType));
+            Assert.That(runtimeClass.Type, Is.SameAs(runtimeClassType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 原生整数链与运行时类基址相加时保持地址域()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var runtimeClassType = new RuntimeClassTypeAnalysisContext(
+            appContext.SystemTypes.SystemStringType,
+            appContext.SystemTypes.SystemStringType.DeclaringAssembly);
+        var runtimeClass = new LocalVariable(
+            "runtimeClass",
+            new Register(null, "X8", 1),
+            runtimeClassType);
+        var shifted = new LocalVariable(
+            "shifted",
+            new Register(null, "X9", 1),
+            appContext.SystemTypes.SystemIntPtrType);
+        var address = new LocalVariable(
+            "address",
+            new Register(null, "X10", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var instruction = new Instruction(
+            0,
+            OpCode.Add,
+            address,
+            new MemoryOperand(runtimeClass, addend: 0xC8),
+            shifted)
+        {
+            IntegerWidthBits = appContext.Binary.PointerSizeBytes * 8,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(address.Type, Is.SameAs(appContext.SystemTypes.SystemIntPtrType));
+            Assert.That(shifted.Type, Is.SameAs(appContext.SystemTypes.SystemIntPtrType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 托管对象内存读取不得触发原生地址算术推导()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var managedObject = new LocalVariable(
+            "managedObject",
+            new Register(null, "X8", 1),
+            appContext.SystemTypes.SystemStringType);
+        var destination = new LocalVariable("destination", new Register(null, "X9", 1));
+        var instruction = new Instruction(
+            0,
+            OpCode.Add,
+            destination,
+            new MemoryOperand(managedObject, addend: 0x10),
+            new Immediate(8))
+        {
+            IntegerWidthBits = appContext.Binary.PointerSizeBytes * 8,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(instruction, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(destination.Type, Is.Null);
+            Assert.That(managedObject.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
     private static InjectedMethodAnalysisContext CreateConstructorFixture(
         TypeAnalysisContext declaringType,
         string name,

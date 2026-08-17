@@ -1126,6 +1126,17 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
             case TypeAnalysisContext type:
+                if (expectedType?.FullName == "System.RuntimeTypeHandle")
+                {
+                    // typeof(T) 作为 RuntimeTypeHandle 实参时必须生成 ldtoken T；构造 T 会改变
+                    // 原始语义，并会让抽象类型、私有构造器类型与无默认构造器类型产生非法 CIL。
+                    var tokenType = importer
+                        .ImportTypeSignature(type.ToTypeSignature(module))
+                        .ToTypeDefOrRef();
+                    instructions.Add(CilOpCodes.Ldtoken, tokenType);
+                    break;
+                }
+
                 if (expectedType is RuntimeClassTypeAnalysisContext
                     or StaticFieldStorageTypeAnalysisContext
                     or RgctxTableTypeAnalysisContext
