@@ -1510,7 +1510,7 @@ public static class LocalVariables
     {
         if (instruction.OpCode is not (
                 OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
-                or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor)
             || instruction.Operands.Count != 3
             || instruction.Operands[0] is not LocalVariable destination)

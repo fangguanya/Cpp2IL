@@ -80,6 +80,36 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Ubfm逻辑右移按X目标位宽传播Int64()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("destination", new Register(null, "X9", 1));
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X8", 3),
+            appContext.SystemTypes.SystemInt64Type);
+        var shift = new Instruction(
+            0,
+            OpCode.ShiftRightUnsigned,
+            destination,
+            source,
+            new Immediate(63))
+        {
+            IntegerWidthBits = 64,
+        };
+
+        var changed = LocalVariables.BindSizedIntegerOperationTypes(shift, appContext);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+            Assert.That(source.Type, Is.SameAs(appContext.SystemTypes.SystemInt64Type));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void Phi全部局部入边类型一致时才建立目标类型共识()
     {

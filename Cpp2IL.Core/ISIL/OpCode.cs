@@ -74,6 +74,9 @@ public enum OpCode
     /// <summary>Shifts the bits of op 2 right by op 3, and moves the result into op 1</summary>
     ShiftRight,
 
+    /// <summary>将操作数2按无符号位模式逻辑右移操作数3位，并把结果写入操作数1</summary>
+    ShiftRightUnsigned,
+
     /// <summary>Bitwise AND on op 2 and op 3, moves the result into op 1</summary>
     And,
 

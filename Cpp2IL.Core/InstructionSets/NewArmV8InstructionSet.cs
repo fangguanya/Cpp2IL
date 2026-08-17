@@ -482,6 +482,90 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
+    /// 按 ARM DecodeBitMasks 的 UBFM 两段区间语义恢复无符号位域移动。
+    /// immr 不越过 imms 时执行逻辑右移并截取低位；越过时先截取源低位再左移到目标位域。
+    /// </summary>
+    internal static bool TryCreateUnsignedBitfieldMoveInstructions(
+        Arm64Instruction instruction,
+        out Instruction[] recovered)
+    {
+        recovered = [];
+        if (instruction.Mnemonic != Arm64Mnemonic.UBFM
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || instruction.Op2Kind != Arm64OperandKind.Immediate
+            || instruction.Op3Kind != Arm64OperandKind.Immediate
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
+            || sourceWidthBits != widthBits
+            || instruction.Op2Imm is < 0 or >= 64
+            || instruction.Op3Imm is < 0 or >= 64)
+            return false;
+
+        var rotateRight = (int)instruction.Op2Imm;
+        var mostSignificantBit = (int)instruction.Op3Imm;
+        if (rotateRight >= widthBits || mostSignificantBit >= widthBits)
+            return false;
+
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+        {
+            recovered = [new Instruction(0, OpCode.Nop)];
+            return true;
+        }
+
+        var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
+        IOperand source = Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg)
+            ? Imm(0)
+            : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op1Reg));
+        var instructions = new List<Instruction>(2);
+
+        static long LowMask(int bitCount)
+            => bitCount >= 64 ? -1 : (1L << bitCount) - 1;
+
+        void AddSized(OpCode opCode, params IOperand[] operands)
+            => instructions.Add(new Instruction(instructions.Count, opCode, operands.ToList())
+            {
+                IntegerWidthBits = widthBits,
+            });
+
+        if (rotateRight <= mostSignificantBit)
+        {
+            AddSized(OpCode.ShiftRightUnsigned, destination, source, Imm(rotateRight));
+            var extractedBits = mostSignificantBit - rotateRight + 1;
+            if (extractedBits < widthBits - rotateRight)
+                AddSized(OpCode.And, destination, destination, Imm(LowMask(extractedBits)));
+        }
+        else
+        {
+            var extractedBits = mostSignificantBit + 1;
+            AddSized(OpCode.And, destination, source, Imm(LowMask(extractedBits)));
+            AddSized(OpCode.ShiftLeft, destination, destination, Imm(widthBits - rotateRight));
+        }
+
+        recovered = instructions.ToArray();
+        return true;
+    }
+
+    /// <summary>识别 UBFM 可使用的同宽 W/X 通用寄存器，31号槽位按零寄存器处理。</summary>
+    private static bool TryGetUnsignedBitfieldRegisterWidthBits(Arm64Register register, out int bits)
+    {
+        if (register is >= Arm64Register.W0 and <= Arm64Register.W31)
+        {
+            bits = 32;
+            return true;
+        }
+
+        if (register is >= Arm64Register.X0 and <= Arm64Register.X31)
+        {
+            bits = 64;
+            return true;
+        }
+
+        bits = 0;
+        return false;
+    }
+
+    /// <summary>
     /// 识别 FMOV 在通用寄存器与标量浮点寄存器之间的同宽位复制。
     /// 该指令不执行数值转换，必须保留 IEEE-754 原始位模式。
     /// </summary>
@@ -1598,7 +1682,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         return instruction.OpCode is
             OpCode.ConditionalSelect or OpCode.Add or OpCode.Subtract or OpCode.Multiply
-            or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight
+            or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
             or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
             or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
             or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
@@ -1657,7 +1741,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             OpCode.Call or OpCode.IndirectCall => 1,
             OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
-                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned or OpCode.And or OpCode.Or
                 or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.AbsoluteNumber
                 or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
@@ -3040,14 +3124,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
                 break;
             case Arm64Mnemonic.UBFM:
-                // UBFM dest, src, #<immr>, #<imms>
-                // dest = (src >> #<immr>) & ((1 << #<imms>) - 1)
                 {
-                    var dest3 = ConvertOperand(instruction, 0);
-                    Add(address, OpCode.Move, dest3, ConvertOperand(instruction, 1)); // dest = src
-                    Add(address, OpCode.ShiftRight, dest3, dest3, ConvertOperand(instruction, 2)); // dest = dest >> #<immr>
-                    var imms = (int)instruction.Op3Imm;
-                    Add(address, OpCode.And, dest3, dest3, Imm((1 << imms) - 1)); // dest = dest & constexpr { ((1 << #<imms>) - 1) }
+                    if (!TryCreateUnsignedBitfieldMoveInstructions(instruction, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction UBFM operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
                 }
                 break;
 

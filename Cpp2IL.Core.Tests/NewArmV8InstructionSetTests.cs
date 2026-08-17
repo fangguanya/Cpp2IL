@@ -1139,6 +1139,78 @@ public class NewArmV8InstructionSetTests
         Assert.That(recovered, Is.Empty);
     }
 
+    [TestCase(new byte[] { 0x09, 0xFD, 0x7F, 0xD3 }, 63L, "X9", "X8",
+        TestName = "基本_出生地余数链逻辑右移63位")]
+    [TestCase(new byte[] { 0x08, 0xFD, 0x60, 0xD3 }, 32L, "X8", "X8",
+        TestName = "基本_出生地余数链逻辑右移32位")]
+    [Category("基本功能")]
+    public void LsrAliasBecomesOneUnsignedRightShift(
+        byte[] machineCode,
+        long expectedShift,
+        string expectedDestination,
+        string expectedSource)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x0271BCAC);
+
+        var recognized = NewArmV8InstructionSet.TryCreateUnsignedBitfieldMoveInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(
+            recognized,
+            Is.True,
+            $"解码形态：{native.Mnemonic} {native.Op0Kind}/{native.Op0Reg} "
+            + $"{native.Op1Kind}/{native.Op1Reg} {native.Op2Kind}/{native.Op2Imm} "
+            + $"{native.Op3Kind}/{native.Op3Imm}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Has.Length.EqualTo(1));
+            Assert.That(recovered[0].OpCode, Is.EqualTo(OpCode.ShiftRightUnsigned));
+            Assert.That(recovered[0].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, expectedSource)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(expectedShift)));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(64));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void UbfizWrapAroundBitfieldMasksThenMovesIntoHighRange()
+    {
+        // UBFIZ X9, X8, #1, #1 等价于 UBFM X9, X8, #63, #0。
+        var native = DecodeSingleInstruction([0x09, 0x01, 0x7F, 0xD3], 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateUnsignedBitfieldMoveInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.And,
+                OpCode.ShiftLeft,
+            }));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(1)));
+            Assert.That(recovered[1].Operands[2], Is.EqualTo(new Immediate(1)));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == 64), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void AsrAliasIsNotMisclassifiedAsUnsignedBitfieldMove()
+    {
+        // ASR 属于 SBFM，有符号补位语义不得进入 UBFM 的逻辑右移路径。
+        var native = DecodeSingleInstruction([0x09, 0xFD, 0x7F, 0x93], 0x1000);
+
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateUnsignedBitfieldMoveInstructions(native, out var recovered),
+            Is.False);
+        Assert.That(recovered, Is.Empty);
+    }
+
     [Test]
     [Category("异常输入")]
     public void VectorRegisterIsRejectedAsScalarNumericWidth()

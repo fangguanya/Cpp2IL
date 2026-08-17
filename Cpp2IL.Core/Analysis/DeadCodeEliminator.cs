@@ -174,7 +174,7 @@ public static class DeadCodeEliminator
         {
             OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
-                or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.Not or OpCode.Negate
                 or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber

@@ -83,6 +83,33 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 逻辑右移唯一映射到ShrUn()
+    {
+        Assert.That(
+            IlGenerator.GetBinaryNumericCilOpCode(OpCode.ShiftRightUnsigned),
+            Is.EqualTo(CilOpCodes.Shr_Un));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 算术右移继续映射到Shr()
+    {
+        Assert.That(
+            IlGenerator.GetBinaryNumericCilOpCode(OpCode.ShiftRight),
+            Is.EqualTo(CilOpCodes.Shr));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非二元数值操作码拒绝进入Cil映射()
+    {
+        Assert.That(
+            () => IlGenerator.GetBinaryNumericCilOpCode(OpCode.Move),
+            Throws.TypeOf<ArgumentOutOfRangeException>());
+    }
+
+    [Test]
     public void Void方法尾部为普通调用时需要返回终结点()
     {
         var finalInstruction = new CilInstruction(CilOpCodes.Call, null);
