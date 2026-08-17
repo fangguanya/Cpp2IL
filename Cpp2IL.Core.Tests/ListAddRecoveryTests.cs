@@ -1352,10 +1352,12 @@ public class ListAddRecoveryTests
             Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
             useDirectArrayAccess: true);
 
-        var recovered = ListAddRecovery.Run(fixture.Method);
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
 
         Assert.Multiple(() =>
         {
+            Assert.That(earlyRecovered, Is.Zero);
             Assert.That(recovered, Is.EqualTo(1));
             Assert.That(fixture.Graph.Instructions.Count(instruction =>
                 instruction.IsCall
@@ -1373,14 +1375,84 @@ public class ListAddRecoveryTests
             includeMatchingCarrierMove: true,
             useDirectArrayAccess: true);
 
-        var recovered = ListAddRecovery.Run(fixture.Method);
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
 
         Assert.Multiple(() =>
         {
+            Assert.That(earlyRecovered, Is.Zero);
             Assert.That(recovered, Is.EqualTo(1));
             Assert.That(fixture.Graph.Instructions.Any(instruction =>
                 instruction is { OpCode: OpCode.Move, Operands: [var destination, _] }
                 && ReferenceEquals(destination, fixture.Carrier)), Is.True);
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 数组写入仍保留唯一缩放地址证据时保持原恢复能力()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true,
+            retainDirectArrayAddressEvidence: true);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.EqualTo(1));
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 连续数组追加先恢复保留证据项再恢复紧凑项()
+    {
+        var fixture = CreateChainedFixture(
+            addCount: 2,
+            retainedArrayAccessAt: 0,
+            compactArrayAccessAt: 1);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.EqualTo(1));
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 版本回写后的独立载体在紧凑追加中保留()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true,
+            includeHeadBusinessAfterVersionWrite: true);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Name: "headCarrier" }, Immediate { Value: 7 }] }), Is.True);
             Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
         });
     }
@@ -1399,10 +1471,12 @@ public class ListAddRecoveryTests
             directArrayWrongIndex: wrongIndex);
         var originalBlockCount = fixture.Graph.Blocks.Count;
 
-        var recovered = ListAddRecovery.Run(fixture.Method);
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
 
         Assert.Multiple(() =>
         {
+            Assert.That(earlyRecovered, Is.Zero);
             Assert.That(recovered, Is.Zero);
             Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
             Assert.That(fixture.Graph.Instructions.Any(instruction =>
@@ -1432,8 +1506,10 @@ public class ListAddRecoveryTests
         bool slowPathExplicitJump = false,
         bool includeTypeofRuntimeClassCarrier = false,
         bool useDirectArrayAccess = false,
+        bool retainDirectArrayAddressEvidence = false,
         bool directArrayWrongItems = false,
-        bool directArrayWrongIndex = false)
+        bool directArrayWrongIndex = false,
+        bool includeHeadBusinessAfterVersionWrite = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -1511,7 +1587,7 @@ public class ListAddRecoveryTests
             new(3, OpCode.CheckGreaterOrEqualUnsigned, condition, SizeRead(), new ArrayLength(items)),
             new(4, OpCode.ConditionalJump, new Immediate(-1), condition),
         };
-        if (!useDirectArrayAccess)
+        if (!useDirectArrayAccess || retainDirectArrayAddressEvidence)
         {
             instructions.Add(new Instruction(instructions.Count, OpCode.ShiftLeft, elementOffset, SizeRead(), new Immediate(3)));
             instructions.Add(new Instruction(
@@ -1600,6 +1676,15 @@ public class ListAddRecoveryTests
             graph.MergeCallBlocks();
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
         method.ControlFlowGraph = graph;
+        if (includeHeadBusinessAfterVersionWrite)
+        {
+            // 中文注释：模拟生产方法在 _version 回写后载入与 List 无关的迭代器载体。
+            var headCarrier = Local("headCarrier", app.SystemTypes.SystemIntPtrType);
+            var headBlock = graph.FindBlockByInstruction(instructions[2])!;
+            headBlock.Instructions.Insert(
+                headBlock.Instructions.IndexOf(instructions[2]) + 1,
+                new Instruction(-1, OpCode.Move, headCarrier, new Immediate(7)));
+        }
         var slowBlock = graph.FindBlockByInstruction(instructions[slowCallIndex])!;
         var fastBlock = graph.FindBlockByInstruction(instructions[5])!;
         if (readMistypedRuntimeMethodCarrierFromMerge)
@@ -1732,7 +1817,9 @@ public class ListAddRecoveryTests
 
     private static ChainedFixture CreateChainedFixture(
         int addCount,
-        int mismatchStoredValueAt = -1)
+        int mismatchStoredValueAt = -1,
+        int retainedArrayAccessAt = -1,
+        int compactArrayAccessAt = -1)
     {
         if (addCount < 2)
             throw new ArgumentOutOfRangeException(nameof(addCount));
@@ -1806,13 +1893,30 @@ public class ListAddRecoveryTests
             var branch = new Instruction(instructions.Count, OpCode.ConditionalJump, new Immediate(-1), condition);
             instructions.Add(branch);
             instructions.Add(new Instruction(instructions.Count, OpCode.Add, newSize, currentSize, new Immediate(1)));
-            instructions.Add(new Instruction(instructions.Count, OpCode.ShiftLeft, elementOffset, currentSize, new Immediate(3)));
-            instructions.Add(new Instruction(instructions.Count, OpCode.Add, elementAddress, items, elementOffset));
+            var useCompactArrayAccess = index == compactArrayAccessAt;
+            var useArrayAccess = useCompactArrayAccess || index == retainedArrayAccessAt;
+            if (!useCompactArrayAccess)
+            {
+                instructions.Add(new Instruction(
+                    instructions.Count,
+                    OpCode.ShiftLeft,
+                    elementOffset,
+                    currentSize,
+                    new Immediate(3)));
+                instructions.Add(new Instruction(
+                    instructions.Count,
+                    OpCode.Add,
+                    elementAddress,
+                    items,
+                    elementOffset));
+            }
             instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(sizeField), newSize));
             instructions.Add(new Instruction(
                 instructions.Count,
                 OpCode.Move,
-                new MemoryOperand(elementAddress, null, 0x20),
+                useArrayAccess
+                    ? new ArrayAccess(items, currentSize)
+                    : new MemoryOperand(elementAddress, null, 0x20),
                 index == mismatchStoredValueAt ? otherValue : values[index]));
             var fastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
             instructions.Add(fastJump);

@@ -26,19 +26,16 @@ public static class ListAddRecovery
         // 中文注释：Newobj 的类型槽在元数据闭合后可能已从 List<object> 精确到 List<T>；
         // 容量菱形匹配前只校准 AddWithResize，使公开 Add 的元素类型直接继承真实接收者。
         RebindAddWithResizeCallsFromReceivers(graph);
-        var recovered = 0;
         // 共享快尾会在逐项改写后只剩一个前驱，因此必须在任何图修改之前冻结其身份。
         var originalSharedFastTails = graph.Blocks
             .Where(block => block.Predecessors.Count >= 2)
             .ToHashSet();
-
-        while (true)
-        {
-            var passRecovered = RunRecoveryPass(graph, originalSharedFastTails);
-            if (passRecovered == 0)
-                break;
-            recovered += passRecovered;
-        }
+        // 早期入口只处理原生内存路径和保留 1/1 地址证据的数组路径；末次死码
+        // 删除后才出现的 0/0 紧凑数组形态由独立入口处理，避免改变既有候选顺序。
+        var recovered = RunRecoveryPhase(
+            graph,
+            originalSharedFastTails,
+            compactArrayAccessOnly: false);
 
         // 完整容量菱形已经优先闭合。剩余的开放 List<T>.AddWithResize 若以立即数零，
         // 或“地址载体唯一写零”作为接收者，只可能来自共享原生地址的错误托管绑定；
@@ -50,6 +47,40 @@ public static class ListAddRecovery
             DeadCodeEliminator.Run(method);
 
         return recovered + suppressed;
+    }
+
+    /// <summary>
+    /// 末次死码删除把已归一化数组写入的缩放和地址合成消除后，只恢复 0/0 证据的
+    /// <see cref="ArrayAccess"/> 容量菱形；原生内存与 1/1 证据路径保持在早期入口。
+    /// </summary>
+    public static int RunCompactArrayAccess(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var originalSharedFastTails = graph.Blocks
+            .Where(block => block.Predecessors.Count >= 2)
+            .ToHashSet();
+        return RunRecoveryPhase(
+            graph,
+            originalSharedFastTails,
+            compactArrayAccessOnly: true);
+    }
+
+    private static int RunRecoveryPhase(
+        ISILControlFlowGraph graph,
+        HashSet<Block> originalSharedFastTails,
+        bool compactArrayAccessOnly)
+    {
+        var recovered = 0;
+        while (true)
+        {
+            var passRecovered = RunRecoveryPass(
+                graph,
+                originalSharedFastTails,
+                compactArrayAccessOnly);
+            if (passRecovered == 0)
+                return recovered;
+            recovered += passRecovered;
+        }
     }
 
     internal static int RebindAddWithResizeCallsFromReceivers(ISILControlFlowGraph graph)
@@ -159,14 +190,19 @@ public static class ListAddRecovery
     /// </summary>
     private static int RunRecoveryPass(
         ISILControlFlowGraph graph,
-        HashSet<Block> originalSharedFastTails)
+        HashSet<Block> originalSharedFastTails,
+        bool compactArrayAccessOnly)
     {
         var recovered = 0;
         foreach (var slowBlock in graph.Blocks.ToList())
         {
             var sharedSlowRecovered = 0;
             while (graph.Blocks.Contains(slowBlock)
-                   && TryRecoverSharedSlowTail(graph, slowBlock, originalSharedFastTails))
+                   && TryRecoverSharedSlowTail(
+                       graph,
+                       slowBlock,
+                       originalSharedFastTails,
+                       compactArrayAccessOnly))
                 sharedSlowRecovered++;
             if (sharedSlowRecovered > 0)
             {
@@ -174,7 +210,8 @@ public static class ListAddRecovery
                 continue;
             }
 
-            if (TryRecoverSharedFastTail(graph, slowBlock, originalSharedFastTails))
+            if (!compactArrayAccessOnly
+                && TryRecoverSharedFastTail(graph, slowBlock, originalSharedFastTails))
             {
                 recovered++;
                 continue;
@@ -229,6 +266,7 @@ public static class ListAddRecovery
                     slowTail,
                     addWithResize.AppContext,
                     addWithResize.TypeGenericParameters.Single(),
+                    compactArrayAccessOnly,
                     out var publicValue,
                     out var preservedSlowTail))
                 continue;
@@ -267,7 +305,8 @@ public static class ListAddRecovery
     private static bool TryRecoverSharedSlowTail(
         ISILControlFlowGraph graph,
         Block slowBlock,
-        HashSet<Block> originalSharedFastTails)
+        HashSet<Block> originalSharedFastTails,
+        bool compactArrayAccessOnly)
     {
         if (!TryMatchSlowPath(
                 slowBlock,
@@ -348,6 +387,7 @@ public static class ListAddRecovery
                     slowTail,
                     addWithResize.AppContext,
                     addWithResize.TypeGenericParameters.Single(),
+                    compactArrayAccessOnly,
                     out var publicValue,
                     out var preservedSlowTail))
             {
@@ -1318,11 +1358,9 @@ public static class ListAddRecovery
             return false;
 
         var itemsLoadIndex = prefix.IndexOf(itemLoads[0]);
-        var versionAddIndex = prefix.IndexOf(versionAdds[0]);
         var business = prefix.Where(instruction => !allowed.Contains(instruction)).ToList();
         if (business.Any(instruction =>
                 prefix.IndexOf(instruction) <= itemsLoadIndex
-                || prefix.IndexOf(instruction) >= versionAddIndex
                 || !IsPreservableHeadBusinessInstruction(
                     instruction,
                     receiver,
@@ -1361,9 +1399,9 @@ public static class ListAddRecovery
     }
 
     /// <summary>
-    /// 只搬运发生在 List 状态变更之前的业务计算；它不得读取或写入集合接收者、
-    /// 容量载体和分支条件，也不得包含调用或控制流。这样公开 Add 仍位于原业务指令之后，
-    /// 同时不会把可能观察集合状态的操作跨过版本与大小更新。
+    /// 搬运 items 读取之后、容量比较之前的独立计算；它不得读取或写入集合接收者、
+    /// 容量载体和分支条件，也不得包含调用或控制流。ARM64 可在 _version 回写后载入
+    /// 与集合无关的迭代器或元数据载体；公开 Add 合并时将它们稳定地保留在调用之前。
     /// </summary>
     private static bool IsPreservableHeadBusinessInstruction(
         Instruction instruction,
@@ -1643,6 +1681,7 @@ public static class ListAddRecovery
         IReadOnlyList<Instruction> slowTail,
         ApplicationAnalysisContext appContext,
         TypeAnalysisContext elementType,
+        bool compactArrayAccessOnly,
         out IOperand publicValue,
         out List<Instruction> preservedSlowTail)
     {
@@ -1671,6 +1710,8 @@ public static class ListAddRecovery
         }
         MemoryOperand? memory = stores[0].Operands[0] is MemoryOperand rawMemory ? rawMemory : null;
         var arrayAccess = stores[0].Operands[0] as ArrayAccess;
+        if (compactArrayAccessOnly && memory.HasValue)
+            return false;
         if (!TryReconcileElementValue(
                 graph,
                 stores[0].Operands[1],
@@ -1707,14 +1748,64 @@ public static class ListAddRecovery
         if (arrayAccess != null)
         {
             // ArrayRecovery 已经把原生的“缩放索引 + 基址加法 + 内存写入”折叠为
-            // items[index]。此时数组局部和集合大小状态就是完整的元素地址证据，原始
-            // 缩放与地址指令会被消除为 Nop，不再重复要求已经被归一化掉的证明。
+            // items[index]。较晚完成归一化时，原始缩放与地址指令已经变为 Nop；较早
+            // 完成时两条证据仍保留。两种形态分别要求 0/0 或 1/1，拒绝半套地址链。
             if (!ReferenceEquals(arrayAccess.Array, items)
                 || !IsSameStateOperand(arrayAccess.Index, sizeState, receiver, "_size"))
             {
                 Logger.VerboseNewline(
                     $"ListAdd恢复拒绝：直接数组访问的数组或索引状态不匹配，访问={arrayAccess}。");
                 return false;
+            }
+
+            var retainedScales = instructions.Where(instruction =>
+                instruction is
+                {
+                    OpCode: OpCode.ShiftLeft or OpCode.Multiply,
+                    Operands: [LocalVariable, _, Immediate]
+                }).ToList();
+            if (retainedScales.Count > 1)
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd恢复拒绝：直接数组访问保留的索引缩放数={retainedScales.Count}。");
+                return false;
+            }
+
+            if (retainedScales.Count == 0 && !compactArrayAccessOnly
+                || retainedScales.Count == 1 && compactArrayAccessOnly)
+                return false;
+
+            if (retainedScales is [var retainedScale]
+                && retainedScale.Operands[0] is LocalVariable retainedElementOffset)
+            {
+                var retainedAddresses = instructions.Where(instruction =>
+                    instruction is { OpCode: OpCode.Add, Operands: [LocalVariable, var left, var right] }
+                    && ((IsItemsAddressBase(left, receiver, items)
+                         && ReferenceEquals(right, retainedElementOffset))
+                        || (IsItemsAddressBase(right, receiver, items)
+                            && ReferenceEquals(left, retainedElementOffset)))).ToList();
+                if (retainedAddresses.Count != 1)
+                {
+                    Logger.VerboseNewline(
+                        $"ListAdd恢复拒绝：直接数组访问保留的元素地址证据数={retainedAddresses.Count}。");
+                    return false;
+                }
+
+                allowed.Add(retainedScale);
+                allowed.Add(retainedAddresses[0]);
+                var retainedScaleSource = retainedScale.Operands[1];
+                if (!IsSameStateOperand(retainedScaleSource, sizeState, receiver, "_size")
+                    && !CollectUInt32IndexNormalization(
+                        instructions,
+                        retainedScale,
+                        receiver,
+                        sizeState,
+                        retainedScaleSource,
+                        allowed))
+                {
+                    Logger.VerboseNewline("ListAdd恢复拒绝：直接数组访问的保留索引归一化链未闭合。");
+                    return false;
+                }
             }
         }
         else

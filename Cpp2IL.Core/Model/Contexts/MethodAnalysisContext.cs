@@ -541,6 +541,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // 清理数组与地址局部等后期重写留下的无用定义。
         DeadCodeEliminator.Run(this);
+        // 中文注释：末次死码删除刚把部分 List<T>.Add 快路的缩放和地址合成消为 Nop；
+        // 此处只恢复 0/0 直接数组证据，不重复早期原生内存与 1/1 数组路径。
+        ListAddRecovery.RunCompactArrayAccess(this);
         DeadAddressCarrierRecovery.Run(this);
 
         LocalVariables.RemoveUnused(this);
