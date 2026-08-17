@@ -481,6 +481,13 @@ public static class IlGenerator
                         constrainedReceiver = ConstrainedReceiverType(receiverOperand);
                         if (constrainedReceiver != null && receiverOperand is LocalVariable receiverLocal)
                             LoadLocalAddress(receiverLocal, method, locals);
+                        else if (targetMethod.DeclaringType?.IsValueType == true
+                                 && receiverOperand is LocalVariable valueTypeReceiver)
+                        {
+                            // 中文注释：值类型实例方法的 this 是托管地址。直接 ldloc 虽可通过旧栈计数门，
+                            // 但 ILSpy 只能渲染为 Enumerator*；ldloca 才对应可编译的 receiver.Current。
+                            LoadLocalAddress(valueTypeReceiver, method, locals);
+                        }
                         else
                             LoadOperand(receiverOperand, method, locals, writeLine, stringCtor, targetMethod.DeclaringType);
                     }
