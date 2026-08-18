@@ -743,6 +743,34 @@ public class MetadataResolverTests
     }
 
     [Test]
+    [Category("异常输入")]
+    public void 循环复制链只判定一次并保持二层读取原样()
+    {
+        var first = new LocalVariable("first", new Register(null, "X27", 1));
+        var second = new LocalVariable("second", new Register(null, "X27", 2));
+        var result = new LocalVariable("result", new Register(null, "X1", 1));
+        var memory = new MemoryOperand(first);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, first, second),
+            new(1, OpCode.Move, second, first),
+            new(2, OpCode.Move, result, memory),
+        };
+
+        var changed = MetadataResolver.ResolvePost27TypeLoads(
+            instructions,
+            new HashSet<ulong> { 0x59EF8C0 },
+            (_, _) => throw new AssertionException("循环复制链不得查询元数据表项"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(instructions[2].Operands[1], Is.EqualTo(memory));
+            Assert.That(result.Type, Is.Null);
+        });
+    }
+
+    [Test]
     [Category("基本功能")]
     public void 静态偏移跳过常量并解析真实存储字段()
     {

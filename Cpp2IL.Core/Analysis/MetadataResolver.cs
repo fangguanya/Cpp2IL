@@ -265,6 +265,9 @@ public static class MetadataResolver
         // 中文注释：调用方若已为同一SSA指令快照建立唯一定义索引，必须复用该索引；
         // 这避免内联类型检查和元数据解析对63,397个方法重复执行GroupBy全图计算。
         var definitions = knownDefinitions ?? BuildUniqueDefinitions(instructions);
+        // 中文注释：大型启动方法会从同一元数据表基址读取数百个字段；地址链若逐条递归，
+        // Phi与复制链会产生指数级重复遍历。按SSA局部缓存成功和失败结果，整方法只求值一次。
+        var absoluteSlotAddresses = new Dictionary<LocalVariable, ulong?>();
         var resolvedEntries = new Dictionary<(ulong Address, long Offset), IOperand?>();
         var changed = 0;
 
@@ -286,7 +289,11 @@ public static class MetadataResolver
                     ]
                 }
                 || !destinationFilter(destination)
-                || ResolveAbsoluteSlotAddress(tableBase, definitions, []) is not { } tableGlobalAddress
+                || ResolveAbsoluteSlotAddress(
+                    tableBase,
+                    definitions,
+                    [],
+                    absoluteSlotAddresses) is not { } tableGlobalAddress
                 || tableAddressFilter != null && !tableAddressFilter(tableGlobalAddress))
                 continue;
 
@@ -316,11 +323,27 @@ public static class MetadataResolver
         IOperand operand,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
         HashSet<LocalVariable> visited)
+        => ResolveAbsoluteSlotAddress(operand, definitions, visited, []);
+
+    /// <summary>
+    /// 共享同一SSA图的绝对槽地址解析结果；空结果也必须缓存，避免异常复制环和异址Phi在
+    /// 每个内存读取处重复遍历。正在访问集合仍独立约束当前递归路径，保持循环拒绝语义。
+    /// </summary>
+    private static ulong? ResolveAbsoluteSlotAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
     {
-        if (operand is not LocalVariable local
-            || !visited.Add(local)
+        if (operand is not LocalVariable local)
+            return null;
+        if (resolvedAddresses.TryGetValue(local, out var cachedAddress))
+            return cachedAddress;
+        if (!visited.Add(local)
             || !definitions.TryGetValue(local, out var definition))
             return null;
+
+        ulong? resolvedAddress;
 
         if (definition is
             {
@@ -337,27 +360,43 @@ public static class MetadataResolver
                     } absoluteSlot
                 ]
             })
-            return (ulong)absoluteSlot.Addend;
-
-        if (definition is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable source] })
-            return ResolveAbsoluteSlotAddress(source, definitions, visited);
-
-        if (definition.OpCode != OpCode.Phi || definition.Operands.Count < 2)
-            return null;
-
-        ulong? resolvedAddress = null;
-        for (var index = 1; index < definition.Operands.Count; index++)
         {
-            var inputAddress = ResolveAbsoluteSlotAddress(
-                definition.Operands[index],
+            resolvedAddress = (ulong)absoluteSlot.Addend;
+        }
+        else if (definition is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable source] })
+        {
+            resolvedAddress = ResolveAbsoluteSlotAddress(
+                source,
                 definitions,
-                new HashSet<LocalVariable>(visited));
-            if (inputAddress == null || resolvedAddress is { } existing && existing != inputAddress.Value)
-                return null;
+                visited,
+                resolvedAddresses);
+        }
+        else if (definition.OpCode == OpCode.Phi && definition.Operands.Count >= 2)
+        {
+            resolvedAddress = null;
+            for (var index = 1; index < definition.Operands.Count; index++)
+            {
+                var inputAddress = ResolveAbsoluteSlotAddress(
+                    definition.Operands[index],
+                    definitions,
+                    visited,
+                    resolvedAddresses);
+                if (inputAddress == null || resolvedAddress is { } existing && existing != inputAddress.Value)
+                {
+                    resolvedAddress = null;
+                    break;
+                }
 
-            resolvedAddress = inputAddress;
+                resolvedAddress = inputAddress;
+            }
+        }
+        else
+        {
+            resolvedAddress = null;
         }
 
+        visited.Remove(local);
+        resolvedAddresses[local] = resolvedAddress;
         return resolvedAddress;
     }
 
