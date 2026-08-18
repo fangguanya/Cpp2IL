@@ -64,7 +64,7 @@ public static class ErasedInstanceReceiverRecovery
             if (candidate.ReceiverType is GenericParameterTypeAnalysisContext
                 || !candidate.ReceiverType.IsAssignableTo(candidate.TargetType)
                 || !method.DeclaringType.IsAssignableTo(candidate.TargetType)
-                || !HasErasedScalarValueGraph(candidate.Receiver, allDefinitions))
+                || !HasErasedFinalReceiverGraph(candidate.Receiver, allDefinitions))
                 continue;
 
             rewrites.Add((candidate.Instruction, candidate.ReceiverIndex));
@@ -118,6 +118,20 @@ public static class ErasedInstanceReceiverRecovery
         }
 
         return rewrites.Count;
+    }
+
+    private static bool HasErasedFinalReceiverGraph(
+        LocalVariable receiver,
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions)
+    {
+        if (!allDefinitions.ContainsKey(receiver))
+        {
+            // 中文注释：ARM64 实例接收者固定从 X0 传入；若同类型调用的 X0 完全没有
+            // 定义，说明优化器删除了未被被调方法观察的 this。其他参数寄存器不作推断。
+            return receiver.Register.Name == "X0";
+        }
+
+        return HasErasedScalarValueGraph(receiver, allDefinitions);
     }
 
     private static bool HasErasedScalarValueGraph(

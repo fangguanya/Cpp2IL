@@ -75,6 +75,16 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     public List<LocalVariable> ParameterLocals = [];
 
     /// <summary>
+    /// SSA 阶段冻结的 ARM64 被调用方保存寄存器直接复制证据。
+    /// </summary>
+    /// <remarks>
+    /// 异常清理 Phi 在退 SSA 后可能删除真实的 <c>X19-X29 &lt;- X0</c> 复制；这里只保存
+    /// 已版本化局部的身份，不推断类型，也不改变控制流。终态恢复器必须再次验证来源确为
+    /// 托管调用或分配结果、类型相容且证据唯一后才可消费。
+    /// </remarks>
+    internal List<(LocalVariable Destination, LocalVariable Source, int Index)> CalleeSavedSsaCopyEvidence = [];
+
+    /// <summary>
     /// Does this method return void?
     /// </summary>
     public bool IsVoid => ReturnType == AppContext.SystemTypes.SystemVoidType;
@@ -379,6 +389,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        // 中文注释：此刻物理寄存器复制仍保留完整 SSA 版本；后续 Phi 简化可能把真实复制
+        // 删除为 Nop，因此必须在任何复制传播和死码删除前冻结其身份证据。
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
@@ -508,6 +521,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         MetadataResolver.ResolveFieldOffsets(this);
         InlineConstructorRecovery.Run(this);
 
+        // 中文注释：终态字段类型已稳定；按 TypeInfo→static_fields→自类型单例→实例字段
+        // 的完整布局证据恢复管理器接收者，任何字段歧义或静态表根冲突都保持红门。
+        StaticSingletonReceiverRecovery.Run(this);
+
         // 中文注释：异常清理 Phi 可能仅留下未定义的 X19-X28 接收者；以此前唯一相容的
         // 托管生产值恢复 List<T> 与 IEnumerator<T> 的跨调用保存身份，并同步泛型签名。
         CalleeSavedManagedReceiverRecovery.Run(this);
@@ -534,6 +551,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：集合长度与公开属性已提供最后一批精确标量种子；沿退 SSA Move 连通分量
         // 一次性回填其上游 Not/Phi 载体，避免在 IL 生成阶段把 Int32 仍声明成 Object。
         LocalVariables.ResolveFinalScalarCopyCarrierTypes(this);
+        // 中文注释：退 SSA 的布尔边复制在此已稳定；只闭合由权威 Boolean 叶、0/1 复制和
+        // 小位逻辑组成的分量，引用类型或非布尔掩码会使整个分量失败关闭。
+        LocalVariables.ResolveFinalBooleanBitwiseCarrierTypes(this);
 
         // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
         // 此时裁掉其不可达返回/抛出边，避免异常 ABI 状态值进入托管返回类型。
@@ -564,6 +584,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConvertedIsil = null;
         ControlFlowGraph = null;
         DominatorInfo = null;
+        CalleeSavedSsaCopyEvidence.Clear();
     }
 
     public ConcreteGenericMethodAnalysisContext MakeGenericInstanceMethod(params IEnumerable<TypeAnalysisContext> methodGenericParameters)

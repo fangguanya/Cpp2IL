@@ -84,6 +84,7 @@ public static class KeyFunctionRecovery
                     continue;
 
                 RewriteObjectBox(
+                    method,
                     instruction,
                     definitions,
                     method.ControlFlowGraph.Blocks,
@@ -1185,6 +1186,7 @@ public static class KeyFunctionRecovery
     }
 
     private static void RewriteObjectBox(
+        MethodAnalysisContext method,
         Instruction instruction,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
         IReadOnlyList<Block> allBlocks,
@@ -1222,9 +1224,29 @@ public static class KeyFunctionRecovery
                 : TryCanonicalizeBoxTypeHandle(instruction.Operands[2], definitions, out var handleKey)
                     && boxTypesByHandle.TryGetValue(handleKey, out var provenType)
                         ? provenType
-                        : null;
+                        : ResolveMetadataBoxTypeHandle(method, instruction.Operands[2], definitions);
         if (value == null || boxedType == null || resolution == null)
+        {
+            var addressedText = addressed?.Slot.ToString() ?? "<未解析>";
+            var valueText = value?.ToString() ?? "<未解析>";
+            var valueTypeText = value?.Type?.FullName ?? "<未解析>";
+            var sourceTypesText = string.Join(",", directlyProvenTypes.Select(type => type.FullName));
+            Instruction? valueDefinition = null;
+            var definitionText = value != null && definitions.TryGetValue(value, out valueDefinition)
+                ? valueDefinition.ToString()
+                : "<未解析>";
+            var sourceDefinitionText = valueDefinition?.Operands.ElementAtOrDefault(1) is LocalVariable valueSource
+                                       && definitions.TryGetValue(valueSource, out var sourceDefinition)
+                ? sourceDefinition.ToString()
+                : "<未解析>";
+            Logger.VerboseNewline(
+                $"Object::Box拒绝：call={instruction.Index}，addressed={addressedText}，" +
+                $"value={valueText}，valueType={valueTypeText}，" +
+                $"definition={definitionText}，sourceDefinition={sourceDefinitionText}，" +
+                $"sourceTypes={sourceTypesText}，reason=缺少唯一装箱值或值类型",
+                nameof(KeyFunctionRecovery));
             return;
+        }
 
         // 类型句柄只在同方法内、同一规范链且类型唯一时补全未知栈槽，随后由Box参与主类型不动点。
         foreach (var source in resolution.Sources)
@@ -1235,6 +1257,76 @@ public static class KeyFunctionRecovery
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, value, boxedType);
+    }
+
+    /// <summary>
+    /// 从 post-27 元数据表的绝对槽与条目偏移恢复 Object::Box 类型句柄。该查询只接受
+    /// 元数据登记为 Type/TypeInfo 的项；普通内存、字符串、方法句柄和未登记槽均保持未知。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveMetadataBoxTypeHandle(
+        MethodAnalysisContext method,
+        IOperand typeHandle,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        typeHandle = ResolveUniqueMoveSource(typeHandle, definitions);
+        if (typeHandle is not MemoryOperand
+            {
+                Base: LocalVariable tableBase,
+                Index: null,
+                Addend: >= 0,
+            } entry)
+        {
+            Logger.VerboseNewline(
+                $"Object::Box类型句柄形态未匹配：kind={typeHandle.GetType().FullName}，value={typeHandle}",
+                nameof(KeyFunctionRecovery));
+            return null;
+        }
+
+        var tableAddress = MetadataResolver.ResolveAbsoluteSlotAddress(tableBase, definitions, []);
+        if (tableAddress == null)
+        {
+            var definitionText = definitions.TryGetValue(tableBase, out var tableDefinition)
+                ? tableDefinition.ToString()
+                : "<未解析>";
+            Logger.VerboseNewline(
+                $"Object::Box类型表根未解析：base={tableBase}，definition={definitionText}，offset=0x{entry.Addend:X}",
+                nameof(KeyFunctionRecovery));
+            return null;
+        }
+
+        var appContext = method.AppContext;
+        if (appContext == null)
+        {
+            Logger.VerboseNewline("Object::Box类型句柄缺少应用上下文", nameof(KeyFunctionRecovery));
+            return null;
+        }
+
+        var libContext = appContext.LibCpp2IlContext;
+        if (libContext == null)
+        {
+            Logger.VerboseNewline("Object::Box类型句柄缺少LibCpp2IL上下文", nameof(KeyFunctionRecovery));
+            return null;
+        }
+
+        var usage = libContext.CheckForPost27GlobalTableEntryAt(
+            tableAddress.Value,
+            entry.Addend);
+        if (usage?.Type is MetadataUsageType.Type or MetadataUsageType.TypeInfo)
+        {
+            var resolvedType = appContext.ResolveIl2CppType(usage.AsType());
+            return resolvedType.IsValueType ? resolvedType : null;
+        }
+
+        var defaultsTypeName = Il2CppDefaultsUsefulOffsets.GetBoxedSystemTypeName(
+            entry.Addend,
+            appContext.Binary.PointerSizeBytes);
+        if (defaultsTypeName == "System.Int32")
+            return appContext.SystemTypes.SystemInt32Type;
+
+        Logger.VerboseNewline(
+            $"Object::Box类型句柄未命中元数据或默认类型表：callTable=0x{tableAddress.Value:X}，offset=0x{entry.Addend:X}",
+            nameof(KeyFunctionRecovery));
+        return null;
     }
 
     private static BoxValueResolution? ResolveAddressPhiBoxValue(

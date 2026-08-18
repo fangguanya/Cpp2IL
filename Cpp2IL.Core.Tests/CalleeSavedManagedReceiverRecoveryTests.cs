@@ -193,6 +193,313 @@ public class CalleeSavedManagedReceiverRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 两个相容分配存在时按冻结的X27直接复制恢复首个列表()
+    {
+        var fixture = CreateFixture(addSecondCandidate: true);
+        var saved = new LocalVariable(
+            "savedDirect",
+            new Register(null, fixture.OriginalReceiver.Register.Name, 1),
+            fixture.OriginalReceiver.Type);
+        var undefined = new LocalVariable(
+            "savedEntry",
+            new Register(null, fixture.OriginalReceiver.Register.Name, 2),
+            fixture.OriginalReceiver.Type);
+        var savedMove = new Instruction(2, OpCode.Move, saved, fixture.FirstCandidate);
+        var phi = new Instruction(-1, OpCode.Phi, fixture.OriginalReceiver, saved, undefined);
+        var instructions = fixture.Caller.ControlFlowGraph!.Instructions.ToList();
+        instructions.Insert(1, savedMove);
+        instructions.Insert(2, phi);
+        fixture.Caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(fixture.Caller);
+        savedMove.OpCode = OpCode.Nop;
+        savedMove.SetOperands();
+        phi.OpCode = OpCode.Nop;
+        phi.SetOperands();
+        // 中文注释：复制合并可能重建同一 SSA 寄存器的 LocalVariable 对象；证据必须按
+        // 完整寄存器版本匹配，而不是依赖旧对象引用。
+        var refreshedCandidate = new LocalVariable(
+            "refreshedFirst",
+            fixture.FirstCandidate.Register,
+            fixture.FirstCandidate.Type);
+        fixture.Caller.ControlFlowGraph.Instructions
+            .Single(instruction => instruction.Index == 0)
+            .Destination = refreshedCandidate;
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Call.Operands[2], Is.SameAs(refreshedCandidate));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一X27版本冻结两个不同托管来源时保持红门()
+    {
+        var fixture = CreateFixture(addSecondCandidate: true);
+        var secondCandidate = (LocalVariable)fixture.Caller.ControlFlowGraph!.Instructions[1].Destination!;
+        var firstSaved = new LocalVariable(
+            "firstSaved",
+            new Register(null, fixture.OriginalReceiver.Register.Name, 1),
+            fixture.OriginalReceiver.Type);
+        var secondSaved = new LocalVariable(
+            "secondSaved",
+            new Register(null, fixture.OriginalReceiver.Register.Name, 2),
+            fixture.OriginalReceiver.Type);
+        var firstMove = new Instruction(2, OpCode.Move, firstSaved, fixture.FirstCandidate);
+        var secondMove = new Instruction(3, OpCode.Move, secondSaved, secondCandidate);
+        var phi = new Instruction(-1, OpCode.Phi, fixture.OriginalReceiver, firstSaved, secondSaved);
+        var instructions = fixture.Caller.ControlFlowGraph.Instructions.ToList();
+        instructions.Insert(2, firstMove);
+        instructions.Insert(3, secondMove);
+        instructions.Insert(4, phi);
+        fixture.Caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(fixture.Caller);
+        firstMove.OpCode = OpCode.Nop;
+        firstMove.SetOperands();
+        secondMove.OpCode = OpCode.Nop;
+        secondMove.SetOperands();
+        phi.OpCode = OpCode.Nop;
+        phi.SetOperands();
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Call.Operands[2], Is.SameAs(fixture.OriginalReceiver));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void X27复制来源不是托管生产结果时禁止伪造接收者()
+    {
+        var fixture = CreateFixture();
+        var unrelated = new LocalVariable(
+            "unrelated",
+            new Register(null, "X0", 20),
+            fixture.FirstCandidate.Type);
+        var saved = new LocalVariable(
+            "savedDirect",
+            new Register(null, fixture.OriginalReceiver.Register.Name, 1),
+            fixture.OriginalReceiver.Type);
+        var savedMove = new Instruction(2, OpCode.Move, saved, unrelated);
+        var phi = new Instruction(-1, OpCode.Phi, fixture.OriginalReceiver, saved);
+        var instructions = fixture.Caller.ControlFlowGraph!.Instructions.ToList();
+        instructions.Insert(2, savedMove);
+        instructions.Insert(3, phi);
+        fixture.Caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(fixture.Caller);
+        savedMove.OpCode = OpCode.Nop;
+        savedMove.SetOperands();
+        phi.OpCode = OpCode.Nop;
+        phi.SetOperands();
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Call.Operands[2], Is.SameAs(fixture.OriginalReceiver));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 唯一Phi来源恢复未定义X27的空值比较读取()
+    {
+        var fixture = CreateDirectUseFixture();
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.FirstCandidate));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 空值比较存在两个相容Phi来源时保持红门()
+    {
+        var fixture = CreateDirectUseFixture(compatibleSourceCount: 2);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 空值比较接收者已有定义时禁止覆盖真实数据流()
+    {
+        var fixture = CreateDirectUseFixture(defineReceiver: true);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void X29保存的唯一This参数恢复实例空值比较()
+    {
+        var fixture = CreateParameterUseFixture();
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.FirstParameter));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void X29的Phi含两个相容引用参数时保持红门()
+    {
+        var fixture = CreateParameterUseFixture(parameterSourceCount: 2);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void X29来源不是参数或托管生产结果时禁止恢复()
+    {
+        var fixture = CreateParameterUseFixture(useNonParameterSource: true);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void X29仅有同源退Ssa边复制时仍恢复This参数()
+    {
+        var fixture = CreateParameterUseFixture();
+        AddReceiverDefinition(
+            fixture,
+            new Instruction(-1, OpCode.Move, fixture.Receiver, fixture.FirstParameter));
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.FirstParameter));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void X29生成边复制含未证明来源时保持红门()
+    {
+        var fixture = CreateParameterUseFixture();
+        var unproven = new LocalVariable(
+            "unproven",
+            new Register(null, "X29", 99),
+            fixture.Receiver.Type);
+        AddReceiverDefinition(fixture, new Instruction(-1, OpCode.Move, fixture.Receiver, unproven));
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void X29存在真实索引定义时禁止按生成边覆盖()
+    {
+        var fixture = CreateParameterUseFixture();
+        AddReceiverDefinition(
+            fixture,
+            new Instruction(30, OpCode.Move, fixture.Receiver, fixture.FirstParameter));
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Comparison.Operands[1], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void X29保存的This搬回X0后恢复实例调用接收者()
+    {
+        var fixture = CreateCallerSavedCallFixture();
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Call.Operands[2], Is.SameAs(fixture.FirstParameter));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void X0回搬链含两个相容参数来源时保持红门()
+    {
+        var fixture = CreateCallerSavedCallFixture(parameterSourceCount: 2);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Call.Operands[2], Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void X0回搬链没有托管参数或生产来源时禁止恢复()
+    {
+        var fixture = CreateCallerSavedCallFixture(useNonParameterSource: true);
+
+        var recovered = CalleeSavedManagedReceiverRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Call.Operands[2], Is.SameAs(fixture.Receiver));
+        });
+    }
+
     private static Fixture CreateFixture(bool addSecondCandidate = false, bool defineReceiver = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -239,6 +546,236 @@ public class CalleeSavedManagedReceiverRecoveryTests
         caller.ParameterLocals = [];
 
         return new Fixture(caller, call, receiver, firstCandidate, result);
+    }
+
+    private static DirectUseFixture CreateDirectUseFixture(
+        int compatibleSourceCount = 1,
+        bool defineReceiver = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var objectList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemObjectType]);
+        var stringList = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
+        var first = new LocalVariable("first", new Register(null, "X0", 1), stringList);
+        var receiver = new LocalVariable("merged", new Register(null, "X27", 8), objectList);
+        var condition = new LocalVariable("condition", new Register(null, "W0", 1), app.SystemTypes.SystemBooleanType);
+        var instructions = new System.Collections.Generic.List<Instruction>();
+        var savedLocals = new System.Collections.Generic.List<LocalVariable>();
+        var evidenceMoves = new System.Collections.Generic.List<Instruction>();
+
+        for (var index = 0; index < compatibleSourceCount; index++)
+        {
+            var candidate = index == 0
+                ? first
+                : new LocalVariable($"candidate{index}", new Register(null, "X0", index + 1), stringList);
+            var saved = new LocalVariable($"saved{index}", new Register(null, "X27", index + 1), objectList);
+            instructions.Add(new Instruction(index, OpCode.Newobj, candidate, stringList));
+            var move = new Instruction(index + 20, OpCode.Move, saved, candidate);
+            instructions.Add(move);
+            savedLocals.Add(saved);
+            evidenceMoves.Add(move);
+        }
+
+        var phi = new Instruction(
+            -1,
+            OpCode.Phi,
+            new[] { receiver }.Concat(savedLocals).Cast<IOperand>().ToList());
+        instructions.Add(phi);
+        if (defineReceiver)
+            instructions.Add(new Instruction(30, OpCode.Move, receiver, first));
+        var comparison = new Instruction(40, OpCode.CheckNotEqual, condition, receiver, new Immediate(0));
+        instructions.Add(comparison);
+        instructions.Add(new Instruction(41, OpCode.Return, condition));
+
+        var owner = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "DirectUseCallerOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var caller = new InjectedMethodAnalysisContext(
+            owner,
+            "Caller",
+            app.SystemTypes.SystemBooleanType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = [first, receiver, condition, .. savedLocals];
+        caller.ParameterLocals = [];
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(caller);
+
+        foreach (var move in evidenceMoves)
+        {
+            move.OpCode = OpCode.Nop;
+            move.SetOperands();
+        }
+        phi.OpCode = OpCode.Nop;
+        phi.SetOperands();
+
+        return new DirectUseFixture(caller, comparison, receiver, first);
+    }
+
+    private static ParameterUseFixture CreateParameterUseFixture(
+        int parameterSourceCount = 1,
+        bool useNonParameterSource = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "ParameterUseCallerOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var caller = new InjectedMethodAnalysisContext(
+            owner,
+            "Caller",
+            app.SystemTypes.SystemBooleanType,
+            MethodAttributes.Public,
+            []);
+        var firstParameter = new LocalVariable("this", new Register(null, "X0", 0), owner)
+        {
+            IsThis = true,
+        };
+        var parameterLocals = new System.Collections.Generic.List<LocalVariable> { firstParameter };
+        for (var index = 1; index < parameterSourceCount; index++)
+            parameterLocals.Add(new LocalVariable($"parameter{index}", new Register(null, $"X{index}", 0), owner));
+
+        var evidenceSources = useNonParameterSource
+            ? [new LocalVariable("unrelated", new Register(null, "X8", 1), owner)]
+            : parameterLocals;
+        var savedLocals = new System.Collections.Generic.List<LocalVariable>();
+        var evidenceMoves = new System.Collections.Generic.List<Instruction>();
+        var instructions = new System.Collections.Generic.List<Instruction>();
+        for (var index = 0; index < evidenceSources.Count; index++)
+        {
+            var saved = new LocalVariable($"saved{index}", new Register(null, "X29", index + 1), owner);
+            var move = new Instruction(index, OpCode.Move, saved, evidenceSources[index]);
+            savedLocals.Add(saved);
+            evidenceMoves.Add(move);
+            instructions.Add(move);
+        }
+
+        var receiver = new LocalVariable("merged", new Register(null, "X29", 20), owner);
+        var phi = new Instruction(
+            -1,
+            OpCode.Phi,
+            new[] { receiver }.Concat(savedLocals).Cast<IOperand>().ToList());
+        var condition = new LocalVariable("condition", new Register(null, "W0", 1), app.SystemTypes.SystemBooleanType);
+        var comparison = new Instruction(40, OpCode.CheckNotEqual, condition, receiver, new Immediate(0));
+        instructions.Add(phi);
+        instructions.Add(comparison);
+        instructions.Add(new Instruction(41, OpCode.Return, condition));
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = [firstParameter, receiver, condition, .. savedLocals];
+        caller.ParameterLocals = parameterLocals;
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(caller);
+
+        foreach (var move in evidenceMoves)
+        {
+            move.OpCode = OpCode.Nop;
+            move.SetOperands();
+        }
+        phi.OpCode = OpCode.Nop;
+        phi.SetOperands();
+
+        return new ParameterUseFixture(caller, comparison, receiver, firstParameter);
+    }
+
+    private static void AddReceiverDefinition(ParameterUseFixture fixture, Instruction definition)
+    {
+        var instructions = fixture.Caller.ControlFlowGraph!.Instructions.ToList();
+        var comparisonIndex = instructions.IndexOf(fixture.Comparison);
+        instructions.Insert(comparisonIndex, definition);
+        fixture.Caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+    }
+
+    private static CallerSavedCallFixture CreateCallerSavedCallFixture(
+        int parameterSourceCount = 1,
+        bool useNonParameterSource = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "CallerSavedOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var target = new InjectedMethodAnalysisContext(
+            owner,
+            "Target",
+            app.SystemTypes.SystemBooleanType,
+            MethodAttributes.Public,
+            []);
+        var caller = new InjectedMethodAnalysisContext(
+            owner,
+            "Caller",
+            app.SystemTypes.SystemBooleanType,
+            MethodAttributes.Public,
+            []);
+        var firstParameter = new LocalVariable("this", new Register(null, "X0", 0), owner)
+        {
+            IsThis = true,
+        };
+        var parameterLocals = new System.Collections.Generic.List<LocalVariable> { firstParameter };
+        for (var index = 1; index < parameterSourceCount; index++)
+            parameterLocals.Add(new LocalVariable($"parameter{index}", new Register(null, $"X{index}", 0), owner));
+
+        var sources = useNonParameterSource
+            ? [new LocalVariable("unrelated", new Register(null, "X8", 1), owner)]
+            : parameterLocals;
+        var savedLocals = new System.Collections.Generic.List<LocalVariable>();
+        var evidenceMoves = new System.Collections.Generic.List<Instruction>();
+        var instructions = new System.Collections.Generic.List<Instruction>();
+        for (var index = 0; index < sources.Count; index++)
+        {
+            var saved = new LocalVariable($"saved{index}", new Register(null, "X29", index + 1), owner);
+            var move = new Instruction(index, OpCode.Move, saved, sources[index]);
+            savedLocals.Add(saved);
+            evidenceMoves.Add(move);
+            instructions.Add(move);
+        }
+
+        LocalVariable savedSource;
+        Instruction? phi = null;
+        if (savedLocals.Count == 1)
+        {
+            savedSource = savedLocals[0];
+        }
+        else
+        {
+            savedSource = new LocalVariable("savedMerged", new Register(null, "X29", 20), owner);
+            phi = new Instruction(
+                -1,
+                OpCode.Phi,
+                new[] { savedSource }.Concat(savedLocals).Cast<IOperand>().ToList());
+            instructions.Add(phi);
+        }
+
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 408), owner);
+        var receiverMove = new Instruction(30, OpCode.Move, receiver, savedSource);
+        var result = new LocalVariable("result", new Register(null, "W0", 409), app.SystemTypes.SystemBooleanType);
+        var call = new Instruction(40, OpCode.Call, target, result, receiver);
+        instructions.Add(receiverMove);
+        instructions.Add(call);
+        instructions.Add(new Instruction(41, OpCode.Return, result));
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = [firstParameter, receiver, result, .. savedLocals];
+        caller.ParameterLocals = parameterLocals;
+        CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(caller);
+
+        foreach (var move in evidenceMoves.Append(receiverMove))
+        {
+            move.OpCode = OpCode.Nop;
+            move.SetOperands();
+        }
+        if (phi != null)
+        {
+            phi.OpCode = OpCode.Nop;
+            phi.SetOperands();
+        }
+
+        return new CallerSavedCallFixture(caller, call, receiver, firstParameter);
     }
 
     private static MethodAnalysisContext CreateFieldFixture(
@@ -300,4 +837,22 @@ public class CalleeSavedManagedReceiverRecoveryTests
         LocalVariable OriginalReceiver,
         LocalVariable FirstCandidate,
         LocalVariable Result);
+
+    private sealed record DirectUseFixture(
+        MethodAnalysisContext Caller,
+        Instruction Comparison,
+        LocalVariable Receiver,
+        LocalVariable FirstCandidate);
+
+    private sealed record ParameterUseFixture(
+        MethodAnalysisContext Caller,
+        Instruction Comparison,
+        LocalVariable Receiver,
+        LocalVariable FirstParameter);
+
+    private sealed record CallerSavedCallFixture(
+        MethodAnalysisContext Caller,
+        Instruction Call,
+        LocalVariable Receiver,
+        LocalVariable FirstParameter);
 }

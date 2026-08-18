@@ -915,6 +915,10 @@ public static class ListAddRecovery
            || left is Immediate leftImmediate
            && right is Immediate rightImmediate
            && leftImmediate.Value == rightImmediate.Value
+           || left is ArrayAccess leftArrayAccess
+           && right is ArrayAccess rightArrayAccess
+           && ReferenceEquals(leftArrayAccess.Array, rightArrayAccess.Array)
+           && AreEquivalentValue(leftArrayAccess.Index, rightArrayAccess.Index)
            || left is FieldReference leftField
            && right is FieldReference rightField
            && AreSameFieldRead(leftField, rightField)
@@ -2075,6 +2079,17 @@ public static class ListAddRecovery
             return true;
         }
 
+        // 中文注释：ArrayRecovery 会分别为快速数组写入和慢速扩容调用重建数组元素读取；
+        // 两个 ArrayAccess 实例即使引用身份不同，只要数组载体与索引表达完全相同，
+        // 就代表同一次业务元素读取。数组或索引任一漂移时仍保留原容量分支。
+        if (fastValue is ArrayAccess fastArrayAccess
+            && slowValue is ArrayAccess slowArrayAccess
+            && AreEquivalentValue(fastArrayAccess, slowArrayAccess))
+        {
+            publicValue = slowValue;
+            return true;
+        }
+
         if (fastValue is not MemoryOperand { IsConstant: true, Addend: > 0 } packed
             || slowValue is not HomogeneousFloatingAggregateArgument aggregate
             || !TryDecodePackedHfaConstant(appContext, packed, aggregate, out var decoded))
@@ -2276,7 +2291,7 @@ public static class ListAddRecovery
     /// 限定可跨调用重载的稳定源。局部量和立即数不代表可重读存储，保持失败关闭。
     /// </summary>
     private static bool IsStableCallClobberSource(IOperand source)
-        => source is FieldReference or MemoryOperand;
+        => source is FieldReference or MemoryOperand or ArrayLength;
 
     /// <summary>
     /// 比较调用前后的稳定读取身份；字段要求字段、接收者和偏移一致，内存槽要求基址、索引
@@ -2288,7 +2303,10 @@ public static class ListAddRecovery
            && AreSameFieldRead(leftField, rightField)
            || left is MemoryOperand leftMemory
            && right is MemoryOperand rightMemory
-           && AreSameMemoryOperand(leftMemory, rightMemory);
+           && AreSameMemoryOperand(leftMemory, rightMemory)
+           || left is ArrayLength leftLength
+           && right is ArrayLength rightLength
+           && ReferenceEquals(leftLength.Array, rightLength.Array);
 
     private static bool AreSameFieldRead(FieldReference left, FieldReference right)
         => ReferenceEquals(left.Field, right.Field)

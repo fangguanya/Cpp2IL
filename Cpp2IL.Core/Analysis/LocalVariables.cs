@@ -1499,6 +1499,138 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// 退 SSA 后恢复由布尔调用结果、零值边复制和 AND/OR/XOR 组成的完整布尔分量。
+    /// </summary>
+    public static bool ResolveFinalBooleanBitwiseCarrierTypes(MethodAnalysisContext method) =>
+        BindFinalBooleanBitwiseComponentTypes(
+            method.ControlFlowGraph!.Instructions,
+            method.AppContext.SystemTypes.SystemBooleanType);
+
+    internal static bool BindFinalBooleanBitwiseComponentTypes(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext booleanType)
+    {
+        var adjacency = new Dictionary<LocalVariable, HashSet<LocalVariable>>();
+        var bitwiseNodes = new HashSet<LocalVariable>();
+        var bitwiseDestinations = new HashSet<LocalVariable>();
+        var acceptedBitwise = new HashSet<Instruction>();
+
+        static void Connect(
+            IDictionary<LocalVariable, HashSet<LocalVariable>> graph,
+            LocalVariable left,
+            LocalVariable right)
+        {
+            if (!graph.TryGetValue(left, out var leftEdges))
+                graph[left] = leftEdges = [];
+            if (!graph.TryGetValue(right, out var rightEdges))
+                graph[right] = rightEdges = [];
+            leftEdges.Add(right);
+            rightEdges.Add(left);
+        }
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
+                && instruction.Operands.Count == 3
+                && instruction.Operands[0] is LocalVariable destination
+                && instruction.Operands.OfType<Immediate>().All(immediate => immediate.Value is 0 or 1))
+            {
+                var locals = instruction.Operands.OfType<LocalVariable>().Distinct().ToArray();
+                if (locals.Length < 2)
+                    continue;
+                acceptedBitwise.Add(instruction);
+                bitwiseDestinations.Add(destination);
+                foreach (var local in locals)
+                    bitwiseNodes.Add(local);
+                for (var index = 1; index < locals.Length; index++)
+                    Connect(adjacency, locals[0], locals[index]);
+                continue;
+            }
+
+            if (instruction is
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [LocalVariable moveDestination, LocalVariable moveSource],
+                })
+                Connect(adjacency, moveDestination, moveSource);
+        }
+
+        var definitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var visited = new HashSet<LocalVariable>();
+        var changed = false;
+        foreach (var root in bitwiseNodes)
+        {
+            if (!visited.Add(root))
+                continue;
+
+            var component = new HashSet<LocalVariable> { root };
+            var pending = new Queue<LocalVariable>();
+            pending.Enqueue(root);
+            while (pending.Count > 0)
+            {
+                var current = pending.Dequeue();
+                if (!adjacency.TryGetValue(current, out var neighbors))
+                    continue;
+                foreach (var neighbor in neighbors)
+                    if (component.Add(neighbor))
+                    {
+                        visited.Add(neighbor);
+                        pending.Enqueue(neighbor);
+                    }
+            }
+
+            if (!component.Overlaps(bitwiseNodes)
+                || component.Any(local => !IsReplaceableFinalBooleanCarrier(local.Type, booleanType))
+                || !component.Any(local =>
+                    GenericCallRebinder.TypesEquivalent(local.Type, booleanType)
+                    && !bitwiseDestinations.Contains(local))
+                || component.Any(local =>
+                    !GenericCallRebinder.TypesEquivalent(local.Type, booleanType)
+                    && !HasOnlyBooleanComponentDefinitions(
+                        local,
+                        component,
+                        definitions,
+                        acceptedBitwise)))
+                continue;
+
+            foreach (var local in component)
+                if (!GenericCallRebinder.TypesEquivalent(local.Type, booleanType))
+                {
+                    local.Type = booleanType;
+                    changed = true;
+                }
+        }
+
+        return changed;
+    }
+
+    private static bool HasOnlyBooleanComponentDefinitions(
+        LocalVariable local,
+        IReadOnlySet<LocalVariable> component,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
+        IReadOnlySet<Instruction> acceptedBitwise)
+    {
+        if (!definitions.TryGetValue(local, out var localDefinitions) || localDefinitions.Length == 0)
+            return false;
+
+        return localDefinitions.All(instruction =>
+            acceptedBitwise.Contains(instruction)
+            || instruction is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 or 1 }] }
+            || instruction is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
+            && component.Contains(source));
+    }
+
+    private static bool IsReplaceableFinalBooleanCarrier(
+        TypeAnalysisContext? type,
+        TypeAnalysisContext booleanType) =>
+        type == null
+        || GenericCallRebinder.TypesEquivalent(type, booleanType)
+        || type.FullName == "System.Object";
+
     private static bool IsReplaceableFinalCopyCarrier(
         TypeAnalysisContext? type,
         TypeAnalysisContext consensusType) =>

@@ -315,6 +315,83 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 快慢路径分别构造同一数组元素读取时恢复为公开Add调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var fixture = CreateFixture(app.SystemTypes.SystemObjectType);
+        var sourceArray = Local("sourceArray", app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        var index = Local("sourceIndex", app.SystemTypes.SystemInt32Type);
+        ReplaceElementValues(
+            fixture,
+            new ArrayAccess(sourceArray, index),
+            new ArrayAccess(sourceArray, index));
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var call = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(call.Operands[0], Is.InstanceOf<MethodAnalysisContext>());
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(call.Operands[2], Is.InstanceOf<ArrayAccess>());
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 数组元素读取使用两个同值立即数索引时仍恢复公开Add调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var fixture = CreateFixture(app.SystemTypes.SystemObjectType);
+        var sourceArray = Local("sourceArray", app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        ReplaceElementValues(
+            fixture,
+            new ArrayAccess(sourceArray, new Immediate(0)),
+            new ArrayAccess(sourceArray, new Immediate(0)));
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 快慢路径数组元素读取的数组载体不同时保留原容量分支()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var fixture = CreateFixture(app.SystemTypes.SystemObjectType);
+        var sourceArray = Local("sourceArray", app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        var otherArray = Local("otherArray", app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        var index = Local("sourceIndex", app.SystemTypes.SystemInt32Type);
+        ReplaceElementValues(
+            fixture,
+            new ArrayAccess(sourceArray, index),
+            new ArrayAccess(otherArray, index));
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 慢路径在扩容调用后重载同一字段载体时保留重载并恢复Add()
     {
@@ -336,6 +413,68 @@ public class ListAddRecoveryTests
             Assert.That(((MethodAnalysisContext)calls[0].Operands[0]).Name, Is.EqualTo("Add"));
             Assert.That(carrierReloads, Has.Count.EqualTo(2));
             Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 慢路径在扩容调用后重载同一数组长度时保留重载并恢复Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var carrier = AddSlowArrayLengthCarrierRefresh(fixture, mismatchArray: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var lengthReloads = fixture.Graph.Instructions.Where(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [var destination, ArrayLength] }
+            && ReferenceEquals(destination, carrier)).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(lengthReloads, Has.Count.EqualTo(2));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 数组长度的前后读取为不同对象实例时仍按同一数组载体闭合()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var carrier = AddSlowArrayLengthCarrierRefresh(fixture, mismatchArray: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [var destination, ArrayLength] }
+                && ReferenceEquals(destination, carrier)), Is.EqualTo(2));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 慢路径重载另一数组的长度时保留原容量控制流()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        AddSlowArrayLengthCarrierRefresh(fixture, mismatchArray: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
         });
     }
 
@@ -2808,6 +2947,33 @@ public class ListAddRecoveryTests
             new MemoryOperand(stackBase, null, mismatchOffset ? offset + 8 : offset)));
     }
 
+    private static LocalVariable AddSlowArrayLengthCarrierRefresh(Fixture fixture, bool mismatchArray)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var carrier = Local("arrayLengthCarrier", app.SystemTypes.SystemInt32Type);
+        var sourceArray = Local("sourceArray", app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        var otherArray = Local("otherArray", app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var head = fixture.Graph.Blocks.Single(block => block.Instructions.Any(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] }));
+        var itemsLoadIndex = head.Instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] });
+
+        // 中文注释：调用前后的 ArrayLength 故意使用不同对象实例，只共享可证明的数组载体。
+        head.Instructions.Insert(
+            itemsLoadIndex + 1,
+            new Instruction(3, OpCode.Move, carrier, new ArrayLength(sourceArray)));
+        var slowBlock = fixture.Graph.FindBlockByInstruction(slowCall)!;
+        slowBlock.Instructions.Add(new Instruction(
+            slowCall.Index + 1,
+            OpCode.Move,
+            carrier,
+            new ArrayLength(mismatchArray ? otherArray : sourceArray)));
+        return carrier;
+    }
+
     private static void SetImmediateValues(Fixture fixture, long fastValue, long slowValue)
     {
         var fastStore = fixture.Graph.Instructions.Single(instruction =>
@@ -2903,6 +3069,18 @@ public class ListAddRecoveryTests
             System.Reflection.MethodAttributes.Private,
             [genericParameter]);
         return new ConcreteGenericMethodAnalysisContext(addWithResize, [genericParameter], []);
+    }
+
+    private static void ReplaceElementValues(Fixture fixture, IOperand fastValue, IOperand slowValue)
+    {
+        // 中文注释：统一替换夹具的快速数组写入值与慢速扩容参数，避免各测试重复定位容量菱形。
+        var fastStore = fixture.Graph.Instructions.Single(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] });
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        fastStore.SetOperand(1, fastValue);
+        slowCall.SetOperand(2, slowValue);
     }
 
     private static LocalVariable Local(string name, TypeAnalysisContext type, string? registerName = null)

@@ -112,6 +112,73 @@ public class ErasedInstanceReceiverRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 同类型实例调用的未定义X0恢复为入口This()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("erasedX0", owner, 408);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 409);
+        var call = new Instruction(0, OpCode.Call, target, result, receiver);
+        Prepare(caller, call, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(call.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同类型实例调用的未定义X1保持红门()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = new LocalVariable("erasedX1", new Register(null, "X1", 408), owner);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 409);
+        var call = new Instruction(0, OpCode.Call, target, result, receiver);
+        Prepare(caller, call, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.Operands[2], Is.SameAs(receiver));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 异类型调用者的未定义X0禁止恢复为This()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var unrelated = Type("Unrelated", app.SystemTypes.SystemObjectType);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(unrelated, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("erasedX0", owner, 408);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 409);
+        var call = new Instruction(0, OpCode.Call, target, result, receiver);
+        Prepare(caller, call, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.Operands[2], Is.SameAs(receiver));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 已定型同类接收者的零和非零Phi恢复为入口This()
     {

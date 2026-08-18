@@ -22,12 +22,6 @@ public static class ReadOnlyScalarLiteralRecovery
         var binary = method.AppContext.Binary;
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction.OpCode is not (
-                    OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide)
-                || !TryResolveFloatingType(instruction, method.AppContext, out var floatingType, out var widthBits))
-                continue;
-
-            var changed = false;
             for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
             {
                 if (instruction.Operands[operandIndex] is not MemoryOperand
@@ -37,6 +31,14 @@ public static class ReadOnlyScalarLiteralRecovery
                         Scale: 0,
                         Addend: >= 0
                     } memory)
+                    continue;
+
+                if (!TryResolveFloatingType(
+                        instruction,
+                        operandIndex,
+                        method.AppContext,
+                        out var floatingType,
+                        out var widthBits))
                     continue;
 
                 var address = checked((ulong)memory.Addend);
@@ -53,11 +55,11 @@ public static class ReadOnlyScalarLiteralRecovery
                     continue;
 
                 instruction.SetOperand(operandIndex, literal);
-                changed = true;
+                if (instruction.OpCode is
+                        OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                    && instruction.Destination is LocalVariable moveDestination)
+                    moveDestination.Type = floatingType;
             }
-
-            if (changed && instruction.Destination is LocalVariable destination)
-                destination.Type = floatingType;
         }
     }
 
@@ -91,28 +93,68 @@ public static class ReadOnlyScalarLiteralRecovery
 
     private static bool TryResolveFloatingType(
         Instruction instruction,
+        int operandIndex,
         ApplicationAnalysisContext appContext,
         out TypeAnalysisContext floatingType,
         out int widthBits)
     {
-        var types = instruction.Operands
-            .OfType<LocalVariable>()
-            .Select(local => local.Type)
-            .Where(type => type?.FullName is "System.Single" or "System.Double")
-            .GroupBy(type => type!.FullName)
-            .Select(group => group.First())
-            .ToArray();
-        if (types.Length != 1)
+        TypeAnalysisContext? expectedType = null;
+        if (instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext called
+            && TryResolveCallParameterIndex(instruction, called, operandIndex, out var parameterIndex))
+        {
+            expectedType = called.Parameters[parameterIndex].ParameterType;
+        }
+        else if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, ..] }
+                 && operandIndex == 1)
+        {
+            expectedType = destination.Type;
+        }
+        else if (instruction is { OpCode: OpCode.Move, Operands: [FieldReference field, ..] }
+                 && operandIndex == 1)
+        {
+            expectedType = field.Field.FieldType;
+        }
+        else if (instruction.OpCode is
+                 OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide)
+        {
+            var types = instruction.Operands
+                .OfType<LocalVariable>()
+                .Select(local => local.Type)
+                .Where(type => type?.FullName is "System.Single" or "System.Double")
+                .DistinctBy(type => type!.FullName)
+                .ToArray();
+            if (types.Length == 1)
+                expectedType = types[0];
+        }
+
+        if (expectedType?.FullName is not ("System.Single" or "System.Double"))
         {
             floatingType = null!;
             widthBits = 0;
             return false;
         }
 
-        widthBits = types[0]!.FullName == "System.Single" ? 32 : 64;
+        widthBits = expectedType.FullName == "System.Single" ? 32 : 64;
         floatingType = widthBits == 32
             ? appContext.SystemTypes.SystemSingleType
             : appContext.SystemTypes.SystemDoubleType;
         return true;
+    }
+
+    /// <summary>
+    /// 根据 ISIL 调用操作数布局把当前操作数映射回托管形参。实例接收者和非 void
+    /// 调用的返回值槽位均不属于形参；越界、静态/实例布局不一致时保持未知。
+    /// </summary>
+    internal static bool TryResolveCallParameterIndex(
+        Instruction call,
+        MethodAnalysisContext called,
+        int operandIndex,
+        out int parameterIndex)
+    {
+        var firstParameter = (call.OpCode == OpCode.Call ? 2 : 1)
+                             + (called.IsStatic ? 0 : 1);
+        parameterIndex = operandIndex - firstParameter;
+        return parameterIndex >= 0 && parameterIndex < called.Parameters.Count;
     }
 }

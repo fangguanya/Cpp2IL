@@ -312,7 +312,7 @@ public static class MetadataResolver
     /// 沿SSA单一定义链解析绝对槽地址。Move复制继续追踪；Phi只有在全部输入都能证明为
     /// 同一绝对地址时才收敛，异址、缺失定义和循环链均保持未解析。
     /// </summary>
-    private static ulong? ResolveAbsoluteSlotAddress(
+    internal static ulong? ResolveAbsoluteSlotAddress(
         IOperand operand,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
         HashSet<LocalVariable> visited)

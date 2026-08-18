@@ -2661,6 +2661,96 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 退SSA布尔Or树从权威叶恢复全部对象载体()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var booleanType = app.SystemTypes.SystemBooleanType;
+        var seed = new LocalVariable("seed", new Register(null, "X0", 1), booleanType);
+        var left = new LocalVariable("left", new Register(null, "X20", 1), app.SystemTypes.SystemObjectType);
+        var right = new LocalVariable("right", new Register(null, "X21", 1), app.SystemTypes.SystemObjectType);
+        var combined = new LocalVariable("combined", new Register(null, "X8", 1), app.SystemTypes.SystemObjectType);
+        var result = new LocalVariable("result", new Register(null, "X9", 1), booleanType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, left, seed),
+            new(1, OpCode.Move, left, new Immediate(0)),
+            new(2, OpCode.Move, right, seed),
+            new(3, OpCode.Move, right, new Immediate(0)),
+            new(4, OpCode.Or, combined, left, right),
+            new(5, OpCode.Or, result, combined, seed),
+        };
+
+        var changed = LocalVariables.BindFinalBooleanBitwiseComponentTypes(instructions, booleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(left.Type, Is.SameAs(booleanType));
+            Assert.That(right.Type, Is.SameAs(booleanType));
+            Assert.That(combined.Type, Is.SameAs(booleanType));
+            Assert.That(result.Type, Is.SameAs(booleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 多级边复制与Xor一共同组成的布尔分量保持闭合()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var booleanType = app.SystemTypes.SystemBooleanType;
+        var seed = new LocalVariable("seed", new Register(null, "X0", 1), booleanType);
+        var carrier = new LocalVariable("carrier", new Register(null, "X20", 1), app.SystemTypes.SystemObjectType);
+        var alias = new LocalVariable("alias", new Register(null, "X21", 1), app.SystemTypes.SystemObjectType);
+        var negated = new LocalVariable("negated", new Register(null, "X8", 1), app.SystemTypes.SystemObjectType);
+        var result = new LocalVariable("result", new Register(null, "X9", 1), booleanType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, seed),
+            new(1, OpCode.Move, carrier, new Immediate(0)),
+            new(2, OpCode.Move, alias, carrier),
+            new(3, OpCode.Xor, negated, alias, new Immediate(1)),
+            new(4, OpCode.Or, result, negated, seed),
+        };
+
+        var changed = LocalVariables.BindFinalBooleanBitwiseComponentTypes(instructions, booleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(carrier.Type, Is.SameAs(booleanType));
+            Assert.That(alias.Type, Is.SameAs(booleanType));
+            Assert.That(negated.Type, Is.SameAs(booleanType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 布尔Or分量混入引用定义时保持对象与引用类型不变()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var booleanType = app.SystemTypes.SystemBooleanType;
+        var seed = new LocalVariable("seed", new Register(null, "X0", 1), booleanType);
+        var reference = new LocalVariable("reference", new Register(null, "X1", 1), app.SystemTypes.SystemStringType);
+        var polluted = new LocalVariable("polluted", new Register(null, "X20", 1), app.SystemTypes.SystemObjectType);
+        var result = new LocalVariable("result", new Register(null, "X8", 1), booleanType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, polluted, reference),
+            new(1, OpCode.Or, result, polluted, seed),
+        };
+
+        var changed = LocalVariables.BindFinalBooleanBitwiseComponentTypes(instructions, booleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(polluted.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+            Assert.That(reference.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 运行时类布局读取参与移位时恢复原生整数结果()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
