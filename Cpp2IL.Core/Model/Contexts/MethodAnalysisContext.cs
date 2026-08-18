@@ -420,6 +420,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 再一次性裁除元数据与类初始化保护区，避免对同一 CFG 做重复保护区扫描。
         MetadataInitGuardRemover.Run(this);
 
+        // 中文注释：post-27 第一层绝对槽保存元数据表基址，第二层读取才是 Il2CppClass*；
+        // 必须在字段不动点前只改写第二层，才能继续闭合 static_fields 与单例字段链。
+        MetadataResolver.ResolvePost27TypeLoads(this, initializedRuntimeMetadataSlots);
         LocalVariables.ResolveTypesAndFields(this);
         // 初始化保护和注入异常边已经裁除，字符串目标类型也已收敛；此时闭合post-27
         // 二层字符串槽，既保留第一层地址载体证据，也避免把其他元数据指针误写为字符串。
