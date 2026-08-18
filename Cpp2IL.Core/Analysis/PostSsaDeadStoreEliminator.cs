@@ -16,7 +16,7 @@ public static class PostSsaDeadStoreEliminator
         var liveIn = graph.Blocks.ToDictionary(block => block, _ => new HashSet<LocalVariable>());
         var liveOut = graph.Blocks.ToDictionary(block => block, _ => new HashSet<LocalVariable>());
         var pending = new Queue<Block>(graph.Blocks);
-        var queued = graph.Blocks.ToHashSet();
+        var queued = new HashSet<Block>(graph.Blocks);
 
         // 中文注释：使用前驱工作队列求解单调活跃性方程；每个变化只通知真实前驱，
         // 不对整张方法图执行固定次数的重复扫描。
@@ -72,7 +72,7 @@ public static class PostSsaDeadStoreEliminator
     /// 给定块出口活跃集计算入口活跃集。未被后续读取的纯局部定义不读取其源操作数，
     /// 因而同一逆向传递同时完成死写级联，不需要额外的删除后重算。
     /// </summary>
-    private static HashSet<LocalVariable> Transfer(Block block, IReadOnlySet<LocalVariable> liveOut)
+    private static HashSet<LocalVariable> Transfer(Block block, IReadOnlyCollection<LocalVariable> liveOut)
     {
         var live = new HashSet<LocalVariable>(liveOut);
         for (var index = block.Instructions.Count - 1; index >= 0; index--)
