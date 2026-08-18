@@ -1061,7 +1061,11 @@ public static class MetadataResolver
         var changed = false;
 
         var loads = new Dictionary<LocalVariable, MemoryOperand>();
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var registerDefinitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => ((LocalVariable)instruction.Destination!).Register)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode == OpCode.Move
                 && instruction.Operands[0] is LocalVariable destination
@@ -1072,14 +1076,36 @@ public static class MetadataResolver
         foreach (var block in method.ControlFlowGraph.Blocks)
         {
             // 尾调用重写会在块末追加Return，使用快照避免枚举期间修改集合。
-            foreach (var instruction in block.Instructions.ToArray())
+            var blockInstructions = block.Instructions.ToArray();
+            for (var instructionPosition = 0; instructionPosition < blockInstructions.Length; instructionPosition++)
             {
+                var instruction = blockInstructions[instructionPosition];
                 if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                     continue;
 
                 if (SlotLoad(instruction.Operands[0]) is not { } target
-                    || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
+                    || target.Base is not LocalVariable klassLocal)
                     continue;
+
+                var receiverRejection = string.Empty;
+                var receiverType = klassLocal.Type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented }
+                    ? represented
+                    : ResolveLinearPredecessorVTableReceiverType(
+                        method,
+                        block,
+                        instructionPosition,
+                        klassLocal,
+                        registerDefinitions,
+                        out receiverRejection);
+                if (receiverType == null)
+                {
+                    Logger.VerboseNewline(
+                        $"普通虚调用接收者未闭合：method={method.Name}，instruction={instruction.Index}，" +
+                        $"block={block.ID}，predecessors={block.Predecessors.Count}，klass={klassLocal}，" +
+                        $"reason={receiverRejection}",
+                        nameof(MetadataResolver));
+                    continue;
+                }
 
                 var offset = target.Addend - vtableOffset;
                 if (offset < 0 || offset % invokeDataSize != 0)
@@ -1088,6 +1114,11 @@ public static class MetadataResolver
                 var slot = (int)(offset / invokeDataSize);
                 if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
                     continue;
+
+                Logger.VerboseNewline(
+                    $"普通虚调用闭合：method={method.Name}，instruction={instruction.Index}，" +
+                    $"receiver={receiverType.FullName}，slot={slot}，target={resolved.DeclaringType?.FullName}.{resolved.Name}",
+                    nameof(MetadataResolver));
 
                 var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
 
@@ -1114,6 +1145,301 @@ public static class MetadataResolver
             LocalVariable local when loads.TryGetValue(local, out var load) => load,
             _ => null
         };
+    }
+
+    /// <summary>
+    /// ARM64常把多个托管接收者复用到同一X0局部，整体类型传播只能保守地收敛到System.Object。
+    /// 普通虚调用仍可从“具体字段读取 → 对象头klass读取 → vtable调用”的前驱闭包
+    /// 精确恢复接收者类型。只接受klass零偏移读取和最近的确定引用类型赋值；多前驱必须
+    /// 全部分支闭合到同一具体类型，否则保持未解析。
+    /// </summary>
+    internal static TypeAnalysisContext? ResolveLinearPredecessorVTableReceiverType(
+        MethodAnalysisContext method,
+        Block dispatchBlock,
+        int dispatchPosition,
+        LocalVariable klassLocal,
+        out string rejection)
+    {
+        var reachable = new HashSet<Block>();
+        var pending = new Stack<Block>();
+        pending.Push(dispatchBlock);
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (!reachable.Add(block))
+                continue;
+            foreach (var predecessor in block.Predecessors)
+                pending.Push(predecessor);
+        }
+
+        var registerDefinitions = reachable
+            .SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => ((LocalVariable)instruction.Destination!).Register)
+            .ToDictionary(group => group.Key, group => group.Take(2).ToArray());
+        return ResolveLinearPredecessorVTableReceiverType(
+            method,
+            dispatchBlock,
+            dispatchPosition,
+            klassLocal,
+            registerDefinitions,
+            out rejection);
+    }
+
+    private static TypeAnalysisContext? ResolveLinearPredecessorVTableReceiverType(
+        MethodAnalysisContext method,
+        Block dispatchBlock,
+        int dispatchPosition,
+        LocalVariable klassLocal,
+        IReadOnlyDictionary<Register, Instruction[]> registerDefinitions,
+        out string rejection)
+    {
+        rejection = "分派位置不在基本块内";
+        if (dispatchPosition <= 0 || dispatchPosition > dispatchBlock.Instructions.Count)
+            return null;
+
+        rejection = "分派前没有对象头klass零偏移读取";
+        LocalVariable? receiver = null;
+        var klassLoadPosition = -1;
+        for (var position = dispatchPosition - 1; position >= 0; position--)
+        {
+            if (dispatchBlock.Instructions[position] is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [LocalVariable destination, MemoryOperand
+                    {
+                        Base: LocalVariable candidateReceiver,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0,
+                    }],
+                }
+                || !SameLocal(destination, klassLocal))
+                continue;
+
+            receiver = candidateReceiver;
+            klassLoadPosition = position;
+            break;
+        }
+
+        if (receiver == null)
+            return null;
+
+        var localResolution = ResolveLatestReceiverAssignment(
+            dispatchBlock.Instructions,
+            klassLoadPosition,
+            receiver);
+        if (localResolution.Found)
+        {
+            rejection = localResolution.Reason;
+            return localResolution.Type;
+        }
+
+        var incoming = ResolveIncomingPredecessors(dispatchBlock, receiver);
+        rejection = incoming.Reason;
+        return incoming.Type;
+
+        ReceiverResolution ResolveIncomingPredecessors(Block block, LocalVariable targetReceiver)
+        {
+            // 逆向遍历到每条路径上的首个接收者赋值即停止。这样得到的正是到达分派点的
+            // 最近定义集合；共享循环块只访问一次，复杂度为 O(基本块数 + 控制流边数)。
+            var visited = new HashSet<Block>();
+            var pending = new Stack<Block>(block.Predecessors);
+            var reachingTypes = new List<TypeAnalysisContext>();
+            var reachedEntryWithoutDefinition = false;
+            var unresolvedAssignment = false;
+            var evidence = new List<string>();
+
+            while (pending.Count > 0)
+            {
+                var predecessor = pending.Pop();
+                if (!visited.Add(predecessor))
+                    continue;
+
+                var local = ResolveLatestReceiverAssignment(
+                    predecessor.Instructions,
+                    predecessor.Instructions.Count,
+                    targetReceiver);
+                if (local.Found)
+                {
+                    if (local.Type == null)
+                        unresolvedAssignment = true;
+                    else
+                        reachingTypes.Add(local.Type);
+                    if (evidence.Count < 8)
+                        evidence.Add($"块{predecessor.ID}=定义:{local.Type?.FullName ?? local.Reason}");
+                    continue;
+                }
+
+                if (predecessor.Predecessors.Count == 0)
+                {
+                    reachedEntryWithoutDefinition = true;
+                    if (evidence.Count < 8)
+                        evidence.Add($"块{predecessor.ID}=入口无定义");
+                    continue;
+                }
+
+                foreach (var earlier in predecessor.Predecessors)
+                    pending.Push(earlier);
+            }
+
+            if (unresolvedAssignment)
+                return new ReceiverResolution(
+                    true,
+                    null,
+                    $"前驱最近赋值存在未定型来源；证据={string.Join(";", evidence)}");
+            if (reachedEntryWithoutDefinition || reachingTypes.Count == 0)
+                return new ReceiverResolution(
+                    false,
+                    null,
+                    $"至少一条入口路径没有接收者定义；证据={string.Join(";", evidence)}");
+
+            var consensus = reachingTypes[0];
+            var distinctTypes = reachingTypes
+                .Where(type => !GenericCallRebinder.TypesEquivalent(consensus, type))
+                .Prepend(consensus)
+                .Select(type => type.FullName)
+                .Distinct(StringComparer.Ordinal)
+                .Take(4)
+                .ToArray();
+            if (distinctTypes.Length != 1)
+                return new ReceiverResolution(
+                    true,
+                    null,
+                    $"前驱最近赋值类型不一致：{string.Join(",", distinctTypes)}");
+
+            return new ReceiverResolution(true, consensus, string.Empty);
+        }
+
+        ReceiverResolution ResolveLatestReceiverAssignment(
+            IReadOnlyList<Instruction> instructions,
+            int beforePosition,
+            LocalVariable receiver)
+        {
+            for (var position = beforePosition - 1; position >= 0; position--)
+            {
+                if (instructions[position].Destination is not LocalVariable destination
+                    || !SameLocal(destination, receiver))
+                    continue;
+
+                if (instructions[position] is
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [_, var source],
+                })
+                {
+                    var candidate = ResolvePreciseSourceType(source, []);
+                    var accepted = candidate is { IsValueType: false }
+                                   && candidate.FullName != "System.Object"
+                        ? candidate
+                        : null;
+                    return new ReceiverResolution(
+                        true,
+                        accepted,
+                        accepted == null ? $"最近接收者赋值没有确定引用类型：{source}" : string.Empty);
+                }
+
+                if (instructions[position] is { OpCode: OpCode.Phi, Operands.Count: >= 3 } phi)
+                {
+                    var inputTypes = phi.Operands
+                        .Skip(1)
+                        .Select(input => ResolvePreciseSourceType(input, []))
+                        .Where(type => type is { IsValueType: false }
+                                       && type.FullName != "System.Object")
+                        .Cast<TypeAnalysisContext>()
+                        .ToArray();
+                    if (inputTypes.Length != phi.Operands.Count - 1)
+                        return new ReceiverResolution(
+                            true,
+                            null,
+                            "接收者Phi至少有一个输入没有确定引用类型");
+
+                    var consensus = inputTypes[0];
+                    if (inputTypes.Skip(1).Any(type =>
+                            !GenericCallRebinder.TypesEquivalent(consensus, type)))
+                        return new ReceiverResolution(
+                            true,
+                            null,
+                            $"接收者Phi输入类型不一致：{string.Join(",", inputTypes.Select(type => type.FullName).Distinct().Take(4))}");
+
+                    return new ReceiverResolution(true, consensus, string.Empty);
+                }
+            }
+
+            return new ReceiverResolution(false, null, "当前块没有接收者赋值");
+        }
+
+        TypeAnalysisContext? ResolvePreciseSourceType(IOperand source, HashSet<Register> visited)
+        {
+            switch (source)
+            {
+                case FieldReference field:
+                    return field.Field.FieldType;
+                case MemoryOperand memory:
+                    return ResolveProvenCurrentInstanceFieldType(method, memory);
+                case LocalVariable local when visited.Add(local.Register):
+                    if (registerDefinitions.TryGetValue(local.Register, out var definitions))
+                    {
+                        var originTypes = definitions
+                            .Where(definition => definition is
+                            {
+                                OpCode: OpCode.Move,
+                                Operands: [_, _],
+                            })
+                            .Select(definition => ResolvePreciseSourceType(
+                                definition.Operands[1],
+                                new HashSet<Register>(visited)))
+                            .Where(type => type is { IsValueType: false }
+                                           && type.FullName != "System.Object")
+                            .Cast<TypeAnalysisContext>()
+                            .ToArray();
+                        if (originTypes.Length > 0
+                            && originTypes.Skip(1).All(type =>
+                                GenericCallRebinder.TypesEquivalent(originTypes[0], type)))
+                            return originTypes[0];
+                    }
+                    return local.Type;
+                default:
+                    return null;
+            }
+        }
+
+        static bool SameLocal(LocalVariable left, LocalVariable right) =>
+            ReferenceEquals(left, right) || left.Register == right.Register;
+    }
+
+    private readonly record struct ReceiverResolution(
+        bool Found,
+        TypeAnalysisContext? Type,
+        string Reason);
+
+    /// <summary>
+    /// 解析保存寄存器中的当前实例字段。只有 SSA 冻结证据明确证明字段基址来自 this，且偏移
+    /// 在当前声明类型层次中唯一时才返回字段类型；这避免把任意 X19-X29 对象误认作当前实例。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveProvenCurrentInstanceFieldType(
+        MethodAnalysisContext method,
+        MemoryOperand memory)
+    {
+        if (memory is not
+            {
+                Base: LocalVariable fieldOwner,
+                Index: null,
+                Scale: 0,
+            }
+            || !method.CalleeSavedSsaCopyEvidence.Any(evidence =>
+                evidence.Destination.Register == fieldOwner.Register
+                && evidence.Source.IsThis))
+            return null;
+
+        if (method.DeclaringType is not { } owner)
+            return null;
+
+        var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
+        var field = genericOwner != null
+            ? GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, memory.Addend)
+            : FindUniqueRuntimeFieldAtOffset(owner, isStatic: false, memory.Addend);
+        return field?.FieldType;
     }
 
     /// <summary>

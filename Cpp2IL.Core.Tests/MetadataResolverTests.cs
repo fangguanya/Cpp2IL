@@ -280,6 +280,251 @@ public class MetadataResolverTests
 
     [Test]
     [Category("基本功能")]
+    public void 对象寄存器复用时从最近字段赋值恢复虚表接收者类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var arrayListType = assembly.GetTypeByFullName("System.Collections.ArrayList")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "VirtualReceiverOwner",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public);
+        var field = owner.InjectFieldContext(
+            "GiftArray",
+            arrayListType,
+            System.Reflection.FieldAttributes.Private);
+        field.OverrideOffset = 0x178;
+        var method = owner.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var thisLocal = new LocalVariable("this", new Register(null, "X0"), owner) { IsThis = true };
+        var savedThis = new LocalVariable(
+            "savedThis",
+            new Register(null, "X19", 1),
+            app.SystemTypes.SystemObjectType);
+        method.CalleeSavedSsaCopyEvidence.Add((savedThis, thisLocal, 0));
+        var reusedReceiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 281),
+            app.SystemTypes.SystemObjectType);
+        var assignedReceiver = new LocalVariable(
+            "assignedReceiver",
+            reusedReceiver.Register,
+            app.SystemTypes.SystemObjectType);
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var predecessor = new Block
+        {
+            Instructions =
+            {
+                new Instruction(0, OpCode.Move, assignedReceiver, new MemoryOperand(savedThis, addend: 0x178)),
+            },
+        };
+        var dispatchBlock = new Block
+        {
+            Instructions =
+            {
+                new Instruction(1, OpCode.Move, klass, new MemoryOperand(reusedReceiver)),
+                new Instruction(2, OpCode.IndirectCall, new MemoryOperand(klass, addend: 0x388)),
+            },
+            Predecessors = { predecessor },
+        };
+        predecessor.Successors.Add(dispatchBlock);
+
+        var resolved = MetadataResolver.ResolveLinearPredecessorVTableReceiverType(
+            method,
+            dispatchBlock,
+            1,
+            klass,
+            out _);
+
+        Assert.That(resolved, Is.SameAs(arrayListType));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 多前驱中的基类局部沿唯一SSA定义恢复为同一具体字段类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var arrayListType = assembly.GetTypeByFullName("System.Collections.ArrayList")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "VirtualReceiverConsensusOwner",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public);
+        var field = owner.InjectFieldContext(
+            "GiftArray",
+            arrayListType,
+            System.Reflection.FieldAttributes.Private);
+        field.OverrideOffset = 0x178;
+        var method = owner.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var thisLocal = new LocalVariable("this", new Register(null, "X0"), owner) { IsThis = true };
+        var savedThis = new LocalVariable(
+            "savedThis",
+            new Register(null, "X19", 1),
+            app.SystemTypes.SystemObjectType);
+        method.CalleeSavedSsaCopyEvidence.Add((savedThis, thisLocal, 0));
+
+        var baseTypedOrigin = new LocalVariable(
+            "baseTypedOrigin",
+            new Register(null, "X0", 19),
+            app.SystemTypes.SystemObjectType);
+        var firstPhiInput = new LocalVariable(
+            "firstPhiInput",
+            new Register(null, "X0", 207),
+            app.SystemTypes.SystemObjectType);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 281),
+            app.SystemTypes.SystemObjectType);
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var originBlock = new Block
+        {
+            Instructions =
+            {
+                new Instruction(0, OpCode.Move, baseTypedOrigin, new MemoryOperand(savedThis, addend: 0x178)),
+            },
+        };
+        var firstPredecessor = new Block
+        {
+            Instructions =
+            {
+                new Instruction(1, OpCode.Move, firstPhiInput, new MemoryOperand(savedThis, addend: 0x178)),
+            },
+            Predecessors = { originBlock },
+        };
+        var secondPredecessor = new Block
+        {
+            Instructions = { new Instruction(2, OpCode.Nop) },
+            Predecessors = { originBlock },
+        };
+        var dispatchBlock = new Block
+        {
+            Instructions =
+            {
+                new Instruction(3, OpCode.Phi, receiver, firstPhiInput, baseTypedOrigin),
+                new Instruction(4, OpCode.Move, klass, new MemoryOperand(receiver)),
+                new Instruction(5, OpCode.IndirectCall, new MemoryOperand(klass, addend: 0x388)),
+            },
+            Predecessors = { firstPredecessor, secondPredecessor },
+        };
+        originBlock.Successors.Add(firstPredecessor);
+        originBlock.Successors.Add(secondPredecessor);
+        firstPredecessor.Successors.Add(dispatchBlock);
+        secondPredecessor.Successors.Add(dispatchBlock);
+
+        var resolved = MetadataResolver.ResolveLinearPredecessorVTableReceiverType(
+            method,
+            dispatchBlock,
+            2,
+            klass,
+            out _);
+
+        Assert.That(resolved, Is.SameAs(arrayListType));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Klass读取之后再次复用接收者不改变已捕获虚表类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "VirtualReceiverBoundaryOwner",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public);
+        var method = owner.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var receiverType = app.SystemTypes.SystemStringType;
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), app.SystemTypes.SystemObjectType);
+        var later = new LocalVariable("later", new Register(null, "X1"), app.SystemTypes.SystemObjectType);
+        var typedSource = new LocalVariable("typedSource", new Register(null, "X20"), receiverType);
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var dispatchBlock = new Block
+        {
+            Instructions =
+            {
+                new Instruction(0, OpCode.Move, receiver, typedSource),
+                new Instruction(1, OpCode.Move, klass, new MemoryOperand(receiver)),
+                new Instruction(2, OpCode.Move, receiver, later),
+                new Instruction(3, OpCode.IndirectCall, new MemoryOperand(klass, addend: 0x138)),
+            },
+        };
+
+        var resolved = MetadataResolver.ResolveLinearPredecessorVTableReceiverType(
+            method,
+            dispatchBlock,
+            3,
+            klass,
+            out _);
+
+        Assert.That(resolved, Is.SameAs(receiverType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 多前驱歧义不推断虚表接收者类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "VirtualReceiverAmbiguousOwner",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public);
+        var method = owner.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), app.SystemTypes.SystemObjectType);
+        var firstReceiver = new LocalVariable("firstReceiver", receiver.Register, app.SystemTypes.SystemObjectType);
+        var secondReceiver = new LocalVariable("secondReceiver", receiver.Register, app.SystemTypes.SystemObjectType);
+        var firstSource = new LocalVariable("firstSource", new Register(null, "X20"), app.SystemTypes.SystemStringType);
+        var arrayListType = assembly.GetTypeByFullName("System.Collections.ArrayList")!;
+        var secondSource = new LocalVariable("secondSource", new Register(null, "X21"), arrayListType);
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var firstPredecessor = new Block
+        {
+            Instructions = { new Instruction(0, OpCode.Move, firstReceiver, firstSource) },
+        };
+        var secondPredecessor = new Block
+        {
+            Instructions = { new Instruction(0, OpCode.Move, secondReceiver, secondSource) },
+        };
+        var dispatchBlock = new Block
+        {
+            Instructions =
+            {
+                new Instruction(1, OpCode.Move, klass, new MemoryOperand(receiver)),
+                new Instruction(2, OpCode.IndirectCall, new MemoryOperand(klass, addend: 0x138)),
+            },
+            Predecessors = { firstPredecessor, secondPredecessor },
+        };
+
+        var resolved = MetadataResolver.ResolveLinearPredecessorVTableReceiverType(
+            method,
+            dispatchBlock,
+            1,
+            klass,
+            out _);
+
+        Assert.That(resolved, Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 字符串槽地址Phi后的公共解引用恢复为字符串值Phi()
     {
         var first = new LocalVariable("first", new Register(null, "X8", 1));
