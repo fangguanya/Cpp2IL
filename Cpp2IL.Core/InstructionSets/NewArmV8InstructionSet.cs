@@ -799,6 +799,32 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    internal static bool TryDecodeDisassembledUnsignedHalfwordMoveToGeneral(
+        Arm64Mnemonic mnemonic,
+        uint machineCode,
+        out int generalRegister,
+        out int vectorRegister,
+        out int laneIndex)
+    {
+        // Disarm新版本会把UMOV识别为正式助记符；旧版本则可能归入INVALID或UNIMPLEMENTED。
+        // 三种入口必须共用同一份机器码解码逻辑，避免分派层与位域语义产生重复实现。
+        if (mnemonic is not Arm64Mnemonic.UMOV
+            and not Arm64Mnemonic.INVALID
+            and not Arm64Mnemonic.UNIMPLEMENTED)
+        {
+            generalRegister = 0;
+            vectorRegister = 0;
+            laneIndex = 0;
+            return false;
+        }
+
+        return TryDecodeUnsignedHalfwordMoveToGeneral(
+            machineCode,
+            out generalRegister,
+            out vectorRegister,
+            out laneIndex);
+    }
+
     internal static bool TryDecodePackedHalfwordPredicatePattern(
         ReadOnlySpan<uint> machineCodes,
         out Arm64PackedHalfwordPredicatePattern pattern)
@@ -3468,11 +3494,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 AddInteger(address, OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
+            case Arm64Mnemonic.UMOV:
             case Arm64Mnemonic.INVALID:
             case Arm64Mnemonic.UNIMPLEMENTED:
                 {
                     var machineCode = ReadMachineCodeAtAddress(context, address);
-                    if (TryDecodeUnsignedHalfwordMoveToGeneral(
+                    if (TryDecodeDisassembledUnsignedHalfwordMoveToGeneral(
+                            instruction.Mnemonic,
                             machineCode,
                             out var generalRegister,
                             out var vectorRegister,

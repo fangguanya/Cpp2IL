@@ -2039,6 +2039,30 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void DisassembledUmovUsesUnsignedHalfwordRecoveryRoute()
+    {
+        const uint machineCode = 0x0E063C08u;
+        var instruction = DecodeSingleInstruction(BitConverter.GetBytes(machineCode), 0x024B4C7C);
+
+        var decoded = NewArmV8InstructionSet.TryDecodeDisassembledUnsignedHalfwordMoveToGeneral(
+            instruction.Mnemonic,
+            machineCode,
+            out var generalRegister,
+            out var vectorRegister,
+            out var laneIndex);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(instruction.Mnemonic, Is.EqualTo(Arm64Mnemonic.UMOV));
+            Assert.That(decoded, Is.True);
+            Assert.That(generalRegister, Is.EqualTo(8));
+            Assert.That(vectorRegister, Is.Zero);
+            Assert.That(laneIndex, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void UnsignedHalfwordMoveAcceptsHighestPackedLane()
     {
@@ -2059,6 +2083,20 @@ public class NewArmV8InstructionSetTests
         Assert.That(
             NewArmV8InstructionSet.TryDecodeUnsignedHalfwordMoveToGeneral(
                 0x0E123C00u,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void UnsignedHalfwordMoveRejectsUnrelatedRecognizedMnemonic()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeDisassembledUnsignedHalfwordMoveToGeneral(
+                Arm64Mnemonic.MOV,
+                0x0E063C08u,
                 out _,
                 out _,
                 out _),
