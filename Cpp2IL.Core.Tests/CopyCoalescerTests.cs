@@ -81,6 +81,39 @@ public class CopyCoalescerTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 实例参数与后续同槽数组结果保持独立()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var thisLocal = Local("this", appContext.SystemTypes.SystemObjectType, 0);
+        thisLocal.IsThis = true;
+        var reusedResult = new LocalVariable("arrayResult", new Register(0, "this"));
+        var copy = new Instruction(-1, OpCode.Move, reusedResult, thisLocal);
+        var allocation = new Instruction(
+            1,
+            OpCode.NewArr,
+            reusedResult,
+            appContext.SystemTypes.SystemStringType.MakeSzArrayType(),
+            new Immediate(10));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            copy,
+            allocation,
+            new(2, OpCode.Return),
+        });
+
+        CopyCoalescer.Run(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(allocation.Operands[0], Is.SameAs(reusedResult));
+            Assert.That(allocation.Operands[0], Is.Not.SameAs(thisLocal));
+            Assert.That(thisLocal.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 退SSA生成的Enumerator到单精度伪复制被删除()
     {

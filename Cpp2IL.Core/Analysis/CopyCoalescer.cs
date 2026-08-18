@@ -38,7 +38,12 @@ public static class CopyCoalescer
                 var a = groups.Find(group[0]);
                 var b = groups.Find(group[i]);
 
-                if (a == b || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
+                // this 是 CIL 参数而不是可复用的物理寄存器槽。ARM64 在把实例保存到 X19 后
+                // 会立即复用 X0 承载数组等调用结果；若与未定型结果合并，后续数组恢复会把
+                // this 改写成数组局部，并把数组元素存储误解析为状态机字段写入。
+                if (a.IsThis || b.IsThis
+                    || a == b
+                    || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
                     continue;
 
                 groups.Union(a, b);
@@ -49,6 +54,11 @@ public static class CopyCoalescer
         {
             var a = groups.Find(destination);
             var b = groups.Find(source);
+
+            // this 的参数身份必须贯穿整个方法；即使活跃区间不重叠，也不得把后续 X0
+            // 返回值并入 this，否则 CIL 固定参数类型会被后期结果类型覆盖。
+            if (a.IsThis || b.IsThis)
+                continue;
 
             // 两个独立构造的具体泛型上下文可能不是同一对象，但只要结构化类型一致，
             // 副本合并就不需要任何转换；不同具体泛型仍保持独立。
