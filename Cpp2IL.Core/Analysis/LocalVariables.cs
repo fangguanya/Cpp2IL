@@ -1368,6 +1368,20 @@ public static class LocalVariables
     }
 
     /// <summary>
+    /// 退 SSA 与集合恢复会在主类型不动点之后引入新的复制结果，浮点源类型也可能直到
+    /// 字段和字面量恢复后才落定。这里仅重放既有浮点算术规则，使结果与唯一的
+    /// Single/Double 源证据一致，不重新执行字段、调用或控制流分析。
+    /// </summary>
+    public static bool ResolveFinalFloatingArithmeticCarrierTypes(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide)
+                changed |= BindFloatingArithmeticTypes(instruction, method.AppContext);
+        return changed;
+    }
+
+    /// <summary>
     /// 退SSA与复制合并会引入新的边复制，并把同一物理寄存器的多个控制流值汇合到一个局部量。
     /// 这里仅使用已定型比较操作数和ARM64指令携带的精确整数位宽恢复最终标量载体；引用、地址、
     /// 运行时元数据和没有位宽证据的运算均保持原类型。
@@ -1395,10 +1409,58 @@ public static class LocalVariables
     public static bool ResolveRecoveredLengthComparisonCarrierTypes(MethodAnalysisContext method)
     {
         var changed = false;
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var instructions = method.ControlFlowGraph!.Instructions;
+
+        // 中文注释：数组长度在 CIL 中天然产生 native unsigned，但普通 Count/Length 属性产生 Int32。
+        // ARM64 数组循环常用 X 寄存器承载索引；若长度复制随后与 nint/nuint 比较，则长度局部必须
+        // 保持同一原生整数表示，否则 ldlen 的值会被写入 object 或与原生索引形成非法栈合并。
+        foreach (var instruction in instructions)
+            changed |= BindRecoveredLengthMoveCarrierType(instruction, instructions, method.AppContext);
+
+        foreach (var instruction in instructions)
             changed |= BindRecoveredLengthComparisonOperandTypes(instruction, method.AppContext);
         return changed;
     }
+
+    internal static bool BindRecoveredLengthMoveCarrierType(
+        Instruction instruction,
+        IReadOnlyList<Instruction> instructions,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable destination, var source],
+            }
+            || !IsRecoveredLengthOperand(source)
+            || destination.Type?.FullName is not (null or "System.Object" or "System.Boolean"))
+            return false;
+
+        var comparisonTypes = instructions
+            .Where(candidate => candidate.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned
+                && candidate.Operands.Count == 3
+                && candidate.Operands.Skip(1).Contains(destination))
+            .SelectMany(candidate => candidate.Operands.Skip(1))
+            .Where(operand => !ReferenceEquals(operand, destination))
+            .OfType<LocalVariable>()
+            .Select(local => local.Type)
+            .Where(IsLengthCarrierType)
+            .Cast<TypeAnalysisContext>()
+            .GroupBy(type => type.FullName, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+
+        // 中文注释：冲突的比较宽度不做猜测；没有外部宽度证据时使用托管 Count/Length 的 Int32。
+        if (comparisonTypes.Length > 1)
+            return false;
+        var targetType = comparisonTypes.Length == 1
+            ? comparisonTypes[0]
+            : appContext.SystemTypes.SystemInt32Type;
+        return SetExactType(destination, targetType);
+    }
+
+    private static bool IsLengthCarrierType(TypeAnalysisContext? type) =>
+        IsFinalScalarType(type) || type?.FullName is "System.IntPtr" or "System.UIntPtr";
 
     /// <summary>
     /// 私有字段在布局恢复后可能被重新物化为公开属性getter；仅消费这些新产生的精确标量结果，
@@ -1506,6 +1568,59 @@ public static class LocalVariables
         BindFinalBooleanBitwiseComponentTypes(
             method.ControlFlowGraph!.Instructions,
             method.AppContext.SystemTypes.SystemBooleanType);
+
+    /// <summary>
+    /// 退 SSA 后，只有 0/1 两个定义且仅被相等比较消费的局部表示控制流布尔状态。
+    /// 该规则不接受算术、字段、调用或引用定义，因此不会把普通计数器或对象槽猜成布尔值。
+    /// </summary>
+    public static bool ResolveFinalBooleanBranchCarrierTypes(MethodAnalysisContext method) =>
+        BindFinalBooleanBranchCarrierTypes(
+            method.ControlFlowGraph!.Instructions,
+            method.AppContext.SystemTypes.SystemBooleanType);
+
+    internal static bool BindFinalBooleanBranchCarrierTypes(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext booleanType)
+    {
+        var definitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var changed = false;
+
+        foreach (var pair in definitions)
+        {
+            var local = pair.Key;
+            if (!IsReplaceableFinalBooleanCarrier(local.Type, booleanType)
+                || pair.Value.Length < 2
+                || pair.Value.Any(definition => definition is not
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable, Immediate { Value: 0 or 1 }],
+                    })
+                || pair.Value
+                    .Select(definition => ((Immediate)definition.Operands[1]).Value)
+                    .Distinct()
+                    .Count() != 2)
+                continue;
+
+            var uses = instructions
+                .Where(instruction => instruction.Operands
+                    .Skip(instruction.Destination is LocalVariable ? 1 : 0)
+                    .Any(operand => ReferenceEquals(operand, local)))
+                .ToArray();
+            if (uses.Length == 0
+                || uses.Any(use => use.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
+                    || use.Operands.Count != 3
+                    || !use.Operands.Skip(1).OfType<Immediate>().Any(value => value.Value is 0 or 1)))
+                continue;
+
+            local.Type = booleanType;
+            changed = true;
+        }
+
+        return changed;
+    }
 
     internal static bool BindFinalBooleanBitwiseComponentTypes(
         IReadOnlyList<Instruction> instructions,

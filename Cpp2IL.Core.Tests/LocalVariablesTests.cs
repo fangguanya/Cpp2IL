@@ -2855,6 +2855,157 @@ public class LocalVariablesTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 退SSA后单精度加法结果覆盖Object占位类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable("source", new Register(null, "V8", 1), app.SystemTypes.SystemSingleType);
+        var result = new LocalVariable("result", new Register(null, "V0", 1), app.SystemTypes.SystemObjectType);
+        var method = CreateConstructorFixture(
+            app.SystemTypes.SystemObjectType,
+            "RecoverFinalFloatingAdd",
+            [new Instruction(0, OpCode.Add, result, source, source)],
+            [source, result]);
+
+        var changed = LocalVariables.ResolveFinalFloatingArithmeticCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 数组长度复制跟随原生索引比较宽度()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0", 1),
+            new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType));
+        var length = new LocalVariable("length", new Register(null, "X8", 1), app.SystemTypes.SystemObjectType);
+        var index = new LocalVariable("index", new Register(null, "X19", 1), app.SystemTypes.SystemIntPtrType);
+        var move = new Instruction(0, OpCode.Move, length, new ArrayLength(array));
+        var compare = new Instruction(
+            1,
+            OpCode.CheckLess,
+            new LocalVariable("condition", new Register(null, "Z", 1), app.SystemTypes.SystemBooleanType),
+            index,
+            length);
+        var instructions = new[] { move, compare };
+
+        var changed = LocalVariables.BindRecoveredLengthMoveCarrierType(move, instructions, app);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(length.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 长度复制遇到冲突比较宽度时保持Object占位()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0", 1),
+            new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType));
+        var length = new LocalVariable("length", new Register(null, "X8", 1), app.SystemTypes.SystemObjectType);
+        var nativeIndex = new LocalVariable("nativeIndex", new Register(null, "X19", 1), app.SystemTypes.SystemIntPtrType);
+        var intIndex = new LocalVariable("intIndex", new Register(null, "W20", 1), app.SystemTypes.SystemInt32Type);
+        var condition = new LocalVariable("condition", new Register(null, "Z", 1), app.SystemTypes.SystemBooleanType);
+        var move = new Instruction(0, OpCode.Move, length, new ArrayLength(array));
+        var instructions = new[]
+        {
+            move,
+            new Instruction(1, OpCode.CheckLess, condition, nativeIndex, length),
+            new Instruction(2, OpCode.CheckLess, condition, intIndex, length),
+        };
+
+        var changed = LocalVariables.BindRecoveredLengthMoveCarrierType(move, instructions, app);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(length.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 两路零一状态且仅参与分支比较时恢复Boolean()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var state = new LocalVariable("state", new Register(null, "X24", 1), app.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable("condition", new Register(null, "Z", 1), app.SystemTypes.SystemBooleanType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, state, new Immediate(1)),
+            new(1, OpCode.Move, state, new Immediate(0)),
+            new(2, OpCode.CheckNotEqual, condition, state, new Immediate(0)),
+        };
+
+        var changed = LocalVariables.BindFinalBooleanBranchCarrierTypes(instructions, app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(state.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 零一状态允许被多个相等分支共同读取()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var state = new LocalVariable("state", new Register(null, "X24", 1));
+        var first = new LocalVariable("first", new Register(null, "Z", 1), app.SystemTypes.SystemBooleanType);
+        var second = new LocalVariable("second", new Register(null, "Z", 2), app.SystemTypes.SystemBooleanType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, state, new Immediate(0)),
+            new(1, OpCode.Move, state, new Immediate(1)),
+            new(2, OpCode.CheckEqual, first, state, new Immediate(0)),
+            new(3, OpCode.CheckNotEqual, second, state, new Immediate(1)),
+        };
+
+        var changed = LocalVariables.BindFinalBooleanBranchCarrierTypes(instructions, app.SystemTypes.SystemBooleanType);
+
+        Assert.That(changed, Is.True);
+        Assert.That(state.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 零一整数被算术消费时不得猜成Boolean()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var state = new LocalVariable("state", new Register(null, "X24", 1), app.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable("condition", new Register(null, "Z", 1), app.SystemTypes.SystemBooleanType);
+        var sum = new LocalVariable("sum", new Register(null, "X8", 1));
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, state, new Immediate(0)),
+            new(1, OpCode.Move, state, new Immediate(1)),
+            new(2, OpCode.CheckEqual, condition, state, new Immediate(0)),
+            new(3, OpCode.Add, sum, state, new Immediate(1)),
+        };
+
+        var changed = LocalVariables.BindFinalBooleanBranchCarrierTypes(instructions, app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(state.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+        });
+    }
+
     private static InjectedMethodAnalysisContext CreateConstructorFixture(
         TypeAnalysisContext declaringType,
         string name,

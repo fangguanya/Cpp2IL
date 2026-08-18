@@ -1055,6 +1055,7 @@ public static class IlGenerator
                 LoadLocal(arrayLength.Array, method, locals);
                 instructions.Add(CilOpCodes.Ldlen);
                 instructions.Add(CilOpCodes.Conv_I4);
+                EmitLengthRepresentationConversion(expectedType, instructions);
                 break;
             case StringLength stringLength:
                 LoadLocal(stringLength.Value, method, locals);
@@ -1070,6 +1071,7 @@ public static class IlGenerator
                     MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
                 // callvirt同时保持原生字段解引用在空接收者上的NullReferenceException语义。
                 instructions.Add(CilOpCodes.Callvirt, importer.ImportMethod(lengthGetter));
+                EmitLengthRepresentationConversion(expectedType, instructions);
                 break;
             case ListCount listCount:
                 LoadLocal(listCount.Value, method, locals);
@@ -1086,6 +1088,7 @@ public static class IlGenerator
                     MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
                 // callvirt保持私有字段解引用在空接收者上的NullReferenceException语义。
                 instructions.Add(CilOpCodes.Callvirt, importer.ImportMethod(countGetter));
+                EmitLengthRepresentationConversion(expectedType, instructions);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
                 if (expectedType is { IsValueType: false }
@@ -1245,6 +1248,26 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+    }
+
+    /// <summary>
+    /// 长度值写入退 SSA 后的原生或扩展整数载体时，按目标局部的精确表示补齐 CIL 转换。
+    /// Int32 目标保持原样；引用和未知目标不添加转换，由栈验证继续报告真实类型缺口。
+    /// </summary>
+    private static void EmitLengthRepresentationConversion(
+        TypeAnalysisContext? expectedType,
+        CilInstructionCollection instructions)
+    {
+        CilOpCode? conversion = expectedType?.FullName switch
+        {
+            "System.IntPtr" => CilOpCodes.Conv_I,
+            "System.UIntPtr" => CilOpCodes.Conv_U,
+            "System.Int64" => CilOpCodes.Conv_I8,
+            "System.UInt64" => CilOpCodes.Conv_U8,
+            _ => null,
+        };
+        if (conversion != null)
+            instructions.Add(conversion.Value);
     }
 
     private static void EmitConditionalSelect(

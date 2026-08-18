@@ -506,6 +506,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 可写静态存储仍保留为内存访问，不冻结其运行时状态。
         ReadOnlyScalarLiteralRecovery.Run(this);
 
+        // 中文注释：字段、字面量和退 SSA 复制已提供最终浮点证据；只重放二元浮点算术类型绑定，
+        // 防止晚期结果局部仍以 object 接收 Single/Double 栈值。
+        LocalVariables.ResolveFinalFloatingArithmeticCarrierTypes(this);
+
         // 退SSA后的比较边与原生整数位宽此时同时可见；据此恢复循环计数器和状态掩码，
         // 避免同一物理寄存器的布尔返回值把32位整数载体污染成object。
         LocalVariables.ResolveFinalScalarCarrierTypes(this);
@@ -557,6 +561,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：退 SSA 的布尔边复制在此已稳定；只闭合由权威 Boolean 叶、0/1 复制和
         // 小位逻辑组成的分量，引用类型或非布尔掩码会使整个分量失败关闭。
         LocalVariables.ResolveFinalBooleanBitwiseCarrierTypes(this);
+        // 中文注释：没有位逻辑叶的 0/1 分支状态在退 SSA 后表现为两个立即数定义；只有其全部
+        // 消费者都是零/一比较时才恢复 Boolean，算术、调用和字段消费者继续保持红门。
+        LocalVariables.ResolveFinalBooleanBranchCarrierTypes(this);
 
         // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
         // 此时裁掉其不可达返回/抛出边，避免异常 ABI 状态值进入托管返回类型。
