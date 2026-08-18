@@ -1164,7 +1164,9 @@ public static class ListAddRecovery
             || candidate.Operands[1] is not LocalVariable list
             || method.Name != "AddWithResize"
             || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
-            || instructions.Take(callIndex).Any(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+            || !IsValidSlowValuePrefix(
+                instructions.Take(callIndex).ToList(),
+                candidate.Operands[2])
             || !IsValidSlowTail(block, trailingInstructions))
             return false;
 
@@ -1176,6 +1178,95 @@ public static class ListAddRecovery
             .Where(instruction => instruction.OpCode is not (OpCode.Return or OpCode.Jump))
             .ToList();
         return true;
+    }
+
+    /// <summary>
+    /// 验证慢路径调用前只包含其 HFA 实参的封闭常量构造链。
+    /// </summary>
+    private static bool IsValidSlowValuePrefix(
+        IReadOnlyList<Instruction> prefix,
+        IOperand value)
+    {
+        var semanticPrefix = prefix
+            .Where(instruction => !IsIgnorableRuntimeMetadataMove(instruction))
+            .ToList();
+        if (semanticPrefix.Count == 0)
+            return true;
+        if (value is not HomogeneousFloatingAggregateArgument aggregate)
+            return false;
+
+        var construction = new HashSet<Instruction>();
+        foreach (var component in aggregate.Components)
+        {
+            if (!TryCollectHfaComponentConstruction(
+                    semanticPrefix,
+                    component,
+                    new HashSet<LocalVariable>(),
+                    construction))
+                return false;
+        }
+
+        return semanticPrefix.All(construction.Contains);
+    }
+
+    private static bool TryCollectHfaComponentConstruction(
+        IReadOnlyList<Instruction> prefix,
+        IOperand operand,
+        ISet<LocalVariable> active,
+        ISet<Instruction> construction)
+    {
+        if (operand is FloatLiteral or DoubleLiteral)
+            return true;
+        if (operand is not LocalVariable local || !active.Add(local))
+            return false;
+
+        try
+        {
+            var definitions = prefix
+                .Where(instruction => ReferenceEquals(instruction.Destination, local))
+                .Take(2)
+                .ToList();
+            if (definitions.Count != 1)
+                return false;
+
+            var definition = definitions[0];
+            if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+            {
+                construction.Add(definition);
+                return TryCollectHfaComponentConstruction(
+                    prefix,
+                    source,
+                    active,
+                    construction);
+            }
+
+            if (definition is not
+                {
+                    OpCode: OpCode.ReinterpretIntegerBitsAsFloat,
+                    Operands: [_, var integerBits, Immediate width],
+                }
+                || width.Value is not (32 or 64))
+                return false;
+
+            var integerConstruction = new List<Instruction>();
+            if (!TryEvaluateUnsignedConstant(
+                    prefix,
+                    integerBits,
+                    unchecked((int)width.Value),
+                    new HashSet<LocalVariable>(),
+                    integerConstruction,
+                    out _))
+                return false;
+
+            construction.Add(definition);
+            foreach (var instruction in integerConstruction)
+                construction.Add(instruction);
+            return true;
+        }
+        finally
+        {
+            active.Remove(local);
+        }
     }
 
     /// <summary>
@@ -2099,7 +2190,11 @@ public static class ListAddRecovery
             entry.component is LocalVariable local
             && local.Register.Name == $"V{entry.index}"
             && graph.Instructions.All(instruction => !ReferenceEquals(instruction.Destination, local)));
-        if (!unresolvedAbiComponents && !HaveSameFloatingBits(aggregate.Components, decoded.Components))
+        if (!unresolvedAbiComponents
+            && !HaveSameResolvedFloatingBits(
+                graph.Instructions,
+                aggregate.Components,
+                decoded.Components))
             return false;
 
         publicValue = decoded;
@@ -2126,13 +2221,15 @@ public static class ListAddRecovery
             return false;
 
         var construction = new List<Instruction>();
-        if (!TryEvaluateUInt32Constant(
+        if (!TryEvaluateUnsignedConstant(
                 valueScope,
                 fastValue,
+                bitWidth: 32,
                 new HashSet<LocalVariable>(),
                 construction,
-                out var fastBits))
+                out var evaluatedFastBits))
             return false;
+        var fastBits = unchecked((uint)evaluatedFastBits);
 
         try
         {
@@ -2162,16 +2259,24 @@ public static class ListAddRecovery
     /// 仅接受已在真实产物中出现的 <c>Move/And/Or</c>；局部变量多定义、循环定义或
     /// 任一非常量操作均中止恢复，避免将运行时浮点数冻结为字面量。
     /// </remarks>
-    private static bool TryEvaluateUInt32Constant(
+    private static bool TryEvaluateUnsignedConstant(
         IReadOnlyList<Instruction> valueScope,
         IOperand operand,
+        int bitWidth,
         ISet<LocalVariable> active,
         ICollection<Instruction> construction,
-        out uint value)
+        out ulong value)
     {
+        if (bitWidth is not (32 or 64))
+        {
+            value = 0;
+            return false;
+        }
+
+        var mask = bitWidth == 32 ? uint.MaxValue : ulong.MaxValue;
         if (operand is Immediate immediate)
         {
-            value = unchecked((uint)immediate.UnsignedValue);
+            value = immediate.UnsignedValue & mask;
             return true;
         }
 
@@ -2191,15 +2296,22 @@ public static class ListAddRecovery
             var matched = definition switch
             {
                 { OpCode: OpCode.Move, Operands: [_, var source] } =>
-                    TryEvaluateUInt32Constant(valueScope, source, active, construction, out value),
+                    TryEvaluateUnsignedConstant(
+                        valueScope,
+                        source,
+                        bitWidth,
+                        active,
+                        construction,
+                        out value),
                 {
                     OpCode: OpCode.And or OpCode.Or,
                     Operands: [_, var left, var right],
-                } => TryEvaluateBinaryUInt32Constant(
+                } => TryEvaluateBinaryUnsignedConstant(
                     valueScope,
                     definition.OpCode,
                     left,
                     right,
+                    bitWidth,
                     active,
                     construction,
                     out value),
@@ -2217,23 +2329,37 @@ public static class ListAddRecovery
         }
     }
 
-    private static bool TryEvaluateBinaryUInt32Constant(
+    private static bool TryEvaluateBinaryUnsignedConstant(
         IReadOnlyList<Instruction> valueScope,
         OpCode opCode,
         IOperand left,
         IOperand right,
+        int bitWidth,
         ISet<LocalVariable> active,
         ICollection<Instruction> construction,
-        out uint value)
+        out ulong value)
     {
         value = 0;
-        if (!TryEvaluateUInt32Constant(valueScope, left, active, construction, out var leftValue)
-            || !TryEvaluateUInt32Constant(valueScope, right, active, construction, out var rightValue))
+        if (!TryEvaluateUnsignedConstant(
+                valueScope,
+                left,
+                bitWidth,
+                active,
+                construction,
+                out var leftValue)
+            || !TryEvaluateUnsignedConstant(
+                valueScope,
+                right,
+                bitWidth,
+                active,
+                construction,
+                out var rightValue))
             return false;
 
-        value = opCode == OpCode.And
+        var mask = bitWidth == 32 ? uint.MaxValue : ulong.MaxValue;
+        value = (opCode == OpCode.And
             ? leftValue & rightValue
-            : leftValue | rightValue;
+            : leftValue | rightValue) & mask;
         return true;
     }
 
@@ -2357,29 +2483,113 @@ public static class ListAddRecovery
         }
     }
 
-    private static bool HaveSameFloatingBits(
-        IReadOnlyList<IOperand> left,
-        IReadOnlyList<IOperand> right)
+    /// <summary>
+    /// 比较已由 ARM64 位重解释指令定义的 HFA 分量与只读区解码结果。
+    /// </summary>
+    /// <remarks>
+    /// 真实的 Vector2/Vector3 慢路径会先把整数位模式重解释为 V0-V3 浮点局部，
+    /// 再把这些局部作为 AddWithResize 实参。每个局部必须只有一个 Move 或位重解释定义，
+    /// 且最终位宽和值逐位相同；多定义、循环和运行时算术均保持失败关闭。
+    /// </remarks>
+    private static bool HaveSameResolvedFloatingBits(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyList<IOperand> actual,
+        IReadOnlyList<IOperand> expected)
     {
-        if (left.Count != right.Count)
+        if (actual.Count != expected.Count)
             return false;
 
-        for (var index = 0; index < left.Count; index++)
+        for (var index = 0; index < actual.Count; index++)
         {
-            var same = left[index] switch
-            {
-                FloatLiteral leftFloat when right[index] is FloatLiteral rightFloat =>
-                    FloatingPointBitHelper.SingleToInt32Bits(leftFloat.Value)
-                    == FloatingPointBitHelper.SingleToInt32Bits(rightFloat.Value),
-                DoubleLiteral leftDouble when right[index] is DoubleLiteral rightDouble =>
-                    BitConverter.DoubleToInt64Bits(leftDouble.Value) == BitConverter.DoubleToInt64Bits(rightDouble.Value),
-                _ => false,
-            };
-            if (!same)
+            if (!TryResolveFloatingBits(
+                    instructions,
+                    actual[index],
+                    new HashSet<LocalVariable>(),
+                    out var actualWidth,
+                    out var actualBits)
+                || !TryGetLiteralFloatingBits(
+                    expected[index],
+                    out var expectedWidth,
+                    out var expectedBits)
+                || actualWidth != expectedWidth
+                || actualBits != expectedBits)
                 return false;
         }
 
         return true;
+    }
+
+    private static bool TryResolveFloatingBits(
+        IReadOnlyList<Instruction> instructions,
+        IOperand operand,
+        ISet<LocalVariable> active,
+        out int bitWidth,
+        out ulong bits)
+    {
+        if (TryGetLiteralFloatingBits(operand, out bitWidth, out bits))
+            return true;
+
+        bitWidth = 0;
+        bits = 0;
+        if (operand is not LocalVariable local || !active.Add(local))
+            return false;
+
+        try
+        {
+            var definitions = instructions
+                .Where(instruction => ReferenceEquals(instruction.Destination, local))
+                .Take(2)
+                .ToList();
+            if (definitions.Count != 1)
+                return false;
+
+            var definition = definitions[0];
+            if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                return TryResolveFloatingBits(instructions, source, active, out bitWidth, out bits);
+
+            if (definition is not
+                {
+                    OpCode: OpCode.ReinterpretIntegerBitsAsFloat,
+                    Operands: [_, var integerBits, Immediate width],
+                }
+                || width.Value is not (32 or 64))
+                return false;
+
+            bitWidth = unchecked((int)width.Value);
+            return TryEvaluateUnsignedConstant(
+                instructions,
+                integerBits,
+                bitWidth,
+                new HashSet<LocalVariable>(),
+                new List<Instruction>(),
+                out bits);
+        }
+        finally
+        {
+            active.Remove(local);
+        }
+    }
+
+    private static bool TryGetLiteralFloatingBits(
+        IOperand operand,
+        out int bitWidth,
+        out ulong bits)
+    {
+        switch (operand)
+        {
+            case FloatLiteral single:
+                bitWidth = 32;
+                bits = unchecked((uint)FloatingPointBitHelper.SingleToInt32Bits(single.Value));
+                return true;
+            case DoubleLiteral @double:
+                bitWidth = 64;
+                bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(@double.Value));
+                return true;
+            default:
+                bitWidth = 0;
+                bits = 0;
+                return false;
+        }
     }
 
     private static bool CollectUInt32IndexNormalization(

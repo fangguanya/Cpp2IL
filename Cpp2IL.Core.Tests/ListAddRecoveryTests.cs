@@ -832,6 +832,74 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Hfa慢路径已定义位重解释分量与快路径打包常量统一为公开Add()
+    {
+        var vector = CreateHfaValueType("ListAddDefinedVector2");
+        var fixture = CreateFixture(vector);
+        ConfigureDefinedHfaConstant(fixture, vector, includeMoveCarrier: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var publicCall = fixture.Graph.Instructions.Single(instruction => instruction.IsCall);
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(((MethodAnalysisContext)publicCall.Operands[0]).Name, Is.EqualTo("Add"));
+            Assert.That(publicCall.Operands[2], Is.InstanceOf<HomogeneousFloatingAggregateArgument>());
+            Assert.That(
+                ((HomogeneousFloatingAggregateArgument)publicCall.Operands[2]).Components,
+                Has.All.InstanceOf<FloatLiteral>());
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Hfa位重解释分量经过唯一Move载体时仍逐位闭合()
+    {
+        var vector = CreateHfaValueType("ListAddDefinedCarrierVector2");
+        var fixture = CreateFixture(vector);
+        ConfigureDefinedHfaConstant(fixture, vector, includeMoveCarrier: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Hfa已定义分量有一项位模式不同时保留原容量控制流()
+    {
+        var vector = CreateHfaValueType("ListAddMismatchedDefinedVector2");
+        var fixture = CreateFixture(vector);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+        ConfigureDefinedHfaConstant(
+            fixture,
+            vector,
+            includeMoveCarrier: false,
+            secondBitsXor: 1u);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 快路径重新读取同一Items字段时仍闭合为Add()
     {
@@ -3036,6 +3104,69 @@ public class ListAddRecoveryTests
             && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
         slowCall.SetOperand(2, new MemoryOperand(addend: unchecked((long)constantAddress)));
         return (slowBits, result);
+    }
+
+    /// <summary>
+    /// 按真实二进制中的连续八字节构造 Vector2 打包常量，并让慢路径通过位重解释局部传参。
+    /// </summary>
+    private static void ConfigureDefinedHfaConstant(
+        Fixture fixture,
+        TypeAnalysisContext aggregateType,
+        bool includeMoveCarrier,
+        uint secondBitsXor = 0)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var constantAddress = app.Binary.GetVirtualAddressOfPrimaryExecutableSection();
+        Assert.That(app.Binary.TryMapVirtualAddressToRaw(constantAddress, out var rawAddress), Is.True);
+        var bytes = app.Binary.Reader.ReadByteArrayAtRawAddress(rawAddress, sizeof(float) * 2);
+        Assert.That(bytes, Has.Length.EqualTo(sizeof(float) * 2));
+        var firstBits = BitConverter.ToUInt32(bytes, 0);
+        var secondBits = BitConverter.ToUInt32(bytes, sizeof(float)) ^ secondBitsXor;
+
+        var fastStore = fixture.Graph.Instructions.Single(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand, _] });
+        fastStore.SetOperand(1, new MemoryOperand(addend: unchecked((long)constantAddress)));
+
+        var firstDecoded = Local("hfaFirstDecoded", app.SystemTypes.SystemSingleType, "V0");
+        var secondDecoded = Local("hfaSecondDecoded", app.SystemTypes.SystemSingleType, "V1");
+        var firstValue = includeMoveCarrier
+            ? Local("hfaFirstCarrier", app.SystemTypes.SystemSingleType, "V0")
+            : firstDecoded;
+        var secondValue = includeMoveCarrier
+            ? Local("hfaSecondCarrier", app.SystemTypes.SystemSingleType, "V1")
+            : secondDecoded;
+        var definitions = new List<Instruction>
+        {
+            new(
+                -1,
+                OpCode.ReinterpretIntegerBitsAsFloat,
+                firstDecoded,
+                new Immediate(unchecked((long)firstBits)),
+                new Immediate(32)),
+            new(
+                -1,
+                OpCode.ReinterpretIntegerBitsAsFloat,
+                secondDecoded,
+                new Immediate(unchecked((long)secondBits)),
+                new Immediate(32)),
+        };
+        if (includeMoveCarrier)
+        {
+            definitions.Add(new Instruction(-1, OpCode.Move, firstValue, firstDecoded));
+            definitions.Add(new Instruction(-1, OpCode.Move, secondValue, secondDecoded));
+        }
+
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var insertionIndex = fixture.SlowBlock.Instructions.IndexOf(slowCall);
+        foreach (var definition in definitions)
+            fixture.SlowBlock.Instructions.Insert(insertionIndex++, definition);
+        slowCall.SetOperand(
+            2,
+            new HomogeneousFloatingAggregateArgument(
+                aggregateType,
+                [firstValue, secondValue]));
     }
 
     private static InjectedTypeAnalysisContext CreateHfaValueType(string name)
