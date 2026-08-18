@@ -78,4 +78,84 @@ public class ConstantControlFlowRecoveryTests
             Assert.That(branch.OpCode, Is.EqualTo(OpCode.ConditionalJump));
         });
     }
+
+    [Test]
+    [Category("基本功能")]
+    public void 多个相同零入边的Phi状态折叠为恒假分支()
+    {
+        var state = new LocalVariable("state", new Register(null, "X21"));
+        var condition = new LocalVariable("condition", new Register(null, "W8"));
+        var target = new Instruction(5, OpCode.Throw, new Immediate(0));
+        var branch = new Instruction(3, OpCode.ConditionalJump, target, condition);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, state, new Immediate(0)),
+            new Instruction(1, OpCode.Move, state, new Immediate(0)),
+            new Instruction(2, OpCode.CheckNotEqual, condition, state, new Immediate(0)),
+            branch,
+            new Instruction(4, OpCode.Return, new Immediate(7)),
+            target,
+        ]);
+
+        var rewritten = ConstantControlFlowRecovery.Run(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(graph.Instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.False);
+            Assert.That(graph.Instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Phi入边常量不一致时保留条件分支()
+    {
+        var state = new LocalVariable("state", new Register(null, "X21"));
+        var condition = new LocalVariable("condition", new Register(null, "W8"));
+        var target = new Instruction(5, OpCode.Return, new Immediate(1));
+        var branch = new Instruction(3, OpCode.ConditionalJump, target, condition);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, state, new Immediate(0)),
+            new Instruction(1, OpCode.Move, state, new Immediate(1)),
+            new Instruction(2, OpCode.CheckNotEqual, condition, state, new Immediate(0)),
+            branch,
+            new Instruction(4, OpCode.Return, new Immediate(0)),
+            target,
+        ]);
+
+        var rewritten = ConstantControlFlowRecovery.Run(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(branch.OpCode, Is.EqualTo(OpCode.ConditionalJump));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 循环复制定义不得冒充常量Phi()
+    {
+        var first = new LocalVariable("first", new Register(null, "X21"));
+        var second = new LocalVariable("second", new Register(null, "X22"));
+        var condition = new LocalVariable("condition", new Register(null, "W8"));
+        var target = new Instruction(5, OpCode.Return, new Immediate(1));
+        var branch = new Instruction(3, OpCode.ConditionalJump, target, condition);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, first, second),
+            new Instruction(1, OpCode.Move, second, first),
+            new Instruction(2, OpCode.CheckEqual, condition, first, new Immediate(0)),
+            branch,
+            new Instruction(4, OpCode.Return, new Immediate(0)),
+            target,
+        ]);
+
+        var rewritten = ConstantControlFlowRecovery.Run(graph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(branch.OpCode, Is.EqualTo(OpCode.ConditionalJump));
+        });
+    }
 }

@@ -1430,6 +1430,82 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// 退 SSA、集合长度与属性恢复全部完成后，以局部到局部的 Move 为无向等价边，一次性计算
+    /// 连通分量中的唯一标量类型。只有分量恰有一个 Int/UInt/Float 精确类型，且其余节点均为
+    /// 未定型、Object 或 Boolean ABI 占位时才传播；引用类型或两个不同数值域会否决整个分量。
+    /// </summary>
+    public static bool ResolveFinalScalarCopyCarrierTypes(MethodAnalysisContext method)
+    {
+        var adjacency = new Dictionary<LocalVariable, HashSet<LocalVariable>>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [LocalVariable destination, LocalVariable source]
+                })
+                continue;
+
+            if (!adjacency.TryGetValue(destination, out var destinationEdges))
+                adjacency[destination] = destinationEdges = [];
+            if (!adjacency.TryGetValue(source, out var sourceEdges))
+                adjacency[source] = sourceEdges = [];
+            destinationEdges.Add(source);
+            sourceEdges.Add(destination);
+        }
+
+        var visited = new HashSet<LocalVariable>();
+        var changed = false;
+        foreach (var root in adjacency.Keys)
+        {
+            if (!visited.Add(root))
+                continue;
+
+            var component = new List<LocalVariable>();
+            var pending = new Queue<LocalVariable>();
+            pending.Enqueue(root);
+            while (pending.Count > 0)
+            {
+                var current = pending.Dequeue();
+                component.Add(current);
+                foreach (var neighbor in adjacency[current])
+                    if (visited.Add(neighbor))
+                        pending.Enqueue(neighbor);
+            }
+
+            var scalarTypes = component
+                .Select(local => local.Type)
+                .Where(IsFinalScalarType)
+                .Cast<TypeAnalysisContext>()
+                .GroupBy(type => type.FullName, StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToArray();
+            if (scalarTypes.Length != 1)
+                continue;
+
+            var consensusType = scalarTypes[0];
+            if (component.Any(local => !IsReplaceableFinalCopyCarrier(local.Type, consensusType)))
+                continue;
+
+            foreach (var local in component)
+                if (!GenericCallRebinder.TypesEquivalent(local.Type, consensusType))
+                {
+                    local.Type = consensusType;
+                    changed = true;
+                }
+        }
+
+        return changed;
+    }
+
+    private static bool IsReplaceableFinalCopyCarrier(
+        TypeAnalysisContext? type,
+        TypeAnalysisContext consensusType) =>
+        type == null
+        || GenericCallRebinder.TypesEquivalent(type, consensusType)
+        || type.FullName is "System.Object" or "System.Boolean";
+
     internal static bool BindFinalComparisonOperandTypes(
         Instruction instruction,
         ApplicationAnalysisContext? appContext = null)

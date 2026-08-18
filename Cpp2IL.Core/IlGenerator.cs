@@ -35,6 +35,17 @@ public static class IlGenerator
         _ => throw new ArgumentOutOfRangeException(nameof(opCode), opCode, "不是二元数值操作码。"),
     };
 
+    /// <summary>
+    /// 把原生整数目标位宽转换为 CIL 结果规范化操作。ARM64 W 目标无条件只保留低32位，
+    /// 即使输入仍是 I8 也必须在写回局部前生成 I4；X 目标和无位宽证据的托管运算保持原栈类型。
+    /// </summary>
+    internal static CilOpCode? GetIntegerResultNormalizationCilOpCode(int widthBits) => widthBits switch
+    {
+        0 or 64 => null,
+        32 => CilOpCodes.Conv_I4,
+        _ => throw new ArgumentOutOfRangeException(nameof(widthBits), widthBits, "不是 ARM64 标量整数目标位宽。"),
+    };
+
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
         var assembly = context.DeclaringType!.DeclaringAssembly;
@@ -722,6 +733,8 @@ public static class IlGenerator
                     case OpCode.Or:
                     case OpCode.Xor:
                         instructions.Add(GetBinaryNumericCilOpCode(instruction.OpCode));
+                        if (GetIntegerResultNormalizationCilOpCode(instruction.IntegerWidthBits) is { } normalization)
+                            instructions.Add(normalization);
                         break;
                 }
 

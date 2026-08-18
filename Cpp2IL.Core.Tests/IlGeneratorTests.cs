@@ -110,6 +110,32 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Arm64字目标在写回前规范化为I4()
+    {
+        Assert.That(
+            IlGenerator.GetIntegerResultNormalizationCilOpCode(32),
+            Is.EqualTo(CilOpCodes.Conv_I4));
+    }
+
+    [TestCase(0, TestName = "边界_无原生位宽证据保持托管栈类型")]
+    [TestCase(64, TestName = "边界_X目标保持I8结果")]
+    [Category("边界值")]
+    public void 非字目标不增加结果转换(int widthBits)
+    {
+        Assert.That(IlGenerator.GetIntegerResultNormalizationCilOpCode(widthBits), Is.Null);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非法标量算术位宽拒绝生成猜测转换()
+    {
+        Assert.That(
+            () => IlGenerator.GetIntegerResultNormalizationCilOpCode(16),
+            Throws.TypeOf<ArgumentOutOfRangeException>());
+    }
+
+    [Test]
     public void Void方法尾部为普通调用时需要返回终结点()
     {
         var finalInstruction = new CilInstruction(CilOpCodes.Call, null);

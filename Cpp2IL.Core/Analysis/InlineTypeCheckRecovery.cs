@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -21,10 +22,23 @@ public static class InlineTypeCheckRecovery
         IsInstThenDereference,
     }
 
-    public static void Run(MethodAnalysisContext method)
+    public static void Run(
+        MethodAnalysisContext method,
+        ISet<ulong>? initializedRuntimeMetadataSlots = null)
     {
         var cfg = method.ControlFlowGraph!;
         var definitions = BuildUniqueDefinitions(cfg.Instructions);
+        Func<LocalVariable, TypeAnalysisContext?>? resolvePost27TypeLocal = null;
+        if (initializedRuntimeMetadataSlots is { Count: > 0 })
+        {
+            // 中文注释：只对已经进入类深度/继承表检查的目标类局部按需解析元数据；
+            // 禁止为每个方法遍历所有内存读取，避免全量63,397方法产生第二份分析成本。
+            resolvePost27TypeLocal = local => MetadataResolver.ResolvePost27TypeLocal(
+                method,
+                local,
+                definitions,
+                initializedRuntimeMetadataSlots);
+        }
         var changed = false;
 
         foreach (var secondCheckBlock in cfg.Blocks.ToList())
@@ -33,6 +47,7 @@ public static class InlineTypeCheckRecovery
                     secondCheckBlock,
                     definitions,
                     method.AppContext.SystemTypes.SystemObjectType,
+                    resolvePost27TypeLocal,
                     out var source,
                     out var targetType,
                     out var firstCheckBlock,
@@ -74,6 +89,7 @@ public static class InlineTypeCheckRecovery
         Block secondCheckBlock,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
         TypeAnalysisContext objectType,
+        Func<LocalVariable, TypeAnalysisContext?>? resolvePost27TypeLocal,
         out LocalVariable source,
         out TypeAnalysisContext targetType,
         out Block firstCheckBlock,
@@ -108,11 +124,9 @@ public static class InlineTypeCheckRecovery
         if (equality.OpCode != OpCode.CheckEqual || equality.Operands.Count != 3)
             return false;
         var hierarchyEntryOperand = ResolveMoveSource(equality.Operands[1], definitions);
-        var candidateTypeOperand = ResolveMoveSource(equality.Operands[2], definitions);
         if (hierarchyEntryOperand is not MemoryOperand hierarchyEntry
-            || candidateTypeOperand is not TypeAnalysisContext candidateType)
-            return false;
-        if (hierarchyEntry.Addend != -PointerSize || hierarchyEntry.Base is not LocalVariable hierarchyEntryAddress)
+            || hierarchyEntry.Addend != -PointerSize
+            || hierarchyEntry.Base is not LocalVariable hierarchyEntryAddress)
             return false;
         if (!definitions.TryGetValue(hierarchyEntryAddress, out var hierarchyAddressDefinition)
             || hierarchyAddressDefinition.OpCode != OpCode.Add
@@ -134,7 +148,15 @@ public static class InlineTypeCheckRecovery
             return false;
         if (targetDepth.Addend != TypeDepthOffset || targetDepth.Base is not LocalVariable targetClass)
             return false;
-        if (RuntimeClassRepresentedType(targetClass) is not { IsValueType: false } representedTarget)
+        var representedTarget = RuntimeClassRepresentedType(targetClass)
+            ?? resolvePost27TypeLocal?.Invoke(targetClass);
+        if (representedTarget is not { IsValueType: false })
+            return false;
+        var candidateTypeOperand = ResolveMoveSource(equality.Operands[2], definitions);
+        var candidateType = candidateTypeOperand as TypeAnalysisContext;
+        if (candidateType == null && equality.Operands[2] is LocalVariable candidateTypeLocal)
+            candidateType = resolvePost27TypeLocal?.Invoke(candidateTypeLocal);
+        if (candidateType == null)
             return false;
         if (!GenericCallRebinder.TypesEquivalent(candidateType, representedTarget))
             return false;

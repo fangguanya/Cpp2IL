@@ -599,6 +599,151 @@ public class MetadataResolverTests
 
     [Test]
     [Category("基本功能")]
+    public void 初始化保护区后的二层类型槽恢复未定型目标()
+    {
+        var targetType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X27", 1));
+        var result = new LocalVariable("result", new Register(null, "X1", 1));
+        var tableDefinition = new Instruction(
+            0,
+            OpCode.Move,
+            tableBase,
+            new MemoryOperand(addend: 0x59F7388));
+        var load = new Instruction(1, OpCode.Move, result, new MemoryOperand(tableBase));
+        ulong observedAddress = 0;
+        long observedOffset = -1;
+
+        var changed = MetadataResolver.ResolvePost27TypeLoads(
+            [tableDefinition, load],
+            new HashSet<ulong> { 0x59F7388 },
+            (address, offset) =>
+            {
+                observedAddress = address;
+                observedOffset = offset;
+                return targetType;
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(observedAddress, Is.EqualTo(0x59F7388));
+            Assert.That(observedOffset, Is.Zero);
+            Assert.That(load.Operands[1], Is.SameAs(targetType));
+            Assert.That(result.Type, Is.TypeOf<RuntimeClassTypeAnalysisContext>());
+            Assert.That(((RuntimeClassTypeAnalysisContext)result.Type!).RepresentedType, Is.SameAs(targetType));
+            Assert.That(tableDefinition.Operands[1], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同址Phi与最大对齐偏移的二层类型读取只解析一次()
+    {
+        var targetType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType;
+        var first = new LocalVariable("first", new Register(null, "X27", 1));
+        var second = new LocalVariable("second", new Register(null, "X27", 2));
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X27", 3));
+        var firstResult = new LocalVariable("firstResult", new Register(null, "X1", 1));
+        var secondResult = new LocalVariable("secondResult", new Register(null, "X1", 2));
+        var firstDefinition = new Instruction(0, OpCode.Move, first, new MemoryOperand(addend: 0x5A00000));
+        var secondDefinition = new Instruction(1, OpCode.Move, second, new MemoryOperand(addend: 0x5A00000));
+        var tablePhi = new Instruction(-1, OpCode.Phi, tableBase, first, second);
+        var firstLoad = new Instruction(2, OpCode.Move, firstResult, new MemoryOperand(tableBase, addend: 0x7FFF8));
+        var secondLoad = new Instruction(3, OpCode.Move, secondResult, new MemoryOperand(tableBase, addend: 0x7FFF8));
+        var resolverCalls = 0;
+
+        var changed = MetadataResolver.ResolvePost27TypeLoads(
+            [firstDefinition, secondDefinition, tablePhi, firstLoad, secondLoad],
+            new HashSet<ulong> { 0x5A00000 },
+            (address, offset) =>
+            {
+                resolverCalls++;
+                return address == 0x5A00000 && offset == 0x7FFF8 ? targetType : null;
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(2));
+            Assert.That(resolverCalls, Is.EqualTo(1));
+            Assert.That(firstLoad.Operands[1], Is.SameAs(targetType));
+            Assert.That(secondLoad.Operands[1], Is.SameAs(targetType));
+            Assert.That(
+                ((RuntimeClassTypeAnalysisContext)firstResult.Type!).RepresentedType,
+                Is.SameAs(targetType));
+            Assert.That(
+                ((RuntimeClassTypeAnalysisContext)secondResult.Type!).RepresentedType,
+                Is.SameAs(targetType));
+            Assert.That(tablePhi.Operands.Skip(1), Is.EqualTo(new IOperand[] { first, second }));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 异址Phi多定义地址和非类型表项均不改写()
+    {
+        var ambiguous = new LocalVariable("ambiguous", new Register(null, "X27", 1));
+        var first = new LocalVariable("first", new Register(null, "X28", 1));
+        var second = new LocalVariable("second", new Register(null, "X28", 2));
+        var differentPhi = new LocalVariable("differentPhi", new Register(null, "X28", 3));
+        var unresolvedBase = new LocalVariable("unresolvedBase", new Register(null, "X29", 1));
+        var ambiguousMemory = new MemoryOperand(ambiguous);
+        var differentMemory = new MemoryOperand(differentPhi);
+        var unresolvedMemory = new MemoryOperand(unresolvedBase);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, ambiguous, new MemoryOperand(addend: 0x1000)),
+            new(1, OpCode.Move, ambiguous, new MemoryOperand(addend: 0x2000)),
+            new(2, OpCode.Move, first, new MemoryOperand(addend: 0x3000)),
+            new(3, OpCode.Move, second, new MemoryOperand(addend: 0x4000)),
+            new(-1, OpCode.Phi, differentPhi, first, second),
+            new(4, OpCode.Move, unresolvedBase, new MemoryOperand(addend: 0x5000)),
+            new(5, OpCode.Move, new LocalVariable("a", new Register(null, "X0", 1)), ambiguousMemory),
+            new(6, OpCode.Move, new LocalVariable("b", new Register(null, "X0", 2)), differentMemory),
+            new(7, OpCode.Move, new LocalVariable("c", new Register(null, "X0", 3)), unresolvedMemory),
+        };
+
+        var changed = MetadataResolver.ResolvePost27TypeLoads(
+            instructions,
+            new HashSet<ulong> { 0x1000, 0x3000, 0x4000, 0x5000 },
+            (_, _) => null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(instructions[6].Operands[1], Is.EqualTo(ambiguousMemory));
+            Assert.That(instructions[7].Operands[1], Is.EqualTo(differentMemory));
+            Assert.That(instructions[8].Operands[1], Is.EqualTo(unresolvedMemory));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 空初始化槽目录不扫描二层类型读取()
+    {
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X27", 1));
+        var result = new LocalVariable("result", new Register(null, "X1", 1));
+        var memory = new MemoryOperand(tableBase);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, tableBase, new MemoryOperand(addend: 0x59F7388)),
+            new(1, OpCode.Move, result, memory),
+        };
+
+        var changed = MetadataResolver.ResolvePost27TypeLoads(
+            instructions,
+            new HashSet<ulong>(),
+            (_, _) => throw new AssertionException("空目录不得调用元数据解析器"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(instructions[1].Operands[1], Is.EqualTo(memory));
+            Assert.That(result.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 静态偏移跳过常量并解析真实存储字段()
     {
         var fixture = CreateStaticFieldOffsetFixture(includeLiteral: true, runtimeFieldCount: 1);
