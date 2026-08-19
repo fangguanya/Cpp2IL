@@ -47,7 +47,9 @@ public static class PropertyBackingFieldRecovery
                         ? [setter, sourceValue]
                         : [setter, fieldDestination.Local, sourceValue]);
                     recovered++;
-                    continue;
+                    // 中文注释：同一条赋值的右值也可能是另一个跨类型私有字段。setter 改写后
+                    // 必须继续扫描新的调用实参；否则 target.Property = source.<Property>k__BackingField
+                    // 只恢复左侧写入，右侧读取仍会生成 CS0122。
                 }
 
                 // 中文注释：字段读取可能已被折叠进另一调用或返回的操作数；先物化公开 getter

@@ -125,6 +125,58 @@ public class PropertyBackingFieldRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 字段到字段赋值同时恢复Getter与Setter()
+    {
+        var writeFixture = CreateFixture("<TargetValue>k__BackingField", write: true, propertyName: "TargetValue");
+        var readFixture = CreateFixture("<SourceValue>k__BackingField", write: false, propertyName: "SourceValue");
+        var sourceField = (FieldReference)readFixture.Access.Operands[1];
+        writeFixture.Access.SetOperand(1, sourceField);
+
+        var recovered = PropertyBackingFieldRecovery.Run(writeFixture.Caller);
+        var instructions = writeFixture.Caller.ControlFlowGraph!.Instructions;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(instructions, Has.Count.EqualTo(3));
+            Assert.That(instructions[0].OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(instructions[0].Operands[0], Is.SameAs(readFixture.Getter));
+            Assert.That(instructions[1].OpCode, Is.EqualTo(OpCode.CallVoid));
+            Assert.That(instructions[1].Operands[0], Is.SameAs(writeFixture.Setter));
+            Assert.That(instructions[1].Operands[2], Is.SameAs(instructions[0].Operands[1]));
+            Assert.That(instructions.SelectMany(instruction => instruction.Operands).OfType<FieldReference>(), Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 右值没有公开Getter时只恢复左侧Setter并保留字段红门()
+    {
+        var writeFixture = CreateFixture("<TargetValue>k__BackingField", write: true, propertyName: "TargetValue");
+        var readFixture = CreateFixture(
+            "<SourceValue>k__BackingField",
+            write: false,
+            propertyName: "SourceValue",
+            publicAccessors: false);
+        var sourceField = (FieldReference)readFixture.Access.Operands[1];
+        writeFixture.Access.SetOperand(1, sourceField);
+
+        var recovered = PropertyBackingFieldRecovery.Run(writeFixture.Caller);
+        var instructions = writeFixture.Caller.ControlFlowGraph!.Instructions;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(instructions, Has.Count.EqualTo(2));
+            Assert.That(instructions[0].OpCode, Is.EqualTo(OpCode.CallVoid));
+            Assert.That(instructions[0].Operands[0], Is.SameAs(writeFixture.Setter));
+            Assert.That(instructions[0].Operands[2], Is.SameAs(sourceField));
+            Assert.That(instructions[0].Operands.OfType<FieldReference>(), Has.Exactly(1).Items);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 私有访问器保持字段红门()
     {
