@@ -2258,6 +2258,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 // 聚合体载体读取；后续字段偏移解析会把这些内存形态精确绑定到值类型字段。
                 foreach (var projection in Arm64CallingConventionResolver.ReturnProjections(calledMethod))
                     Add(address, OpCode.Move, projection.Destination, projection.Source);
+
+                // 普通小结构体会把一至两个完整托管引用槽分别返回在X0/X1。CIL调用只产生
+                // 一个完整结构体，因此必须把字段重新投影到原生后继指令实际读取的寄存器。
+                foreach (var projection in Arm64CallingConventionResolver
+                             .ReferenceRegisterReturnProjections(calledMethod))
+                    Add(address, OpCode.Move, projection.Destination, projection.Source);
             }
         }
 

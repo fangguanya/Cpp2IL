@@ -241,6 +241,102 @@ public class Arm64CallingConventionResolverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 两个引用字段按X1到X0逆序投影完整返回值()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var aggregate = CreateValueType("TwoReferenceFields", stringType, stringType);
+        SetSequentialFieldOffsets(aggregate, sizeof(long));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        var projections = Arm64CallingConventionResolver.ReferenceRegisterReturnProjections(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                projections.Select(projection => projection.Destination.Name),
+                Is.EqualTo(new[] { "X1", "X0" }));
+            Assert.That(
+                projections.Select(projection => projection.Source.Addend),
+                Is.EqualTo(new long[] { sizeof(long), 0 }));
+            Assert.That(
+                Arm64CallingConventionResolver.ReturnOperands(method)
+                    .Cast<Register>()
+                    .Select(register => register.Name),
+                Is.EqualTo(new[] { "X0", "X1" }));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 单引用字段只投影X0零偏移槽()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var aggregate = CreateValueType("OneReferenceField", stringType);
+        aggregate.Fields[0].Offset = 0;
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        var projection = Arm64CallingConventionResolver
+            .ReferenceRegisterReturnProjections(method)
+            .Single();
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(projection.Destination.Name, Is.EqualTo("X0"));
+            Assert.That(((Register)projection.Source.Base!).Name, Is.EqualTo("X0"));
+            Assert.That(projection.Source.Addend, Is.Zero);
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非八字节对齐引用字段不生成通用寄存器投影()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var aggregate = CreateValueType("MisalignedReferenceFields", stringType, stringType);
+        aggregate.Fields[0].Offset = 0;
+        aggregate.Fields[1].Offset = sizeof(int);
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        Assert.That(
+            Arm64CallingConventionResolver.ReferenceRegisterReturnProjections(method),
+            Is.Empty);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 引用和值字段混合聚合体不生成引用槽投影()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var aggregate = CreateValueType(
+            "MixedReferenceAndValueFields",
+            app.SystemTypes.SystemStringType,
+            app.SystemTypes.SystemInt64Type);
+        SetSequentialFieldOffsets(aggregate, sizeof(long));
+        var method = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        Assert.That(
+            Arm64CallingConventionResolver.ReferenceRegisterReturnProjections(method),
+            Is.Empty);
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 浮点标量返回值不生成聚合体字段投影()
     {

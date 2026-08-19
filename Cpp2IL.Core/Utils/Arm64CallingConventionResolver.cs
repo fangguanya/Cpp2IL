@@ -55,6 +55,11 @@ public static class Arm64CallingConventionResolver
                 .Select((_, index) => (IOperand)new Register(null, $"V{index}"))
                 .ToArray();
 
+        if (TryGetReferenceRegisterAggregateFields(method.ReturnType, out var referenceFields))
+            return referenceFields
+                .Select(field => (IOperand)new Register(null, $"X{field.Offset / PointerSize}"))
+                .ToArray();
+
         return [ReturnRegister(method)];
     }
 
@@ -78,6 +83,30 @@ public static class Arm64CallingConventionResolver
             projections.Add((
                 new Register(null, $"V{fieldIndex}"),
                 new MemoryOperand(aggregateCarrier, addend: fields[fieldIndex].Offset)));
+        }
+
+        return projections;
+    }
+
+    /// <summary>
+    /// 为最多十六字节、由一至两个完整托管引用槽组成的普通值类型建立 X0/X1 返回投影。
+    /// CIL 调用先在 X0 对应局部中保存完整结构体；投影必须从高槽到低槽执行，防止覆盖
+    /// X0 后再从第一个字段读取第二个字段。字段宽度、偏移或布局存在歧义时不生成投影。
+    /// </summary>
+    internal static IReadOnlyList<(Register Destination, MemoryOperand Source)>
+        ReferenceRegisterReturnProjections(MethodAnalysisContext method)
+    {
+        if (!TryGetReferenceRegisterAggregateFields(method.ReturnType, out var fields))
+            return [];
+
+        var aggregateCarrier = ReturnRegister(method);
+        var projections = new List<(Register Destination, MemoryOperand Source)>(fields.Count);
+        for (var fieldIndex = fields.Count - 1; fieldIndex >= 0; fieldIndex--)
+        {
+            var field = fields[fieldIndex];
+            projections.Add((
+                new Register(null, $"X{field.Offset / PointerSize}"),
+                new MemoryOperand(aggregateCarrier, addend: field.Offset)));
         }
 
         return projections;
@@ -191,6 +220,51 @@ public static class Arm64CallingConventionResolver
         var elementType = instanceFields[0].FieldType;
         if (!X64CallingConventionResolver.IsFloatingPoint(elementType)
             || instanceFields.Any(field => !TypesExactlyMatch(field.FieldType, elementType)))
+            return false;
+
+        fields = instanceFields;
+        return true;
+    }
+
+    /// <summary>
+    /// 识别 AAPCS64 可直接通过 X0/X1 返回的引用聚合体。当前只接纳每个八字节槽恰好
+    /// 对应一个确定托管引用字段的布局；压缩字段、值类型字段、泛型参数和额外尾部均失败关闭。
+    /// </summary>
+    internal static bool TryGetReferenceRegisterAggregateFields(
+        TypeAnalysisContext type,
+        out IReadOnlyList<FieldAnalysisContext> fields)
+    {
+        fields = [];
+        if (!type.IsValueType
+            || X64CallingConventionResolver.IsFloatingPoint(type)
+            || TryGetHomogeneousFloatingAggregateFields(type, out _))
+            return false;
+
+        var instanceFields = type.Fields
+            .Where(field => !field.IsStatic && (field.Attributes & FieldAttributes.Literal) == 0)
+            .OrderBy(field => field.Offset)
+            .ToArray();
+        if (instanceFields.Length is < 1 or > 2)
+            return false;
+
+        for (var index = 0; index < instanceFields.Length; index++)
+        {
+            var field = instanceFields[index];
+            if (field.Offset != index * PointerSize
+                || field.FieldType.IsValueType
+                || field.FieldType is GenericParameterTypeAnalysisContext
+                    or ByRefTypeAnalysisContext
+                    or PointerTypeAnalysisContext
+                    or RuntimeClassTypeAnalysisContext
+                    or RuntimeMethodInfoAnalysisContext
+                    or StaticFieldStorageTypeAnalysisContext
+                    or RgctxTableTypeAnalysisContext)
+                return false;
+        }
+
+        var expectedSize = checked(instanceFields.Length * PointerSize);
+        var declaredSize = TypeSizes.UnboxedSize(type, PointerSize);
+        if (declaredSize > 0 && declaredSize != expectedSize)
             return false;
 
         fields = instanceFields;
