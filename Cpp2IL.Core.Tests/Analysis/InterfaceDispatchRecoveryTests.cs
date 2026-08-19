@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -691,6 +692,234 @@ public class InterfaceDispatchRecoveryTests
             Assert.That(wrongBaseLoad.OpCode, Is.EqualTo(OpCode.Move));
             Assert.That(wrongBaseLoad.Operands, Has.Count.EqualTo(2));
         });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 已恢复接口直调会删除纯原生查表区域并保留入口寄存器状态()
+    {
+        var fixture = CreateLookupExcisionFixture(includeBusinessBackedge: false, includeSideEffect: false);
+
+        var changed = InterfaceDispatchRecovery.TryExciseLookupRegion(
+            fixture.Graph,
+            fixture.Head,
+            fixture.Merge,
+            fixture.Slow,
+            fixture.SlowCall,
+            fixture.Definitions,
+            fixture.HomeBlocks,
+            out var removedBlockCount,
+            out var rejection);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True, rejection);
+            Assert.That(removedBlockCount, Is.EqualTo(2));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Fast));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Slow));
+            Assert.That(fixture.Head.Successors, Is.EqualTo(new[] { fixture.Merge }));
+            Assert.That(fixture.Merge.Predecessors, Is.EqualTo(new[] { fixture.Head }));
+            Assert.That(fixture.StatePhi.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(fixture.StatePhi.Operands, Is.EqualTo(new IOperand[] { fixture.StatePhiDestination, fixture.HeadState }));
+            Assert.That(fixture.LookupPhi.OpCode, Is.EqualTo(OpCode.Nop));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 业务循环回边重入查表入口时仍只裁剪查表并保留回边()
+    {
+        var fixture = CreateLookupExcisionFixture(includeBusinessBackedge: true, includeSideEffect: false);
+
+        var changed = InterfaceDispatchRecovery.TryExciseLookupRegion(
+            fixture.Graph,
+            fixture.Head,
+            fixture.Merge,
+            fixture.Slow,
+            fixture.SlowCall,
+            fixture.Definitions,
+            fixture.HomeBlocks,
+            out var removedBlockCount,
+            out var rejection);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True, rejection);
+            Assert.That(removedBlockCount, Is.EqualTo(2));
+            Assert.That(fixture.Backedge, Is.Not.Null);
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Backedge!));
+            Assert.That(fixture.Backedge!.Successors, Is.EqualTo(new[] { fixture.Head }));
+            Assert.That(fixture.Head.Predecessors, Does.Contain(fixture.Backedge));
+            Assert.That(fixture.Head.Successors, Is.EqualTo(new[] { fixture.Merge }));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 查表区域混入业务调用时原子拒绝且控制流保持不变()
+    {
+        var fixture = CreateLookupExcisionFixture(includeBusinessBackedge: true, includeSideEffect: true);
+        var originalBlocks = fixture.Graph.Blocks.ToList();
+        var originalHeadSuccessors = fixture.Head.Successors.ToList();
+        var originalMergePredecessors = fixture.Merge.Predecessors.ToList();
+        var originalStatePhiOperands = fixture.StatePhi.Operands.ToList();
+
+        var changed = InterfaceDispatchRecovery.TryExciseLookupRegion(
+            fixture.Graph,
+            fixture.Head,
+            fixture.Merge,
+            fixture.Slow,
+            fixture.SlowCall,
+            fixture.Definitions,
+            fixture.HomeBlocks,
+            out var removedBlockCount,
+            out var rejection);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(removedBlockCount, Is.Zero);
+            Assert.That(rejection, Does.Contain("副作用"));
+            Assert.That(fixture.Graph.Blocks, Is.EqualTo(originalBlocks));
+            Assert.That(fixture.Head.Successors, Is.EqualTo(originalHeadSuccessors));
+            Assert.That(fixture.Merge.Predecessors, Is.EqualTo(originalMergePredecessors));
+            Assert.That(fixture.StatePhi.OpCode, Is.EqualTo(OpCode.Phi));
+            Assert.That(fixture.StatePhi.Operands, Is.EqualTo(originalStatePhiOperands));
+        });
+    }
+
+    private sealed record LookupExcisionFixture(
+        ISILControlFlowGraph Graph,
+        Block Head,
+        Block Fast,
+        Block Slow,
+        Block Merge,
+        Block? Backedge,
+        Instruction SlowCall,
+        Instruction StatePhi,
+        Instruction LookupPhi,
+        LocalVariable StatePhiDestination,
+        LocalVariable HeadState,
+        Dictionary<LocalVariable, Instruction> Definitions,
+        Dictionary<Instruction, Block> HomeBlocks);
+
+    /// <summary>构造与 ARM64 接口快慢查表同构的最小闭合控制流。</summary>
+    private static LookupExcisionFixture CreateLookupExcisionFixture(
+        bool includeBusinessBackedge,
+        bool includeSideEffect)
+    {
+        var graph = new ISILControlFlowGraph([new Instruction(999, OpCode.Return)]);
+        var entry = new Block { ID = 0, BlockType = BlockType.Entry };
+        var exit = new Block { ID = 1, BlockType = BlockType.Exit };
+        var initial = new Block { ID = 2 };
+        var head = new Block { ID = 3 };
+        var fast = new Block { ID = 4 };
+        var slow = new Block { ID = 5 };
+        var merge = new Block { ID = 6 };
+        var continuation = new Block { ID = 7 };
+        var backedge = includeBusinessBackedge ? new Block { ID = 8 } : null;
+
+        var initialState = Local("initialState");
+        var loopState = Local("loopState");
+        var headState = Local("headState");
+        var klass = Local("klass");
+        var receiver = Local("receiver");
+        var fastInvokeData = Local("fastInvokeData");
+        var slowInvokeData = Local("slowInvokeData");
+        var slowState = Local("slowState");
+        var stateAfterLookup = Local("stateAfterLookup");
+        var invokeDataAfterLookup = Local("invokeDataAfterLookup");
+        var condition = Local("condition");
+
+        initial.Instructions.Add(new Instruction(0, OpCode.Move, initialState, new Immediate(7)));
+        initial.Instructions.Add(new Instruction(1, OpCode.Jump, head));
+
+        var headStateDefinition = includeBusinessBackedge
+            ? new Instruction(2, OpCode.Phi, headState, initialState, loopState)
+            : new Instruction(2, OpCode.Move, headState, initialState);
+        var klassDefinition = new Instruction(3, OpCode.Move, klass, new MemoryOperand(receiver));
+        head.Instructions.Add(headStateDefinition);
+        head.Instructions.Add(klassDefinition);
+        head.Instructions.Add(new Instruction(4, OpCode.ConditionalJump, slow, condition));
+
+        fast.Instructions.Add(new Instruction(5, OpCode.Move, fastInvokeData, new Immediate(0x138)));
+        fast.Instructions.Add(new Instruction(6, OpCode.Jump, merge));
+
+        var slowCall = new Instruction(7, OpCode.Call, new Immediate(0x219B070), slowInvokeData);
+        slow.Instructions.Add(slowCall);
+        slow.Instructions.Add(new Instruction(8, OpCode.Move, slowState, new Immediate(0)));
+        if (includeSideEffect)
+            slow.Instructions.Add(new Instruction(9, OpCode.CallVoid, new Immediate(0x123456)));
+        slow.Instructions.Add(new Instruction(10, OpCode.Jump, merge));
+
+        var statePhi = new Instruction(11, OpCode.Phi, stateAfterLookup, headState, slowState);
+        var lookupPhi = new Instruction(12, OpCode.Phi, invokeDataAfterLookup, fastInvokeData, slowInvokeData);
+        merge.Instructions.Add(statePhi);
+        merge.Instructions.Add(lookupPhi);
+        merge.Instructions.Add(new Instruction(13, OpCode.Jump, continuation));
+        continuation.Instructions.Add(new Instruction(14, OpCode.Return, stateAfterLookup));
+
+        if (backedge != null)
+        {
+            backedge.Instructions.Add(new Instruction(15, OpCode.Move, loopState, stateAfterLookup));
+            backedge.Instructions.Add(new Instruction(16, OpCode.Jump, head));
+        }
+
+        Connect(entry, initial);
+        Connect(initial, head);
+        Connect(head, fast);
+        Connect(head, slow);
+        Connect(fast, merge);
+        Connect(slow, merge);
+        Connect(merge, continuation);
+        if (backedge == null)
+            Connect(continuation, exit);
+        else
+        {
+            Connect(continuation, exit);
+            Connect(continuation, backedge);
+            Connect(backedge, head);
+        }
+
+        graph.EntryBlock = entry;
+        graph.ExitBlock = exit;
+        graph.Blocks = [entry, exit, initial, head, fast, slow, merge, continuation];
+        if (backedge != null)
+            graph.Blocks.Add(backedge);
+
+        foreach (var block in graph.Blocks)
+            block.CalculateBlockType();
+
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var homeBlocks = new Dictionary<Instruction, Block>();
+        foreach (var block in graph.Blocks)
+        foreach (var instruction in block.Instructions)
+        {
+            homeBlocks[instruction] = block;
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+        }
+
+        return new LookupExcisionFixture(
+            graph,
+            head,
+            fast,
+            slow,
+            merge,
+            backedge,
+            slowCall,
+            statePhi,
+            lookupPhi,
+            stateAfterLookup,
+            headState,
+            definitions,
+            homeBlocks);
+    }
+
+    private static void Connect(Block from, Block to)
+    {
+        from.Successors.Add(to);
+        to.Predecessors.Add(from);
     }
 
     private static (Instruction Dispatch, IReadOnlyList<Instruction> Instructions) CreateSharedInvokeDataShape(

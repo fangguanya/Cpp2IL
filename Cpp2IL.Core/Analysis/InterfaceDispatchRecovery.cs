@@ -1401,31 +1401,121 @@ public static class InterfaceDispatchRecovery
         continuation.CalculateBlockType();
     }
 
-    // Bailing here is fine, it just leaves the (already resolved) call with dead lookup around it
+    /// <summary>
+    /// 在接口目标已经闭合为托管直调后，删除只服务于原生 VirtualInvokeData 查表的控制流。
+    /// 裁剪失败只保留已解析直调与冗余查表，不会部分改写控制流。
+    /// </summary>
     private static void TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
     {
         var merge = match.Merge;
 
         if (!homeBlock.TryGetValue(match.SlowCall, out var slowBlock))
+        {
+            Logger.VerboseNewline($"接口查表子图裁剪跳过：慢路径调用没有所属块；汇合块={merge.ID}", nameof(InterfaceDispatchRecovery));
             return;
+        }
 
         if (Definition(definitions, match.KlassLocal) is not { } klassDefinition
             || !homeBlock.TryGetValue(klassDefinition, out var head) || head == merge)
+        {
+            Logger.VerboseNewline($"接口查表子图裁剪跳过：对象类指针定义块缺失；汇合块={merge.ID}", nameof(InterfaceDispatchRecovery));
             return;
+        }
+
+        if (!TryExciseLookupRegion(
+                cfg,
+                head,
+                merge,
+                slowBlock,
+                match.SlowCall,
+                definitions,
+                homeBlock,
+                out var removedBlockCount,
+                out var rejection))
+        {
+            Logger.VerboseNewline(
+                $"接口查表子图裁剪跳过：{rejection}；入口块={head.ID}；汇合块={merge.ID}；慢路径块={slowBlock.ID}",
+                nameof(InterfaceDispatchRecovery));
+            return;
+        }
+
+        Logger.VerboseNewline(
+            $"接口查表子图已裁剪：入口块={head.ID}；汇合块={merge.ID}；删除块数={removedBlockCount}",
+            nameof(InterfaceDispatchRecovery));
+    }
+
+    /// <summary>
+    /// 原子裁剪一个已经闭合的接口查表区域。入口块可以同时由初次进入边和业务循环回边到达；
+    /// 两类前驱都保留，并统一跳往已恢复的托管调用汇合块。
+    /// </summary>
+    internal static bool TryExciseLookupRegion(
+        ISILControlFlowGraph cfg,
+        Block head,
+        Block merge,
+        Block slowBlock,
+        Instruction slowCall,
+        Dictionary<LocalVariable, Instruction> definitions,
+        Dictionary<Instruction, Block> homeBlock,
+        out int removedBlockCount,
+        out string rejection)
+    {
+        removedBlockCount = 0;
+        rejection = string.Empty;
+
+        if (!cfg.Blocks.Contains(head) || !cfg.Blocks.Contains(merge) || !cfg.Blocks.Contains(slowBlock))
+        {
+            rejection = "入口、汇合或慢路径块已不属于当前控制流图";
+            return false;
+        }
 
         if (!TryCollectRegion(cfg, head, merge, out var region) || !region.Contains(slowBlock))
-            return;
-
-        if (!RegionIsSideEffectFree(region, match.SlowCall) || AnyValueEscapes(cfg, region, merge))
-            return;
-
-        if (!MergePhisAreDead(cfg, merge, out var removable))
-            return;
-
-        foreach (var instruction in removable)
         {
-            instruction.OpCode = OpCode.Nop;
-            instruction.SetOperands();
+            rejection = "查表区域不闭合或未包含慢路径";
+            return false;
+        }
+
+        if (!RegionIsSideEffectFree(region, slowCall))
+        {
+            rejection = "区域包含业务副作用";
+            return false;
+        }
+
+        if (AnyValueEscapes(cfg, region, merge))
+        {
+            rejection = "区域定义仍被汇合块以外的指令读取";
+            return false;
+        }
+
+        if (!TryPlanMergePhiBypass(
+                cfg,
+                merge,
+                region,
+                definitions,
+                homeBlock,
+                out var phiRewrites,
+                out rejection))
+            return false;
+
+        // 全部约束验证完成后才开始写图，确保异常形状保持逐指令不变。
+        foreach (var (phi, replacement, deadLoads) in phiRewrites)
+        {
+            foreach (var deadLoad in deadLoads)
+            {
+                deadLoad.OpCode = OpCode.Nop;
+                deadLoad.SetOperands();
+            }
+
+            if (replacement == null)
+            {
+                phi.OpCode = OpCode.Nop;
+                phi.SetOperands();
+            }
+            else
+            {
+                var destination = phi.Destination!;
+                phi.OpCode = OpCode.Move;
+                phi.SetOperands(destination, replacement);
+            }
         }
 
         foreach (var successor in head.Successors)
@@ -1445,7 +1535,8 @@ public static class InterfaceDispatchRecovery
         head.CalculateBlockType();
 
         merge.Predecessors.RemoveAll(region.Contains);
-        merge.Predecessors.Add(head);
+        if (!merge.Predecessors.Contains(head))
+            merge.Predecessors.Add(head);
 
         foreach (var block in region)
         {
@@ -1458,9 +1549,12 @@ public static class InterfaceDispatchRecovery
             block.Predecessors.Clear();
             cfg.Blocks.Remove(block);
         }
+
+        removedBlockCount = region.Count;
+        return true;
     }
 
-    // The region has to be closed, so nothing else may enter or leave it
+    /// <summary>查表区域必须闭合，除入口与汇合外不得存在外部进入或离开边。</summary>
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block head, Block merge, out HashSet<Block> region)
     {
         region = [];
@@ -1474,11 +1568,13 @@ public static class InterfaceDispatchRecovery
             if (block == head)
                 continue;
 
-            if (block == merge || block == cfg.EntryBlock || block == cfg.ExitBlock || region.Count > 64)
+            if (block == merge || block == cfg.EntryBlock || block == cfg.ExitBlock)
                 return false;
 
             if (!region.Add(block))
                 continue;
+            if (region.Count > 64)
+                return false;
 
             foreach (var predecessor in block.Predecessors)
                 queue.Enqueue(predecessor);
@@ -1496,7 +1592,7 @@ public static class InterfaceDispatchRecovery
                 return false;
         }
 
-        // we rewrite the head's terminator, so it can't branch anywhere else
+        // 入口终结指令将改写为直达汇合块，因此入口不得连接查表区域之外的其他业务块。
         return head.Successors.All(s => s == merge || collected.Contains(s));
     }
 
@@ -1533,7 +1629,7 @@ public static class InterfaceDispatchRecovery
         return true;
     }
 
-    // Merge phis are exempt, their deadness gets checked separately
+    /// <summary>汇合Phi另行归一；其他外部消费者一律阻断裁剪。</summary>
     private static bool AnyValueEscapes(ISILControlFlowGraph cfg, HashSet<Block> region, Block merge)
     {
         var regionDefs = new HashSet<LocalVariable>();
@@ -1560,10 +1656,22 @@ public static class InterfaceDispatchRecovery
         return false;
     }
 
-    // They may only feed loads off the VirtualInvokeData pointer, which must themselves be dead
-    private static bool MergePhisAreDead(ISILControlFlowGraph cfg, Block merge, out List<Instruction> removable)
+    /// <summary>
+    /// 规划入口直达汇合块后的 Phi 改写。若 Phi 的一个输入在查表区域外定义，绕过查表后
+    /// 必须保留这个入口状态；若全部输入均由查表区域产生，则只接受已经无消费者的值，
+    /// 或只服务于无后继消费者的 VirtualInvokeData 载入。
+    /// </summary>
+    private static bool TryPlanMergePhiBypass(
+        ISILControlFlowGraph cfg,
+        Block merge,
+        HashSet<Block> region,
+        Dictionary<LocalVariable, Instruction> definitions,
+        Dictionary<Instruction, Block> homeBlock,
+        out List<(Instruction Phi, IOperand? Replacement, List<Instruction> DeadLoads)> rewrites,
+        out string rejection)
     {
-        removable = [];
+        rewrites = [];
+        rejection = string.Empty;
 
         var useSites = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var block in cfg.Blocks)
@@ -1585,22 +1693,59 @@ public static class InterfaceDispatchRecovery
                 continue;
 
             if (phi.Operands[0] is not LocalVariable phiDest)
+            {
+                rejection = "汇合Phi缺少局部量目标";
                 return false;
+            }
 
+            var externalInputs = new List<IOperand>();
+            foreach (var source in phi.Operands.Skip(1))
+            {
+                var definedInsideRegion = source is LocalVariable sourceLocal
+                    && Definition(definitions, sourceLocal) is { } definition
+                    && homeBlock.TryGetValue(definition, out var owner)
+                    && region.Contains(owner);
+                if (!definedInsideRegion && externalInputs.All(existing => !OperandsEquivalent(existing, source)))
+                    externalInputs.Add(source);
+            }
+
+            if (externalInputs.Count == 1)
+            {
+                rewrites.Add((phi, externalInputs[0], []));
+                continue;
+            }
+
+            if (externalInputs.Count > 1)
+            {
+                rejection = $"汇合Phi含有 {externalInputs.Count} 个不一致的区域外输入";
+                return false;
+            }
+
+            var deadLoads = new List<Instruction>();
             foreach (var use in useSites.TryGetValue(phiDest, out var phiUses) ? phiUses : [])
             {
                 if (use is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand] }
                     || (useSites.TryGetValue(loaded, out var loadUses) && loadUses.Count > 0))
+                {
+                    rejection = "纯查表Phi仍有业务消费者";
                     return false;
+                }
 
-                removable.Add(use);
+                deadLoads.Add(use);
             }
 
-            removable.Add(phi);
+            rewrites.Add((phi, null, deadLoads));
         }
 
         return true;
     }
+
+    /// <summary>仅比较裁剪规划所需的稳定操作数身份。</summary>
+    private static bool OperandsEquivalent(IOperand left, IOperand right)
+        => ReferenceEquals(left, right)
+           || left is Immediate leftImmediate
+           && right is Immediate rightImmediate
+           && leftImmediate.Value == rightImmediate.Value;
 
     private static bool Uses(Instruction instruction, HashSet<LocalVariable> candidates)
         => UsedLocals(instruction).Any(candidates.Contains);
