@@ -138,6 +138,31 @@ public sealed class LibCpp2IlContext
         return CheckForPost27GlobalAt(tableAddress + unsignedOffset);
     }
 
+    /// <summary>
+    /// 解析元数据版本 27 及以上的 RELA 指针表项。与“全局槽保存连续编码表基址”的布局不同，
+    /// 此布局的每个表项都独立保存一个编码 metadata usage 地址，因此必须先按表项偏移读取
+    /// 指针，再在该指针位置读取并解码 usage。
+    /// </summary>
+    public MetadataUsage? CheckForPost27GlobalPointerTableEntryAt(ulong tableAddress, long entryByteOffset)
+    {
+        if (Metadata.MetadataVersion < 27f
+            || entryByteOffset < 0
+            || entryByteOffset % Binary.PointerSizeBytes != 0)
+            return null;
+
+        var unsignedOffset = (ulong)entryByteOffset;
+        if (tableAddress > ulong.MaxValue - unsignedOffset)
+            return null;
+
+        var entryAddress = tableAddress + unsignedOffset;
+        if (!Binary.TryMapVirtualAddressToRaw(entryAddress, out var entryRaw)
+            || entryRaw >= Binary.RawLength)
+            return null;
+
+        var metadataUsageAddress = Binary.ReadPointerAtVirtualAddress(entryAddress);
+        return CheckForPost27GlobalAt(metadataUsageAddress);
+    }
+
     public MetadataUsage? GetAnyGlobalByAddress(ulong address)
     {
         if (Metadata.MetadataVersion >= 27f)

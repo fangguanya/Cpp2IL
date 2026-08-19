@@ -514,6 +514,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 避免同一物理寄存器的布尔返回值把32位整数载体污染成object。
         LocalVariables.ResolveFinalScalarCarrierTypes(this);
 
+        // 中文注释：退 SSA 后索引、无符号上界、RELA 表基址和默认字符串槽同时可见；
+        // 只有四项证据完整闭合时才把原生指针表恢复为托管 switch。
+        RuntimeMetadataStringTableRecovery.Run(this);
+
         // 原生优化可省略从未被被调方法观察的this实参；退SSA边复制与终态标量类型现在同时
         // 可见；该阶段只处理类型已相容的标量合流，与早期类型冲突规则互斥。
         ErasedInstanceReceiverRecovery.RunScalarValueReceivers(this);

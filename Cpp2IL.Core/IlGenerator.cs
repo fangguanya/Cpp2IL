@@ -1032,6 +1032,14 @@ public static class IlGenerator
             case StringLiteral s:
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
+            case MetadataStringTableLookup lookup:
+                EmitMetadataStringTableLookup(
+                    lookup,
+                    method,
+                    locals,
+                    writeLine,
+                    stringCtor);
+                break;
             case HomogeneousFloatingAggregateArgument aggregate:
                 EmitHomogeneousFloatingAggregateArgument(
                     aggregate,
@@ -1248,6 +1256,44 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+    }
+
+    /// <summary>
+    /// 把已由 RELA 与 metadata usage 双重证明的字符串表生成成托管 switch。
+    /// 每条分支恰好压入一个字符串，越界路径压入原生保护分支的默认值。
+    /// </summary>
+    private static void EmitMetadataStringTableLookup(
+        MetadataStringTableLookup lookup,
+        MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals,
+        MemberReference writeLine,
+        MemberReference stringCtor)
+    {
+        if (lookup.Values.Count == 0)
+            throw new DecompilerException("字符串元数据表不得为空。");
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var caseInstructions = lookup.Values
+            .Select(_ => new CilInstruction(CilOpCodes.Nop))
+            .ToArray();
+        var end = new CilInstruction(CilOpCodes.Nop);
+        var labels = caseInstructions
+            .Select(instruction => (ICilLabel)new CilInstructionLabel(instruction))
+            .ToArray();
+
+        LoadOperand(lookup.Index, method, locals, writeLine, stringCtor);
+        instructions.Add(CilOpCodes.Switch, labels);
+        instructions.Add(CilOpCodes.Ldstr, lookup.DefaultValue.Value);
+        instructions.Add(CilOpCodes.Br, new CilInstructionLabel(end));
+
+        for (var index = 0; index < lookup.Values.Count; index++)
+        {
+            instructions.Add(caseInstructions[index]);
+            instructions.Add(CilOpCodes.Ldstr, lookup.Values[index].Value);
+            instructions.Add(CilOpCodes.Br, new CilInstructionLabel(end));
+        }
+
+        instructions.Add(end);
     }
 
     /// <summary>

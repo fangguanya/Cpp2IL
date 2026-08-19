@@ -155,6 +155,10 @@ public static class DeadCodeEliminator
             case ListCount { Value: { } listValue }:
                 yield return listValue;
                 break;
+            case MetadataStringTableLookup lookup:
+                foreach (var used in EnumerateUsedLocals(lookup.Index))
+                    yield return used;
+                break;
             case HomogeneousFloatingAggregateArgument aggregate:
                 foreach (var component in aggregate.Components)
                 foreach (var used in EnumerateUsedLocals(component))

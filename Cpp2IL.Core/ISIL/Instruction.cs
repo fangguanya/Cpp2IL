@@ -282,9 +282,14 @@ public class Instruction : IOperand
     }
 
     private static IEnumerable<IOperand> ExpandAggregateSource(IOperand operand)
-        => operand is HomogeneousFloatingAggregateArgument aggregate
-            ? aggregate.Components.SelectMany(ExpandAggregateSource)
-            : [operand];
+        => operand switch
+        {
+            HomogeneousFloatingAggregateArgument aggregate
+                => aggregate.Components.SelectMany(ExpandAggregateSource),
+            MetadataStringTableLookup lookup
+                => ExpandAggregateSource(lookup.Index),
+            _ => [operand],
+        };
 
     public override string ToString()
     {
