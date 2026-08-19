@@ -1081,7 +1081,7 @@ public class MetadataResolverTests
     public void 托管对象加常量地址与附加偏移合并为实例字段()
     {
         var fixture = CreateIndirectInstanceFieldFixture(
-            addSecondDefinition: false,
+            addressOffsets: [0x20],
             useIndexedMemory: false);
 
         var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
@@ -1102,7 +1102,7 @@ public class MetadataResolverTests
     public void 带索引的托管地址访问保持内存语义()
     {
         var fixture = CreateIndirectInstanceFieldFixture(
-            addSecondDefinition: false,
+            addressOffsets: [0x20],
             useIndexedMemory: true);
 
         var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
@@ -1115,11 +1115,49 @@ public class MetadataResolverTests
     }
 
     [Test]
-    [Category("异常输入")]
-    public void 多定义托管字段地址保持未解析()
+    [Category("基本功能")]
+    public void 分支上等价的托管字段地址解析为同一字段()
     {
         var fixture = CreateIndirectInstanceFieldFixture(
-            addSecondDefinition: true,
+            addressOffsets: [0x20, 0x20],
+            useIndexedMemory: false);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Access.Operands[0], Is.TypeOf<FieldReference>());
+            var reference = (FieldReference)fixture.Access.Operands[0];
+            Assert.That(reference.Field, Is.SameAs(fixture.Field));
+            Assert.That(reference.Local, Is.SameAs(fixture.Receiver));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百条等价地址定义全部核对后仍解析字段()
+    {
+        var fixture = CreateIndirectInstanceFieldFixture(
+            addressOffsets: Enumerable.Repeat(0x20L, 400).ToArray(),
+            useIndexedMemory: false);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Access.Operands[0], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)fixture.Access.Operands[0]).Field, Is.SameAs(fixture.Field));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 任一分支字段地址偏移漂移时保持未解析()
+    {
+        var fixture = CreateIndirectInstanceFieldFixture(
+            addressOffsets: [0x20, 0x20, 0x28],
             useIndexedMemory: false);
 
         var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
@@ -1132,7 +1170,7 @@ public class MetadataResolverTests
     }
 
     private static IndirectInstanceFieldFixture CreateIndirectInstanceFieldFixture(
-        bool addSecondDefinition,
+        IReadOnlyList<long> addressOffsets,
         bool useIndexedMemory)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -1158,18 +1196,16 @@ public class MetadataResolverTests
             "index",
             new Register(null, "X9"),
             app.SystemTypes.SystemInt32Type);
-        var instructions = new List<Instruction>
-        {
-            new(0, OpCode.Add, address, receiver, new Immediate(0x20))
-        };
-        if (addSecondDefinition)
-            instructions.Add(new Instruction(1, OpCode.Add, address, receiver, new Immediate(0x28)));
+        var instructions = addressOffsets
+            .Select((offset, index) =>
+                new Instruction(index, OpCode.Add, address, receiver, new Immediate(offset)))
+            .ToList();
         var memory = useIndexedMemory
             ? new MemoryOperand(address, index, addend: 5, scale: 1)
             : new MemoryOperand(address, addend: 5);
-        var access = new Instruction(2, OpCode.Move, memory, new Immediate(0));
+        var access = new Instruction(addressOffsets.Count, OpCode.Move, memory, new Immediate(0));
         instructions.Add(access);
-        instructions.Add(new Instruction(3, OpCode.Return));
+        instructions.Add(new Instruction(addressOffsets.Count + 1, OpCode.Return));
         method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
         return new IndirectInstanceFieldFixture(method, receiver, field, access);
     }

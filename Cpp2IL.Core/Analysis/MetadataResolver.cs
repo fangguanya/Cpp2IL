@@ -633,7 +633,9 @@ public static class MetadataResolver
     }
 
     /// <summary>
-    /// 一次建立局部量定义索引；每个局部最多保留两个定义，足以区分唯一与歧义而不重复保存大方法数据。
+    /// 一次建立局部量完整定义索引。
+    /// 退 SSA 后的同一物理寄存器可在多条分支上产生等价定义；必须保留全部定义，
+    /// 才能证明所有分支都指向同一托管对象字段，也能在任一后续定义漂移时失败关闭。
     /// </summary>
     internal static IReadOnlyDictionary<LocalVariable, Instruction[]> BuildDefinitionIndex(
         IReadOnlyList<Instruction> instructions)
@@ -641,7 +643,7 @@ public static class MetadataResolver
         return instructions
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
-            .ToDictionary(group => group.Key, group => group.Take(2).ToArray());
+            .ToDictionary(group => group.Key, group => group.ToArray());
     }
 
     /// <summary>
@@ -668,34 +670,32 @@ public static class MetadataResolver
         }
 
         if (!definitions.TryGetValue(memoryBase, out var addressDefinitions)
-            || addressDefinitions.Length != 1
-            || addressDefinitions[0] is not
-            {
-                OpCode: OpCode.Add,
-                Operands.Count: 3
-            } addressDefinition)
+            || addressDefinitions.Length == 0)
             return false;
 
         LocalVariable? receiver = null;
         long addressOffset = 0;
-        if (addressDefinition.Operands[1] is LocalVariable leftReceiver
-            && addressDefinition.Operands[2] is Immediate rightOffset)
+        foreach (var addressDefinition in addressDefinitions)
         {
-            receiver = leftReceiver;
-            addressOffset = rightOffset.Value;
-        }
-        else if (addressDefinition.Operands[1] is Immediate leftOffset
-                 && addressDefinition.Operands[2] is LocalVariable rightReceiver)
-        {
-            receiver = rightReceiver;
-            addressOffset = leftOffset.Value;
+            if (!TryDecodeManagedFieldAddressDefinition(
+                    addressDefinition,
+                    out var candidateReceiver,
+                    out var candidateOffset))
+                return false;
+
+            if (receiver == null)
+            {
+                receiver = candidateReceiver;
+                addressOffset = candidateOffset;
+                continue;
+            }
+
+            if (!ReferenceEquals(receiver, candidateReceiver)
+                || addressOffset != candidateOffset)
+                return false;
         }
 
-        if (receiver?.Type == null
-            || receiver.Type.IsValueType
-            || receiver.Type is PointerTypeAnalysisContext
-                or ByRefTypeAnalysisContext
-                or StaticFieldStorageTypeAnalysisContext)
+        if (receiver == null)
             return false;
 
         try
@@ -709,6 +709,49 @@ public static class MetadataResolver
 
         local = receiver;
         return true;
+    }
+
+    /// <summary>
+    /// 解码单条“托管对象 + 常量”字段地址定义。
+    /// 两种加法操作数顺序共用同一入口，数值、指针、byref 和静态存储根均保持原生地址语义。
+    /// </summary>
+    private static bool TryDecodeManagedFieldAddressDefinition(
+        Instruction definition,
+        out LocalVariable receiver,
+        out long addressOffset)
+    {
+        receiver = null!;
+        addressOffset = 0;
+        if (definition is not
+            {
+                OpCode: OpCode.Add,
+                Operands.Count: 3
+            })
+            return false;
+
+        if (definition.Operands[1] is LocalVariable leftReceiver
+            && definition.Operands[2] is Immediate rightOffset)
+        {
+            receiver = leftReceiver;
+            addressOffset = rightOffset.Value;
+        }
+        else if (definition.Operands[1] is Immediate leftOffset
+                 && definition.Operands[2] is LocalVariable rightReceiver)
+        {
+            receiver = rightReceiver;
+            addressOffset = leftOffset.Value;
+        }
+        else
+        {
+            return false;
+        }
+
+        return receiver.Type != null
+               && !receiver.Type.IsValueType
+               && receiver.Type is not (
+                   PointerTypeAnalysisContext
+                   or ByRefTypeAnalysisContext
+                   or StaticFieldStorageTypeAnalysisContext);
     }
 
     /// <summary>
