@@ -166,6 +166,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    /// <summary>
+    /// 识别普通通用寄存器的前索引写回。
+    /// 前索引寻址会先把立即数加到基址寄存器，再使用更新后的地址访问内存；
+    /// SP 由独立的栈槽路径处理，寄存器索引形式则不属于 ARM64 前索引立即数编码。
+    /// </summary>
+    internal static bool TryDecodePreIndexedRegisterWriteback(
+        Arm64MemoryIndexMode indexMode,
+        Arm64Register memoryBase,
+        Arm64Register addendRegister,
+        out Register writebackRegister)
+    {
+        if (indexMode != Arm64MemoryIndexMode.PreIndex
+            || memoryBase is < Arm64Register.X0 or > Arm64Register.X30
+            || addendRegister != Arm64Register.INVALID)
+        {
+            writebackRegister = default;
+            return false;
+        }
+
+        writebackRegister = new Register(
+            null,
+            Arm64RegisterHelper.CanonicalName(memoryBase));
+        return true;
+    }
+
     internal static bool TryCreateStackOffset(
         Arm64Register baseRegister,
         Arm64Register addendRegister,
@@ -2768,6 +2793,32 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             OpCode.Move,
                             new StackOffset(0),
                             ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
+                    if (TryDecodePreIndexedRegisterWriteback(
+                            instruction.MemIndexMode,
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            out var preIndexedWritebackRegister))
+                    {
+                        // 普通寄存器前索引必须显式产生基址写回；否则后续 [Xn] 会继续读取旧对象。
+                        // 先更新基址再访问零偏移内存，精确对应 ARM64 的 pre-index 语义。
+                        Add(
+                            address,
+                            OpCode.Add,
+                            preIndexedWritebackRegister,
+                            preIndexedWritebackRegister,
+                            Imm(instruction.MemOffset));
+                        AddMemory(
+                            address,
+                            storeWidthBits,
+                            OpCode.Move,
+                            new MemoryOperand(new Register(null, preIndexedWritebackRegister.Name)),
+                            ConvertStoreSourceOperand(instruction));
+
+                        if (adrpOffsets.TryGetValue(instruction.MemBase, out var knownBaseAddress))
+                            adrpOffsets[instruction.MemBase] = unchecked(knownBaseAddress + (ulong)instruction.MemOffset);
                         break;
                     }
 

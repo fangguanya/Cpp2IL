@@ -282,6 +282,65 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void 普通寄存器前索引存储识别字段地址写回()
+    {
+        // STR X0, [X19, #0x80]!；来自 MiniGameBurglary.GetMazeForIndex 的真实指令。
+        var native = DecodeSingleInstruction([0x60, 0x0E, 0x08, 0xF8], 0x02BDC778);
+
+        var decoded = NewArmV8InstructionSet.TryDecodePreIndexedRegisterWriteback(
+            native.MemIndexMode,
+            native.MemBase,
+            native.MemAddendReg,
+            out var writebackRegister);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(native.Mnemonic, Is.EqualTo(Arm64Mnemonic.STR));
+            Assert.That(native.MemOffset, Is.EqualTo(0x80));
+            Assert.That(decoded, Is.True);
+            Assert.That(writebackRegister.Name, Is.EqualTo("X19"));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 普通寄存器前索引接受负立即数写回()
+    {
+        // STR X0, [X19, #-8]!；验证有符号 imm9 下界附近不会丢失写回身份。
+        var native = DecodeSingleInstruction([0x60, 0x8E, 0x1F, 0xF8], 0x1000);
+
+        var decoded = NewArmV8InstructionSet.TryDecodePreIndexedRegisterWriteback(
+            native.MemIndexMode,
+            native.MemBase,
+            native.MemAddendReg,
+            out var writebackRegister);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(native.MemOffset, Is.EqualTo(-8));
+            Assert.That(decoded, Is.True);
+            Assert.That(writebackRegister.Name, Is.EqualTo("X19"));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通偏移存储不得伪造基址写回()
+    {
+        // STR X0, [X19, #0x80]；没有感叹号，基址必须保持不变。
+        var native = DecodeSingleInstruction([0x60, 0x42, 0x00, 0xF9], 0x1000);
+
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodePreIndexedRegisterWriteback(
+                native.MemIndexMode,
+                native.MemBase,
+                native.MemAddendReg,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void AdrpRelativePageBecomesAbsolutePage()
     {
         Assert.That(
