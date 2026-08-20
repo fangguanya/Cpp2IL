@@ -330,6 +330,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    /// <summary>
+    /// 通用寄存器被值指令重写后，清除同一物理寄存器上残留的 ADRP 页地址事实。
+    /// Wn 写入同样会覆盖 Xn 的低位并清零高位，因此宽度别名必须作为一个寄存器处理。
+    /// </summary>
+    internal static bool InvalidateAdrpRegisterWrite(
+        IDictionary<Arm64Register, ulong> pageAddresses,
+        Arm64OperandKind destinationKind,
+        Arm64Register destinationRegister)
+    {
+        if (destinationKind != Arm64OperandKind.Register)
+            return false;
+
+        var destinationName = Arm64RegisterHelper.CanonicalName(destinationRegister);
+        var staleRegisters = pageAddresses.Keys
+            .Where(register => Arm64RegisterHelper.CanonicalName(register) == destinationName)
+            .ToArray();
+        foreach (var staleRegister in staleRegisters)
+            pageAddresses.Remove(staleRegister);
+
+        return staleRegisters.Length != 0;
+    }
+
     internal static bool TryFindObservedIndirectReturnBuffer(
         IReadOnlyList<Instruction> emittedInstructions,
         out StackOffset stackOffset)
@@ -2547,6 +2569,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         bool TryEmitConditionalSelect(string registerPrefix)
         {
+            // CSEL/FCSEL 的目标是新值，旧 ADRP 页基址到这里已经死亡。必须在条件解析前失效，
+            // 这样即使条件暂未建模，后续 LDR 也不会把动态选择结果错误折叠成陈旧绝对地址。
+            InvalidateAdrpRegisterWrite(adrpOffsets, instruction.Op0Kind, instruction.Op0Reg);
+
             if (!TryEmitCondition(
                     instruction.FinalOpConditionCode,
                     registerPrefix + "_CONDITION",
@@ -2776,7 +2802,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), moveSource);
-                Add(address, OpCode.CheckEqual, new Register(null, "Z"), ConvertOperand(instruction, 0), Imm(0));
+                // MOV、FMOV、SXTW 与 LDR 家族均不写 NZCV。保留此前 CMP/TST 等标志生产者，
+                // 使跨加载的 CSEL/条件分支继续读取原生指令流中的真实条件。
                 break;
             case Arm64Mnemonic.MOVK:
                 {

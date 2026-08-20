@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using AssetRipper.Primitives;
 using Cpp2IL.Core.Api;
 using Cpp2IL.Core.InstructionSets;
+using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
@@ -57,7 +58,15 @@ public class Arm64StartupFixtureIntegrationTests
     {
         var context = LoadFixture();
         var libContext = context.LibCpp2IlContext;
-        var slots = new ulong[] { 0x5A01398, 0x5A01388, 0x59EFE68, 0x59EFE58 };
+        var slots = new ulong[]
+        {
+            0x5A01398,
+            0x5A01388,
+            0x59EFE68,
+            0x59EFE58,
+            0x59EFE70,
+            0x59EFE60,
+        };
         var usages = slots.Select(address => new
         {
             Address = address,
@@ -80,7 +89,71 @@ public class Arm64StartupFixtureIntegrationTests
             "yellow",
             "a16_darkCheckboxChecked",
             "a16_darkCheckboxChecked-dm",
+            "a16_darkCheckboxUnchecked",
+            "a16_darkCheckboxUnchecked-dm",
         }));
+    }
+
+    [Test]
+    [Category("fixture集成")]
+    public void 账户图像初始化的两个条件字符串均保留到最终控制流()
+    {
+        var context = LoadFixture();
+        var method = context.Assemblies
+            .SelectMany(assembly => assembly.Types)
+            .Single(type => type.Definition?.FullName == "MiniGameAccount")
+            .Methods
+            .Single(candidate => candidate.Definition?.Name == "SetupImages");
+        var rawInstructions = context.InstructionSet.GetIsilFromMethod(method);
+        var rawSelections = rawInstructions
+            .Where(instruction => instruction.OpCode == OpCode.ConditionalSelect)
+            .Select(instruction => instruction.ToString())
+            .ToArray();
+
+        TestContext.Out.WriteLine("原始条件选择：");
+        foreach (var selection in rawSelections)
+            TestContext.Out.WriteLine(selection);
+        TestContext.Out.WriteLine("原始关键窗口：");
+        foreach (var item in rawInstructions
+                     .Select((instruction, index) => new { instruction, index })
+                     .Where(item => item.index is >= 54 and <= 75))
+            TestContext.Out.WriteLine($"{item.index}: {item.instruction}");
+
+        method.Analyze();
+        var finalInstructions = method.ControlFlowGraph!.Instructions;
+        var finalSelections = finalInstructions
+            .Where(instruction => instruction.OpCode == OpCode.ConditionalSelect)
+            .ToArray();
+        var imageCalls = finalInstructions
+            .Where(instruction => instruction.OpCode == OpCode.Call
+                && instruction.Operands.Any(operand => operand is MethodAnalysisContext target
+                    && target.DeclaringType?.FullName == "UIImageHub"
+                    && target.Name == "ImageForString"))
+            .ToArray();
+
+        TestContext.Out.WriteLine("最终条件选择：");
+        foreach (var selection in finalSelections)
+            TestContext.Out.WriteLine(selection);
+        TestContext.Out.WriteLine("最终图像调用：");
+        foreach (var call in imageCalls)
+            TestContext.Out.WriteLine(call);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rawSelections, Has.Length.EqualTo(2));
+            Assert.That(finalSelections.Count(selection => selection.Destination
+                is LocalVariable destination
+                && destination.Type == context.SystemTypes.SystemStringType), Is.EqualTo(2));
+            Assert.That(
+                finalSelections[1].Operands[1].ToString(),
+                Is.EqualTo(finalSelections[0].Operands[1].ToString()),
+                "两次字符串选择之间的普通加载不写 NZCV，必须复用同一暗色模式条件。");
+            Assert.That(imageCalls, Has.Length.EqualTo(2));
+            Assert.That(imageCalls.All(call => call.SourcesAndConstants.Any(source =>
+                source is StringLiteral
+                || source is LocalVariable local
+                    && local.Type == context.SystemTypes.SystemStringType)), Is.True);
+        }
     }
 
     private static ApplicationAnalysisContext LoadFixture()

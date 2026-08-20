@@ -439,6 +439,78 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 条件选择重写目标寄存器后清除陈旧Adrp页地址()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X20] = 0x05E71000,
+        };
+
+        var invalidated = NewArmV8InstructionSet.InvalidateAdrpRegisterWrite(
+            pages,
+            Arm64OperandKind.Register,
+            Arm64Register.X20);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(invalidated, Is.True);
+            Assert.That(pages, Does.Not.ContainKey(Arm64Register.X20));
+            Assert.That(
+                NewArmV8InstructionSet.TryCreateAdrpMemoryOperand(
+                    pages,
+                    Arm64Register.X20,
+                    Arm64Register.INVALID,
+                    0,
+                    out _),
+                Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 三十二位目标别名同样清除六十四位Adrp页地址()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X20] = 0x05E71000,
+            [Arm64Register.X21] = 0x059EF000,
+        };
+
+        NewArmV8InstructionSet.InvalidateAdrpRegisterWrite(
+            pages,
+            Arm64OperandKind.Register,
+            Arm64Register.W20);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(pages, Does.Not.ContainKey(Arm64Register.X20));
+            Assert.That(pages[Arm64Register.X21], Is.EqualTo(0x059EF000));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非寄存器目标不得污染Adrp页地址事实()
+    {
+        var pages = new Dictionary<Arm64Register, ulong>
+        {
+            [Arm64Register.X20] = 0x05E71000,
+        };
+
+        var invalidated = NewArmV8InstructionSet.InvalidateAdrpRegisterWrite(
+            pages,
+            Arm64OperandKind.Immediate,
+            Arm64Register.X20);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(invalidated, Is.False);
+            Assert.That(pages[Arm64Register.X20], Is.EqualTo(0x05E71000));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void IndexedAdrpStoreKeepsDynamicAddressing()
     {
