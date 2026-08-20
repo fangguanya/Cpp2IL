@@ -465,6 +465,60 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 返回签名恢复StringEmpty静态字段()
+    {
+        var fixture = CreateStringEmptyReturnFixture();
+
+        var resolvedCount = LocalVariables.ResolveExpectedSelfTypedStaticFields(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolvedCount, Is.EqualTo(1));
+            Assert.That(fixture.Return.Operands[0], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)fixture.Return.Operands[0]).Field.Name, Is.EqualTo("Empty"));
+            Assert.That(fixture.RuntimeClass.Type, Is.TypeOf<RuntimeClassTypeAnalysisContext>());
+            Assert.That(fixture.StaticStorage.Type, Is.TypeOf<StaticFieldStorageTypeAnalysisContext>());
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 返回字段偏移不匹配时保持原始静态区读取()
+    {
+        var fixture = CreateStringEmptyReturnFixture(fieldOffsetDelta: 8);
+
+        var resolvedCount = LocalVariables.ResolveExpectedSelfTypedStaticFields(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolvedCount, Is.Zero);
+            Assert.That(fixture.Return.Operands[0], Is.TypeOf<MemoryOperand>());
+            Assert.That(fixture.RuntimeClass.Type, Is.Null);
+            Assert.That(fixture.StaticStorage.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 返回链已有冲突类身份时保持原始静态区读取()
+    {
+        var fixture = CreateStringEmptyReturnFixture(conflictingRuntimeClass: true);
+
+        var resolvedCount = LocalVariables.ResolveExpectedSelfTypedStaticFields(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolvedCount, Is.Zero);
+            Assert.That(fixture.Return.Operands[0], Is.TypeOf<MemoryOperand>());
+            Assert.That(
+                ((RuntimeClassTypeAnalysisContext)fixture.RuntimeClass.Type!).RepresentedType,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType));
+            Assert.That(fixture.StaticStorage.Type, Is.Null);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 错位StaticFields读取不得绑定StringEmpty所有者()
     {
@@ -530,6 +584,55 @@ public class LocalVariablesTests
             Assert.That(runtimeClass.Type, Is.SameAs(conflictingType));
             Assert.That(staticStorage.Type, Is.Null);
         });
+    }
+
+    /// <summary>
+    /// 构造与真实ARM64路径一致的“默认类型表→String类→静态区→Empty字段→Return”闭包。
+    /// 三类测试只改变一个边界条件，公共图构造集中在此处，避免重复维护偏移与局部身份。
+    /// </summary>
+    private static (
+        MethodAnalysisContext Method,
+        Instruction Return,
+        LocalVariable RuntimeClass,
+        LocalVariable StaticStorage) CreateStringEmptyReturnFixture(
+        long fieldOffsetDelta = 0,
+        bool conflictingRuntimeClass = false)
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var emptyField = stringType.Fields.Single(field =>
+            field.IsStatic
+            && field.Name == "Empty"
+            && GenericCallRebinder.TypesEquivalent(field.FieldType, stringType));
+        var tableBase = new LocalVariable("tableBase", new Register(null, "X8", 1));
+        var runtimeClassType = conflictingRuntimeClass
+            ? new RuntimeClassTypeAnalysisContext(
+                appContext.SystemTypes.SystemObjectType,
+                appContext.SystemTypes.SystemObjectType.DeclaringAssembly)
+            : null;
+        var runtimeClass = new LocalVariable(
+            "runtimeClass",
+            new Register(null, "X8", 2),
+            runtimeClassType);
+        var staticStorage = new LocalVariable("staticStorage", new Register(null, "X8", 3));
+        var returnInstruction = new Instruction(
+            3,
+            OpCode.Return,
+            new MemoryOperand(staticStorage, null, emptyField.Offset + fieldOffsetDelta));
+        var method = new InjectedMethodAnalysisContext(
+            stringType,
+            "ReturnStringEmpty",
+            stringType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, tableBase, new MemoryOperand(null, null, 0x1000)),
+            new Instruction(1, OpCode.Move, runtimeClass, new MemoryOperand(tableBase, null, 0x90)),
+            new Instruction(2, OpCode.Move, staticStorage, new MemoryOperand(runtimeClass, null, 0xB8)),
+            returnInstruction,
+        ]);
+        method.Locals = [tableBase, runtimeClass, staticStorage];
+        return (method, returnInstruction, runtimeClass, staticStorage);
     }
 
     [Test]

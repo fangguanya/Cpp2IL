@@ -831,8 +831,33 @@ public static class LocalVariables
         var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
         var resolvedCount = 0;
 
+        bool ResolveOperand(Instruction owner, int operandIndex, TypeAnalysisContext expectedType)
+        {
+            if (operandIndex >= owner.Operands.Count
+                || !TryResolveSelfTypedStaticFieldLoad(
+                    owner.Operands[operandIndex],
+                    expectedType,
+                    uniqueDefinitions,
+                    staticFieldsOffset,
+                    out var resolvedField))
+                return false;
+
+            // 中文注释：Move、Return和调用形参共享同一条字段证明与提交路径，避免三处
+            // 分别维护静态表闭包后产生规则漂移或重复计数。
+            owner.SetOperand(operandIndex, resolvedField!);
+            resolvedCount++;
+            return true;
+        }
+
         foreach (var instruction in instructions)
         {
+            if (instruction.OpCode == OpCode.Return && instruction.Operands.Count == 1)
+            {
+                // 中文注释：ARM64会把String.Empty直接从TypeInfo静态区装入X0后返回；
+                // 返回签名就是精确消费者，必须与Move和调用形参走相同的自类型字段闭包。
+                ResolveOperand(instruction, 0, method.ReturnType);
+            }
+
             if (instruction.OpCode == OpCode.Move && instruction.Operands.Count >= 2)
             {
                 var expectedType = instruction.Operands[0] switch
@@ -842,17 +867,8 @@ public static class LocalVariables
                     _ => null,
                 };
 
-                if (expectedType != null
-                    && TryResolveSelfTypedStaticFieldLoad(
-                        instruction.Operands[1],
-                        expectedType,
-                        uniqueDefinitions,
-                        staticFieldsOffset,
-                        out var resolvedMoveField))
-                {
-                    instruction.SetOperand(1, resolvedMoveField!);
-                    resolvedCount++;
-                }
+                if (expectedType != null)
+                    ResolveOperand(instruction, 1, expectedType);
             }
 
             if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
@@ -868,16 +884,10 @@ public static class LocalVariables
                 if (parameterIndex >= calledMethod.Parameters.Count)
                     break;
 
-                if (!TryResolveSelfTypedStaticFieldLoad(
-                    instruction.Operands[operandIndex],
-                    calledMethod.Parameters[parameterIndex].ParameterType,
-                    uniqueDefinitions,
-                    staticFieldsOffset,
-                    out var resolvedField))
-                    continue;
-
-                instruction.SetOperand(operandIndex, resolvedField!);
-                resolvedCount++;
+                ResolveOperand(
+                    instruction,
+                    operandIndex,
+                    calledMethod.Parameters[parameterIndex].ParameterType);
             }
         }
 
