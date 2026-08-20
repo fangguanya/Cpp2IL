@@ -122,7 +122,8 @@ public static class ReadOnlyScalarLiteralRecovery
                 .OfType<LocalVariable>()
                 .Select(local => local.Type)
                 .Where(type => type?.FullName is "System.Single" or "System.Double")
-                .DistinctBy(type => type!.FullName)
+                .GroupBy(type => type!.FullName, System.StringComparer.Ordinal)
+                .Select(group => group.First())
                 .ToArray();
             if (types.Length == 1)
                 expectedType = types[0];

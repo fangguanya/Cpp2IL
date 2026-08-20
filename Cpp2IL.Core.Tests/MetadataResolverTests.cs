@@ -1337,6 +1337,136 @@ public class MetadataResolverTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 已初始化同址槽的内联读取恢复为强类型元数据操作数()
+    {
+        var slot = new LocalVariable("slot", new Register(null, "X29"));
+        var result = new LocalVariable("result", new Register(null, "X0"));
+        var literal = new StringLiteral("fixture");
+        var load = new Instruction(0, OpCode.Move, slot, new MemoryOperand(addend: 0x1000));
+        var call = new Instruction(1, OpCode.Call, new StringLiteral("consumer"), result, new MemoryOperand(slot));
+        var instructions = new[] { load, call };
+
+        var recovered = MetadataResolver.ResolveInitializedInlineMetadataOperands(
+            instructions,
+            new HashSet<ulong> { 0x1000 },
+            address => address == 0x1000 ? literal : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(call.Operands[2], Is.EqualTo(literal));
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(load.Operands, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 退Ssa载体的多个同址定义仍恢复同一内联元数据操作数()
+    {
+        var slot = new LocalVariable("slot", new Register(null, "X29"));
+        var result = new LocalVariable("result", new Register(null, "X0"));
+        var type = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, slot, new MemoryOperand(addend: 0x2000)),
+            new(1, OpCode.Move, slot, new MemoryOperand(addend: 0x2000)),
+            new(2, OpCode.Call, new StringLiteral("consumer"), result, new MemoryOperand(slot)),
+        };
+
+        var recovered = MetadataResolver.ResolveInitializedInlineMetadataOperands(
+            instructions,
+            new HashSet<ulong> { 0x2000 },
+            address => address == 0x2000 ? type : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(instructions[2].Operands[2], Is.SameAs(type));
+            Assert.That(instructions.Take(2).Select(instruction => instruction.OpCode),
+                Is.All.EqualTo(OpCode.Nop));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已解析槽载体仍有真实读取时保留其定义()
+    {
+        var slot = new LocalVariable("slot", new Register(null, "X29"));
+        var result = new LocalVariable("result", new Register(null, "X0"));
+        var otherResult = new LocalVariable("otherResult", new Register(null, "X1"));
+        var load = new Instruction(0, OpCode.Move, slot, new MemoryOperand(addend: 0x2400));
+        var resolvedCall = new Instruction(1, OpCode.Call, new StringLiteral("consumer"), result, new MemoryOperand(slot));
+        var remainingRead = new Instruction(2, OpCode.Add, otherResult, slot, new Immediate(8));
+        var instructions = new[] { load, resolvedCall, remainingRead };
+
+        var recovered = MetadataResolver.ResolveInitializedInlineMetadataOperands(
+            instructions,
+            new HashSet<ulong> { 0x2400 },
+            _ => new StringLiteral("fixture"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(remainingRead.Operands[1], Is.SameAs(slot));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 普通Move中的类型元数据读取保留给运行时类闭包()
+    {
+        var slot = new LocalVariable("slot", new Register(null, "X29"));
+        var runtimeClass = new LocalVariable("runtimeClass", new Register(null, "X8"));
+        var type = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var inlineRead = new MemoryOperand(slot);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, slot, new MemoryOperand(addend: 0x2800)),
+            new(1, OpCode.Move, runtimeClass, inlineRead),
+        };
+
+        var recovered = MetadataResolver.ResolveInitializedInlineMetadataOperands(
+            instructions,
+            new HashSet<ulong> { 0x2800 },
+            _ => type);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(instructions[1].Operands[1], Is.EqualTo(inlineRead));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未初始化或多定义异址的内联元数据读取保持原样()
+    {
+        var slot = new LocalVariable("slot", new Register(null, "X29"));
+        var result = new LocalVariable("result", new Register(null, "X0"));
+        var inlineRead = new MemoryOperand(slot);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, slot, new MemoryOperand(addend: 0x3000)),
+            new(1, OpCode.Move, slot, new MemoryOperand(addend: 0x4000)),
+            new(2, OpCode.Call, new StringLiteral("consumer"), result, inlineRead),
+        };
+
+        var recovered = MetadataResolver.ResolveInitializedInlineMetadataOperands(
+            instructions,
+            new HashSet<ulong> { 0x3000, 0x4000 },
+            _ => new StringLiteral("unexpected"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(instructions[2].Operands[2], Is.EqualTo(inlineRead));
+        });
+    }
+
     private static IndirectInstanceFieldFixture CreateIndirectInstanceFieldFixture(
         IReadOnlyList<long> addressOffsets,
         bool useIndexedMemory)

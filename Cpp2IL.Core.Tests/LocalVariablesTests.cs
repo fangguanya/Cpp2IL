@@ -414,6 +414,29 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 已解析泛型字段覆盖共享ListObject占位类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var sharedType = listType.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var fieldType = listType.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var destination = new LocalVariable(
+            "destination",
+            new Register(null, "X19", 1),
+            sharedType);
+
+        var changed = LocalVariables.BindResolvedFieldLoadType(destination, fieldType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(destination.Type, Is.SameAs(fieldType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void Post27二级表恢复StringEmpty静态字段所有者()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
@@ -1670,6 +1693,35 @@ public class LocalVariablesTests
 
     [Test]
     [Category("边界值")]
+    public void 共享ListObject实例目标不得降级结构化开放接收者()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var clear = listDefinition.Methods.First(method => method.Name == "Clear");
+        var sharedTarget = new ConcreteGenericMethodAnalysisContext(
+            clear,
+            [appContext.SystemTypes.SystemObjectType],
+            []);
+        var structuredElement = listDefinition.MakeGenericInstanceType([genericElement]);
+        var structuredReceiverType = listDefinition.MakeGenericInstanceType([structuredElement]);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0", 1),
+            structuredReceiverType);
+
+        var changed = LocalVariables.BindResolvedInstanceReceiverType(receiver, sharedTarget);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(structuredReceiverType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
     public void 开放接口接收者跨继承接口调用时保持原声明身份()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
@@ -1959,6 +2011,33 @@ public class LocalVariablesTests
         {
             Assert.That(changed, Is.False);
             Assert.That(local.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 共享ListObject形参不得降级字段已证明的结构化开放泛型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var structuredElement = listDefinition.MakeGenericInstanceType([genericElement]);
+        var structuredLocalType = listDefinition.MakeGenericInstanceType([structuredElement]);
+        var sharedParameterType = listDefinition.MakeGenericInstanceType([
+            appContext.SystemTypes.SystemObjectType
+        ]);
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            structuredLocalType);
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(local, sharedParameterType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(local.Type, Is.SameAs(structuredLocalType));
         });
     }
 

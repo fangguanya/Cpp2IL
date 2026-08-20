@@ -275,6 +275,20 @@ public static class GenericCallRebinder
         TypeAnalysisContext genericDefinition,
         out GenericInstanceTypeAnalysisContext projected)
     {
+        if (actual is SzArrayTypeAnalysisContext array
+            && genericDefinition.FullName is
+                "System.Collections.Generic.IEnumerable`1"
+                or "System.Collections.Generic.ICollection`1"
+                or "System.Collections.Generic.IList`1"
+                or "System.Collections.Generic.IReadOnlyCollection`1"
+                or "System.Collections.Generic.IReadOnlyList`1")
+        {
+            // 中文注释：CLR 的一维零基数组直接实现以上五个泛型接口；用数组元素类型实例化
+            // 目标接口，使 Enumerable.Select(string[], Func<string,...>) 能按真实签名闭合。
+            projected = genericDefinition.MakeGenericInstanceType([array.ElementType]);
+            return true;
+        }
+
         var queue = new Queue<TypeAnalysisContext>();
         var visited = new HashSet<string>();
         queue.Enqueue(actual);
@@ -383,7 +397,7 @@ public static class GenericCallRebinder
     {
         if (existing is not GenericInstanceTypeAnalysisContext existingGeneric
             || concrete is not GenericInstanceTypeAnalysisContext concreteGeneric
-            || !SameTypeDefinition(existingGeneric.GenericType, concreteGeneric.GenericType)
+            || !TypesEquivalent(existingGeneric.GenericType, concreteGeneric.GenericType)
             || existingGeneric.GenericArguments.Count != concreteGeneric.GenericArguments.Count)
             return false;
 

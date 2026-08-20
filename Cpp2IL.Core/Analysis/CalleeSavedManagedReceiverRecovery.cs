@@ -19,6 +19,85 @@ namespace Cpp2IL.Core.Analysis;
 public static class CalleeSavedManagedReceiverRecovery
 {
     /// <summary>
+    /// 退 SSA 后恢复被调用方保存寄存器中的托管复制载体类型。
+    /// </summary>
+    /// <remarks>
+    /// 只有该局部的全部定义均为同一托管引用类型的直接复制或空值时才提交；真实指针算术、
+    /// 不同引用类型和非保存寄存器均保持原类型。该规则用于数组循环等不以实例调用消费载体的路径。
+    /// </remarks>
+    public static int ResolveManagedCopyCarrierTypes(MethodAnalysisContext method)
+        => ResolveManagedCopyCarrierTypes(
+            method.ControlFlowGraph!.Instructions,
+            method.ParameterLocals);
+
+    internal static int ResolveManagedCopyCarrierTypes(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyCollection<LocalVariable>? parameterLocals = null)
+    {
+        var definitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var recovered = 0;
+
+        foreach (var pair in definitions)
+        {
+            var destination = pair.Key;
+            if (!IsCalleeSavedArm64Register(destination.Register.Name)
+                || parameterLocals?.Contains(destination) == true
+                || !IsReplaceableManagedCopyCarrier(destination.Type))
+                continue;
+
+            var sourceTypes = new List<TypeAnalysisContext>();
+            var valid = true;
+            foreach (var definition in pair.Value)
+            {
+                if (definition is
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable, Immediate { Value: 0 }],
+                    })
+                    continue;
+
+                if (definition is not
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable, LocalVariable { Type: { } sourceType }],
+                    }
+                    || !IsConcreteManagedReference(sourceType))
+                {
+                    valid = false;
+                    break;
+                }
+
+                sourceTypes.Add(sourceType);
+            }
+
+            var consensusTypes = sourceTypes
+                .GroupBy(type => type.FullName, StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToArray();
+            if (!valid || consensusTypes.Length != 1)
+                continue;
+
+            destination.Type = consensusTypes[0];
+            recovered++;
+        }
+
+        return recovered;
+    }
+
+    private static bool IsReplaceableManagedCopyCarrier(TypeAnalysisContext? type)
+        => type == null || type.FullName is "System.Object" or "System.IntPtr" or "System.UIntPtr";
+
+    private static bool IsConcreteManagedReference(TypeAnalysisContext type)
+        => !type.IsValueType
+           && type is not (RuntimeClassTypeAnalysisContext
+               or StaticFieldStorageTypeAnalysisContext
+               or RuntimeMethodInfoAnalysisContext)
+           && type.FullName != "System.Object";
+
+    /// <summary>
     /// 在 SSA 局部刚建立时冻结 X19-X29 的直接局部复制身份。
     /// </summary>
     internal static void CaptureSsaCopyEvidence(MethodAnalysisContext method)
@@ -323,6 +402,6 @@ public static class CalleeSavedManagedReceiverRecovery
 
         // 中文注释：X29 通常是帧指针，但 IL2CPP 在保存旧 X29 后会把它复用为长期 this；
         // 后续恢复仍要求同一 SSA 复制证据和托管来源，因此普通栈基址不会进入候选集。
-        return int.TryParse(name.AsSpan(1), out var number) && number is >= 19 and <= 29;
+        return int.TryParse(name.Substring(1), out var number) && number is >= 19 and <= 29;
     }
 }

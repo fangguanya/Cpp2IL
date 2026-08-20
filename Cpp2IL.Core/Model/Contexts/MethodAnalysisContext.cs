@@ -392,6 +392,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：此刻物理寄存器复制仍保留完整 SSA 版本；后续 Phi 简化可能把真实复制
         // 删除为 Nop，因此必须在任何复制传播和死码删除前冻结其身份证据。
         CalleeSavedManagedReceiverRecovery.CaptureSsaCopyEvidence(this);
+        // 中文注释：任何元数据操作数改写前冻结全部“绝对槽 - 零偏移二次读取”候选链；
+        // 元数据调用解析完成后再用初始化槽目录过滤，兼顾完整证据与精确边界。
+        var runtimeClassSlotCandidates = RuntimeClassSlotIdentityRecovery.CaptureCandidates(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
@@ -414,7 +417,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 初始化保护区删除后不再能从CFG枚举其 MethodInfo 槽；因此先冻结槽地址目录，
         // 后续只把该不可变证据用于清理同一方法内的隐藏元数据读取。
         var initializedRuntimeMetadataSlots = RuntimeMetadataSlotResolver.CaptureInitializedSlotAddresses(this);
-
         InjectedCheckRemover.Run(this);
         // 中文注释：类初始化分支内部常带编译器注入的空引用检查；必须先删除注入异常边，
         // 再一次性裁除元数据与类初始化保护区，避免对同一 CFG 做重复保护区扫描。
@@ -489,10 +491,20 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        // 中文注释：退 SSA 的保守简化已物化最终绝对槽读取；使用早期冻结的类型种子与当前
+        // 唯一槽链配对，只重放 static_fields、字段和泛型调用闭包。
+        var finalRuntimeClassSlotGroups = RuntimeClassSlotIdentityRecovery.BuildCurrentPlan(
+            runtimeClassSlotCandidates,
+            this,
+            initializedRuntimeMetadataSlots);
+        LocalVariables.ResolveRuntimeClassSlotFieldClosure(this, finalRuntimeClassSlotGroups);
         // SSA拆除后的保守复制传播才把局部承载的方法目标物化为最终MethodAnalysisContext。
         // 这里仅执行一次二级TypeInfo静态字段闭合，并从调用形参、定型局部和字段写入读取预期类型；
         // 链上每个局部仍必须只有一个定义。
         LocalVariables.ResolveExpectedSelfTypedStaticFields(this);
+        // 中文注释：必须先完成 RuntimeClass 与字段闭包，再把剩余的零偏移槽读取改写为
+        // 字符串、类型或方法操作数；否则类型元数据会提前吃掉 static_fields 的类载体证据。
+        MetadataResolver.ResolveInitializedInlineMetadataOperands(this, initializedRuntimeMetadataSlots);
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
@@ -529,6 +541,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：退 SSA 的引用 Phi 此时已表现为“零或具体引用”的边复制。先把零恢复为
         // null 并定型目标，再运行字段偏移解析，才能识别上一 Scenario 的链式字段写入。
         CopyCoalescer.ResolveNullReferencePhiCopyTypes(ControlFlowGraph);
+        // 中文注释：数组与集合布局恢复之前，以全部定义的一致托管复制证据覆盖 X19-X29 上的
+        // IntPtr/Object ABI 占位；不同类型或真实指针定义会使该局部保持原样。
+        CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(this);
         MetadataResolver.ResolveFieldOffsets(this);
         InlineConstructorRecovery.Run(this);
 

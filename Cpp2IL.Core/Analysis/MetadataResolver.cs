@@ -110,6 +110,109 @@ public static class MetadataResolver
     }
 
     /// <summary>
+    /// 退 SSA 后恢复“已初始化绝对槽载体被直接零偏移读取”的元数据操作数。
+    /// 槽地址、初始化证明、多定义同址和零偏移四项必须同时成立。
+    /// </summary>
+    public static int ResolveInitializedInlineMetadataOperands(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong> initializedRuntimeMetadataSlots)
+    {
+        var libContext = method.AppContext.LibCpp2IlContext;
+        var recovered = ResolveInitializedInlineMetadataOperands(
+            method.ControlFlowGraph!.Instructions,
+            initializedRuntimeMetadataSlots,
+            address =>
+            {
+                var usage = ResolveAbsoluteSlotUsage(
+                    address,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt);
+                return usage == null ? null : ResolveMetadataUsageOperand(method, usage);
+            });
+        if (recovered > 0)
+        {
+            Logger.VerboseNewline(
+                $"初始化内联元数据槽：method={method.Name}，recovered={recovered}",
+                nameof(MetadataResolver));
+        }
+
+        return recovered;
+    }
+
+    internal static int ResolveInitializedInlineMetadataOperands(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyCollection<ulong> initializedRuntimeMetadataSlots,
+        Func<ulong, IOperand?> slotResolver)
+    {
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        var definitions = BuildConvergedDefinitionIndex(instructions);
+        var resolvedAddresses = new Dictionary<LocalVariable, ulong?>();
+        var resolvedSlots = new Dictionary<ulong, IOperand?>();
+        var resolvedCarriers = new HashSet<LocalVariable>();
+        var recovered = 0;
+
+        foreach (var instruction in instructions)
+        {
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (ReferenceEquals(instruction.Operands[operandIndex], instruction.Destination)
+                    || instruction.Operands[operandIndex] is not MemoryOperand
+                    {
+                        Base: LocalVariable slotCarrier,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0,
+                    }
+                    || ResolveConvergedAbsoluteSlotAddress(
+                        slotCarrier,
+                        definitions,
+                        [],
+                        resolvedAddresses) is not { } address
+                    || !initializedRuntimeMetadataSlots.Contains(address))
+                    continue;
+
+                if (!resolvedSlots.TryGetValue(address, out var resolved))
+                {
+                    resolved = slotResolver(address);
+                    resolvedSlots[address] = resolved;
+                }
+
+                if (resolved == null)
+                    continue;
+
+                if (resolved is TypeAnalysisContext && instruction.OpCode == OpCode.Move)
+                {
+                    // 中文注释：普通 Move 的零偏移 TypeInfo 读取生成的是 Il2CppClass 载体，
+                    // 必须保留给 RuntimeClassTypeAnalysisContext 与 static_fields 闭包；
+                    // 直接调用操作数中的类型（Newobj、SzArrayNew）才使用普通类型操作数。
+                    continue;
+                }
+
+                instruction.SetOperand(operandIndex, resolved);
+                resolvedCarriers.Add(slotCarrier);
+                recovered++;
+            }
+        }
+
+        // 中文注释：该阶段位于通用 Simplifier 之后，只清理由本规则完全消费且全图再无读取的
+        // 绝对槽载体定义；复用统一的操作数局部枚举，避免另写一套不完整的复合操作数递归。
+        var stillUsed = new HashSet<LocalVariable>(
+            instructions.SelectMany(DeadCodeEliminator.EnumerateUsedLocals));
+        foreach (var carrier in resolvedCarriers.Where(carrier => !stillUsed.Contains(carrier)))
+        {
+            foreach (var definition in definitions[carrier])
+            {
+                definition.OpCode = OpCode.Nop;
+                definition.SetOperands();
+            }
+        }
+
+        return recovered;
+    }
+
+    /// <summary>
     /// 初始化保护区裁除和首次类型传播完成后，恢复“绝对槽保存编码项地址，强类型字符串局部
     /// 再从该地址读取”的post-27二层布局。第一层地址载体保持原样，只有唯一Move定义、
     /// 无索引内存读取、System.String目标和StringLiteral元数据四项证据同时成立时才改写。
@@ -448,6 +551,22 @@ public static class MetadataResolver
         => ResolveAbsoluteSlotAddress(operand, definitions, visited, []);
 
     /// <summary>
+    /// 沿退 SSA 后的多定义链解析绝对槽地址。一个局部的全部定义必须独立收敛到同一地址；
+    /// 异址、缺失定义、不可解析指令或循环链均保持未解析。
+    /// </summary>
+    internal static ulong? ResolveConvergedAbsoluteSlotAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> definitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
+        => ResolveAbsoluteSlotAddressCore(
+            operand,
+            null,
+            definitions,
+            visited,
+            resolvedAddresses);
+
+    /// <summary>
     /// 共享同一SSA图的绝对槽地址解析结果；空结果也必须缓存，避免异常复制环和异址Phi在
     /// 每个内存读取处重复遍历。正在访问集合仍独立约束当前递归路径，保持循环拒绝语义。
     /// </summary>
@@ -456,17 +575,75 @@ public static class MetadataResolver
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
         HashSet<LocalVariable> visited,
         Dictionary<LocalVariable, ulong?> resolvedAddresses)
+        => ResolveAbsoluteSlotAddressCore(
+            operand,
+            definitions,
+            null,
+            visited,
+            resolvedAddresses);
+
+    private static ulong? ResolveAbsoluteSlotAddressCore(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction>? uniqueDefinitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>>? convergedDefinitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
     {
         if (operand is not LocalVariable local)
             return null;
         if (resolvedAddresses.TryGetValue(local, out var cachedAddress))
             return cachedAddress;
-        if (!visited.Add(local)
-            || !definitions.TryGetValue(local, out var definition))
+        if (!visited.Add(local))
             return null;
 
-        ulong? resolvedAddress;
+        ulong? resolvedAddress = null;
+        if (convergedDefinitions != null)
+        {
+            if (convergedDefinitions.TryGetValue(local, out var definitions)
+                && definitions.Count > 0)
+            {
+                foreach (var definition in definitions)
+                {
+                    var definitionAddress = ResolveDefinitionAbsoluteSlotAddress(
+                        definition,
+                        uniqueDefinitions,
+                        convergedDefinitions,
+                        visited,
+                        resolvedAddresses);
+                    if (definitionAddress == null
+                        || resolvedAddress is { } existing && existing != definitionAddress.Value)
+                    {
+                        resolvedAddress = null;
+                        break;
+                    }
 
+                    resolvedAddress = definitionAddress;
+                }
+            }
+        }
+        else if (uniqueDefinitions != null
+                 && uniqueDefinitions.TryGetValue(local, out var definition))
+        {
+            resolvedAddress = ResolveDefinitionAbsoluteSlotAddress(
+                definition,
+                uniqueDefinitions,
+                null,
+                visited,
+                resolvedAddresses);
+        }
+
+        visited.Remove(local);
+        resolvedAddresses[local] = resolvedAddress;
+        return resolvedAddress;
+    }
+
+    private static ulong? ResolveDefinitionAbsoluteSlotAddress(
+        Instruction definition,
+        IReadOnlyDictionary<LocalVariable, Instruction>? uniqueDefinitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>>? convergedDefinitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
+    {
         if (definition is
             {
                 OpCode: OpCode.Move,
@@ -483,24 +660,28 @@ public static class MetadataResolver
                 ]
             })
         {
-            resolvedAddress = (ulong)absoluteSlot.Addend;
+            return (ulong)absoluteSlot.Addend;
         }
-        else if (definition is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable source] })
+
+        if (definition is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable source] })
         {
-            resolvedAddress = ResolveAbsoluteSlotAddress(
+            return ResolveAbsoluteSlotAddressCore(
                 source,
-                definitions,
+                uniqueDefinitions,
+                convergedDefinitions,
                 visited,
                 resolvedAddresses);
         }
-        else if (definition.OpCode == OpCode.Phi && definition.Operands.Count >= 2)
+
+        if (definition.OpCode == OpCode.Phi && definition.Operands.Count >= 2)
         {
-            resolvedAddress = null;
+            ulong? resolvedAddress = null;
             for (var index = 1; index < definition.Operands.Count; index++)
             {
-                var inputAddress = ResolveAbsoluteSlotAddress(
+                var inputAddress = ResolveAbsoluteSlotAddressCore(
                     definition.Operands[index],
-                    definitions,
+                    uniqueDefinitions,
+                    convergedDefinitions,
                     visited,
                     resolvedAddresses);
                 if (inputAddress == null || resolvedAddress is { } existing && existing != inputAddress.Value)
@@ -511,15 +692,11 @@ public static class MetadataResolver
 
                 resolvedAddress = inputAddress;
             }
-        }
-        else
-        {
-            resolvedAddress = null;
+
+            return resolvedAddress;
         }
 
-        visited.Remove(local);
-        resolvedAddresses[local] = resolvedAddress;
-        return resolvedAddress;
+        return null;
     }
 
     /// <summary>
@@ -767,6 +944,15 @@ public static class MetadataResolver
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
             .ToDictionary(group => group.Key, group => group.ToArray());
     }
+
+    /// <summary>
+    /// 将一次构建的完整定义索引投影为同址解析器使用的只读列表视图。
+    /// </summary>
+    internal static IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> BuildConvergedDefinitionIndex(
+        IReadOnlyList<Instruction> instructions)
+        => BuildDefinitionIndex(instructions).ToDictionary(
+            pair => pair.Key,
+            pair => (IReadOnlyList<Instruction>)pair.Value);
 
     /// <summary>
     /// 解析直接字段基址，或把唯一的“托管对象加常量”地址定义与内存附加偏移合并。

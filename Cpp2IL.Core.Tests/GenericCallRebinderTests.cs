@@ -181,6 +181,69 @@ public class GenericCallRebinderTests
 
     [Test]
     [Category("基本功能")]
+    public void Enumerable字段选择器从字符串数组闭合并推进ToList()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.GetAssemblyByName("mscorlib")!;
+        var enumerable = app.GetAssemblyByName("System.Core")!
+            .GetTypeByFullName("System.Linq.Enumerable")!;
+        var orderBy = enumerable.Methods.Single(method =>
+            method.Name == "OrderBy"
+            && method.Parameters.Count == 2
+            && method.GenericParameters.Count == 2);
+        var toList = enumerable.Methods.Single(method =>
+            method.Name == "ToList"
+            && method.Parameters.Count == 1
+            && method.GenericParameters.Count == 1);
+        var objectType = app.SystemTypes.SystemObjectType;
+        var stringType = app.SystemTypes.SystemStringType;
+        var funcType = mscorlib.GetTypeByFullName("System.Func`2")!;
+        var selectorType = funcType.MakeGenericInstanceType([stringType, stringType]);
+        var orderByTarget = new ConcreteGenericMethodAnalysisContext(
+            orderBy,
+            [],
+            [objectType, objectType]);
+        var toListTarget = new ConcreteGenericMethodAnalysisContext(toList, [], [objectType]);
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X0"),
+            new SzArrayTypeAnalysisContext(stringType));
+        var owner = new LocalVariable("owner", new Register(null, "X9"), objectType);
+        var selectorField = new InjectedFieldAnalysisContext(
+            "selector",
+            selectorType,
+            FieldAttributes.Static,
+            objectType);
+        var selector = new FieldReference(selectorField, owner, 0x8A8);
+        var ordered = new LocalVariable(
+            "ordered",
+            new Register(null, "X0", 2),
+            orderByTarget.ReturnType);
+        var list = new LocalVariable(
+            "list",
+            new Register(null, "X0", 3),
+            toListTarget.ReturnType);
+        var orderByCall = new Instruction(0, OpCode.Call, orderByTarget, ordered, source, selector);
+        var toListCall = new Instruction(1, OpCode.Call, toListTarget, list, ordered);
+
+        var orderByChanged = GenericCallRebinder.TryRebind(orderByCall);
+        var toListChanged = GenericCallRebinder.TryRebind(toListCall);
+        var reboundOrderBy = (ConcreteGenericMethodAnalysisContext)orderByCall.Operands[0];
+        var reboundToList = (ConcreteGenericMethodAnalysisContext)toListCall.Operands[0];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(orderByChanged, Is.True);
+            Assert.That(toListChanged, Is.True);
+            Assert.That(reboundOrderBy.MethodGenericParameters, Is.EqualTo(new[] { stringType, stringType }));
+            Assert.That(reboundToList.MethodGenericParameters, Is.EqualTo(new[] { stringType }));
+            Assert.That(ordered.Type!.FullName, Does.Contain("System.String"));
+            Assert.That(list.Type!.FullName, Does.Contain("System.String"));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 开放List成员从具体值参数闭合声明类型实参()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

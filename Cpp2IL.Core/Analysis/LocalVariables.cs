@@ -317,9 +317,14 @@ public static class LocalVariables
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveAmbiguousCalls), MetadataResolver.ResolveAmbiguousCalls(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(MetadataResolver.ResolveVirtualCalls), MetadataResolver.ResolveVirtualCalls(method));
             changed |= RecordChangingPass(lastChangingPasses, nameof(GenericCallRebinder), GenericCallRebinder.Run(method));
-            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), PropagateFromCallParameters(method));
             var captureFinalIteration = MaxTypePropagationLoopCount != -1
                 && loopCount == MaxTypePropagationLoopCount;
+            var typesBeforeCalls = captureFinalIteration ? CaptureLocalTypes(method) : null;
+            var callChanges = PropagateFromCallParameters(method);
+            changed |= RecordChangingPass(lastChangingPasses, nameof(PropagateFromCallParameters), callChanges);
+            if (callChanges && typesBeforeCalls != null)
+                lastChangingTypeDetails.AddRange(DescribeTypeChanges(
+                    nameof(PropagateFromCallParameters), typesBeforeCalls, method));
             var typesBeforeAddressBinding = captureFinalIteration ? CaptureLocalTypes(method) : null;
             var addressBindingChanges = captureFinalIteration ? new List<string>() : null;
             var addressBindingChanged = BindAddressCarrierTypes(
@@ -449,6 +454,33 @@ public static class LocalVariables
                     nameof(PropagateTypesOnce), typesBeforePropagation, method));
             if (propagationChanges != null)
                 lastChangingTypeDetails.AddRange(propagationChanges);
+        }
+    }
+
+    /// <summary>
+    /// 退 SSA 保守简化后只闭合同址 TypeInfo、static_fields、字段类型与受其驱动的泛型调用。
+    /// </summary>
+    public static void ResolveRuntimeClassSlotFieldClosure(
+        MethodAnalysisContext method,
+        IReadOnlyList<RuntimeClassSlotIdentityRecovery.SlotGroup> runtimeClassSlotGroups)
+    {
+        if (runtimeClassSlotGroups.Count == 0)
+            return;
+
+        var changed = true;
+        var loopCount = 0;
+        while (changed)
+        {
+            if (MaxTypePropagationLoopCount != -1 && ++loopCount > MaxTypePropagationLoopCount)
+                throw new DecompilerException(
+                    $"Runtime class slot field closure not settling! (looped {MaxTypePropagationLoopCount} times)");
+
+            changed = RuntimeClassSlotIdentityRecovery.Run(runtimeClassSlotGroups) > 0;
+            changed |= PropagateStaticFieldStorage(method);
+            changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= PropagateTypesOnce(method);
+            changed |= GenericCallRebinder.Run(method);
+            changed |= PropagateFromCallParameters(method);
         }
     }
 
@@ -1735,9 +1767,9 @@ public static class LocalVariables
 
     private static bool HasOnlyBooleanComponentDefinitions(
         LocalVariable local,
-        IReadOnlySet<LocalVariable> component,
+        IReadOnlyCollection<LocalVariable> component,
         IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
-        IReadOnlySet<Instruction> acceptedBitwise)
+        IReadOnlyCollection<Instruction> acceptedBitwise)
     {
         if (!definitions.TryGetValue(local, out var localDefinitions) || localDefinitions.Length == 0)
             return false;
@@ -2008,7 +2040,9 @@ public static class LocalVariables
         if (GenericCallRebinder.TypesEquivalent(destination.Type, fieldType))
             return false;
 
-        if (destination.Type != null && !fieldType.IsAssignableTo(destination.Type))
+        if (destination.Type != null
+            && !fieldType.IsAssignableTo(destination.Type)
+            && !GenericCallRebinder.IsSharedObjectPlaceholder(destination.Type, fieldType))
             return false;
 
         destination.Type = fieldType;
@@ -2411,6 +2445,12 @@ public static class LocalVariables
         if (local.Type == null)
             return SetTypeIfUnknown(local, parameterType);
 
+        // 中文注释：List<object> 等共享泛型调用形参只是 ABI 宽占位；字段或 Phi 已证明
+        // List<WeightedEntry<T>> 等结构化开放类型时，禁止把强类型降回 object，否则字段传播
+        // 与调用传播会在同一不动点中来回覆盖而永不收敛。
+        if (GenericCallRebinder.IsSharedObjectPlaceholder(parameterType, local.Type))
+            return false;
+
         if (!ContainsUninstantiatedGenericParameter(local.Type))
             return false;
 
@@ -2531,6 +2571,12 @@ public static class LocalVariables
             return SetTypeIfUnknown(receiver, declaringType);
 
         if (GenericCallRebinder.TypesEquivalent(receiver.Type, declaringType))
+            return false;
+
+        // 中文注释：共享泛型实例调用会把 List<T> 的接收者按 List<object> ABI 目标解析。
+        // 字段或 Phi 已证明 List<WeightedEntry<T>> 等结构化开放类型后，该目标只代表调用约定，
+        // 不得把接收者降级回 object，否则会与字段类型传播在不动点迭代中反复振荡。
+        if (GenericCallRebinder.IsSharedObjectPlaceholder(declaringType, receiver.Type))
             return false;
 
         var declaringInterface = declaringType is GenericInstanceTypeAnalysisContext declaringGenericInstance

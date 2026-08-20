@@ -18,6 +18,97 @@ public class CalleeSavedManagedReceiverRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 保存寄存器的单一数组复制覆盖IntPtr占位类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = app.SystemTypes.SystemStringType.MakeSzArrayType();
+        var source = new LocalVariable("source", new Register(null, "X0", 1), arrayType);
+        var carrier = new LocalVariable(
+            "carrier",
+            new Register(null, "X19", 1),
+            app.SystemTypes.SystemIntPtrType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, source),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(carrier.Type, Is.SameAs(arrayType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 保存寄存器的同型多定义与空值共同收敛为数组类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = app.SystemTypes.SystemStringType.MakeSzArrayType();
+        var first = new LocalVariable("first", new Register(null, "X0", 1), arrayType);
+        var second = new LocalVariable("second", new Register(null, "X0", 2), arrayType);
+        var carrier = new LocalVariable(
+            "carrier",
+            new Register(null, "X29", 1),
+            app.SystemTypes.SystemObjectType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, carrier, first),
+            new(1, OpCode.Move, carrier, new Immediate(0)),
+            new(2, OpCode.Move, carrier, second),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(carrier.Type, Is.SameAs(arrayType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 保存寄存器的异型引用或真实算术定义保持原类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stringValue = new LocalVariable(
+            "stringValue",
+            new Register(null, "X0", 1),
+            app.SystemTypes.SystemStringType);
+        var objectArray = new LocalVariable(
+            "objectArray",
+            new Register(null, "X0", 2),
+            app.SystemTypes.SystemObjectType.MakeSzArrayType());
+        var conflicting = new LocalVariable(
+            "conflicting",
+            new Register(null, "X19", 1),
+            app.SystemTypes.SystemIntPtrType);
+        var arithmetic = new LocalVariable(
+            "arithmetic",
+            new Register(null, "X20", 1),
+            app.SystemTypes.SystemIntPtrType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, conflicting, stringValue),
+            new(1, OpCode.Move, conflicting, objectArray),
+            new(2, OpCode.Add, arithmetic, arithmetic, new Immediate(8)),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(conflicting.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+            Assert.That(arithmetic.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 唯一具体List分配恢复未定义X19接收者并重绑ToArray()
     {
         var fixture = CreateFixture();
