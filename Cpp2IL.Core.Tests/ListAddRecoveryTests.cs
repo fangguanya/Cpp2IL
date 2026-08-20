@@ -1574,6 +1574,85 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 已折叠数组访问保留UInt32索引归一化链时恢复公开Add调用()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true,
+            useNormalizedDirectArrayIndex: true);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.OpCode is OpCode.And or OpCode.Xor or OpCode.Subtract), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已折叠数组访问可从公开Count闭合UInt32索引归一化链()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true,
+            useDirectArrayAccess: true,
+            useNormalizedDirectArrayIndex: true);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.False);
+        });
+    }
+
+    [TestCase(true, false, false)]
+    [TestCase(false, true, false)]
+    [TestCase(false, false, true)]
+    [Category("异常输入")]
+    public void 已折叠数组访问的UInt32索引证据不唯一或不等价时保留原控制流(
+        bool wrongMask,
+        bool wrongSource,
+        bool duplicateDefinition)
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true,
+            useNormalizedDirectArrayIndex: true,
+            normalizedDirectArrayWrongMask: wrongMask,
+            normalizedDirectArrayWrongSource: wrongSource,
+            normalizedDirectArrayDuplicateDefinition: duplicateDefinition);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 已归一化数组写入夹带等价载体时保留载体并恢复Add()
     {
@@ -1716,7 +1795,11 @@ public class ListAddRecoveryTests
         bool retainDirectArrayAddressEvidence = false,
         bool directArrayWrongItems = false,
         bool directArrayWrongIndex = false,
-        bool includeHeadBusinessAfterVersionWrite = false)
+        bool includeHeadBusinessAfterVersionWrite = false,
+        bool useNormalizedDirectArrayIndex = false,
+        bool normalizedDirectArrayWrongMask = false,
+        bool normalizedDirectArrayWrongSource = false,
+        bool normalizedDirectArrayDuplicateDefinition = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -1760,6 +1843,9 @@ public class ListAddRecoveryTests
         var elementOffset = Local("elementOffset", app.SystemTypes.SystemIntPtrType);
         var elementAddress = Local("elementAddress", app.SystemTypes.SystemIntPtrType);
         var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
+        var maskedIndex = Local("maskedIndex", app.SystemTypes.SystemIntPtrType);
+        var biasedIndex = Local("biasedIndex", app.SystemTypes.SystemIntPtrType);
+        var normalizedIndex = Local("normalizedIndex", app.SystemTypes.SystemIntPtrType);
         var carrier = Local("carrier", elementType);
         var valueField = new InjectedFieldAnalysisContext(
             "_testValue",
@@ -1805,11 +1891,39 @@ public class ListAddRecoveryTests
                 elementOffset));
         }
         instructions.Add(new Instruction(instructions.Count, OpCode.Add, newSize, SizeRead(), new Immediate(1)));
+        if (useNormalizedDirectArrayIndex)
+        {
+            // 中文注释：复现 ArrayRecovery 已折叠缩放/地址，但保留 UInt32 到原生索引规范化的真实末态。
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.And,
+                maskedIndex,
+                normalizedDirectArrayWrongSource ? new Immediate(7) : SizeRead(),
+                new Immediate(normalizedDirectArrayWrongMask ? 0xFFFFFFFEL : 0xFFFFFFFFL)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Xor,
+                biasedIndex,
+                maskedIndex,
+                new Immediate(0x80000000L)));
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Subtract,
+                normalizedIndex,
+                biasedIndex,
+                new Immediate(0x80000000L)));
+            if (normalizedDirectArrayDuplicateDefinition)
+                instructions.Add(new Instruction(instructions.Count, OpCode.Move, normalizedIndex, new Immediate(3)));
+        }
         instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(sizeField), newSize));
         IOperand elementWrite = useDirectArrayAccess
             ? new ArrayAccess(
                 directArrayWrongItems ? otherItems : items,
-                directArrayWrongIndex ? new Immediate(99) : SizeRead())
+                directArrayWrongIndex
+                    ? new Immediate(99)
+                    : useNormalizedDirectArrayIndex
+                        ? normalizedIndex
+                        : SizeRead())
             : new MemoryOperand(elementAddress, null, 0x20);
         instructions.Add(new Instruction(
             instructions.Count,

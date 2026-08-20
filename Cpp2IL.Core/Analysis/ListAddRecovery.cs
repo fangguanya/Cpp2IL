@@ -1846,7 +1846,14 @@ public static class ListAddRecovery
             // items[index]。较晚完成归一化时，原始缩放与地址指令已经变为 Nop；较早
             // 完成时两条证据仍保留。两种形态分别要求 0/0 或 1/1，拒绝半套地址链。
             if (!ReferenceEquals(arrayAccess.Array, items)
-                || !IsSameStateOperand(arrayAccess.Index, sizeState, receiver, "_size"))
+                || !IsSameStateOperand(arrayAccess.Index, sizeState, receiver, "_size")
+                && !CollectUInt32IndexNormalization(
+                    instructions,
+                    stores[0],
+                    receiver,
+                    sizeState,
+                    arrayAccess.Index,
+                    allowed))
             {
                 Logger.VerboseNewline(
                     $"ListAdd恢复拒绝：直接数组访问的数组或索引状态不匹配，访问={arrayAccess}。");
@@ -2592,40 +2599,75 @@ public static class ListAddRecovery
         }
     }
 
+    /// <summary>
+    /// 收集 ARM64 将 Int32 集合索引规范化到原生寄存器宽度的唯一位运算链。
+    /// </summary>
+    /// <remarks>
+    /// ArrayRecovery 可能已经把缩放和地址合成折叠为 ArrayAccess，此时归一化链与消费者之间
+    /// 会夹着大小回写；因此按消费者之前的唯一数据定义回溯，而不是依赖三条指令紧邻缩放。
+    /// </remarks>
     private static bool CollectUInt32IndexNormalization(
         IReadOnlyList<Instruction> instructions,
-        Instruction scale,
+        Instruction consumer,
         LocalVariable receiver,
         IOperand sizeState,
-        IOperand scaleSource,
+        IOperand normalizedSource,
         ICollection<Instruction> allowed)
     {
-        var scaleIndex = IndexOf(instructions, scale);
-        if (scaleIndex < 3
-            || instructions[scaleIndex - 3] is not
-            {
-                OpCode: OpCode.And,
-                Operands: [LocalVariable masked, var maskSource, Immediate { Value: 0xFFFFFFFFL }]
-            } and
-            || instructions[scaleIndex - 2] is not
-            {
-                OpCode: OpCode.Xor,
-                Operands: [LocalVariable biased, var xorSource, Immediate { Value: 0x80000000L }]
-            } xor
-            || instructions[scaleIndex - 1] is not
+        if (normalizedSource is not LocalVariable normalized
+            || !TryGetUniqueDefinitionBefore(instructions, consumer, normalized, out var subtract)
+            || subtract is not
             {
                 OpCode: OpCode.Subtract,
-                Operands: [LocalVariable normalized, var subtractSource, Immediate { Value: 0x80000000L }]
-            } subtract
+                Operands: [_, LocalVariable biased, Immediate { Value: 0x80000000L }]
+            }
+            || !TryGetUniqueDefinitionBefore(instructions, subtract, biased, out var xor)
+            || xor is not
+            {
+                OpCode: OpCode.Xor,
+                Operands: [_, LocalVariable masked, Immediate { Value: 0x80000000L }]
+            }
+            || !TryGetUniqueDefinitionBefore(instructions, xor, masked, out var and)
+            || and is not
+            {
+                OpCode: OpCode.And,
+                Operands: [_, var maskSource, Immediate { Value: 0xFFFFFFFFL }]
+            }
             || !IsSameStateOperand(maskSource, sizeState, receiver, "_size")
-            || !ReferenceEquals(xorSource, masked)
-            || !ReferenceEquals(subtractSource, biased)
-            || !ReferenceEquals(scaleSource, normalized))
+            || !ReferenceEquals(subtract.Operands[0], normalized)
+            || !ReferenceEquals(xor.Operands[0], biased)
+            || !ReferenceEquals(and.Operands[0], masked))
             return false;
 
         allowed.Add(and);
         allowed.Add(xor);
         allowed.Add(subtract);
+        return true;
+    }
+
+    /// <summary>
+    /// 在指定消费者之前读取局部量的唯一当前定义；多定义和逆序定义均保持失败关闭。
+    /// </summary>
+    private static bool TryGetUniqueDefinitionBefore(
+        IReadOnlyList<Instruction> instructions,
+        Instruction consumer,
+        LocalVariable local,
+        out Instruction definition)
+    {
+        definition = null!;
+        var consumerIndex = IndexOf(instructions, consumer);
+        if (consumerIndex < 0)
+            return false;
+
+        var definitions = instructions
+            .Take(consumerIndex)
+            .Where(instruction => ReferenceEquals(instruction.Destination, local))
+            .Take(2)
+            .ToList();
+        if (definitions.Count != 1)
+            return false;
+
+        definition = definitions[0];
         return true;
     }
 
