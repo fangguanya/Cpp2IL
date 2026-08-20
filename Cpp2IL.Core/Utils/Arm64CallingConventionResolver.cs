@@ -200,6 +200,33 @@ public static class Arm64CallingConventionResolver
     }
 
     /// <summary>
+    /// 判断一个确定托管实参是否以指定通用寄存器承载，并且其声明类型与候选字段类型精确一致。
+    /// 该查询复用 ArgumentOperands 的完整 AAPCS64 布局结果，不在消费者分析中重复计算寄存器槽。
+    /// 隐藏 MethodInfo 不属于托管实参，因此不会被误认成引用字段消费者。
+    /// </summary>
+    internal static bool UsesGeneralRegisterForManagedArgumentOfType(
+        MethodAnalysisContext method,
+        string registerName,
+        TypeAnalysisContext expectedType)
+    {
+        var managedArgumentTypes = new List<TypeAnalysisContext>();
+        if (!method.IsStatic && method.DeclaringType != null)
+            managedArgumentTypes.Add(method.DeclaringType);
+        managedArgumentTypes.AddRange(method.Parameters.Select(parameter => parameter.ParameterType));
+
+        var operands = ArgumentOperands(method);
+        for (var index = 0; index < managedArgumentTypes.Count && index < operands.Count; index++)
+        {
+            if (operands[index] is Register register
+                && register.Name == registerName
+                && TypesExactlyMatch(managedArgumentTypes[index], expectedType))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// 按 AAPCS64 识别由一至四个同类型 Single 或 Double 实例字段组成的同质浮点聚合体。
     /// 静态字段和常量不属于实例布局；混合类型、空聚合体和超过四个成员都必须拒绝。
     /// </summary>

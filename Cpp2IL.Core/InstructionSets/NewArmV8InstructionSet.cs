@@ -1541,7 +1541,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 ref conditionalComparisonFallbackNzcv);
         }
 
-        PruneUnconsumedHomogeneousFloatingReturnProjections(instructions, context);
+        PruneUnconsumedReturnProjections(instructions, context);
 
         // fix branches
         for (var i = 0; i < instructions.Count; i++)
@@ -1568,6 +1568,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         adrpOffsets.Clear();
         return instructions;
+    }
+
+    /// <summary>
+    /// 对所有调用后聚合体投影执行统一的消费者硬门。投影只是把原生 ABI 分槽重新映射到
+    /// 托管字段的候选；缺少确定后继消费者时必须恢复完整值类型语义。
+    /// </summary>
+    private static void PruneUnconsumedReturnProjections(
+        IReadOnlyList<Instruction> instructions,
+        MethodAnalysisContext context)
+    {
+        PruneUnconsumedHomogeneousFloatingReturnProjections(instructions, context);
+        PruneUnconsumedReferenceRegisterReturnProjections(instructions, context);
     }
 
     /// <summary>
@@ -1639,6 +1651,119 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// 引用聚合体返回既可能被原生代码按 X0/X1 字段槽消费，也可能继续作为完整值类型使用。
+    /// 仅在后继指令给出确定字段证据时保留投影：高位返回槽被读取，或已解析托管调用以同一
+    /// 物理寄存器接收精确字段类型。原始调用的宽寄存器快照、隐藏 MethodInfo 和完整聚合体
+    /// 接收者都不构成字段证据。
+    /// </summary>
+    private static void PruneUnconsumedReferenceRegisterReturnProjections(
+        IReadOnlyList<Instruction> instructions,
+        MethodAnalysisContext context)
+    {
+        for (var callIndex = 0; callIndex < instructions.Count; callIndex++)
+        {
+            var call = instructions[callIndex];
+            if (call.OpCode != OpCode.Call
+                || call.Operands.Count < 2
+                || call.Operands[0] is not Immediate target
+                || !context.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var methods)
+                || methods.Count != 1)
+                continue;
+
+            var calledMethod = methods[0];
+            var projections = Arm64CallingConventionResolver
+                .ReferenceRegisterReturnProjections(calledMethod);
+            if (projections.Count == 0
+                || !MatchesReturnProjectionSequence(instructions, callIndex + 1, projections))
+                continue;
+
+            var consumerStart = callIndex + 1 + projections.Count;
+            if (HasReferenceRegisterAggregateFieldConsumer(
+                    instructions,
+                    consumerStart,
+                    calledMethod,
+                    context.AppContext.MethodsByAddress))
+            {
+                callIndex += projections.Count;
+                continue;
+            }
+
+            for (var projectionIndex = callIndex + 1; projectionIndex < consumerStart; projectionIndex++)
+            {
+                instructions[projectionIndex].OpCode = OpCode.Nop;
+                instructions[projectionIndex].SetOperands();
+            }
+            callIndex += projections.Count;
+        }
+    }
+
+    /// <summary>
+    /// 从投影序列之后扫描引用字段的确定消费者。两槽聚合体的 X1 没有完整值载体含义，
+    /// 因此普通指令读取 X1 即为字段证据；X0 只有在唯一托管调用声明了精确字段类型时才成立。
+    /// 所有调用均会改写易失 X 寄存器，未匹配的调用会终止当前候选的数据流。
+    /// </summary>
+    internal static bool HasReferenceRegisterAggregateFieldConsumer(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        MethodAnalysisContext returnMethod,
+        IReadOnlyDictionary<ulong, List<MethodAnalysisContext>> methodsByAddress)
+    {
+        if (!Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateFields(
+                returnMethod.ReturnType,
+                out var fields))
+            return false;
+
+        var activeFields = fields.ToDictionary(
+            field => $"X{field.Offset / sizeof(long)}",
+            field => field,
+            StringComparer.Ordinal);
+
+        for (var instructionIndex = startIndex;
+             instructionIndex < instructions.Count && activeFields.Count > 0;
+             instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid)
+            {
+                if (Arm64CallingConventionResolver.HasRawArgumentLayout(instruction)
+                    && instruction.Operands[0] is Immediate target
+                    && methodsByAddress.TryGetValue(target.UnsignedValue, out var callees)
+                    && callees.Count == 1
+                    && activeFields.Any(active =>
+                        Arm64CallingConventionResolver.UsesGeneralRegisterForManagedArgumentOfType(
+                            callees[0],
+                            active.Key,
+                            active.Value.FieldType)))
+                    return true;
+
+                activeFields.Clear();
+                continue;
+            }
+
+            if (instruction.OpCode == OpCode.IndirectCall)
+            {
+                activeFields.Clear();
+                continue;
+            }
+
+            var readRegisterNames = new HashSet<string>(
+                EnumerateSourceRegisters(instruction).Select(register => register.Name),
+                StringComparer.Ordinal);
+            if (activeFields.Keys.Any(registerName =>
+                    registerName != "X0" && readRegisterNames.Contains(registerName)))
+                return true;
+
+            if (TryGetDirectDestinationRegister(instruction, out var destination))
+                activeFields.Remove(destination.Name);
+
+            if (instruction.OpCode is OpCode.Return or OpCode.Throw or OpCode.IndirectJump)
+                activeFields.Clear();
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -2076,7 +2201,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                 result[index].SetOperand(0, result[targetIndex]);
             }
-            PruneUnconsumedHomogeneousFloatingReturnProjections(result, context);
+            PruneUnconsumedReturnProjections(result, context);
             instructions = result;
             return true;
         }

@@ -337,6 +337,110 @@ public class Arm64CallingConventionResolverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 两引用返回的X1后继读取构成确定字段消费者()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var aggregate = CreateValueType("ConsumedTwoReferenceFields", stringType, stringType);
+        SetSequentialFieldOffsets(aggregate, sizeof(long));
+        var returnMethod = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var storeSecondField = new Instruction(
+            0,
+            OpCode.Move,
+            new MemoryOperand(new Register(null, "X19"), addend: sizeof(long)),
+            new Register(null, "X1"))
+        {
+            MemoryAccessWidthBits = 64
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasReferenceRegisterAggregateFieldConsumer(
+                [storeSecondField],
+                0,
+                returnMethod,
+                new Dictionary<ulong, List<MethodAnalysisContext>>()),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 单引用返回传给精确字段类型实参时保留投影()
+    {
+        const long targetAddress = 0x1234;
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var aggregate = CreateValueType("ConsumedOneReferenceField", stringType);
+        aggregate.Fields[0].Offset = 0;
+        var returnMethod = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var consumeString = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "ConsumeString",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            [stringType]);
+        var callOperands = new List<IOperand> { new Immediate(targetAddress) };
+        callOperands.AddRange(Arm64CallingConventionResolver.ResolveForUnmanaged());
+        var call = new Instruction(0, OpCode.CallVoid, callOperands);
+        var methodsByAddress = new Dictionary<ulong, List<MethodAnalysisContext>>
+        {
+            [(ulong)targetAddress] = [consumeString]
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasReferenceRegisterAggregateFieldConsumer(
+                [call],
+                0,
+                returnMethod,
+                methodsByAddress),
+            Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 单引用返回作为完整聚合体接收者时裁剪字段投影()
+    {
+        const long targetAddress = 0x5678;
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var aggregate = CreateValueType(
+            "CompleteOneReferenceAggregate",
+            app.SystemTypes.SystemObjectType);
+        aggregate.Fields[0].Offset = 0;
+        var returnMethod = aggregate.InjectMethodContext(
+            "ReturnAggregate",
+            aggregate,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var inspectAggregate = aggregate.InjectMethodContext(
+            "InspectAggregate",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public,
+            []);
+        var callOperands = new List<IOperand> { new Immediate(targetAddress) };
+        callOperands.AddRange(Arm64CallingConventionResolver.ResolveForUnmanaged());
+        var call = new Instruction(0, OpCode.CallVoid, callOperands);
+        var methodsByAddress = new Dictionary<ulong, List<MethodAnalysisContext>>
+        {
+            [(ulong)targetAddress] = [inspectAggregate]
+        };
+
+        Assert.That(
+            NewArmV8InstructionSet.HasReferenceRegisterAggregateFieldConsumer(
+                [call],
+                0,
+                returnMethod,
+                methodsByAddress),
+            Is.False);
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 浮点标量返回值不生成聚合体字段投影()
     {
