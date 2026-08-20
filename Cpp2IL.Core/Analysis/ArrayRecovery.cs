@@ -49,22 +49,340 @@ public static class ArrayRecovery
         SystemTypesContext? systemTypes)
     {
         var definitions = SingleDefinitions(cfg);
+        var loopCursors = DiscoverLoopArrayCursors(cfg, pointerSize, systemTypes);
+        var temporaryIndex = 0;
 
-        foreach (var instruction in cfg.Instructions)
+        foreach (var block in cfg.Blocks)
         {
-            for (var i = 0; i < instruction.Operands.Count; i++)
+            for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
             {
-                if (instruction.Operands[i] is not MemoryOperand memory)
-                    continue;
-
-                if (ReferenceArrayIndex(memory, pointerSize, definitions) is { } access)
+                var instruction = block.Instructions[instructionIndex];
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
                 {
-                    BindArrayIndexType(access.Index, memory.IndexExtension, systemTypes);
-                    instruction.SetOperand(i, access);
+                    if (instruction.Operands[operandIndex] is not MemoryOperand memory)
+                        continue;
+
+                    if (LoopReferenceArrayIndex(memory, block, pointerSize, loopCursors) is { } loopAccess)
+                    {
+                        var index = loopAccess.Index;
+                        if (loopAccess.IndexDelta > 0)
+                        {
+                            var computedIndex = new LocalVariable(
+                                $"arrayIndex{temporaryIndex}",
+                                new Register(null, $"ARRAY_INDEX_{temporaryIndex}"),
+                                index.Type);
+                            temporaryIndex++;
+                            block.Instructions.Insert(
+                                instructionIndex,
+                                new Instruction(
+                                    instruction.Index,
+                                    OpCode.Add,
+                                    computedIndex,
+                                    index,
+                                    new Immediate(loopAccess.IndexDelta))
+                                {
+                                    IntegerWidthBits = 32,
+                                });
+                            instructionIndex++;
+                            index = computedIndex;
+                        }
+
+                        instruction.SetOperand(operandIndex, new ArrayAccess(loopAccess.Array, index));
+                        continue;
+                    }
+
+                    if (ReferenceArrayIndex(memory, pointerSize, definitions) is { } access)
+                    {
+                        BindArrayIndexType(access.Index, memory.IndexExtension, systemTypes);
+                        instruction.SetOperand(operandIndex, access);
+                    }
                 }
             }
         }
     }
+
+    /// <summary>
+    /// 识别退 SSA 后成对推进的数组指针游标与托管列索引。只有初始化块、循环更新块、
+    /// 元素步长、初始偏移和回边全部闭合，并且候选索引唯一时才建立映射。
+    /// </summary>
+    private static Dictionary<LocalVariable, LoopArrayCursor> DiscoverLoopArrayCursors(
+        ISILControlFlowGraph cfg,
+        int pointerSize,
+        SystemTypesContext? systemTypes)
+    {
+        var definitions = DefinitionSites(cfg);
+        var dominators = new DominatorInfo(cfg);
+        var result = new Dictionary<LocalVariable, LoopArrayCursor>();
+        var inductions = definitions
+            .Select(pair => TrySplitInductionDefinitions(
+                pair.Key,
+                pair.Value,
+                out var initialisation,
+                out var update,
+                out var step)
+                ? new Induction(pair.Key, initialisation, update, step)
+                : null)
+            .OfType<Induction>()
+            .ToArray();
+        var inductionsByLoopAndStep = inductions.ToLookup(induction =>
+            (induction.Initialisation.Block, induction.Update.Block, induction.Step));
+
+        foreach (var cursorInduction in inductions)
+        {
+            var cursor = cursorInduction.Local;
+            if (cursorInduction.Step <= 0
+                || !TryArrayCursorInitialisation(
+                    cursorInduction.Initialisation.Instruction,
+                    pointerSize,
+                    out var array,
+                    out var elementSize,
+                    out var cursorInitialIndex)
+                || cursorInduction.Step % elementSize != 0
+                || ReferenceEquals(cursorInduction.Initialisation.Block, cursorInduction.Update.Block)
+                || !dominators.Dominates(
+                    cursorInduction.Initialisation.Block,
+                    cursorInduction.Update.Block)
+                || !IsCyclicBlock(cursorInduction.Update.Block))
+                continue;
+
+            var indexStep = cursorInduction.Step / elementSize;
+            var candidates = new List<LoopArrayCursor>();
+            var pairedInductions = inductionsByLoopAndStep[
+                (cursorInduction.Initialisation.Block, cursorInduction.Update.Block, indexStep)];
+            foreach (var indexInduction in pairedInductions)
+            {
+                var index = indexInduction.Local;
+                if (ReferenceEquals(index, cursor)
+                    || indexInduction.Initialisation.Instruction is not
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [_, Immediate { Value: var initialIndex }],
+                    }
+                    || initialIndex < 0
+                    || !SupportedArrayIndexType(index.Type))
+                    continue;
+
+                var bias = cursorInitialIndex - initialIndex;
+                if (bias < 0 || bias > int.MaxValue)
+                    continue;
+
+                candidates.Add(new LoopArrayCursor(array, index, initialIndex, bias, []));
+            }
+
+            // 中文注释：相同步长的多个标量计数器无法证明哪一个对应数组列号；保持原始内存红门。
+            if (candidates.Count != 1)
+                continue;
+
+            var loopBlocks = StronglyConnectedLoopBlocks(cfg, cursorInduction.Update.Block);
+            if (loopBlocks.Count == 0)
+                continue;
+
+            if (candidates[0].Index.Type == null && systemTypes != null)
+                candidates[0].Index.Type = systemTypes.SystemInt32Type;
+            result[cursor] = candidates[0] with { LoopBlocks = loopBlocks };
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 把循环游标的内存偏移换算为“列索引 + 常量增量”；负索引、非整元素偏移和循环外消费均拒绝。
+    /// </summary>
+    private static LoopArrayAccess? LoopReferenceArrayIndex(
+        MemoryOperand memory,
+        Block block,
+        int pointerSize,
+        Dictionary<LocalVariable, LoopArrayCursor> cursors)
+    {
+        if (memory is not
+            {
+                Base: LocalVariable cursor,
+                Index: null,
+                Scale: 0,
+            }
+            || !cursors.TryGetValue(cursor, out var recovered)
+            || !recovered.LoopBlocks.Contains(block))
+            return null;
+
+        var arrayType = (SzArrayTypeAnalysisContext)recovered.Array.Type!;
+        var elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        if (elementSize <= 0 || memory.Addend % elementSize != 0)
+            return null;
+
+        var indexDelta = recovered.Bias + memory.Addend / elementSize;
+        if (indexDelta < 0
+            || indexDelta > int.MaxValue
+            || recovered.InitialIndex > int.MaxValue - indexDelta)
+            return null;
+
+        return new LoopArrayAccess(recovered.Array, recovered.Index, indexDelta);
+    }
+
+    private static bool TryArrayCursorInitialisation(
+        Instruction instruction,
+        int pointerSize,
+        out LocalVariable array,
+        out long elementSize,
+        out long initialIndex)
+    {
+        array = null!;
+        elementSize = 0;
+        initialIndex = 0;
+        if (instruction is not { OpCode: OpCode.Add, Operands: [_, var left, var right] })
+            return false;
+
+        if (!TryArrayAndImmediate(left, right, out array, out var byteOffset)
+            && !TryArrayAndImmediate(right, left, out array, out byteOffset))
+            return false;
+
+        var arrayType = (SzArrayTypeAnalysisContext)array.Type!;
+        elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        var elementOffset = byteOffset - ElementsOffset(pointerSize);
+        if (elementSize <= 0 || elementOffset < 0 || elementOffset % elementSize != 0)
+            return false;
+
+        initialIndex = elementOffset / elementSize;
+        return true;
+    }
+
+    private static bool TryArrayAndImmediate(
+        IOperand arrayOperand,
+        IOperand immediateOperand,
+        out LocalVariable array,
+        out long byteOffset)
+    {
+        if (arrayOperand is LocalVariable { Type: SzArrayTypeAnalysisContext } candidate
+            && immediateOperand is Immediate { Value: var value })
+        {
+            array = candidate;
+            byteOffset = value;
+            return true;
+        }
+
+        array = null!;
+        byteOffset = 0;
+        return false;
+    }
+
+    private static bool TrySplitInductionDefinitions(
+        LocalVariable local,
+        List<DefinitionSite> definitions,
+        out DefinitionSite initialisation,
+        out DefinitionSite update,
+        out long step)
+    {
+        initialisation = null!;
+        update = null!;
+        step = 0;
+        if (definitions.Count != 2)
+            return false;
+
+        var updates = definitions
+            .Select(site => (Site: site, Step: SelfIncrement(site.Instruction, local)))
+            .Where(candidate => candidate.Step.HasValue)
+            .ToArray();
+        if (updates.Length != 1)
+            return false;
+
+        update = updates[0].Site;
+        step = updates[0].Step!.Value;
+        initialisation = ReferenceEquals(definitions[0], update) ? definitions[1] : definitions[0];
+        return true;
+    }
+
+    private static long? SelfIncrement(Instruction instruction, LocalVariable local)
+    {
+        if (instruction is not { OpCode: OpCode.Add, Operands: [var destination, var left, var right] }
+            || !ReferenceEquals(destination, local))
+            return null;
+
+        if (ReferenceEquals(left, local) && right is Immediate { Value: var rightStep })
+            return rightStep;
+        if (ReferenceEquals(right, local) && left is Immediate { Value: var leftStep })
+            return leftStep;
+        return null;
+    }
+
+    private static Dictionary<LocalVariable, List<DefinitionSite>> DefinitionSites(ISILControlFlowGraph cfg)
+    {
+        var definitions = new Dictionary<LocalVariable, List<DefinitionSite>>();
+        foreach (var block in cfg.Blocks)
+        foreach (var instruction in block.Instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+            if (!definitions.TryGetValue(destination, out var sites))
+                definitions[destination] = sites = [];
+            sites.Add(new DefinitionSite(instruction, block));
+        }
+
+        return definitions;
+    }
+
+    private static bool SupportedArrayIndexType(TypeAnalysisContext? type) =>
+        type == null
+        || type.FullName is "System.Int32" or "System.UInt32" or "System.IntPtr" or "System.UIntPtr";
+
+    private static bool IsCyclicBlock(Block block)
+    {
+        var visited = new HashSet<Block>();
+        var pending = new Stack<Block>(block.Successors);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (ReferenceEquals(current, block))
+                return true;
+            if (!visited.Add(current))
+                continue;
+            foreach (var successor in current.Successors)
+                pending.Push(successor);
+        }
+
+        return false;
+    }
+
+    private static HashSet<Block> StronglyConnectedLoopBlocks(ISILControlFlowGraph cfg, Block updateBlock)
+    {
+        var forward = ReachableFrom(updateBlock, block => block.Successors);
+        var backward = ReachableFrom(updateBlock, block => block.Predecessors);
+        forward.IntersectWith(backward);
+        forward.IntersectWith(cfg.Blocks);
+        return forward;
+    }
+
+    private static HashSet<Block> ReachableFrom(Block start, Func<Block, IEnumerable<Block>> edges)
+    {
+        var visited = new HashSet<Block>();
+        var pending = new Stack<Block>();
+        pending.Push(start);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (!visited.Add(current))
+                continue;
+            foreach (var next in edges(current))
+                pending.Push(next);
+        }
+
+        return visited;
+    }
+
+    private sealed record DefinitionSite(Instruction Instruction, Block Block);
+
+    private sealed record Induction(
+        LocalVariable Local,
+        DefinitionSite Initialisation,
+        DefinitionSite Update,
+        long Step);
+
+    private sealed record LoopArrayCursor(
+        LocalVariable Array,
+        LocalVariable Index,
+        long InitialIndex,
+        long Bias,
+        HashSet<Block> LoopBlocks);
+
+    private sealed record LoopArrayAccess(LocalVariable Array, LocalVariable Index, long IndexDelta);
 
     /// <summary>
     /// 数组索引的 ARM64 扩展方式是整数宽度的直接证据；只为尚未定型的局部量绑定类型。
