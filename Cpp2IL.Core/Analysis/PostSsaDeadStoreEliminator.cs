@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -61,7 +62,7 @@ public static class PostSsaDeadStoreEliminator
 
                 if (instruction.Destination is LocalVariable defined)
                     live.Remove(defined);
-                live.UnionWith(DeadCodeEliminator.EnumerateUsedLocals(instruction));
+                live.UnionWith(EnumerateEmittedUses(instruction));
             }
         }
 
@@ -85,9 +86,26 @@ public static class PostSsaDeadStoreEliminator
 
             if (instruction.Destination is LocalVariable defined)
                 live.Remove(defined);
-            live.UnionWith(DeadCodeEliminator.EnumerateUsedLocals(instruction));
+            live.UnionWith(EnumerateEmittedUses(instruction));
         }
 
         return live;
+    }
+
+    /// <summary>
+    /// 按最终 CIL 的真实发射语义枚举读取。未绑定到托管方法的直接调用只会由
+    /// <see cref="IlGenerator"/> 生成诊断文本，不会装载原生调用约定携带的寄存器和栈参数；
+    /// 因而这些伪参数不得让零初始化、地址载体等死写保持存活。已经解析为托管方法的调用
+    /// 仍完整读取接收者与实参，保证 ref/out、实例调用和普通参数的数据流不变。
+    /// </summary>
+    private static IEnumerable<LocalVariable> EnumerateEmittedUses(Instruction instruction)
+    {
+        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid
+            && instruction.Operands.Count > 0
+            && instruction.Operands[0] is not MethodAnalysisContext)
+            yield break;
+
+        foreach (var local in DeadCodeEliminator.EnumerateUsedLocals(instruction))
+            yield return local;
     }
 }
