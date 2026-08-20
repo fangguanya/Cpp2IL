@@ -103,6 +103,17 @@ public static class AggregateStackCopyRecovery
                 || !ReferenceEquals(vectorStore.Operands[1], copy.Vector.TransferLocal))
                 continue;
 
+            if (TryRedirectAggregateReturnDestination(instructions, copy))
+            {
+                aliases.Add(new(
+                    copy.Scalar.DestinationStack,
+                    copy.Vector.DestinationStack,
+                    copy.TailField,
+                    copy.TailOffset));
+                changed = true;
+                continue;
+            }
+
             // 类型已经收敛且标量尾块证明复制覆盖完整结构，此时才把 ABI 分块搬运
             // 还原为一次托管值赋值；随后对字段槽的访问统一指向目标聚合字段。
             vectorStore.SetOperand(1, copy.Vector.SourceStack);
@@ -122,6 +133,62 @@ public static class AggregateStackCopyRecovery
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 隐藏返回缓冲区紧接着被完整复制到最终栈槽时，把托管调用结果直接绑定到最终槽。
+    /// 原生临时缓冲区随后常被异常清理参数覆盖；若只保留 source 到 destination 的普通
+    /// Move，SSA 简化会把覆盖值错误传播为 default(Enumerator)。只有源聚合槽恰好由一个
+    /// 同类型调用定义，且除本次向量加载外没有其它读取时才重定向。
+    /// </summary>
+    private static bool TryRedirectAggregateReturnDestination(
+        IReadOnlyList<Instruction> instructions,
+        AggregateCopy copy)
+    {
+        var definingCalls = instructions
+            .Select((instruction, index) => (instruction, index))
+            .Where(item => item.index < copy.Vector.LoadIndex
+                && item.instruction.IsCall
+                && ReferenceEquals(item.instruction.Destination, copy.Vector.SourceStack)
+                && item.instruction.Operands[0] is MethodAnalysisContext target
+                && GenericCallRebinder.TypesEquivalent(target.ReturnType, copy.AggregateType))
+            .ToArray();
+        if (definingCalls.Length != 1)
+            return false;
+
+        var definingCall = definingCalls[0].instruction;
+        for (var instructionIndex = 0; instructionIndex < instructions.Count; instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (!ReferenceEquals(instruction.Operands[operandIndex], copy.Vector.SourceStack))
+                    continue;
+
+                var isDefinition = ReferenceEquals(instruction, definingCall)
+                    && operandIndex == 1;
+                var isAggregateLoad = instructionIndex == copy.Vector.LoadIndex
+                    && operandIndex == 1;
+                if (!isDefinition && !isAggregateLoad)
+                    return false;
+            }
+        }
+
+        definingCall.SetOperand(1, copy.Vector.DestinationStack);
+        foreach (var index in new[]
+                 {
+                     copy.Vector.LoadIndex,
+                     copy.Scalar.LoadIndex,
+                     copy.Vector.StoreIndex,
+                     copy.Scalar.StoreIndex,
+                 })
+        {
+            var instruction = instructions[index];
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+        }
+
+        return true;
     }
 
     private static bool RewriteFieldAliases(
@@ -145,6 +212,17 @@ public static class AggregateStackCopyRecovery
                     alias.Field,
                     alias.Aggregate,
                     alias.Offset));
+                if (instruction is
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable destination, _]
+                    }
+                    && index == 1)
+                {
+                    // 中文注释：聚合字段身份来自同一次完整结构复制，强于物理寄存器复用
+                    // 遗留的 IDisposable& 等类型；此时仍在 SSA 中，可精确覆盖该唯一结果。
+                    destination.Type = alias.Field.FieldType;
+                }
                 changed = true;
             }
         }

@@ -359,6 +359,16 @@ public static class IlGenerator
                     break;
                 }
 
+                if (instruction.Operands[0] is LocalVariable { Type: null }
+                    && IsZeroConstant(instruction.Operands[1]))
+                {
+                    // 中文注释：未定型局部量在 CIL 局部表中按 object 声明；原生零值必须与
+                    // 该实际槽类型一致地生成 null，否则会形成 object <- I4 的非法栈写入。
+                    instructions.Add(CilOpCodes.Ldnull);
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
+
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor, DestinationType(instruction.Operands[0]));
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;

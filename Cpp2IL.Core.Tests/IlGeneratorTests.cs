@@ -1747,6 +1747,52 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 未定型Object局部量写入原生零生成Ldnull()
+    {
+        var emitted = 生成局部量立即数赋值Cil(null, 0);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.EqualTo(1));
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
+            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已定型Int32局部量写入零保持LdcI4()
+    {
+        var emitted = 生成局部量立即数赋值Cil(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type,
+            0);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted.Count(instruction =>
+                instruction.OpCode == CilOpCodes.Ldc_I4_0
+                || instruction.OpCode == CilOpCodes.Ldc_I4 && instruction.Operand is 0), Is.EqualTo(1));
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未定型Object局部量非零立即数保持数值指令()
+    {
+        var emitted = 生成局部量立即数赋值Cil(null, 7);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted.Any(instruction =>
+                instruction.OpCode.Code == CilCode.Ldc_I4
+                && instruction.Operand is 7), Is.True);
+            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 引用类型进入RuntimeTypeHandle形参生成Ldtoken()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
@@ -1801,6 +1847,65 @@ public class IlGeneratorTests
     private static TypeAnalysisContext 获取运行时类型句柄(ApplicationAnalysisContext appContext)
         => appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.RuntimeTypeHandle")!;
+
+    private static CilInstruction[] 生成局部量立即数赋值Cil(
+        TypeAnalysisContext? localType,
+        long value)
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = appContext.SystemTypes.SystemObjectType;
+        var systemVoid = appContext.SystemTypes.SystemVoidType;
+        var local = new LocalVariable("value", new Register(null, "X8"), localType);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "AssignImmediate",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, local, new Immediate(value)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [local];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "ImmediateLocalTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(
+            module,
+            systemObject,
+            "Object",
+            TypeAttributes.Public | TypeAttributes.Class);
+        if (localType != null && !ReferenceEquals(localType, systemObject))
+        {
+            var separator = localType.FullName.LastIndexOf('.');
+            var name = separator >= 0 ? localType.FullName[(separator + 1)..] : localType.FullName;
+            绑定AsmResolver系统类型(
+                module,
+                localType,
+                name,
+                TypeAttributes.Public
+                | (localType.IsValueType
+                    ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout
+                    : TypeAttributes.Class));
+        }
+
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ImmediateLocalType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "AssignImmediate",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        return definition.CilMethodBody!.Instructions.ToArray();
+    }
 
     private static CilInstruction[] 生成类型实参加载Cil(
         TypeAnalysisContext operandType,

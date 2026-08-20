@@ -1,6 +1,7 @@
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using System.Linq;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -47,6 +48,118 @@ public class AggregateStackCopyRecoveryTests
             var field = (FieldReference)instructions[4].Operands[1];
             Assert.That(field.Local, Is.SameAs(destinationBase));
             Assert.That(field.Field.Name, Is.EqualTo("current"));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 隐藏返回缓冲区完整复制时调用结果直接绑定最终Enumerator槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var getEnumerator = listDefinition.Methods.Single(method =>
+            method.Name == "GetEnumerator" && method.Parameters.Count == 0);
+        var target = new ConcreteGenericMethodAnalysisContext(getEnumerator, [stringType], []);
+        var sourceBase = Local("stack_-A8", target.ReturnType);
+        var vector = Local("V0", target.ReturnType);
+        var destinationBase = Local("stack_-90", target.ReturnType);
+        var sourceTail = Local("stack_-98", stringType);
+        var scalar = Local("X8", stringType);
+        var destinationTail = Local("stack_-80", stringType);
+        var receiver = Local("X0", listDefinition.MakeGenericInstanceType([stringType]));
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Call, target, sourceBase, receiver),
+            new(1, OpCode.Move, vector, sourceBase),
+            new(2, OpCode.Move, scalar, sourceTail),
+            new(3, OpCode.Move, destinationBase, vector),
+            new(4, OpCode.Move, destinationTail, scalar),
+        };
+
+        var changed = AggregateStackCopyRecovery.RewriteResolvedBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(instructions[0].Destination, Is.SameAs(destinationBase));
+            Assert.That(instructions.Skip(1).All(instruction => instruction.OpCode == OpCode.Nop), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 临时返回槽另有读取时保留显式聚合赋值()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var getEnumerator = listDefinition.Methods.Single(method =>
+            method.Name == "GetEnumerator" && method.Parameters.Count == 0);
+        var target = new ConcreteGenericMethodAnalysisContext(getEnumerator, [stringType], []);
+        var sourceBase = Local("stack_-A8", target.ReturnType);
+        var vector = Local("V0", target.ReturnType);
+        var destinationBase = Local("stack_-90", target.ReturnType);
+        var sourceTail = Local("stack_-98", stringType);
+        var scalar = Local("X8", stringType);
+        var destinationTail = Local("stack_-80", stringType);
+        var receiver = Local("X0", listDefinition.MakeGenericInstanceType([stringType]));
+        var observed = Local("X20", target.ReturnType);
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Call, target, sourceBase, receiver),
+            new(1, OpCode.Move, vector, sourceBase),
+            new(2, OpCode.Move, scalar, sourceTail),
+            new(3, OpCode.Move, destinationBase, vector),
+            new(4, OpCode.Move, destinationTail, scalar),
+            new(5, OpCode.Move, observed, sourceBase),
+        };
+
+        var changed = AggregateStackCopyRecovery.RewriteResolvedBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(instructions[0].Destination, Is.SameAs(sourceBase));
+            Assert.That(instructions[3].Operands[1], Is.SameAs(sourceBase));
+            Assert.That(instructions[5].Operands[1], Is.SameAs(sourceBase));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 聚合尾字段覆盖错误地址类型并恢复精确元素类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var disposable = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var concreteEnumerator = CreateEnumerator(stringType);
+        var sourceBase = Local("stack_-D8", concreteEnumerator);
+        var vector = Local("V0", concreteEnumerator);
+        var destinationBase = Local("stack_-80", concreteEnumerator);
+        var sourceTail = Local("stack_-C8", stringType);
+        var scalar = Local("X8", stringType);
+        var destinationTail = Local("stack_-70", stringType);
+        var observed = Local("X9", disposable.MakeByReferenceType());
+        var instructions = new Instruction[]
+        {
+            new(0, OpCode.Move, vector, sourceBase),
+            new(1, OpCode.Move, scalar, sourceTail),
+            new(2, OpCode.Move, destinationBase, vector),
+            new(3, OpCode.Move, destinationTail, scalar),
+            new(4, OpCode.Move, observed, destinationTail),
+        };
+
+        var changed = AggregateStackCopyRecovery.RewriteResolvedBlock(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(observed.Type, Is.SameAs(stringType));
+            Assert.That(instructions[4].Operands[1], Is.TypeOf<FieldReference>());
         });
     }
 
