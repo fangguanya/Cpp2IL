@@ -36,6 +36,59 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 条件Dispose生成平衡的Isinst与Callvirt控制流()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = app.SystemTypes.SystemObjectType;
+        var candidate = new LocalVariable("candidate", new Register(null, "X0"), systemObject);
+        var context = new InjectedMethodAnalysisContext(
+            systemObject,
+            "DisposeCandidate",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [systemObject]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.DisposeIfSupported, candidate),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.Locals = [];
+        context.ParameterLocals = [candidate];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "ConditionalDisposeTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, systemObject, "Object", TypeAttributes.Class | TypeAttributes.Public);
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ConditionalDisposeType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        var definition = new MethodDefinition(
+            "DisposeCandidate",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Object]));
+        typeDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        var validation = CilStackValidator.Validate(
+            definition.CilMethodBody!,
+            "ConditionalDisposeType::DisposeCandidate");
+        var il = definition.CilMethodBody!.Instructions;
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Isinst), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Dup), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Brfalse), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Callvirt), Is.EqualTo(1));
+            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Pop), Is.EqualTo(1));
+            Assert.That(validation.MaxStack, Is.EqualTo(2));
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 空分支块解析到直接后继的首条CIL指令()
     {
         var empty = new Block { ID = 10 };

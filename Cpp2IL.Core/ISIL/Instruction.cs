@@ -232,6 +232,9 @@ public class Instruction : IOperand
                 : _operands.Take(1).ToList(),
 
             OpCode.CallVoid or OpCode.Phi => _operands.Skip(1).ToList(),
+
+            OpCode.DisposeIfSupported => [_operands[0]],
+
             OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
                 or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
                 or OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned

@@ -80,6 +80,12 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     internal readonly ThrowHelperNameCache ThrowHelperNamesByAddress = new();
 
     /// <summary>
+    /// 按原生地址缓存直接运行时辅助函数的机器码分类；全量分析中同一辅助函数只解码一次。
+    /// </summary>
+    internal readonly ConcurrentDictionary<ulong, DirectRuntimeHelperRecovery.HelperKind>
+        DirectRuntimeHelpersByAddress = new();
+
+    /// <summary>
     /// Dict of address to "is this method analogue to il2cpp::vm::Exception::Raise"
     /// </summary>
     public readonly ConcurrentDictionary<ulong, bool> ExceptionRaisersByAddress = new();

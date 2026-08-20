@@ -466,6 +466,31 @@ public static class IlGenerator
                 StoreToOperand(isInstDestination, method, locals, writeLine);
                 break;
 
+            case OpCode.DisposeIfSupported:
+                if (instruction.Operands is not [{ } disposableCandidate])
+                    throw new InvalidOperationException($"DisposeIfSupported指令操作数不完整: {instruction}");
+
+                // IL2CPP 的非泛型 foreach 清理辅助函数等价于“as IDisposable”后条件调用。
+                // dup/brfalse 两条路径分别消费同一个转换结果，确保空值、非 IDisposable 与
+                // 实际 Dispose 调用三种路径在汇合处均保持空栈。
+                var disposableType = factory.CorLibScope.CreateTypeReference("System", "IDisposable");
+                var disposeMethod = disposableType
+                    .CreateMemberReference("Dispose", MethodSignature.CreateInstance(factory.Void))
+                    .ImportWith(importer);
+                var noDispose = new CilInstruction(CilOpCodes.Nop);
+                var afterDispose = new CilInstruction(CilOpCodes.Nop);
+
+                LoadOperand(disposableCandidate, method, locals, writeLine, stringCtor);
+                instructions.Add(CilOpCodes.Isinst, disposableType.ImportWith(importer));
+                instructions.Add(CilOpCodes.Dup);
+                instructions.Add(CilOpCodes.Brfalse, new CilInstructionLabel(noDispose));
+                instructions.Add(CilOpCodes.Callvirt, disposeMethod);
+                instructions.Add(CilOpCodes.Br, new CilInstructionLabel(afterDispose));
+                instructions.Add(noDispose);
+                instructions.Add(CilOpCodes.Pop);
+                instructions.Add(afterDispose);
+                break;
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)

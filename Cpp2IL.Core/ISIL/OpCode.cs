@@ -202,6 +202,9 @@ public enum OpCode
     /// <summary>测试 op 2 是否兼容 op 3 指定的引用类型；成功时写入原对象，失败时写入 null。</summary>
     IsInst,
 
+    /// <summary>若 op 1 实现 IDisposable，则调用 Dispose；空值和非 IDisposable 对象保持无操作。</summary>
+    DisposeIfSupported,
+
     /// <summary>
     /// Allocates a new array of the type described by op 2, with the length in op 3, into op 1.
     /// </summary>

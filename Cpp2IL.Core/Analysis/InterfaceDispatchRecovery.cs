@@ -1235,7 +1235,7 @@ public static class InterfaceDispatchRecovery
         return null;
     }
 
-    private static MethodAnalysisContext? ResolveInterfaceSlot(TypeAnalysisContext declaringInterface, int slot)
+    internal static MethodAnalysisContext? ResolveInterfaceSlot(TypeAnalysisContext declaringInterface, int slot)
     {
         Logger.VerboseNewline(
             $"接口槽位解析 {declaringInterface.FullName}[{slot}]：" +

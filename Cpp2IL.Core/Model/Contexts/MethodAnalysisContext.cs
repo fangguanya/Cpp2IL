@@ -603,6 +603,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ListAddRecovery.RunCompactArrayAccess(this);
         DeadAddressCarrierRecovery.Run(this);
 
+        // 所有退SSA常量、运行时类型、异常栈槽取址与保存寄存器接收者到此均已物化；
+        // 这是三类直接辅助ABI唯一执行点，避免早期不完整操作数造成局部恢复和重复扫描。
+        DirectRuntimeHelperRecovery.Run(this);
+
         LocalVariables.RemoveUnused(this);
     }
 
