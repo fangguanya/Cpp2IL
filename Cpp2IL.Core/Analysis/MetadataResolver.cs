@@ -1,10 +1,11 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
@@ -15,111 +16,853 @@ public static class MetadataResolver
 {
     public static void ResolveAll(MethodAnalysisContext method)
     {
-        ResolveStringLiteralAccessors(method);
         ResolveCalls(method);
         ResolveGetter(method);
         ResolveMetadataUsages(method);
     }
 
-    private static void ResolveStringLiteralAccessors(MethodAnalysisContext method)
-    {
-        var libContext = method.AppContext.LibCpp2IlContext;
-
-        var definitions = new Dictionary<LocalVariable, Instruction>();
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
-            if (instruction.Destination is LocalVariable destination)
-                definitions[destination] = instruction;
-
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
-        {
-            if (instruction.OpCode != OpCode.Call || instruction.Operands[1] is not LocalVariable result)
-                continue;
-
-            for (var i = 2; i < instruction.Operands.Count; i++)
-            {
-                if (LiteralSlotAddress(instruction.Operands[i], definitions) is not { } address
-                    || libContext.GetLiteralByAddress(address) is not { } literal)
-                    continue;
-
-                instruction.OpCode = OpCode.Move;
-                instruction.SetOperands(result, new StringLiteral(literal));
-                break;
-            }
-        }
-    }
-
-    private static ulong? LiteralSlotAddress(IOperand operand, Dictionary<LocalVariable, Instruction> definitions) =>
-        operand switch
-        {
-            Immediate immediate => immediate.UnsignedValue,
-            LocalVariable local when definitions.TryGetValue(local, out var definition)
-                && definition is { OpCode: OpCode.Move, Operands: [_, Immediate immediate] } => immediate.UnsignedValue,
-            _ => null,
-        };
-
     /// <summary>
     /// Resolves <c>Move local, [absoluteAddress]</c> loads of IL2CPP metadata-usage globals into a
     /// strongly-typed operand: a string literal, a <see cref="TypeAnalysisContext"/> (an Il2CppType*/
     /// Il2CppClass* usage) or, for a MethodInfo* usage, a <see cref="RuntimeMethodInfoAnalysisContext"/>
-    /// naming the method it refers to (also used to type the local - see <see cref="LocalVariables"/>),
-    /// or likewise a <see cref="RuntimeFieldInfoAnalysisContext"/> for a FieldInfo* usage.
+    /// naming the method it refers to (also used to type the local - see <see cref="LocalVariables"/>).
     /// </summary>
     private static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
+        var definitions = BuildUniqueDefinitions(method.ControlFlowGraph!.Instructions);
 
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode != OpCode.Move)
                 continue;
 
-            if (instruction.Operands[0] is not LocalVariable)
+            if (instruction.Operands[0] is not LocalVariable
+                || instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0 } memory)
                 continue;
 
-            var address = instruction.Operands[1] switch
+            MetadataUsage? tableUsage = null;
+            if (memory.Base is LocalVariable tableBase
+                && definitions.TryGetValue(tableBase, out var tableDefinition)
+                && tableDefinition.Operands[1] is MemoryOperand { Base: null, Index: null, Scale: 0 } tableGlobal
+                && tableGlobal.Addend >= 0)
             {
-                MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
-                Immediate immediate => immediate.UnsignedValue,
-                _ => 0ul,
-            };
+                tableUsage = libContext.CheckForPost27GlobalTableEntryAt((ulong)tableGlobal.Addend, memory.Addend);
+            }
 
-            if (address == 0)
-                continue;
-
-            // String literal.
-            var stringLiteral = libContext.GetLiteralByAddress(address);
-            if (stringLiteral != null)
+            if (tableUsage != null)
             {
-                instruction.SetOperand(1, new StringLiteral(stringLiteral));
+                if (ResolveMetadataUsageOperand(method, tableUsage) is { } resolvedTableOperand)
+                    instruction.SetOperand(1, resolvedTableOperand);
+
                 continue;
             }
 
-            // Type metadata usage (Il2CppType* / Il2CppClass*).
-            if (method.DeclaringType is { } declaringType)
+            // 旧布局和部分新布局仍会直接从绝对地址读取元数据使用值。
+            if (memory.Base != null || memory.Addend < 0)
+                continue;
+
+            var address = (ulong)memory.Addend;
+            // 绝对槽在旧布局中直接保存编码值；post-27二级布局的第一层保存的是
+            // 编码项地址，必须留给后续[tableBase+offset]或Phi专用规则执行第二次读取。
+            var absoluteUsage = libContext.GetAnyGlobalByAddress(address);
+            if (absoluteUsage != null
+                && ResolveMetadataUsageOperand(method, absoluteUsage) is { } resolvedAbsoluteOperand)
+                instruction.SetOperand(1, resolvedAbsoluteOperand);
+        }
+
+        var stringPhiDetails = new List<string>();
+        var stringPhiRecoveryCount = ResolvePhiBackedStringLoads(
+            method.ControlFlowGraph.Instructions,
+            stringPhiDetails,
+            address =>
             {
-                var typeGlobal = libContext.GetTypeGlobalByAddress(address);
-                if (typeGlobal != null)
+                var usage = libContext.CheckForPost27GlobalTableEntryAt(address, 0);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+        foreach (var detail in stringPhiDetails)
+            Logger.VerboseNewline(
+                $"字符串元数据Phi：method={method.Name}，recovered={stringPhiRecoveryCount}，{detail}",
+                "MetadataResolver");
+    }
+
+    /// <summary>
+    /// 统一解析绝对元数据槽：先识别槽内直接编码值，再识别“槽内保存编码项地址”的
+    /// post-27 二级布局。二级布局必须使用零字节偏移，避免把任意地址误判为元数据表。
+    /// </summary>
+    internal static TUsage? ResolveAbsoluteSlotUsage<TUsage>(
+        ulong address,
+        Func<ulong, TUsage?> directResolver,
+        Func<ulong, long, TUsage?> tableEntryResolver,
+        Func<TUsage, bool>? acceptance = null)
+        where TUsage : class
+    {
+        var direct = directResolver(address);
+        if (direct != null && (acceptance == null || acceptance(direct)))
+            return direct;
+
+        var tableEntry = tableEntryResolver(address, 0);
+        return tableEntry != null && (acceptance == null || acceptance(tableEntry))
+            ? tableEntry
+            : null;
+    }
+
+    /// <summary>
+    /// 退 SSA 后恢复“已初始化绝对槽载体被直接零偏移读取”的元数据操作数。
+    /// 槽地址、初始化证明、多定义同址和零偏移四项必须同时成立。
+    /// </summary>
+    public static int ResolveInitializedInlineMetadataOperands(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong> initializedRuntimeMetadataSlots)
+    {
+        var libContext = method.AppContext.LibCpp2IlContext;
+        var recovered = ResolveInitializedInlineMetadataOperands(
+            method.ControlFlowGraph!.Instructions,
+            initializedRuntimeMetadataSlots,
+            address =>
+            {
+                var usage = ResolveAbsoluteSlotUsage(
+                    address,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt);
+                return usage == null ? null : ResolveMetadataUsageOperand(method, usage);
+            });
+        if (recovered > 0)
+        {
+            Logger.VerboseNewline(
+                $"初始化内联元数据槽：method={method.Name}，recovered={recovered}",
+                nameof(MetadataResolver));
+        }
+
+        return recovered;
+    }
+
+    internal static int ResolveInitializedInlineMetadataOperands(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyCollection<ulong> initializedRuntimeMetadataSlots,
+        Func<ulong, IOperand?> slotResolver)
+    {
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        var definitions = BuildConvergedDefinitionIndex(instructions);
+        var resolvedAddresses = new Dictionary<LocalVariable, ulong?>();
+        var resolvedSlots = new Dictionary<ulong, IOperand?>();
+        var resolvedCarriers = new HashSet<LocalVariable>();
+        var recovered = 0;
+
+        foreach (var instruction in instructions)
+        {
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (ReferenceEquals(instruction.Operands[operandIndex], instruction.Destination)
+                    || instruction.Operands[operandIndex] is not MemoryOperand
+                    {
+                        Base: LocalVariable slotCarrier,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0,
+                    }
+                    || ResolveConvergedAbsoluteSlotAddress(
+                        slotCarrier,
+                        definitions,
+                        [],
+                        resolvedAddresses) is not { } address
+                    || !initializedRuntimeMetadataSlots.Contains(address))
+                    continue;
+
+                if (!resolvedSlots.TryGetValue(address, out var resolved))
                 {
-                    instruction.SetOperand(1, declaringType.AppContext.ResolveIl2CppType(typeGlobal));
+                    resolved = slotResolver(address);
+                    resolvedSlots[address] = resolved;
+                }
+
+                if (resolved == null)
+                    continue;
+
+                if (resolved is TypeAnalysisContext && instruction.OpCode == OpCode.Move)
+                {
+                    // 中文注释：普通 Move 的零偏移 TypeInfo 读取生成的是 Il2CppClass 载体，
+                    // 必须保留给 RuntimeClassTypeAnalysisContext 与 static_fields 闭包；
+                    // 直接调用操作数中的类型（Newobj、SzArrayNew）才使用普通类型操作数。
                     continue;
                 }
-            }
 
-            // Method metadata usage (MethodInfo*). On metadata v27+ GetMethodGlobalByAddress can return
-            // any global, so confirm it is actually a method before resolving - the resolver's switch
-            // throws on other usage kinds.
-            var methodUsage = libContext.GetMethodGlobalByAddress(address);
-            if (methodUsage?.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef
-                && method.AppContext.ResolveContextForMethod(methodUsage) is { DeclaringType: { } methodDeclaringType } methodContext)
+                instruction.SetOperand(operandIndex, resolved);
+                resolvedCarriers.Add(slotCarrier);
+                recovered++;
+            }
+        }
+
+        // 中文注释：该阶段位于通用 Simplifier 之后，只清理由本规则完全消费且全图再无读取的
+        // 绝对槽载体定义；复用统一的操作数局部枚举，避免另写一套不完整的复合操作数递归。
+        var stillUsed = new HashSet<LocalVariable>(
+            instructions.SelectMany(DeadCodeEliminator.EnumerateUsedLocals));
+        foreach (var carrier in resolvedCarriers.Where(carrier => !stillUsed.Contains(carrier)))
+        {
+            foreach (var definition in definitions[carrier])
             {
-                instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly));
-                continue;
+                definition.OpCode = OpCode.Nop;
+                definition.SetOperands();
+            }
+        }
+
+        return recovered;
+    }
+
+    /// <summary>
+    /// 初始化保护区裁除和首次类型传播完成后，恢复“绝对槽保存编码项地址，强类型字符串局部
+    /// 再从该地址读取”的post-27二层布局。第一层地址载体保持原样，只有唯一Move定义、
+    /// 无索引内存读取、System.String目标和StringLiteral元数据四项证据同时成立时才改写。
+    /// </summary>
+    public static int ResolveTypedPost27StringLoads(MethodAnalysisContext method)
+    {
+        var libContext = method.AppContext.LibCpp2IlContext;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var changed = ResolveTypedPost27StringLoads(
+            instructions,
+            method.AppContext.SystemTypes.SystemStringType,
+            (address, offset) =>
+            {
+                var usage = libContext.CheckForPost27GlobalTableEntryAt(address, offset);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+        changed += ResolvePost27ConditionalStringSelections(
+            instructions,
+            method.AppContext.SystemTypes.SystemStringType,
+            address =>
+            {
+                var usage = ResolveAbsoluteSlotUsage(
+                    address,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt,
+                    candidate => candidate.Type == MetadataUsageType.StringLiteral);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+
+        if (changed > 0)
+            Logger.VerboseNewline(
+                $"字符串元数据二层槽：method={method.Name}，recovered={changed}",
+                "MetadataResolver");
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 恢复 ARM64 的“两个字符串元数据槽经 CSEL 选择，再统一解引用”形态。两个输入槽
+    /// 必须都由元数据证明为字符串；提交后选择结果直接承载托管字符串，并只删除其零偏移
+    /// 读取用途，内存写目标和带偏移访问保持原样。
+    /// </summary>
+    internal static int ResolvePost27ConditionalStringSelections(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext stringType,
+        Func<ulong, StringLiteral?> absoluteSlotResolver)
+    {
+        var definitions = BuildUniqueDefinitions(instructions);
+        var resolvedAddresses = new Dictionary<LocalVariable, ulong?>();
+        var resolvedSlots = new Dictionary<ulong, StringLiteral?>();
+        var changed = 0;
+
+        ulong? ResolveSlotAddress(IOperand operand)
+        {
+            if (operand is MemoryOperand
+                {
+                    Base: null,
+                    Index: null,
+                    Scale: 0,
+                    Addend: >= 0
+                } absoluteSlot)
+                return (ulong)absoluteSlot.Addend;
+
+            return ResolveAbsoluteSlotAddress(operand, definitions, [], resolvedAddresses);
+        }
+
+        StringLiteral? ResolveSlot(ulong address)
+        {
+            if (!resolvedSlots.TryGetValue(address, out var resolved))
+            {
+                resolved = absoluteSlotResolver(address);
+                resolvedSlots[address] = resolved;
             }
 
-            // Field metadata usage (FieldInfo*), e.g. the RuntimeFieldHandle passed to InitializeArray.
-            if (libContext.GetRawFieldGlobalByAddress(address) is { Type: MetadataUsageType.FieldInfo } fieldUsage
-                && method.AppContext.ResolveContextForField(fieldUsage.AsField()) is { DeclaringType.DeclaringAssembly: { } fieldAssembly } fieldContext)
-                instruction.SetOperand(1, new RuntimeFieldInfoAnalysisContext(fieldContext, fieldAssembly));
+            return resolved;
+        }
+
+        foreach (var selection in instructions)
+        {
+            if (selection is not
+                {
+                    OpCode: OpCode.ConditionalSelect,
+                    Operands:
+                    [
+                        LocalVariable destination,
+                        _,
+                        var whenTrue,
+                        var whenFalse
+                    ]
+                }
+                || ResolveSlotAddress(whenTrue) is not { } trueSlotAddress
+                || ResolveSlotAddress(whenFalse) is not { } falseSlotAddress
+                || ResolveSlot(trueSlotAddress) is not { } trueLiteral
+                || ResolveSlot(falseSlotAddress) is not { } falseLiteral)
+                continue;
+
+            selection.SetOperand(2, trueLiteral);
+            selection.SetOperand(3, falseLiteral);
+            destination.Type = stringType;
+            RewriteManagedStringDereferences(instructions, destination);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 字符串元数据槽已经提升为托管字符串后，只改写数据流中的零偏移读取。通过统一的
+    /// SourcesAndConstants 判定读取位置，避免为 Return、Move 和 Call 重复维护操作码清单。
+    /// </summary>
+    private static void RewriteManagedStringDereferences(
+        IReadOnlyList<Instruction> instructions,
+        LocalVariable managedString)
+    {
+        foreach (var instruction in instructions)
+        {
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (instruction.Operands[operandIndex] is not MemoryOperand
+                    {
+                        Base: LocalVariable baseLocal,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0
+                    } memory
+                    || !ReferenceEquals(baseLocal, managedString)
+                    || !instruction.SourcesAndConstants.Any(source => source.Equals(memory)))
+                    continue;
+
+                instruction.SetOperand(operandIndex, managedString);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 初始化保护区裁除后，恢复仍经“绝对槽 -&gt; 元数据项”二级读取的类型句柄。
+    /// 该阶段只接受Type/TypeInfo用法，使后续内联强制转换可以取得精确目标类型。
+    /// </summary>
+    public static int ResolvePost27TypeLoads(
+        MethodAnalysisContext method,
+        ISet<ulong> initializedRuntimeMetadataSlots,
+        IReadOnlyDictionary<LocalVariable, Instruction>? definitions = null)
+    {
+        // 中文注释：二层类型表只可能来自本方法已执行初始化保护的槽；绝大多数方法没有
+        // 这类槽，必须在建立SSA定义索引前直接退出，避免全量恢复重复扫描所有内存读取。
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        var appContext = method.AppContext;
+        var libContext = appContext.LibCpp2IlContext;
+        var changed = ResolvePost27TypeLoads(
+            method.ControlFlowGraph!.Instructions,
+            initializedRuntimeMetadataSlots,
+            (address, offset) =>
+            {
+                var usage = libContext.CheckForPost27GlobalTableEntryAt(address, offset);
+                return usage?.Type is MetadataUsageType.Type or MetadataUsageType.TypeInfo
+                    ? appContext.ResolveIl2CppType(usage.AsType())
+                    : null;
+            },
+            definitions);
+
+        if (changed > 0)
+            Logger.VerboseNewline(
+                $"类型元数据二层槽：method={method.Name}，recovered={changed}",
+                "MetadataResolver");
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 只恢复内联类层级检查已经证明为目标类指针的单个SSA局部。该局部必须由唯一Move定义，
+    /// 其二层表基址必须收敛到本方法已初始化的元数据槽；成功后同时提交强类型操作数与
+    /// Il2CppClass运行时类型，供同一检查闭包继续匹配。
+    /// </summary>
+    internal static TypeAnalysisContext? ResolvePost27TypeLocal(
+        MethodAnalysisContext method,
+        LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        ISet<ulong> initializedRuntimeMetadataSlots)
+    {
+        if (local.Type is RuntimeClassTypeAnalysisContext { RepresentedType: var represented })
+            return represented;
+        if (!definitions.TryGetValue(local, out var definition)
+            || definition is not
+            {
+                OpCode: OpCode.Move,
+                Operands:
+                [
+                    LocalVariable,
+                    MemoryOperand
+                    {
+                        Base: LocalVariable tableBase,
+                        Index: null,
+                        Scale: 0,
+                        Addend: >= 0
+                    } entryMemory
+                ]
+            }
+            || ResolveAbsoluteSlotAddress(tableBase, definitions, []) is not { } tableGlobalAddress
+            || !initializedRuntimeMetadataSlots.Contains(tableGlobalAddress))
+            return null;
+
+        var usage = method.AppContext.LibCpp2IlContext.CheckForPost27GlobalTableEntryAt(
+            tableGlobalAddress,
+            entryMemory.Addend);
+        if (usage?.Type is not (MetadataUsageType.Type or MetadataUsageType.TypeInfo))
+            return null;
+
+        var type = method.AppContext.ResolveIl2CppType(usage.AsType());
+        definition.SetOperand(1, type);
+        local.Type = new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly);
+        return type;
+    }
+
+    /// <summary>
+    /// 对已完成类型传播的指令执行可测试的二层字符串槽恢复。相同地址与偏移只解析一次，
+    /// 避免多个返回分支共享默认字符串槽时重复读取二进制和元数据。
+    /// </summary>
+    internal static int ResolveTypedPost27StringLoads(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext stringType,
+        Func<ulong, long, StringLiteral?> post27StringEntryResolver)
+        => ResolvePost27TableLoads(
+            instructions,
+            destination => destination.Type == stringType,
+            (address, offset) => post27StringEntryResolver(address, offset) is { } literal
+                ? literal
+                : null);
+
+    /// <summary>
+    /// 对可测试指令集恢复post-27二层类型槽。目标局部可以尚未定型；元数据用法本身
+    /// 是类型身份的权威证据，调用方会在改写后执行一次类型收敛。
+    /// </summary>
+    internal static int ResolvePost27TypeLoads(
+        IReadOnlyList<Instruction> instructions,
+        ISet<ulong> initializedRuntimeMetadataSlots,
+        Func<ulong, long, TypeAnalysisContext?> post27TypeEntryResolver,
+        IReadOnlyDictionary<LocalVariable, Instruction>? definitions = null)
+    {
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        return ResolvePost27TableLoads(
+            instructions,
+            _ => true,
+            post27TypeEntryResolver,
+            initializedRuntimeMetadataSlots.Contains,
+            (destination, resolved) =>
+            {
+                // 中文注释：Type/TypeInfo元数据项表示Il2CppClass指针，不是该类型的对象实例；
+                // 在提交操作数的同一位置直接赋型，避免为每个命中方法再次执行全图类型不动点。
+                if (resolved is TypeAnalysisContext type)
+                    destination.Type = new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly);
+            },
+            definitions);
+    }
+
+    /// <summary>
+    /// 统一执行post-27二层元数据读取；地址链解析、同项缓存和原指令提交只实现一次，
+    /// 字符串与类型恢复仅提供各自的目标筛选及元数据解析器。
+    /// </summary>
+    private static int ResolvePost27TableLoads(
+        IReadOnlyList<Instruction> instructions,
+        Func<LocalVariable, bool> destinationFilter,
+        Func<ulong, long, IOperand?> entryResolver,
+        Func<ulong, bool>? tableAddressFilter = null,
+        Action<LocalVariable, IOperand>? onResolved = null,
+        IReadOnlyDictionary<LocalVariable, Instruction>? knownDefinitions = null)
+    {
+        // 中文注释：调用方若已为同一SSA指令快照建立唯一定义索引，必须复用该索引；
+        // 这避免内联类型检查和元数据解析对63,397个方法重复执行GroupBy全图计算。
+        var definitions = knownDefinitions ?? BuildUniqueDefinitions(instructions);
+        // 中文注释：大型启动方法会从同一元数据表基址读取数百个字段；地址链若逐条递归，
+        // Phi与复制链会产生指数级重复遍历。按SSA局部缓存成功和失败结果，整方法只求值一次。
+        var absoluteSlotAddresses = new Dictionary<LocalVariable, ulong?>();
+        var resolvedEntries = new Dictionary<(ulong Address, long Offset), IOperand?>();
+        var changed = 0;
+
+        foreach (var load in instructions)
+        {
+            if (load is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable destination,
+                        MemoryOperand
+                        {
+                            Base: LocalVariable tableBase,
+                            Index: null,
+                            Scale: 0,
+                            Addend: >= 0
+                        } entryMemory
+                    ]
+                }
+                || !destinationFilter(destination)
+                || ResolveAbsoluteSlotAddress(
+                    tableBase,
+                    definitions,
+                    [],
+                    absoluteSlotAddresses) is not { } tableGlobalAddress
+                || tableAddressFilter != null && !tableAddressFilter(tableGlobalAddress))
+                continue;
+
+            var key = (tableGlobalAddress, entryMemory.Addend);
+            if (!resolvedEntries.TryGetValue(key, out var resolved))
+            {
+                resolved = entryResolver(key.Item1, key.Item2);
+                resolvedEntries[key] = resolved;
+            }
+
+            if (resolved == null)
+                continue;
+
+            load.SetOperand(1, resolved);
+            onResolved?.Invoke(destination, resolved);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 沿SSA单一定义链解析绝对槽地址。Move复制继续追踪；Phi只有在全部输入都能证明为
+    /// 同一绝对地址时才收敛，异址、缺失定义和循环链均保持未解析。
+    /// </summary>
+    internal static ulong? ResolveAbsoluteSlotAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited)
+        => ResolveAbsoluteSlotAddress(operand, definitions, visited, []);
+
+    /// <summary>
+    /// 沿退 SSA 后的多定义链解析绝对槽地址。一个局部的全部定义必须独立收敛到同一地址；
+    /// 异址、缺失定义、不可解析指令或循环链均保持未解析。
+    /// </summary>
+    internal static ulong? ResolveConvergedAbsoluteSlotAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> definitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
+        => ResolveAbsoluteSlotAddressCore(
+            operand,
+            null,
+            definitions,
+            visited,
+            resolvedAddresses);
+
+    /// <summary>
+    /// 共享同一SSA图的绝对槽地址解析结果；空结果也必须缓存，避免异常复制环和异址Phi在
+    /// 每个内存读取处重复遍历。正在访问集合仍独立约束当前递归路径，保持循环拒绝语义。
+    /// </summary>
+    private static ulong? ResolveAbsoluteSlotAddress(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
+        => ResolveAbsoluteSlotAddressCore(
+            operand,
+            definitions,
+            null,
+            visited,
+            resolvedAddresses);
+
+    private static ulong? ResolveAbsoluteSlotAddressCore(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction>? uniqueDefinitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>>? convergedDefinitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
+    {
+        if (operand is not LocalVariable local)
+            return null;
+        if (resolvedAddresses.TryGetValue(local, out var cachedAddress))
+            return cachedAddress;
+        if (!visited.Add(local))
+            return null;
+
+        ulong? resolvedAddress = null;
+        if (convergedDefinitions != null)
+        {
+            if (convergedDefinitions.TryGetValue(local, out var definitions)
+                && definitions.Count > 0)
+            {
+                foreach (var definition in definitions)
+                {
+                    var definitionAddress = ResolveDefinitionAbsoluteSlotAddress(
+                        definition,
+                        uniqueDefinitions,
+                        convergedDefinitions,
+                        visited,
+                        resolvedAddresses);
+                    if (definitionAddress == null
+                        || resolvedAddress is { } existing && existing != definitionAddress.Value)
+                    {
+                        resolvedAddress = null;
+                        break;
+                    }
+
+                    resolvedAddress = definitionAddress;
+                }
+            }
+        }
+        else if (uniqueDefinitions != null
+                 && uniqueDefinitions.TryGetValue(local, out var definition))
+        {
+            resolvedAddress = ResolveDefinitionAbsoluteSlotAddress(
+                definition,
+                uniqueDefinitions,
+                null,
+                visited,
+                resolvedAddresses);
+        }
+
+        visited.Remove(local);
+        resolvedAddresses[local] = resolvedAddress;
+        return resolvedAddress;
+    }
+
+    private static ulong? ResolveDefinitionAbsoluteSlotAddress(
+        Instruction definition,
+        IReadOnlyDictionary<LocalVariable, Instruction>? uniqueDefinitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>>? convergedDefinitions,
+        HashSet<LocalVariable> visited,
+        Dictionary<LocalVariable, ulong?> resolvedAddresses)
+    {
+        if (definition is
+            {
+                OpCode: OpCode.Move,
+                Operands:
+                [
+                    LocalVariable,
+                    MemoryOperand
+                    {
+                        Base: null,
+                        Index: null,
+                        Scale: 0,
+                        Addend: >= 0
+                    } absoluteSlot
+                ]
+            })
+        {
+            return (ulong)absoluteSlot.Addend;
+        }
+
+        if (definition is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable source] })
+        {
+            return ResolveAbsoluteSlotAddressCore(
+                source,
+                uniqueDefinitions,
+                convergedDefinitions,
+                visited,
+                resolvedAddresses);
+        }
+
+        if (definition.OpCode == OpCode.Phi && definition.Operands.Count >= 2)
+        {
+            ulong? resolvedAddress = null;
+            for (var index = 1; index < definition.Operands.Count; index++)
+            {
+                var inputAddress = ResolveAbsoluteSlotAddressCore(
+                    definition.Operands[index],
+                    uniqueDefinitions,
+                    convergedDefinitions,
+                    visited,
+                    resolvedAddresses);
+                if (inputAddress == null || resolvedAddress is { } existing && existing != inputAddress.Value)
+                {
+                    resolvedAddress = null;
+                    break;
+                }
+
+                resolvedAddress = inputAddress;
+            }
+
+            return resolvedAddress;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 把“多个字符串元数据槽地址经Phi汇合，再统一解引用”的原生形态恢复为字符串值Phi。
+    /// MetadataUsage解析已经把每条输入边的绝对槽加载证明为StringLiteral；此时继续保留
+    /// 公共<c>[phi]</c>会把托管字符串再次当作地址读取，并让退SSA后的定义链丢失。
+    /// 只有全部输入都沿唯一Move链解析为字符串时才提交重写，任何混合输入均保持原样。
+    /// </summary>
+    internal static int ResolvePhiBackedStringLoads(
+        IReadOnlyList<Instruction> instructions,
+        List<string>? details = null,
+        Func<ulong, StringLiteral?>? post27StringSlotResolver = null)
+    {
+        var definitions = BuildUniqueDefinitions(instructions);
+        var changed = 0;
+
+        foreach (var load in instructions)
+        {
+            if (load is
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable { IsReturn: true },
+                        MemoryOperand
+                        {
+                            Base: LocalVariable returnBase,
+                            Index: null,
+                            Scale: 0,
+                            Addend: 0
+                        }
+                    ]
+                })
+            {
+                details?.Add(
+                    $"返回读取基址={returnBase}，定义="
+                    + (definitions.TryGetValue(returnBase, out var returnBaseDefinition)
+                        ? returnBaseDefinition.ToString()
+                        : "<非唯一或缺失>"));
+            }
+
+            if (load is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable,
+                        MemoryOperand
+                        {
+                            Base: LocalVariable phiValue,
+                            Index: null,
+                            Scale: 0,
+                            Addend: 0
+                        }
+                    ]
+                }
+                || !definitions.TryGetValue(phiValue, out var phi)
+                || phi.OpCode != OpCode.Phi
+                || phi.Operands.Count < 3)
+                continue;
+
+            var resolvedInputs = new List<StringLiteral>(phi.Operands.Count - 1);
+            var allInputsResolved = true;
+            string? firstUnresolved = null;
+            for (var index = 1; index < phi.Operands.Count; index++)
+            {
+                if (ResolveStringLiteral(
+                        phi.Operands[index],
+                        definitions,
+                        [],
+                        post27StringSlotResolver) is not { } literal)
+                {
+                    allInputsResolved = false;
+                    var unresolved = phi.Operands[index];
+                    firstUnresolved = unresolved is LocalVariable local
+                        && definitions.TryGetValue(local, out var unresolvedDefinition)
+                            ? $"{local} <- {unresolvedDefinition}"
+                            : unresolved.ToString();
+                    break;
+                }
+
+                resolvedInputs.Add(literal);
+            }
+
+            details?.Add(
+                $"候选Phi={phiValue}，输入={phi.Operands.Count - 1}，"
+                + $"已解析={resolvedInputs.Count}，首个未解析={firstUnresolved ?? "<无>"}");
+            if (!allInputsResolved)
+                continue;
+
+            for (var index = 0; index < resolvedInputs.Count; index++)
+                phi.SetOperand(index + 1, resolvedInputs[index]);
+
+            // Phi现在直接保存托管字符串值，公共读取退化为普通复制；后续类型传播会从
+            // 方法返回值反向绑定Phi，退SSA则在每条原始命中边写入对应字符串常量。
+            load.SetOperand(1, phiValue);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 建立单一定义索引；同一局部出现多个定义时排除该局部，避免跨控制流边猜测来源。
+    /// </summary>
+    private static Dictionary<LocalVariable, Instruction> BuildUniqueDefinitions(
+        IReadOnlyList<Instruction> instructions)
+        => instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+
+    private static StringLiteral? ResolveStringLiteral(
+        IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited,
+        Func<ulong, StringLiteral?>? post27StringSlotResolver)
+    {
+        if (operand is StringLiteral literal)
+            return literal;
+
+        if (operand is not LocalVariable local
+            || !visited.Add(local)
+            || !definitions.TryGetValue(local, out var definition)
+            || definition is not { OpCode: OpCode.Move, Operands.Count: >= 2 })
+            return null;
+
+        if (definition.Operands[1] is MemoryOperand
+            {
+                Base: null,
+                Index: null,
+                Scale: 0,
+                Addend: >= 0
+            } absoluteSlot
+            && post27StringSlotResolver != null)
+            return post27StringSlotResolver((ulong)absoluteSlot.Addend);
+
+        return ResolveStringLiteral(
+            definition.Operands[1],
+            definitions,
+            visited,
+            post27StringSlotResolver);
+    }
+
+    /// <summary>
+    /// 将已验证的元数据使用项转换为 ISIL 强类型操作数。
+    /// 字段元数据需要独立的字段句柄模型，当前保持原始内存读取，避免错误改写。
+    /// </summary>
+    private static IOperand? ResolveMetadataUsageOperand(MethodAnalysisContext method, MetadataUsage usage)
+    {
+        switch (usage.Type)
+        {
+            case MetadataUsageType.StringLiteral:
+                return new StringLiteral(usage.AsLiteral());
+            case MetadataUsageType.Type:
+            case MetadataUsageType.TypeInfo:
+                return method.DeclaringType?.AppContext.ResolveIl2CppType(usage.AsType());
+            case MetadataUsageType.MethodDef:
+            case MetadataUsageType.MethodRef:
+                if (method.AppContext.ResolveContextForMethod(usage) is { DeclaringType: { } declaringType } methodContext)
+                    return new RuntimeMethodInfoAnalysisContext(methodContext, declaringType.DeclaringAssembly);
+
+                return null;
+            default:
+                return null;
         }
     }
 
@@ -132,9 +875,10 @@ public static class MetadataResolver
     /// </summary>
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
-        var changed = false;
+        var changed = PackedFieldStoreRecovery.Run(method) > 0;
+        var definitions = BuildDefinitionIndex(method.ControlFlowGraph!.Instructions);
 
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
@@ -147,47 +891,39 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                if (memory.Base is not LocalVariable local || local?.Type == null)
+                if (!TryResolveFieldBase(memory, definitions, out var local, out var fieldOffset))
                     continue;
 
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
-                var genericOwner = owner as GenericInstanceTypeAnalysisContext;
+                var owner = staticOwner ?? local.Type!;
+                // 泛型声明的字段元数据偏移均可能为零；必须先以声明自身的 T 参数构造开放布局实例，
+                // 否则委托字段无法获得 Func<T>/Comparison<T> 等精确类型，后续 BR 尾调用也无法绑定 Invoke。
+                var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
 
                 FieldAnalysisContext? field;
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
-                        continue;
-
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
-                }
-                else if (staticOwner == null && owner.GenericParameters.Count > 0)
-                {
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, memory.Addend);
+                    // 泛型定义的字段元数据偏移不可信，统一按具体或开放实例重新计算布局。
+                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, fieldOffset);
                 }
                 else
                 {
-                    // an inherited field exists on the base type but sits at the same offset in the
-                    // derived layout, so the whole chain is searched
-                    field = null;
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                        field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
-                            && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                            && f.BackingData?.FieldOffset == memory.Addend);
+                    field = FindUniqueRuntimeFieldAtOffset(
+                        genericOwner?.GenericType ?? owner,
+                        staticOwner != null,
+                        fieldOffset);
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
-                if (genericOwner != null)
+                if (genericOwner != null
+                    && field is not ConcreteGenericFieldAnalysisContext)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                instruction.SetOperand(i, new FieldReference(field, local, checked((int)fieldOffset)));
                 changed = true;
             }
         }
@@ -195,8 +931,169 @@ public static class MetadataResolver
         return changed;
     }
 
+    /// <summary>
+    /// 一次建立局部量完整定义索引。
+    /// 退 SSA 后的同一物理寄存器可在多条分支上产生等价定义；必须保留全部定义，
+    /// 才能证明所有分支都指向同一托管对象字段，也能在任一后续定义漂移时失败关闭。
+    /// </summary>
+    internal static IReadOnlyDictionary<LocalVariable, Instruction[]> BuildDefinitionIndex(
+        IReadOnlyList<Instruction> instructions)
+    {
+        return instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+    }
+
+    /// <summary>
+    /// 将一次构建的完整定义索引投影为同址解析器使用的只读列表视图。
+    /// </summary>
+    internal static IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> BuildConvergedDefinitionIndex(
+        IReadOnlyList<Instruction> instructions)
+        => BuildDefinitionIndex(instructions).ToDictionary(
+            pair => pair.Key,
+            pair => (IReadOnlyList<Instruction>)pair.Value);
+
+    /// <summary>
+    /// 解析直接字段基址，或把唯一的“托管对象加常量”地址定义与内存附加偏移合并。
+    /// 后一种形态来自 ARM64 为成组字段写入预先计算的内部地址；只有单定义、无索引、
+    /// 精确托管引用接收者同时成立时才折回字段，数值和指针算术保持原图。
+    /// </summary>
+    internal static bool TryResolveFieldBase(
+        MemoryOperand memory,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
+        out LocalVariable local,
+        out long fieldOffset)
+    {
+        local = null!;
+        fieldOffset = 0;
+        if (memory.Base is not LocalVariable memoryBase)
+            return false;
+
+        if (memoryBase.Type != null)
+        {
+            local = memoryBase;
+            fieldOffset = memory.Addend;
+            return true;
+        }
+
+        if (!definitions.TryGetValue(memoryBase, out var addressDefinitions)
+            || addressDefinitions.Length == 0)
+            return false;
+
+        LocalVariable? receiver = null;
+        long addressOffset = 0;
+        foreach (var addressDefinition in addressDefinitions)
+        {
+            if (!TryDecodeManagedFieldAddressDefinition(
+                    addressDefinition,
+                    out var candidateReceiver,
+                    out var candidateOffset))
+                return false;
+
+            if (receiver == null)
+            {
+                receiver = candidateReceiver;
+                addressOffset = candidateOffset;
+                continue;
+            }
+
+            if (!ReferenceEquals(receiver, candidateReceiver)
+                || addressOffset != candidateOffset)
+                return false;
+        }
+
+        if (receiver == null)
+            return false;
+
+        try
+        {
+            fieldOffset = checked(addressOffset + memory.Addend);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
+        local = receiver;
+        return true;
+    }
+
+    /// <summary>
+    /// 解码单条“托管对象 + 常量”字段地址定义。
+    /// 两种加法操作数顺序共用同一入口，数值、指针、byref 和静态存储根均保持原生地址语义。
+    /// </summary>
+    private static bool TryDecodeManagedFieldAddressDefinition(
+        Instruction definition,
+        out LocalVariable receiver,
+        out long addressOffset)
+    {
+        receiver = null!;
+        addressOffset = 0;
+        if (definition is not
+            {
+                OpCode: OpCode.Add,
+                Operands.Count: 3
+            })
+            return false;
+
+        if (definition.Operands[1] is LocalVariable leftReceiver
+            && definition.Operands[2] is Immediate rightOffset)
+        {
+            receiver = leftReceiver;
+            addressOffset = rightOffset.Value;
+        }
+        else if (definition.Operands[1] is Immediate leftOffset
+                 && definition.Operands[2] is LocalVariable rightReceiver)
+        {
+            receiver = rightReceiver;
+            addressOffset = leftOffset.Value;
+        }
+        else
+        {
+            return false;
+        }
+
+        return receiver.Type != null
+               && !receiver.Type.IsValueType
+               && receiver.Type is not (
+                   PointerTypeAnalysisContext
+                   or ByRefTypeAnalysisContext
+                   or StaticFieldStorageTypeAnalysisContext);
+    }
+
+    /// <summary>
+    /// 沿声明类型及其基类查找给定偏移上的唯一运行时字段。
+    /// 常量字段只存在于元数据，不占用实例或静态存储；同一声明类型仍有多个候选时保持未解析，避免猜测字段身份。
+    /// </summary>
+    private static FieldAnalysisContext? FindUniqueRuntimeFieldAtOffset(
+        TypeAnalysisContext owner,
+        bool isStatic,
+        long offset)
+    {
+        for (var candidateOwner = owner; candidateOwner != null; candidateOwner = candidateOwner.BaseType)
+        {
+            var candidates = candidateOwner.Fields
+                .Where(field =>
+                    field.IsStatic == isStatic
+                    && field.Offset == offset
+                    && (field.Attributes & System.Reflection.FieldAttributes.Literal) == 0)
+                .Take(2)
+                .ToArray();
+
+            if (candidates.Length == 1)
+                return candidates[0];
+
+            if (candidates.Length > 1)
+                return null;
+        }
+
+        return null;
+    }
+
     private static void ResolveCalls(MethodAnalysisContext method)
     {
+        var resolvedThrow = false;
         foreach (var block in method.ControlFlowGraph!.Blocks)
         {
             if (block.BlockType != BlockType.Call && block.BlockType != BlockType.TailCall)
@@ -213,47 +1110,20 @@ public static class MetadataResolver
             if (keyFunctionAddresses.IsKeyFunctionAddress(target))
             {
                 HandleKeyFunction(method.AppContext, callInstruction, target, keyFunctionAddresses);
-
-                if (target == keyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline
-                    && callInstruction is { OpCode: OpCode.Call, Operands: [_, var initResult, var handle, ..] })
-                {
-                    callInstruction.OpCode = OpCode.Move;
-                    callInstruction.SetOperands(initResult, handle);
-                }
-
                 continue;
             }
 
             //Non-key function call. Try to find a single match
             if (!method.AppContext.MethodsByAddress.TryGetValue(target, out var targetMethods))
             {
-                // Not a managed method at all. It may be one of the runtime helpers built around an exception
-                // type, which either throw it themselves or build it and hand it back for the caller to raise.
+                // Not a managed method at all. It may be one of the runtime helpers that exist purely to
+                // throw, in which case restore the throw itself
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
-                    {
-                        callInstruction.OpCode = OpCode.Newobj;
-                        callInstruction.SetOperands(produced, thrown);
-                    }
-                    else
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                    }
-
-                    continue;
-                }
-
-                // Otherwise it may be one of the raisers, which throw the exception they are given
-                var raisedIndex = callInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
-
-                if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
-                {
-                    var raised = callInstruction.Operands[raisedIndex];
-
                     callInstruction.OpCode = OpCode.Throw;
-                    callInstruction.SetOperands(raised);
+                    callInstruction.SetOperands(thrown);
+                    method.ControlFlowGraph.TerminateAtThrow(block);
+                    resolvedThrow = true;
                 }
 
                 continue;
@@ -263,11 +1133,41 @@ public static class MetadataResolver
             if (targetMethods is not [{ } singleTargetMethod])
                 continue;
 
-            callInstruction.SetOperand(0, singleTargetMethod);
-            singleTargetMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, singleTargetMethod);
+            // IL2CPP 的接口慢查表助手可能与 List<T>.AddWithResize 共用同一原生地址。
+            // 当原始 X0 返回值已经进入 VirtualInvokeData 的双路 Phi 时，先绑定 void 方法会删除
+            // 这个真实返回槽，令后续接口分派只能看到快速路径。此处只延迟具有完整消费者形状的
+            // 共享地址调用；接口、槽位和 vtable 证据仍由 InterfaceDispatchRecovery 统一验收。
+            TryBindCallTarget(method, callInstruction, singleTargetMethod);
         }
 
+        if (resolvedThrow)
+            method.ControlFlowGraph.RemoveUnreachableBlocks();
         method.ControlFlowGraph.MergeCallBlocks();
+    }
+
+    /// <summary>
+    /// 把已解析的方法身份绑定到调用，并同步修正返回槽形状。
+    /// 原生提升阶段在目标未知时会按有返回值的Call保留X0；若目标随后解析为void，
+    /// 该X0只是伪返回槽，必须删除并改成CallVoid，否则IL生成会在call void后写入局部变量。
+    /// </summary>
+    internal static void BindCallTarget(Instruction call, MethodAnalysisContext target)
+    {
+        if (!call.IsCall)
+            throw new InvalidOperationException($"目标只能绑定到调用指令：{call.OpCode}");
+
+        call.SetOperand(0, target);
+
+        // 原始寄存器布局仍以Call的返回槽为基准，必须先完成参数重排，再删除伪返回槽。
+        CallingConventionResolver.RemapRawArguments(call, target);
+        if (call.OpCode != OpCode.Call || !target.IsVoid)
+            return;
+
+        var operands = call.Operands.ToList();
+        if (operands.Count > 1)
+            operands.RemoveAt(1);
+
+        call.OpCode = OpCode.CallVoid;
+        call.SetOperands(operands);
     }
 
     /// <summary>
@@ -301,9 +1201,7 @@ public static class MetadataResolver
             if (AreInterchangeable(candidates))
             {
                 var preferred = PreferredOf(candidates);
-                instruction.SetOperand(0, preferred);
-                preferred.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, preferred);
-                changed = true;
+                changed |= TryBindCallTarget(method, instruction, preferred);
                 continue;
             }
 
@@ -318,7 +1216,7 @@ public static class MetadataResolver
 
             for (var type = receiverType; type != null && match == null; type = type.BaseType)
             {
-                var matches = candidates.Where(c => !c.IsStatic && IsSameType(c.DeclaringType, type)).ToList();
+                var matches = candidates.Where(c => !c.IsStatic && ReferenceEquals(c.DeclaringType, type)).ToList();
 
                 if (matches.Count > 1 && callerIsCtor)
                     matches = matches.Where(c => c.Name == ".ctor").ToList();
@@ -332,9 +1230,7 @@ public static class MetadataResolver
             if (match == null)
                 continue;
 
-            instruction.SetOperand(0, match);
-            match.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, match);
-            changed = true;
+            changed |= TryBindCallTarget(method, instruction, match);
         }
 
         return changed;
@@ -368,42 +1264,10 @@ public static class MetadataResolver
 
     // The receiver ('this') of a call is the first integer-slot argument: operand 1 for CallVoid
     // (after the target), operand 2 for Call (after the target and the return value).
-    // A value type receiver is passed byref, so it arrives as an AddressOf over the local.
     private static LocalVariable? GetReceiver(Instruction call)
     {
         var index = call.OpCode == OpCode.CallVoid ? 1 : 2;
-
-        return index < call.Operands.Count
-            ? call.Operands[index] switch
-            {
-                LocalVariable local => local,
-                AddressOf { Target: LocalVariable addressed } => addressed,
-                _ => null
-            }
-            : null;
-    }
-
-    // Concrete generic method contexts build their declaring type fresh rather than via the
-    // GetOrCreate cache, so generic instances also need comparing structurally.
-    // TODO Fix this, concrete generic methods should use GetOrCreate
-    private static bool IsSameType(TypeAnalysisContext? a, TypeAnalysisContext? b)
-    {
-        if (ReferenceEquals(a, b))
-            return true;
-
-        if (a is not GenericInstanceTypeAnalysisContext leftInstance
-            || b is not GenericInstanceTypeAnalysisContext rightInstance
-            || !ReferenceEquals(leftInstance.GenericType, rightInstance.GenericType)
-            || leftInstance.GenericArguments.Count != rightInstance.GenericArguments.Count)
-            return false;
-
-        for (var i = 0; i < leftInstance.GenericArguments.Count; i++)
-        {
-            if (!IsSameType(leftInstance.GenericArguments[i], rightInstance.GenericArguments[i]))
-                return false;
-        }
-
-        return true;
+        return index < call.Operands.Count ? call.Operands[index] as LocalVariable : null;
     }
 
     /// <summary>
@@ -429,39 +1293,15 @@ public static class MetadataResolver
             if (GetReceiver(instruction) is not { } receiver || AllocatedType(receiver, definitions) is not { } allocatedType)
                 continue;
 
-            var constructor = candidates.FirstOrDefault(c => !c.IsStatic && c.Name == ".ctor" && ReferenceEquals(c.DeclaringType, allocatedType))
-                              ?? FindConstructorForSharedBody(allocatedType, candidates);
+            var constructor = candidates.FirstOrDefault(c => !c.IsStatic && c.Name == ".ctor" && ReferenceEquals(c.DeclaringType, allocatedType));
             if (constructor == null)
                 continue;
 
-            instruction.SetOperand(0, constructor);
-            constructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, constructor);
+            BindCallTarget(instruction, constructor);
             changed = true;
         }
 
         return changed;
-    }
-
-    private static MethodAnalysisContext? FindConstructorForSharedBody(TypeAnalysisContext allocatedType, List<MethodAnalysisContext> candidates)
-    {
-        var candidateParamCounts = new HashSet<int>(candidates
-            .Where(c => c is { IsStatic: false, Name: ".ctor" })
-            .Select(c => c.Parameters.Count));
-
-        if (candidateParamCounts.Count == 0)
-            return null;
-
-        var definition = allocatedType is GenericInstanceTypeAnalysisContext genericInstance ? genericInstance.GenericType : allocatedType;
-        var matches = definition.Methods
-            .Where(m => m is { IsStatic: false, Name: ".ctor" } && candidateParamCounts.Contains(m.Parameters.Count))
-            .ToList();
-
-        if (matches is not [{ } match])
-            return null;
-
-        return allocatedType is GenericInstanceTypeAnalysisContext instance
-            ? new ConcreteGenericMethodAnalysisContext(match, instance.GenericArguments, [])
-            : match;
     }
 
     // Follow SSA copies from a local back to the Newobj that produced the value
@@ -511,22 +1351,16 @@ public static class MetadataResolver
             {
                 // Some shared generic bodies aren't in the address map at all (todo investigate?).
                 // Il2cpp still passes the concrete MethodInfo as the hidden final parameter, so we can use a methodof there if we have one.
-                // However, make sure it isn't our OWN hidden MethodInfo arg, because that would turn all unknown calls into recursion
-                if (ReferenceEquals(representedMethod, method))
-                    continue;
-
                 var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
                 var hiddenParamIndex = firstArg
-                    + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
+                    + (CallingConventionResolver.ReturnsViaHiddenBuffer(representedMethod) ? 1 : 0)
                     + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
                 if (hiddenParamIndex >= instruction.Operands.Count
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
                     continue;
 
-                instruction.SetOperand(0, representedMethod);
-                representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
-                changed = true;
+                changed |= TryBindCallTarget(method, instruction, representedMethod);
                 continue;
             }
 
@@ -538,12 +1372,29 @@ public static class MetadataResolver
             if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase)))
                 continue;
 
-            instruction.SetOperand(0, representedMethod);
-            representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
-            changed = true;
+            changed |= TryBindCallTarget(method, instruction, representedMethod);
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 所有托管调用身份绑定共用同一共享地址保护门，防止直接地址、接收者推导和 MethodInfo
+    /// 三条解析路径出现不同语义。返回值精确表示本次是否完成绑定，供不动点统计使用。
+    /// </summary>
+    private static bool TryBindCallTarget(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        MethodAnalysisContext target)
+    {
+        if (InterfaceDispatchRecovery.ShouldDeferSharedAddWithResizeBinding(
+                instruction,
+                target,
+                method.ControlFlowGraph!.Instructions))
+            return false;
+
+        BindCallTarget(instruction, target);
+        return true;
     }
 
     // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.
@@ -551,8 +1402,8 @@ public static class MetadataResolver
     private const long VTableOffset64 = 0x138;
     private const long VTableOffset32 = 0xC0;
     
-    // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
-    // as long as the klass local's represented type is known.
+    // 在类局部量的实际类型已知时，通过
+    // <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c> 恢复普通虚调用与尾虚调用。
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
@@ -561,7 +1412,11 @@ public static class MetadataResolver
         var changed = false;
 
         var loads = new Dictionary<LocalVariable, MemoryOperand>();
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var registerDefinitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => ((LocalVariable)instruction.Destination!).Register)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode == OpCode.Move
                 && instruction.Operands[0] is LocalVariable destination
@@ -569,40 +1424,68 @@ public static class MetadataResolver
                 loads[destination] = load;
         }
 
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        foreach (var block in method.ControlFlowGraph.Blocks)
         {
-            if (instruction.OpCode != OpCode.IndirectCall)
-                continue;
-
-            if (SlotLoad(instruction.Operands[0]) is not { } target
-                || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
-                continue;
-
-            var offset = target.Addend - vtableOffset;
-            if (offset < 0 || offset % invokeDataSize != 0)
-                continue;
-
-            var slot = (int)(offset / invokeDataSize);
-            if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
-                continue;
-
-            var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
-
-            instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
-            instruction.SetOperand(0, resolved);
-            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
-
-            // the MethodInfo field is also the same method, name it, for cleanliness and so it can
-            // serve as a hidden final parameter if needed
-            for (var i = 1; i < instruction.Operands.Count && assembly != null; i++)
+            // 尾调用重写会在块末追加Return，使用快照避免枚举期间修改集合。
+            var blockInstructions = block.Instructions.ToArray();
+            for (var instructionPosition = 0; instructionPosition < blockInstructions.Length; instructionPosition++)
             {
-                if (SlotLoad(instruction.Operands[i]) is { } methodInfoLoad
-                    && ReferenceEquals(methodInfoLoad.Base, klassLocal)
-                    && methodInfoLoad.Addend == target.Addend + pointerSize)
-                    instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
-            }
+                var instruction = blockInstructions[instructionPosition];
+                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
+                    continue;
 
-            changed = true;
+                if (SlotLoad(instruction.Operands[0]) is not { } target
+                    || target.Base is not LocalVariable klassLocal)
+                    continue;
+
+                var receiverRejection = string.Empty;
+                var receiverType = klassLocal.Type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented }
+                    ? represented
+                    : ResolveLinearPredecessorVTableReceiverType(
+                        method,
+                        block,
+                        instructionPosition,
+                        klassLocal,
+                        registerDefinitions,
+                        out receiverRejection);
+                if (receiverType == null)
+                {
+                    Logger.VerboseNewline(
+                        $"普通虚调用接收者未闭合：method={method.Name}，instruction={instruction.Index}，" +
+                        $"block={block.ID}，predecessors={block.Predecessors.Count}，klass={klassLocal}，" +
+                        $"reason={receiverRejection}",
+                        nameof(MetadataResolver));
+                    continue;
+                }
+
+                var offset = target.Addend - vtableOffset;
+                if (offset < 0 || offset % invokeDataSize != 0)
+                    continue;
+
+                var slot = (int)(offset / invokeDataSize);
+                if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
+                    continue;
+
+                Logger.VerboseNewline(
+                    $"普通虚调用闭合：method={method.Name}，instruction={instruction.Index}，" +
+                    $"receiver={receiverType.FullName}，slot={slot}，target={resolved.DeclaringType?.FullName}.{resolved.Name}",
+                    nameof(MetadataResolver));
+
+                var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+
+                // MethodInfo字段与目标方法属于同一VirtualInvokeData；先替换原始寄存器快照，
+                // 再交给统一间接转移重写器裁剪参数并恢复尾返回。
+                for (var i = 1; i < instruction.Operands.Count && assembly != null; i++)
+                {
+                    if (SlotLoad(instruction.Operands[i]) is { } methodInfoLoad
+                        && ReferenceEquals(methodInfoLoad.Base, klassLocal)
+                        && methodInfoLoad.Addend == target.Addend + pointerSize)
+                        instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+                }
+
+                IndirectTransferCallRewriter.Rewrite(method, instruction, block, resolved);
+                changed = true;
+            }
         }
 
         return changed;
@@ -615,24 +1498,434 @@ public static class MetadataResolver
         };
     }
 
-    private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
+    /// <summary>
+    /// ARM64常把多个托管接收者复用到同一X0局部，整体类型传播只能保守地收敛到System.Object。
+    /// 普通虚调用仍可从“具体字段读取 → 对象头klass读取 → vtable调用”的前驱闭包
+    /// 精确恢复接收者类型。只接受klass零偏移读取和最近的确定引用类型赋值；多前驱必须
+    /// 全部分支闭合到同一具体类型，否则保持未解析。
+    /// </summary>
+    internal static TypeAnalysisContext? ResolveLinearPredecessorVTableReceiverType(
+        MethodAnalysisContext method,
+        Block dispatchBlock,
+        int dispatchPosition,
+        LocalVariable klassLocal,
+        out string rejection)
     {
-        var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
+        var reachable = new HashSet<Block>();
+        var pending = new Stack<Block>();
+        pending.Push(dispatchBlock);
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (!reachable.Add(block))
+                continue;
+            foreach (var predecessor in block.Predecessors)
+                pending.Push(predecessor);
+        }
 
-        if (definition == null || slot >= definition.VtableCount)
+        var registerDefinitions = reachable
+            .SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => ((LocalVariable)instruction.Destination!).Register)
+            .ToDictionary(group => group.Key, group => group.Take(2).ToArray());
+        return ResolveLinearPredecessorVTableReceiverType(
+            method,
+            dispatchBlock,
+            dispatchPosition,
+            klassLocal,
+            registerDefinitions,
+            out rejection);
+    }
+
+    private static TypeAnalysisContext? ResolveLinearPredecessorVTableReceiverType(
+        MethodAnalysisContext method,
+        Block dispatchBlock,
+        int dispatchPosition,
+        LocalVariable klassLocal,
+        IReadOnlyDictionary<Register, Instruction[]> registerDefinitions,
+        out string rejection)
+    {
+        rejection = "分派位置不在基本块内";
+        if (dispatchPosition <= 0 || dispatchPosition > dispatchBlock.Instructions.Count)
             return null;
 
+        rejection = "分派前没有对象头klass零偏移读取";
+        LocalVariable? receiver = null;
+        var klassLoadPosition = -1;
+        for (var position = dispatchPosition - 1; position >= 0; position--)
+        {
+            if (dispatchBlock.Instructions[position] is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [LocalVariable destination, MemoryOperand
+                    {
+                        Base: LocalVariable candidateReceiver,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0,
+                    }],
+                }
+                || !SameLocal(destination, klassLocal))
+                continue;
+
+            receiver = candidateReceiver;
+            klassLoadPosition = position;
+            break;
+        }
+
+        if (receiver == null)
+            return null;
+
+        var localResolution = ResolveLatestReceiverAssignment(
+            dispatchBlock.Instructions,
+            klassLoadPosition,
+            receiver);
+        if (localResolution.Found)
+        {
+            rejection = localResolution.Reason;
+            return localResolution.Type;
+        }
+
+        var incoming = ResolveIncomingPredecessors(dispatchBlock, receiver);
+        rejection = incoming.Reason;
+        return incoming.Type;
+
+        ReceiverResolution ResolveIncomingPredecessors(Block block, LocalVariable targetReceiver)
+        {
+            // 逆向遍历到每条路径上的首个接收者赋值即停止。这样得到的正是到达分派点的
+            // 最近定义集合；共享循环块只访问一次，复杂度为 O(基本块数 + 控制流边数)。
+            var visited = new HashSet<Block>();
+            var pending = new Stack<Block>(block.Predecessors);
+            var reachingTypes = new List<TypeAnalysisContext>();
+            var reachedEntryWithoutDefinition = false;
+            var unresolvedAssignment = false;
+            var evidence = new List<string>();
+
+            while (pending.Count > 0)
+            {
+                var predecessor = pending.Pop();
+                if (!visited.Add(predecessor))
+                    continue;
+
+                var local = ResolveLatestReceiverAssignment(
+                    predecessor.Instructions,
+                    predecessor.Instructions.Count,
+                    targetReceiver);
+                if (local.Found)
+                {
+                    if (local.Type == null)
+                        unresolvedAssignment = true;
+                    else
+                        reachingTypes.Add(local.Type);
+                    if (evidence.Count < 8)
+                        evidence.Add($"块{predecessor.ID}=定义:{local.Type?.FullName ?? local.Reason}");
+                    continue;
+                }
+
+                if (predecessor.Predecessors.Count == 0)
+                {
+                    reachedEntryWithoutDefinition = true;
+                    if (evidence.Count < 8)
+                        evidence.Add($"块{predecessor.ID}=入口无定义");
+                    continue;
+                }
+
+                foreach (var earlier in predecessor.Predecessors)
+                    pending.Push(earlier);
+            }
+
+            if (unresolvedAssignment)
+                return new ReceiverResolution(
+                    true,
+                    null,
+                    $"前驱最近赋值存在未定型来源；证据={string.Join(";", evidence)}");
+            if (reachedEntryWithoutDefinition || reachingTypes.Count == 0)
+                return new ReceiverResolution(
+                    false,
+                    null,
+                    $"至少一条入口路径没有接收者定义；证据={string.Join(";", evidence)}");
+
+            var consensus = reachingTypes[0];
+            var distinctTypes = reachingTypes
+                .Where(type => !GenericCallRebinder.TypesEquivalent(consensus, type))
+                .Prepend(consensus)
+                .Select(type => type.FullName)
+                .Distinct(StringComparer.Ordinal)
+                .Take(4)
+                .ToArray();
+            if (distinctTypes.Length != 1)
+                return new ReceiverResolution(
+                    true,
+                    null,
+                    $"前驱最近赋值类型不一致：{string.Join(",", distinctTypes)}");
+
+            return new ReceiverResolution(true, consensus, string.Empty);
+        }
+
+        ReceiverResolution ResolveLatestReceiverAssignment(
+            IReadOnlyList<Instruction> instructions,
+            int beforePosition,
+            LocalVariable receiver)
+        {
+            for (var position = beforePosition - 1; position >= 0; position--)
+            {
+                if (instructions[position].Destination is not LocalVariable destination
+                    || !SameLocal(destination, receiver))
+                    continue;
+
+                if (instructions[position] is
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [_, var source],
+                })
+                {
+                    var candidate = ResolvePreciseSourceType(source, []);
+                    var accepted = candidate is { IsValueType: false }
+                                   && candidate.FullName != "System.Object"
+                        ? candidate
+                        : null;
+                    return new ReceiverResolution(
+                        true,
+                        accepted,
+                        accepted == null ? $"最近接收者赋值没有确定引用类型：{source}" : string.Empty);
+                }
+
+                if (instructions[position] is { OpCode: OpCode.Phi, Operands.Count: >= 3 } phi)
+                {
+                    var inputTypes = phi.Operands
+                        .Skip(1)
+                        .Select(input => ResolvePreciseSourceType(input, []))
+                        .Where(type => type is { IsValueType: false }
+                                       && type.FullName != "System.Object")
+                        .Cast<TypeAnalysisContext>()
+                        .ToArray();
+                    if (inputTypes.Length != phi.Operands.Count - 1)
+                        return new ReceiverResolution(
+                            true,
+                            null,
+                            "接收者Phi至少有一个输入没有确定引用类型");
+
+                    var consensus = inputTypes[0];
+                    if (inputTypes.Skip(1).Any(type =>
+                            !GenericCallRebinder.TypesEquivalent(consensus, type)))
+                        return new ReceiverResolution(
+                            true,
+                            null,
+                            $"接收者Phi输入类型不一致：{string.Join(",", inputTypes.Select(type => type.FullName).Distinct().Take(4))}");
+
+                    return new ReceiverResolution(true, consensus, string.Empty);
+                }
+            }
+
+            return new ReceiverResolution(false, null, "当前块没有接收者赋值");
+        }
+
+        TypeAnalysisContext? ResolvePreciseSourceType(IOperand source, HashSet<Register> visited)
+        {
+            switch (source)
+            {
+                case FieldReference field:
+                    return field.Field.FieldType;
+                case MemoryOperand memory:
+                    return ResolveProvenCurrentInstanceFieldType(method, memory);
+                case LocalVariable local when visited.Add(local.Register):
+                    if (registerDefinitions.TryGetValue(local.Register, out var definitions))
+                    {
+                        var originTypes = definitions
+                            .Where(definition => definition is
+                            {
+                                OpCode: OpCode.Move,
+                                Operands: [_, _],
+                            })
+                            .Select(definition => ResolvePreciseSourceType(
+                                definition.Operands[1],
+                                new HashSet<Register>(visited)))
+                            .Where(type => type is { IsValueType: false }
+                                           && type.FullName != "System.Object")
+                            .Cast<TypeAnalysisContext>()
+                            .ToArray();
+                        if (originTypes.Length > 0
+                            && originTypes.Skip(1).All(type =>
+                                GenericCallRebinder.TypesEquivalent(originTypes[0], type)))
+                            return originTypes[0];
+                    }
+                    return local.Type;
+                default:
+                    return null;
+            }
+        }
+
+        static bool SameLocal(LocalVariable left, LocalVariable right) =>
+            ReferenceEquals(left, right) || left.Register == right.Register;
+    }
+
+    private readonly record struct ReceiverResolution(
+        bool Found,
+        TypeAnalysisContext? Type,
+        string Reason);
+
+    /// <summary>
+    /// 解析保存寄存器中的当前实例字段。只有 SSA 冻结证据明确证明字段基址来自 this，且偏移
+    /// 在当前声明类型层次中唯一时才返回字段类型；这避免把任意 X19-X29 对象误认作当前实例。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveProvenCurrentInstanceFieldType(
+        MethodAnalysisContext method,
+        MemoryOperand memory)
+    {
+        if (memory is not
+            {
+                Base: LocalVariable fieldOwner,
+                Index: null,
+                Scale: 0,
+            }
+            || !method.CalleeSavedSsaCopyEvidence.Any(evidence =>
+                evidence.Destination.Register == fieldOwner.Register
+                && evidence.Source.IsThis))
+            return null;
+
+        if (method.DeclaringType is not { } owner)
+            return null;
+
+        var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
+        var field = genericOwner != null
+            ? GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, memory.Addend)
+            : FindUniqueRuntimeFieldAtOffset(owner, isStatic: false, memory.Addend);
+        return field?.FieldType;
+    }
+
+    /// <summary>
+    /// 方法RGCTXData的METHOD项已经携带精确托管方法身份。IL2CPP共享泛型代码常从该项的
+    /// MethodInfo中读取虚调用入口并以BR尾调；目标地址本身无需再次猜测。
+    /// </summary>
+    public static bool ResolveMethodRgctxCalls(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        {
+            foreach (var instruction in block.Instructions.ToArray())
+            {
+                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump)
+                    || ResolveTargetMethodInfo(instruction.Operands[0], definitions) is not
+                    {
+                        RepresentedMethod: { } resolved
+                    })
+                    continue;
+
+                IndirectTransferCallRewriter.Rewrite(method, instruction, block, resolved);
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static RuntimeMethodInfoAnalysisContext? ResolveTargetMethodInfo(
+        IOperand operand,
+        ILookup<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (true)
+        {
+            switch (operand)
+            {
+                case MemoryOperand
+                {
+                    Base: LocalVariable methodInfoLocal,
+                    Index: null,
+                    Scale: 0,
+                    Addend: 0
+                }:
+                    return ResolveTargetMethodInfo(methodInfoLocal, definitions);
+                case LocalVariable { Type: RuntimeMethodInfoAnalysisContext typed }:
+                    return typed;
+                case LocalVariable local when visited.Add(local)
+                                                  && definitions[local].Take(2).ToArray() is [var definition]
+                                                  && definition.OpCode == OpCode.Move
+                                                  && definition.Operands.Count >= 2:
+                    operand = definition.Operands[1];
+                    continue;
+                default:
+                    return null;
+            }
+        }
+    }
+
+    internal static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
+    {
+        // 未约束泛型参数的共享代码仍通过实际运行时类型的对象虚表分派；槽身份来自 System.Object，
+        // CIL 生成阶段再使用 constrained. T 保留引用类型和值类型各自的重写语义。
+        var lookupType = type is GenericParameterTypeAnalysisContext
+            ? appContext.SystemTypes.SystemObjectType
+            : type;
+        var definition = (lookupType as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? lookupType.Definition;
+
+        if (definition == null || slot < 0 || slot >= definition.VtableCount)
+            return null;
+
+        // 接口槽在原生虚表中指向类实现，但托管CIL必须引用已经按接收者具体化的接口声明。
+        // 直接引用显式实现会把方法名中的TKey/TValue原样泄漏到反编译源码。
+        foreach (var interfaceOffset in definition.InterfaceOffsets)
+        {
+            if (slot < interfaceOffset.offset)
+                continue;
+
+            var declaringInterface = appContext.ResolveIl2CppType(interfaceOffset.Type);
+            if (lookupType is GenericInstanceTypeAnalysisContext receiver)
+                declaringInterface = GenericInstantiation.Instantiate(
+                    declaringInterface,
+                    receiver.GenericArguments,
+                    []);
+
+            var interfaceSlot = slot - interfaceOffset.offset;
+            var interfaceMethod = declaringInterface is GenericInstanceTypeAnalysisContext genericInterface
+                ? genericInterface.GenericType.Methods.FirstOrDefault(method => method.Definition?.slot == interfaceSlot)
+                : declaringInterface.Methods.FirstOrDefault(method => method.Definition?.slot == interfaceSlot);
+            if (interfaceMethod != null)
+                return SpecializeVTableMethodForReceiver(declaringInterface, interfaceMethod);
+        }
+
         if (appContext.ResolveContextForMethod(definition.VTable[slot]) is { } implementation)
-            return implementation;
+            return SpecializeVTableMethodForReceiver(lookupType, implementation);
 
         // an abstract method has no implementation, try to resolve it
-        for (var declarer = type; declarer != null; declarer = declarer.BaseType)
+        for (var declarer = lookupType; declarer != null; declarer = declarer.BaseType)
         {
-            if (declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
-                return declaration;
+            // 泛型实例包装器自身没有方法列表；声明仍位于开放 GenericType 上，
+            // 找到后再按实际接收者具体化返回值与参数。
+            var methods = declarer is GenericInstanceTypeAnalysisContext genericDeclarer
+                ? genericDeclarer.GenericType.Methods
+                : declarer.Methods;
+            if (methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
+                return SpecializeVTableMethodForReceiver(lookupType, declaration);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 虚表保存的是开放泛型方法定义；接收者已经是封闭泛型实例时，必须同步具体化声明类型、参数与返回值。
+    /// 否则CIL会泄漏TKey/TValue等开放占位符，反编译源码也会产生无法编译的!0。
+    /// </summary>
+    internal static MethodAnalysisContext SpecializeVTableMethodForReceiver(
+        TypeAnalysisContext receiverType,
+        MethodAnalysisContext method)
+    {
+        if (method is ConcreteGenericMethodAnalysisContext
+            || receiverType is not GenericInstanceTypeAnalysisContext receiver
+            || method.DeclaringType == null
+            || !SameTypeDefinition(receiver.GenericType, method.DeclaringType)
+            || method.DeclaringType.GenericParameters.Count != receiver.GenericArguments.Count)
+            return method;
+
+        return new ConcreteGenericMethodAnalysisContext(method, receiver.GenericArguments, []);
+
+        static bool SameTypeDefinition(TypeAnalysisContext left, TypeAnalysisContext right) =>
+            ReferenceEquals(left, right)
+            || (left.Definition != null && ReferenceEquals(left.Definition, right.Definition));
     }
 
     private static MethodAnalysisContext BaseMethodOf(MethodAnalysisContext method) =>

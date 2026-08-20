@@ -255,7 +255,7 @@ public static class WriteBarrierRecovery
         return new Candidate(guard, barrierEntry, merge, region);
     }
 
-    private static bool EndsInReturn(Block block) 
+    private static bool EndsInReturn(Block block)
         => block.Instructions.Count > 0 && block.Instructions[^1].OpCode == OpCode.Return;
 
     private static bool TailBlockMatchesMerge(Block tail, Block merge, Block guard, Dictionary<LocalVariable, ISIL.Instruction> definitions)
@@ -301,7 +301,7 @@ public static class WriteBarrierRecovery
         };
     }
 
-    private static bool EquivalentNullable(IOperand? a, IOperand? b, Block merge, Block guard, Dictionary<LocalVariable, ISIL.Instruction> definitions) 
+    private static bool EquivalentNullable(IOperand? a, IOperand? b, Block merge, Block guard, Dictionary<LocalVariable, ISIL.Instruction> definitions)
         => a == null ? b == null : b != null && EquivalentOperands(a, b, merge, guard, definitions);
 
     private static IOperand ResolveMergePhi(IOperand operand, Block merge, Block guard, Dictionary<LocalVariable, ISIL.Instruction> definitions)

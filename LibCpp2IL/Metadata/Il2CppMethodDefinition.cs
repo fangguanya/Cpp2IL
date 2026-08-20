@@ -173,7 +173,7 @@ public class Il2CppMethodDefinition : ReadableClass
     }
 
     public Il2CppGenericContainer? GenericContainer => genericContainerIndex.IsNull ? null : OwningContext.Metadata.GetGenericContainerFromIndex(genericContainerIndex);
-    
+
     public bool IsUnmanagedCallersOnly => (iflags & 0xF000) != 0;
     
     public MethodImplAttributes MethodImplAttributes => (MethodImplAttributes)(iflags & ~0xF000);

@@ -20,15 +20,44 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
     {
         outputRoot = Path.Combine(outputRoot, "IsilDump");
 
-        var numAssemblies = context.Assemblies.Count;
+        var runtimeOptions = Cpp2IlApi.RuntimeOptions;
+        var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
+        var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
+        var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
+        var assemblies = IsilDumpSelectionHelper.SelectExact(
+            context.Assemblies,
+            assemblyFilters,
+            assembly => assembly.Name,
+            "ISIL 程序集");
+        var types = IsilDumpSelectionHelper.SelectExact(
+            assemblies.SelectMany(assembly => assembly.Types),
+            typeFilters,
+            type => type.Definition?.FullName ?? string.Empty,
+            "ISIL 类型");
+        if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
+            throw new InvalidOperationException("ISIL 类型筛选命中了注入类型或没有方法的类型。");
+
+        var methods = IsilDumpSelectionHelper.SelectExact(
+            types.SelectMany(type => type.Methods)
+                .Where(method => method is not InjectedMethodAnalysisContext),
+            methodFilters,
+            method => method.Definition?.HumanReadableSignature ?? string.Empty,
+            "ISIL 方法");
+
+        var selectedTypes = new HashSet<TypeAnalysisContext>(types);
+        var selectedMethods = new HashSet<MethodAnalysisContext>(methods);
+        var numAssemblies = assemblies.Count;
         var i = 1;
-        foreach (var assembly in context.Assemblies)
+        Logger.InfoNewline(
+            $"ISIL 输出已精确选择 {numAssemblies} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法。",
+            "IsilOutputFormat");
+        foreach (var assembly in assemblies)
         {
             Logger.InfoNewline($"Processing assembly {i++} of {numAssemblies}: {assembly.Name}", "IsilOutputFormat");
 
             var assemblyNameClean = assembly.CleanAssemblyName;
 
-            MiscUtils.ExecuteParallel(assembly.Types, type =>
+            MiscUtils.ExecuteParallel(assembly.Types.Where(selectedTypes.Contains), type =>
             {
                 if (type is InjectedTypeAnalysisContext)
                     return;
@@ -42,7 +71,7 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
 
                 foreach (var method in type.Methods)
                 {
-                    if (method is InjectedMethodAnalysisContext)
+                    if (method is InjectedMethodAnalysisContext || !selectedMethods.Contains(method))
                         continue;
 
                     typeDump.Append("Method: ").AppendLine(method.Definition!.HumanReadableSignature).AppendLine();
@@ -65,6 +94,21 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
                         foreach (var isilInsn in method.ConvertedIsil)
                         {
                             typeDump.Append('\t').Append(isilInsn).AppendLine();
+                        }
+
+                        // 原始ConvertedIsil只反映CFG建立前的输入。恢复器会改写最终控制流，
+                        // 因此同时输出最终块关系和指令，才能逐方法核验List、接口与BLR闭包。
+                        typeDump.AppendLine().AppendLine("Final CFG:");
+                        foreach (var block in method.ControlFlowGraph!.Blocks)
+                        {
+                            typeDump.Append("\tBlock ").Append(block.ID)
+                                .Append(" predecessors=[")
+                                .Append(string.Join(",", block.Predecessors.Select(item => item.ID)))
+                                .Append("] successors=[")
+                                .Append(string.Join(",", block.Successors.Select(item => item.ID)))
+                                .AppendLine("]");
+                            foreach (var instruction in block.Instructions)
+                                typeDump.Append("\t\t").Append(instruction).AppendLine();
                         }
 
                         method.ReleaseAnalysisData();

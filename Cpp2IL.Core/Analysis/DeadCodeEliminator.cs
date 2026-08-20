@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -18,97 +19,151 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class DeadCodeEliminator
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method)
+        => Run(method.ControlFlowGraph!, KeyFunctionRecovery.FindBoxDataWriteRoots(method));
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(cfg, []);
+
+    private static void Run(
+        ISILControlFlowGraph cfg,
+        IReadOnlyCollection<Instruction> additionalRoots)
     {
-        // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
-        // This is monotonic (each pass only nops instructions) and therefore always terminates.
-        var changed = true;
-        while (changed)
+        // 从调用、存储、返回和分支等可观察根反向标记其定义依赖。
+        // 单纯按“使用次数为零”删除会保留互相引用但没有外部使用的Phi环；
+        // SSA单一定义允许一次标记清扫精确删除整个死强连通分量。
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var block in cfg.Blocks)
         {
-            changed = false;
-
-            var useCounts = CountUses(cfg);
-
-            foreach (var block in cfg.Blocks)
+            foreach (var instruction in block.Instructions)
             {
-                foreach (var instruction in block.Instructions)
-                {
-                    if (!IsRemovable(instruction.OpCode))
-                        continue;
+                if (instruction.Destination is not LocalVariable destination)
+                    continue;
 
-                    // Only definitions of a register local are candidates. Stores have a memory or
-                    // field destination (Destination is not a local) and are never dead.
-                    if (instruction.Destination is not LocalVariable destination)
-                        continue;
-
-                    if (useCounts.TryGetValue(destination, out var count) && count > 0)
-                        continue;
-
-                    instruction.OpCode = OpCode.Nop;
-                    instruction.SetOperands();
-                    changed = true;
-                }
+                if (!definitions.TryGetValue(destination, out var localDefinitions))
+                    definitions[destination] = localDefinitions = [];
+                localDefinitions.Add(instruction);
             }
+        }
+
+        var live = new HashSet<Instruction>();
+        var workList = new Stack<Instruction>();
+        foreach (var root in additionalRoots)
+        {
+            if (live.Add(root))
+                workList.Push(root);
+        }
+
+        foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
+        {
+            // 可删除运算写入普通局部时才是候选；存储等非局部目标始终是根。
+            if (IsRemovable(instruction.OpCode) && instruction.Destination is LocalVariable)
+                continue;
+
+            if (live.Add(instruction))
+                workList.Push(instruction);
+        }
+
+        while (workList.Count > 0)
+        {
+            var instruction = workList.Pop();
+            foreach (var used in EnumerateUsedLocals(instruction))
+            {
+                if (!definitions.TryGetValue(used, out var localDefinitions))
+                    continue;
+
+                // 正式路径处于SSA；若调用者给出非SSA图，则保守保留同名局部的全部定义。
+                foreach (var definition in localDefinitions)
+                    if (live.Add(definition))
+                        workList.Push(definition);
+            }
+        }
+
+        foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
+        {
+            if (!IsRemovable(instruction.OpCode)
+                || instruction.Destination is not LocalVariable
+                || live.Contains(instruction))
+                continue;
+
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
         }
     }
 
-    private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)
+    /// <summary>
+    /// 枚举指令真正读取的全部局部量。只按“目标操作数的位置”排除一次写入，不能按
+    /// 对象身份排除目标局部；退 SSA 后的二地址指令允许同一物理局部同时出现在写目标
+    /// 和读取源中，例如 <c>Add X19, X19, 1</c>。这里直接遍历操作数还可覆盖尚未进入
+    /// 通用 Sources 表的间接跳转寄存器。
+    /// </summary>
+    internal static IEnumerable<LocalVariable> EnumerateUsedLocals(Instruction instruction)
     {
-        var counts = new Dictionary<LocalVariable, int>();
+        var destinationIndex = instruction.Destination is LocalVariable
+            ? instruction.OpCode is OpCode.Call or OpCode.IndirectCall ? 1 : 0
+            : -1;
 
-        foreach (var block in cfg.Blocks)
-            foreach (var instruction in block.Instructions)
-                foreach (var used in UsedLocals(instruction))
-                    counts[used] = counts.TryGetValue(used, out var c) ? c + 1 : 1;
+        for (var index = 0; index < instruction.Operands.Count; index++)
+        {
+            if (index == destinationIndex)
+                continue;
 
-        return counts;
+            foreach (var used in EnumerateUsedLocals(instruction.Operands[index]))
+                yield return used;
+        }
     }
 
     /// <summary>
-    /// Every local read by the instruction. The single write position - a plain local destination -
-    /// is excluded. Memory and field operands always contribute their address/object locals as
-    /// reads, even when they are the destination of a store.
+    /// 递归枚举一个操作数读取的局部量。HFA在托管签名中是单个实参，但其每个分量都是
+    /// 独立的数据流源；统一递归后，普通局部量、内存基址和索引都只在一个位置计算。
     /// </summary>
-    private static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
+    private static IEnumerable<LocalVariable> EnumerateUsedLocals(IOperand operand)
     {
-        var destination = instruction.Destination as LocalVariable;
-
-        foreach (var operand in instruction.Operands)
+        switch (operand)
         {
-            switch (operand)
-            {
-                case LocalVariable local when !ReferenceEquals(local, destination):
-                    yield return local;
-                    break;
-                case MemoryOperand memory:
-                    if (memory.Base is LocalVariable baseLocal)
-                        yield return baseLocal;
-                    if (memory.Index is LocalVariable indexLocal)
-                        yield return indexLocal;
-                    break;
-                // A static field access doesn't read the storage pointer it was resolved from, so that
-                // pointer (and the class load feeding it) is free to die.
-                case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
-                    yield return fieldLocal;
-                    break;
-                // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
-                case AddressOf { Target: LocalVariable addressed }:
-                    yield return addressed;
-                    break;
-                case AddressOf { Target: ArrayAccess addressedElement }:
-                    foreach (var used in ArrayAccessLocals(addressedElement))
-                        yield return used;
-                    break;
-                case ArrayAccess access:
-                    foreach (var used in ArrayAccessLocals(access))
-                        yield return used;
-                    break;
-                case ArrayLength { Array: { } lengthArray }:
-                    yield return lengthArray;
-                    break;
-            }
+            case LocalVariable local:
+                yield return local;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is LocalVariable baseLocal)
+                    yield return baseLocal;
+                if (memory.Index is LocalVariable indexLocal)
+                    yield return indexLocal;
+                break;
+            // A static field access doesn't read the storage pointer it was resolved from, so that
+            // pointer (and the class load feeding it) is free to die.
+            case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
+                yield return fieldLocal;
+                break;
+            // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
+            case AddressOf { Target: LocalVariable addressed }:
+                yield return addressed;
+                break;
+            case AddressOf { Target: ArrayAccess addressedElement }:
+                foreach (var used in ArrayAccessLocals(addressedElement))
+                    yield return used;
+                break;
+            case ArrayAccess access:
+                foreach (var used in ArrayAccessLocals(access))
+                    yield return used;
+                break;
+            case ArrayLength { Array: { } lengthArray }:
+                yield return lengthArray;
+                break;
+            case StringLength { Value: { } stringValue }:
+                yield return stringValue;
+                break;
+            case ListCount { Value: { } listValue }:
+                yield return listValue;
+                break;
+            case MetadataStringTableLookup lookup:
+                foreach (var used in EnumerateUsedLocals(lookup.Index))
+                    yield return used;
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var used in EnumerateUsedLocals(component))
+                    yield return used;
+                break;
         }
     }
 
@@ -124,15 +179,20 @@ public static class DeadCodeEliminator
     /// Opcodes with no side effects, so removing a never-read result is safe. Calls, stores,
     /// returns and branches are intentionally excluded.
     /// </summary>
-    private static bool IsRemovable(OpCode opCode) =>
+    internal static bool IsRemovable(OpCode opCode) =>
         opCode switch
         {
-            OpCode.Move or OpCode.Phi
-                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
-                or OpCode.ShiftLeft or OpCode.ShiftRight
+            OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
+                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
-                or OpCode.Not or OpCode.Negate=> true,
-            >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual => true,
+                or OpCode.Not or OpCode.Negate
+                or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
+                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+                or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
+                or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity => true,
+            >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned => true,
             _ => false
         };
 }

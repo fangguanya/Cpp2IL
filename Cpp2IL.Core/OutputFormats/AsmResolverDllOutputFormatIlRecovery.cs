@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
+using System.Collections.Concurrent;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
@@ -18,21 +20,86 @@ namespace Cpp2IL.Core.OutputFormats;
 
 public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 {
+    private HashSet<TypeAnalysisContext>? selectedRecoveryTypes;
+    private HashSet<MethodAnalysisContext>? selectedRecoveryMethods;
+    private int validatedMethodCount;
+    private int selectedMethodCount;
+    private readonly ConcurrentBag<MethodFailure> methodFailures = [];
+
+    private sealed record MethodFailure(
+        string Assembly,
+        string Type,
+        string Method,
+        string Category,
+        string Detail);
+
     public override string OutputFormatId => "dll_il_recovery";
 
     public override string OutputFormatName => "DLL files with IL Recovery";
 
     public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
-        //We're going to need key function addresses, so grab them. This way the logging is more consistent
-        Logger.InfoNewline("Finding key function addresses...");
-        var start = DateTime.Now;
-        _ = context.GetOrCreateKeyFunctionAddresses();
-        Logger.InfoNewline($"Key function addresses found in {DateTime.Now.Subtract(start).TotalMilliseconds}ms");
+        var runtimeOptions = Cpp2IlApi.RuntimeOptions;
+        var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
+        var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
+        var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
+        var hasSelection = assemblyFilters.Count != 0 || typeFilters.Count != 0 || methodFilters.Count != 0;
+        if (hasSelection)
+        {
+            var assemblies = IsilDumpSelectionHelper.SelectExact(
+                context.Assemblies,
+                assemblyFilters,
+                assembly => assembly.Name,
+                "IL恢复程序集");
+            var types = IsilDumpSelectionHelper.SelectExact(
+                assemblies.SelectMany(assembly => assembly.Types),
+                typeFilters,
+                type => type.Definition?.FullName ?? string.Empty,
+                "IL恢复类型");
+            if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
+                throw new InvalidOperationException("IL恢复类型筛选命中了注入类型或没有方法的类型。");
 
-        IlGenerator.InjectHelpersType(context);
+            var methods = IsilDumpSelectionHelper.SelectExact(
+                types.SelectMany(type => type.Methods)
+                    .Where(method => method is not InjectedMethodAnalysisContext),
+                methodFilters,
+                method => method.Definition?.HumanReadableSignature ?? string.Empty,
+                "IL恢复方法");
 
-        return base.BuildAssemblies(context);
+            selectedRecoveryTypes = new HashSet<TypeAnalysisContext>(types);
+            selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(methods);
+            selectedMethodCount = methods.Count;
+            Logger.InfoNewline(
+                $"IL恢复已精确选择 {assemblies.Count} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法；其他成员只保留声明。",
+                "DllOutput");
+        }
+
+        Volatile.Write(ref validatedMethodCount, 0);
+        TotalMethodCount = 0;
+        SuccessfulMethodCount = 0;
+        while (methodFailures.TryTake(out _))
+        {
+        }
+        try
+        {
+            var builtAssemblies = base.BuildAssemblies(context);
+            Logger.InfoNewline(
+                $"CIL 栈验证通过 {Volatile.Read(ref validatedMethodCount)} 个已选择方法。",
+                "DllOutput");
+            return builtAssemblies;
+        }
+        finally
+        {
+            selectedRecoveryTypes = null;
+            selectedRecoveryMethods = null;
+        }
+    }
+
+    protected override bool ShouldFillMethodBody(
+        AssemblyAnalysisContext assemblyContext,
+        TypeAnalysisContext typeContext)
+    {
+        return selectedRecoveryTypes == null || selectedRecoveryTypes.Contains(typeContext);
     }
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
@@ -42,33 +109,43 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         var shouldSkip = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.") ||
                          moduleName.StartsWith("System.") || moduleName == "System" ||
                          moduleName.StartsWith("mscorlib");
+        var importer = new ReferenceImporter(module);
 
         if (!methodDefinition.IsManagedMethodWithBody())
             return;
+
+        if (selectedRecoveryMethods != null && !selectedRecoveryMethods.Contains(methodContext))
+        {
+            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            return;
+        }
 
         methodDefinition.CilMethodBody = new();
         var instructions = methodDefinition.CilMethodBody.Instructions;
 
         if (shouldSkip)
         {
-            FillMethodBodyWithStub(methodDefinition);
+            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
             return;
         }
 
         try
         {
-            Interlocked.Increment(ref TotalMethodCount);
+            TotalMethodCount++;
 
             methodContext.Analyze();
 
             if (methodContext.ConvertedIsil.Count == 0)
-                FillMethodBodyWithStub(methodDefinition);
+                methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
 
+            CilStackValidator.Validate(methodDefinition.CilMethodBody!, methodContext.FullName);
+            Interlocked.Increment(ref validatedMethodCount);
+
             //WriteControlFlowGraph(methodContext, Path.Combine(Environment.CurrentDirectory, "Cpp2IL", "bin", "Debug", "net9.0", "cpp2il_out", "cfg"));
 
-            Interlocked.Increment(ref SuccessfulMethodCount);
+            SuccessfulMethodCount++;
         }
         catch (Exception e)
         {
@@ -76,13 +153,22 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             // else is an unexpected bug and keeps its (collapsed) stack trace.
             var detail = e is DecompilerException ? e.Message : e.ToCollapsedString();
 
-            if (detail.Length > 1000) // unbounded ldstrs can overflow the 24 bit #US heap offset space
-                detail = detail[..1000] + "…";
-
             if (e is DecompilerException)
                 Logger.WarnNewline($"Skipping {methodContext.FullName}: {e.Message}");
             else
                 Logger.ErrorNewline($"Decompiling {methodContext.FullName} failed: {detail}");
+
+            methodFailures.Add(new MethodFailure(
+                methodContext.DeclaringType?.DeclaringAssembly.Name ?? string.Empty,
+                methodContext.DeclaringType?.FullName ?? string.Empty,
+                methodContext.FullName,
+                ClassifyFailure(detail),
+                detail));
+
+            // 保留失败方法的最终 CFG，账本中的 CIL 窗口可由同一方法图追溯到具体 SSA/边复制。
+            var outputRoot = Cpp2IlApi.RuntimeOptions?.OutputRootDirectory;
+            if (!string.IsNullOrWhiteSpace(outputRoot) && methodContext.ControlFlowGraph != null)
+                WriteControlFlowGraph(methodContext, Path.Combine(outputRoot, "FailedMethodGraphs"));
             
             methodDefinition.CilMethodBody = new();
             instructions = methodDefinition.CilMethodBody.Instructions;
@@ -90,7 +176,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             var factory = module.CorLibTypeFactory;
             var exceptionCtor = factory.CorLibScope
                 .CreateTypeReference("System", "Exception")
-                .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void, [factory.String]));
+                .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void, [factory.String]))
+                .ImportWith(importer);
 
             instructions.Add(CilOpCodes.Ldstr, detail);
             instructions.Add(CilOpCodes.Newobj, exceptionCtor);
@@ -98,6 +185,56 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         }
 
         methodContext.ReleaseAnalysisData();
+    }
+
+    protected override void WriteOutputReceipts(string outputRoot)
+    {
+        var failures = methodFailures
+            .OrderBy(failure => failure.Assembly, StringComparer.Ordinal)
+            .ThenBy(failure => failure.Type, StringComparer.Ordinal)
+            .ThenBy(failure => failure.Method, StringComparer.Ordinal)
+            .ToArray();
+        var path = Path.Combine(outputRoot, "dll-il-recovery-method-ledger.json");
+        using (var stream = File.Create(path))
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("schema", "Cpp2IL.DllIlRecovery.MethodLedger/v1");
+            writer.WriteNumber("selectedMethods", selectedMethodCount);
+            writer.WriteNumber("totalMethodsWithBody", TotalMethodCount);
+            writer.WriteNumber("successfulMethods", SuccessfulMethodCount);
+            writer.WriteNumber("validatedMethods", Volatile.Read(ref validatedMethodCount));
+            writer.WriteNumber("failedMethods", failures.Length);
+            writer.WriteStartArray("failures");
+            foreach (var failure in failures)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("assembly", failure.Assembly);
+                writer.WriteString("type", failure.Type);
+                writer.WriteString("method", failure.Method);
+                writer.WriteString("category", failure.Category);
+                writer.WriteString("detail", failure.Detail);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
+        Logger.InfoNewline($"方法恢复账本已写入 {path}；失败 {failures.Length} 个。", "DllOutput");
+    }
+
+    internal static string ClassifyFailure(string detail)
+    {
+        if (detail.Contains("CIL 栈验证失败", StringComparison.Ordinal))
+            return "CIL_STACK_IMBALANCE";
+        if (detail.Contains("CIL 标签验证失败", StringComparison.Ordinal))
+            return "CIL_LABEL_INVALID";
+        if (detail.Contains("Type and field resolution not settling", StringComparison.Ordinal))
+            return "TYPE_FIELD_NOT_SETTLING";
+        if (detail.Contains("Late call and address type resolution not settling", StringComparison.Ordinal))
+            return "LATE_CALL_TYPE_NOT_SETTLING";
+        if (detail.Contains("Stack state not settling", StringComparison.Ordinal))
+            return "STACK_STATE_NOT_SETTLING";
+        return "ANALYSIS_FAILURE";
     }
 
     public static void WriteControlFlowGraph(MethodAnalysisContext method, string outputPath)

@@ -11,6 +11,17 @@ public class Instruction : IOperand
 {
     public int Index;
 
+    /// <summary>
+    /// 原生整数标量运算的精确位宽；零表示该指令没有携带可验证的整数位宽证据。
+    /// </summary>
+    public int IntegerWidthBits { get; set; }
+
+    /// <summary>
+    /// 原生内存读写覆盖的精确位宽；零表示该指令没有携带可验证的访问宽度。
+    /// 该值独立于托管值类型，用于识别一次宽写覆盖多个相邻字段的优化形态。
+    /// </summary>
+    public int MemoryAccessWidthBits { get; set; }
+
     public OpCode OpCode
     {
         get;
@@ -28,7 +39,9 @@ public class Instruction : IOperand
 
     public OperandList Operands => new(_operands);
 
-    // Exists to clear the return register after a CallVoid, basically.
+    /// <summary>
+    /// 指令语义隐式写入的寄存器；用于在显式操作数之外构建完整 SSA 定义关系。
+    /// </summary>
     public Register? ImplicitDefinition;
 
     public bool IsFallThrough =>
@@ -93,26 +106,53 @@ public class Instruction : IOperand
         {
             case OpCode.Move:
             case OpCode.Phi:
+            case OpCode.ConditionalSelect:
             case OpCode.Add:
             case OpCode.Subtract:
             case OpCode.Multiply:
             case OpCode.Divide:
-            case OpCode.Modulo:
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
+            case OpCode.ShiftRightUnsigned:
             case OpCode.And:
             case OpCode.Or:
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.AbsoluteNumber:
+            case OpCode.AbsoluteDifference:
+            case OpCode.MaximumNumber:
+            case OpCode.ConvertFloatingPointPrecision:
+            case OpCode.ConvertFloatToSignedInteger:
+            case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ConvertSignedIntegerWidth:
+            case OpCode.ReinterpretIntegerBitsAsFloat:
+            case OpCode.ReinterpretFloatBitsAsInteger:
+            case OpCode.VectorDuplicate:
+            case OpCode.VectorWidenUnsignedInt16ToInt32:
+            case OpCode.VectorShiftLeft:
+            case OpCode.VectorCompareLessThanZero:
+            case OpCode.VectorBitwiseSelect:
+            case OpCode.VectorMultiplyByElement:
+            case OpCode.VectorAllLanesPredicate:
+            case OpCode.VectorExtractUnsignedInt16:
+            case OpCode.RoundFloatTowardPositiveInfinity:
+            case OpCode.RoundFloatTowardNegativeInfinity:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
             case OpCode.CheckNotEqual:
             case OpCode.CheckGreaterOrEqual:
             case OpCode.CheckLessOrEqual:
+            case OpCode.CheckGreaterUnsigned:
+            case OpCode.CheckLessUnsigned:
+            case OpCode.CheckGreaterOrEqualUnsigned:
+            case OpCode.CheckLessOrEqualUnsigned:
             case OpCode.Newobj:
             case OpCode.Box:
+            case OpCode.Unbox:
+            case OpCode.CastClass:
+            case OpCode.IsInst:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -149,16 +189,39 @@ public class Instruction : IOperand
     {
         var sources = OpCode switch
         {
-            OpCode.Move or OpCode.ConditionalJump
+            OpCode.Move => GetMoveSources(),
+
+            OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj
+                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+                or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
+                or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
+                or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
+                or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
+                or OpCode.AbsoluteNumber
+                or OpCode.Newobj or OpCode.Box or OpCode.Unbox or OpCode.CastClass or OpCode.IsInst
                 => [_operands[1]],
 
-            OpCode.Box => [_operands[2]],
+            OpCode.VectorBitwiseSelect
+                => [_operands[1], _operands[2], _operands[3]],
+
+            OpCode.ConditionalSelect
+                => [_operands[1], _operands[2], _operands[3]],
+
+            OpCode.VectorMultiplyByElement
+                => [_operands[1], _operands[2]],
+
+            OpCode.VectorAllLanesPredicate
+                => [_operands[1], _operands[2]],
+
+            OpCode.VectorExtractUnsignedInt16
+                => [_operands[1]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
-                or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
+                or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 => [_operands[2], _operands[1]],
 
             OpCode.Call => _operands.Skip(2).ToList(),
@@ -171,19 +234,62 @@ public class Instruction : IOperand
             OpCode.CallVoid or OpCode.Phi => _operands.Skip(1).ToList(),
             OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
                 or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+                or OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned
+                or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned
                 => [_operands[1], _operands[2]],
 
             _ => []
         };
 
-        if (OpCode == OpCode.Return && _operands.Count == 1)
-            sources.Add(_operands[0]);
+        if (OpCode == OpCode.Return)
+            sources.AddRange(_operands);
+
+        // HFA 在托管签名中是一个实参，但数据流上由多个连续 V 寄存器共同组成。
+        // use/def 必须看到每个分量，否则死代码删除会误删构造该值的 FMOV/MOVI。
+        sources = sources.SelectMany(ExpandAggregateSource).ToList();
 
         if (constantsOnly)
             sources = sources.Where(o => !IsConstantValue(o)).ToList();
 
         return sources;
     }
+
+    /// <summary>
+    /// 返回 Move 读取的值与写目标地址。内存、实例字段和数组元素写入都会读取其
+    /// 基址或对象；遗漏这些读取会让 pruned SSA 漏建汇合 Phi，继而误删地址计算。
+    /// </summary>
+    private List<IOperand> GetMoveSources()
+    {
+        var sources = new List<IOperand> { _operands[1] };
+        switch (_operands[0])
+        {
+            case MemoryOperand memory:
+                if (memory.Base is not null)
+                    sources.Add(memory.Base);
+                if (memory.Index is not null)
+                    sources.Add(memory.Index);
+                break;
+            case FieldReference { Field.IsStatic: false } field:
+                sources.Add(field.Local);
+                break;
+            case ArrayAccess access:
+                sources.Add(access.Array);
+                sources.Add(access.Index);
+                break;
+        }
+
+        return sources;
+    }
+
+    private static IEnumerable<IOperand> ExpandAggregateSource(IOperand operand)
+        => operand switch
+        {
+            HomogeneousFloatingAggregateArgument aggregate
+                => aggregate.Components.SelectMany(ExpandAggregateSource),
+            MetadataStringTableLookup lookup
+                => ExpandAggregateSource(lookup.Index),
+            _ => [operand],
+        };
 
     public override string ToString()
     {
@@ -212,7 +318,6 @@ public class Instruction : IOperand
         {
             MethodAnalysisContext method => $"{method.DeclaringType!.Name}.{method.Name}",
             RuntimeMethodInfoAnalysisContext methodInfo => $"methodof({methodInfo.RepresentedMethod.FullName})",
-            RuntimeFieldInfoAnalysisContext fieldInfo => $"fieldof({fieldInfo.RepresentedField.DeclaringType.FullName}.{fieldInfo.RepresentedField.Name})",
             TypeAnalysisContext type => $"typeof({type.FullName})",
             Instruction instruction => $"@{instruction.Index}",
             Block block => $"@b{block.ID}",
@@ -224,7 +329,7 @@ public class Instruction : IOperand
         operand switch
         {
             Register or StackOffset or LocalVariable => false,
-            AddressOf or ArrayAccess or ArrayLength => false,
+            AddressOf or ArrayAccess or ArrayLength or ListCount or StringLength => false,
             MemoryOperand memory => memory.IsConstant,
             _ => true
         };

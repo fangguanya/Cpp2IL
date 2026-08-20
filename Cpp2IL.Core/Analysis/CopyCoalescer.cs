@@ -38,7 +38,12 @@ public static class CopyCoalescer
                 var a = groups.Find(group[0]);
                 var b = groups.Find(group[i]);
 
-                if (a == b || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
+                // this 是 CIL 参数而不是可复用的物理寄存器槽。ARM64 在把实例保存到 X19 后
+                // 会立即复用 X0 承载数组等调用结果；若与未定型结果合并，后续数组恢复会把
+                // this 改写成数组局部，并把数组元素存储误解析为状态机字段写入。
+                if (a.IsThis || b.IsThis
+                    || a == b
+                    || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
                     continue;
 
                 groups.Union(a, b);
@@ -50,8 +55,16 @@ public static class CopyCoalescer
             var a = groups.Find(destination);
             var b = groups.Find(source);
 
-            // different types would need a cast at every use, so do this only when the types agree, or one side is null
-            if (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type))
+            // this 的参数身份必须贯穿整个方法；即使活跃区间不重叠，也不得把后续 X0
+            // 返回值并入 this，否则 CIL 固定参数类型会被后期结果类型覆盖。
+            if (a.IsThis || b.IsThis)
+                continue;
+
+            // 两个独立构造的具体泛型上下文可能不是同一对象，但只要结构化类型一致，
+            // 副本合并就不需要任何转换；不同具体泛型仍保持独立。
+            if (a.Type != null
+                && b.Type != null
+                && !GenericCallRebinder.TypesEquivalent(a.Type, b.Type))
                 continue;
 
             if (a == b || Interferes(interference, groups, a, b))
@@ -61,6 +74,118 @@ public static class CopyCoalescer
         }
 
         Rewrite(cfg, groups);
+    }
+
+    /// <summary>
+    /// 删除退 SSA 后由晚期聚合/地址恢复最终证明为跨语义类型的 Phi 复制。该门必须位于
+    /// 所有局部类型和栈槽重写完成之后；指令索引 -1 精确限定 Phi 生成物，不触碰原生 Move。
+    /// </summary>
+    internal static void PruneIncompatiblePhiCopies(ISILControlFlowGraph cfg)
+    {
+        foreach (var instruction in cfg.Instructions.Where(instruction =>
+                     instruction is
+                     {
+                         Index: < 0,
+                         OpCode: OpCode.Move,
+                         Operands: [LocalVariable destination, LocalVariable source]
+                     }
+                     && !SsaForm.ShouldEmitPhiCopy(destination, source)))
+        {
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+        }
+    }
+
+    /// <summary>
+    /// 退 SSA 后，引用 Phi 的空入边已经被常量传播为整数零。若同一目标的其余入边全部是
+    /// 同一个具体引用类型，则把零解释为 null 并恢复目标类型；这样后续字段偏移解析可以把
+    /// 上一节点到当前节点的原生内存写入还原成真实托管字段赋值。
+    /// </summary>
+    internal static bool ResolveNullReferencePhiCopyTypes(ISILControlFlowGraph cfg)
+    {
+        var changed = false;
+        var groups = cfg.Instructions
+            .Where(instruction => instruction is
+            {
+                Index: < 0,
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable, _]
+            })
+            .GroupBy(instruction => (LocalVariable)instruction.Operands[0]);
+
+        foreach (var group in groups)
+        {
+            var sources = group.Select(instruction => instruction.Operands[1]).ToArray();
+            if (sources.Length < 2
+                || !sources.Any(source => source is Immediate { Value: 0 })
+                || sources.Any(source => source is not LocalVariable
+                    && source is not Immediate { Value: 0 }))
+                continue;
+
+            var referenceSources = sources.OfType<LocalVariable>().ToArray();
+            if (referenceSources.Length == 0
+                || referenceSources.Any(source => source.Type is not { IsValueType: false }))
+                continue;
+
+            var consensusType = referenceSources[0].Type!;
+            if (referenceSources.Skip(1).Any(source =>
+                    !GenericCallRebinder.TypesEquivalent(source.Type, consensusType)))
+                continue;
+
+            var destination = group.Key;
+            if (destination.Type != null
+                && !GenericCallRebinder.TypesEquivalent(destination.Type, consensusType)
+                && !GenericCallRebinder.IsSharedObjectPlaceholder(destination.Type, consensusType))
+                continue;
+
+            if (!GenericCallRebinder.TypesEquivalent(destination.Type, consensusType))
+            {
+                destination.Type = consensusType;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 删除“已有真实定义的托管目标 &lt;- 无任何来源的未定型局部”退 SSA 复制。该形态来自
+    /// 异常清理边合并 X0 返回寄存器；源值既非参数也无定义，保留它只会把 object/I4 伪值
+    /// 写入真实调用结果。目标必须另有定义，避免把唯一业务赋值误删。
+    /// </summary>
+    internal static int PruneUndefinedSourcePhiCopies(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitionCounts = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var definedLocals = new HashSet<LocalVariable>(definitionCounts.Keys);
+        var pruned = 0;
+
+        foreach (var instruction in instructions.Where(instruction => instruction is
+                 {
+                     Index: < 0,
+                     OpCode: OpCode.Move,
+                     Operands: [LocalVariable, LocalVariable]
+                 }))
+        {
+            var destination = (LocalVariable)instruction.Operands[0];
+            var source = (LocalVariable)instruction.Operands[1];
+            var destinationDefinitionCount = definitionCounts.TryGetValue(destination, out var count) ? count : 0;
+            if (destination.Type == null
+                || source.Type != null
+                || destinationDefinitionCount < 2
+                || definedLocals.Contains(source)
+                || method.ParameterLocals.Contains(source))
+                continue;
+
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+            pruned++;
+        }
+
+        return pruned;
     }
 
     private static List<(LocalVariable Destination, LocalVariable Source, Instruction Instruction)> FindSameSlotCopies(ISILControlFlowGraph cfg)
@@ -255,8 +380,18 @@ public static class CopyCoalescer
                 case ArrayLength length:
                     yield return length.Array;
                     break;
+                case StringLength length:
+                    yield return length.Value;
+                    break;
+                case ListCount count:
+                    yield return count.Value;
+                    break;
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
+                    break;
+                case HomogeneousFloatingAggregateArgument aggregate:
+                    foreach (var component in aggregate.Components.OfType<LocalVariable>())
+                        yield return component;
                     break;
             }
         }
@@ -293,8 +428,19 @@ public static class CopyCoalescer
                         case ArrayLength length:
                             length.Array = groups.Find(length.Array);
                             break;
+                        case StringLength length:
+                            length.Value = groups.Find(length.Value);
+                            break;
+                        case ListCount count:
+                            count.Value = groups.Find(count.Value);
+                            break;
                         case AddressOf { Target: LocalVariable addressed } addressOf:
                             addressOf.Target = groups.Find(addressed);
+                            break;
+                        case HomogeneousFloatingAggregateArgument aggregate:
+                            for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                                if (aggregate.Components[componentIndex] is LocalVariable component)
+                                    aggregate.Components[componentIndex] = groups.Find(component);
                             break;
                     }
                 }

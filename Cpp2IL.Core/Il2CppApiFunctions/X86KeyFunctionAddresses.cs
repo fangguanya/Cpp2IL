@@ -226,7 +226,7 @@ public class X86KeyFunctionAddresses : BaseKeyFunctionAddresses
 
         return matchingCall.Mnemonic != Mnemonic.INVALID ? matchingCall.NearBranchTarget : 0;
     }
-    
+
     protected override ulong FindFirstCallTargetInMethod(ulong methodVa)
     {
         var disasm = X86Utils.GetMethodBodyAtVirtAddressNew(methodVa, false, _appContext);

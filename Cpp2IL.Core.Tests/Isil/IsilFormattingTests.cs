@@ -48,4 +48,28 @@ public class IsilFormattingTests
 
 		Assert.That(instruction.ToString(), Is.EqualTo("17 Return"));
 	}
+
+	[Test]
+	[Category("基本功能")]
+	public void ConditionalSelect_UsesConditionAndBothValuesWithoutCreatingControlFlow()
+	{
+		var destination = new Register(null, "x0");
+		var condition = new Register(null, "z");
+		var whenTrue = new Register(null, "x1");
+		var whenFalse = new Register(null, "x2");
+		var instruction = new Instruction(
+			8,
+			OpCode.ConditionalSelect,
+			destination,
+			condition,
+			whenTrue,
+			whenFalse);
+
+		using (Assert.EnterMultipleScope())
+		{
+			Assert.That(instruction.Destination, Is.EqualTo(destination));
+			Assert.That(instruction.Sources, Is.EqualTo(new IOperand[] { condition, whenTrue, whenFalse }));
+			Assert.That(instruction.IsFallThrough, Is.True);
+		}
+	}
 }

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -17,12 +18,21 @@ public static class SsaSimplifier
         // dest -> value for every forwardable copy/constant. SSA's single-assignment property means a
         // local is defined at most once, so there is never a conflicting entry for the same key.
         var forwarded = new Dictionary<LocalVariable, IOperand>();
+        // ref/out 调用可在原生栈槽地址上写回新值；即使槽在进入调用前由零常量初始化，
+        // 也不得把调用后的读取全局替换成旧常量。地址目录一次建立，后续传播统一复用。
+        var addressTaken = new HashSet<LocalVariable>(cfg.Blocks
+            .SelectMany(block => block.Instructions)
+            .SelectMany(instruction => instruction.Operands)
+            .OfType<AddressOf>()
+            .Select(address => address.Target)
+            .OfType<LocalVariable>());
 
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && !parameterLocals.Contains(dest)
+                    && (!addressTaken.Contains(dest) || instruction.Operands[1] is LocalVariable)
                     && IsForwardable(instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
 
@@ -97,6 +107,23 @@ public static class SsaSimplifier
                 case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement:
                     field.Local = fieldReplacement;
                     break;
+
+                // 取地址只能改写为另一个局部变量；聚合值复制若漏掉该路径，字段读取会
+                // 指向源值，而 MoveNext/Dispose 仍修改一个已失去定义的目标值。
+                case AddressOf { Target: LocalVariable addressed } addressOf
+                    when resolved.TryGetValue(addressed, out var addressValue)
+                         && addressValue is LocalVariable addressReplacement:
+                    addressOf.Target = addressReplacement;
+                    break;
+
+                case HomogeneousFloatingAggregateArgument aggregate:
+                    for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                    {
+                        if (aggregate.Components[componentIndex] is LocalVariable component
+                            && resolved.TryGetValue(component, out var componentValue))
+                            aggregate.Components[componentIndex] = componentValue;
+                    }
+                    break;
             }
         }
     }
@@ -127,6 +154,13 @@ public static class SsaSimplifier
                             break;
                         case FieldReference field when field.Local is { } fieldLocal:
                             reads.Add(fieldLocal);
+                            break;
+                        case AddressOf { Target: LocalVariable addressed }:
+                            reads.Add(addressed);
+                            break;
+                        case HomogeneousFloatingAggregateArgument aggregate:
+                            foreach (var component in aggregate.Components.OfType<LocalVariable>())
+                                reads.Add(component);
                             break;
                     }
                 }

@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using CommandLine;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL;
 
@@ -48,6 +49,15 @@ public class CommandLineArgs
     [Option("output-to", HelpText = "Root directory to output to. Defaults to cpp2il_out in the current working directory.")]
     public string OutputRootDir { get; set; } = Path.GetFullPath("cpp2il_out");
 
+    [Option("isil-assembly-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确程序集名；空值表示全部程序集。")]
+    public IEnumerable<string> IsilAssemblyFilters { get; set; } = new List<string>();
+
+    [Option("isil-type-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确类型全名；空值表示全部类型。")]
+    public IEnumerable<string> IsilTypeFilters { get; set; } = new List<string>();
+
+    [Option("isil-method-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确方法签名；必须同时指定类型筛选。")]
+    public IEnumerable<string> IsilMethodFilters { get; set; } = new List<string>();
+
     //Flags
 
     [Option("verbose", HelpText = "Enable Verbose Logging.")]
@@ -55,6 +65,9 @@ public class CommandLineArgs
 
     [Option("low-memory-mode", HelpText = "Enable Low Memory Mode. This will attempt to reduce memory usage at the cost of performance.")]
     public bool LowMemoryMode { get; set; }
+
+    [Option("max-method-size-bytes", Default = MethodAnalysisSizePolicy.DefaultMaximumBytes, HelpText = "Maximum native method body size to analyze in bytes. Use -1 for no limit.")]
+    public int MaximumMethodSizeBytes { get; set; }
 
     [Option("wasm-framework-file", HelpText = "Path to the wasm *.framework.js file. Only needed if your binary is a WASM file. If provided, it can be used to remap obfuscated dynCall function names in order to correct method pointers.")]
     public string? WasmFrameworkFilePath { get; set; }

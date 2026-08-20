@@ -24,9 +24,185 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        RecoverPointerDerivedAccesses(
+            method.ControlFlowGraph!,
+            method.AppContext.Binary.PointerSizeBytes,
+            method.AppContext.SystemTypes);
         RecoverAccesses(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);
+    }
+
+    /// <summary>
+    /// ARM64 对引用数组的访问通常先计算 <c>array + ElementsOffset</c>，再用
+    /// <c>[data + index * pointerSize]</c> 取元素。若只看最终内存操作，基址已经是
+    /// IntPtr，普通数组恢复就会遗漏，后续会把元素退化成 object 与原生指针算术。
+    /// 这里沿单一定义回溯地址仿射式，只有根节点、元素偏移和步长全部精确匹配时才
+    /// 改写为 ArrayAccess；多定义、非数组根或不完整步长保持原始操作。
+    /// </summary>
+    internal static void RecoverPointerDerivedAccesses(ISILControlFlowGraph cfg, int pointerSize)
+        => RecoverPointerDerivedAccesses(cfg, pointerSize, null);
+
+    private static void RecoverPointerDerivedAccesses(
+        ISILControlFlowGraph cfg,
+        int pointerSize,
+        SystemTypesContext? systemTypes)
+    {
+        var definitions = SingleDefinitions(cfg);
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand memory)
+                    continue;
+
+                if (ReferenceArrayIndex(memory, pointerSize, definitions) is { } access)
+                {
+                    BindArrayIndexType(access.Index, memory.IndexExtension, systemTypes);
+                    instruction.SetOperand(i, access);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 数组索引的 ARM64 扩展方式是整数宽度的直接证据；只为尚未定型的局部量绑定类型。
+    /// </summary>
+    internal static void BindArrayIndexType(
+        IOperand index,
+        MemoryIndexExtension extension,
+        SystemTypesContext? systemTypes)
+    {
+        if (index is not LocalVariable { Type: null } local || systemTypes == null)
+            return;
+
+        local.Type = extension switch
+        {
+            MemoryIndexExtension.ZeroExtend32 => systemTypes.SystemUInt32Type,
+            MemoryIndexExtension.SignExtend32 => systemTypes.SystemInt32Type,
+            MemoryIndexExtension.ZeroExtend64 => systemTypes.SystemUIntPtrType,
+            MemoryIndexExtension.None or MemoryIndexExtension.SignExtend64 => systemTypes.SystemIntPtrType,
+            _ => throw new ArgumentOutOfRangeException(nameof(extension), extension, null)
+        };
+    }
+
+    private static ArrayAccess? ReferenceArrayIndex(
+        MemoryOperand memory,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (memory.Base is not LocalVariable baseLocal)
+            return null;
+
+        if (FoldedReferenceArrayIndex(memory, baseLocal, pointerSize, definitions) is { } foldedAccess)
+            return foldedAccess;
+
+        var evaluated = Evaluate(baseLocal, definitions, 0);
+        if (evaluated is not
+            {
+                Root: LocalVariable { Type: SzArrayTypeAnalysisContext arrayType } array,
+                Multiplier: 1,
+                Offset: var baseOffset
+            })
+            return null;
+
+        var elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        if (elementSize == 0)
+            return null;
+
+        var offset = baseOffset;
+        try
+        {
+            checked
+            {
+                offset += memory.Addend - ElementsOffset(pointerSize);
+            }
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+
+        if (offset < 0 || offset % elementSize != 0)
+            return null;
+
+        if (memory.Index == null)
+            return memory.Scale == 0
+                ? new ArrayAccess(array, new Immediate(offset / elementSize))
+                : null;
+
+        return offset == 0 && memory.Scale == elementSize
+            ? new ArrayAccess(array, memory.Index)
+            : null;
+    }
+
+    /// <summary>
+    /// ARM64 也会先把 <c>array + index * stride</c> 折进同一个地址局部，最后以内存
+    /// addend 携带数组头大小。该形态包含数组根与索引两个独立变量，普通单根仿射式无法表达；
+    /// 这里只接受精确的 Add、元素头偏移以及与元素大小一致的 ShiftLeft/Multiply。
+    /// </summary>
+    private static ArrayAccess? FoldedReferenceArrayIndex(
+        MemoryOperand memory,
+        LocalVariable baseLocal,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (memory.Index != null
+            || memory.Scale != 0
+            || memory.Addend != ElementsOffset(pointerSize)
+            || !definitions.TryGetValue(baseLocal, out var addressDefinition)
+            || addressDefinition is not { OpCode: OpCode.Add, Operands: [_, var left, var right] })
+            return null;
+
+        return TryFoldedOperands(left, right, pointerSize, definitions)
+               ?? TryFoldedOperands(right, left, pointerSize, definitions);
+    }
+
+    private static ArrayAccess? TryFoldedOperands(
+        IOperand arrayOperand,
+        IOperand scaledIndexOperand,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (Evaluate(arrayOperand, definitions, 0) is not
+            {
+                Root: LocalVariable { Type: SzArrayTypeAnalysisContext arrayType } array,
+                Multiplier: 1,
+                Offset: 0,
+            })
+            return null;
+
+        var elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        if (elementSize == 0
+            || scaledIndexOperand is not LocalVariable scaledIndex
+            || !definitions.TryGetValue(scaledIndex, out var scaleDefinition)
+            || scaleDefinition == null
+            || TryScaledIndex(scaleDefinition, elementSize) is not { } index)
+            return null;
+
+        return new ArrayAccess(array, index);
+    }
+
+    private static IOperand? TryScaledIndex(Instruction definition, long elementSize)
+    {
+        if (definition is
+            {
+                OpCode: OpCode.ShiftLeft,
+                Operands: [_, var shifted, Immediate { Value: >= 0 and < 31 } shift],
+            }
+            && 1L << (int)shift.Value == elementSize)
+            return shifted;
+
+        if (definition is
+            {
+                OpCode: OpCode.Multiply,
+                Operands: [_, var multiplied, Immediate { Value: var factor }],
+            }
+            && factor == elementSize)
+            return multiplied;
+
+        return null;
     }
 
     private static void RecoverAccesses(MethodAnalysisContext method)
@@ -50,7 +226,10 @@ public static class ArrayRecovery
                 }
 
                 if (ElementIndex(memory, arrayType, pointerSize) is { } index)
+                {
+                    BindArrayIndexType(index, memory.IndexExtension, method.AppContext.SystemTypes);
                     instruction.SetOperand(i, new ArrayAccess(array, index));
+                }
             }
         }
     }
@@ -304,7 +483,10 @@ public static class ArrayRecovery
                 return definition switch
                 {
                     { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => EvaluateLea(lea, definitions, depth + 1),
-                    { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1),
+                    // 中文注释：字段读取等非仿射来源已经给局部写入精确数组类型；来源本身不可求值时，
+                    // 保留当前局部为数组根，而不是让后续元素地址恢复整体失效。
+                    { OpCode: OpCode.Move, Operands: [_, var source] } =>
+                        Evaluate(source, definitions, depth + 1) ?? new Affine(local, 1, 0),
                     { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1), Evaluate(right, definitions, depth + 1)),
                     { OpCode: OpCode.ShiftLeft, Operands: [_, var left, Immediate { Value: >= 0 and < 32 } shift] } => ScaleBy(Evaluate(left, definitions, depth + 1), 1L << (int)shift.Value),
                     { OpCode: OpCode.Multiply, Operands: [_, var left, Immediate factor] } => ScaleBy(Evaluate(left, definitions, depth + 1), factor.Value),
@@ -352,6 +534,13 @@ public static class ArrayRecovery
         foreach (var instruction in cfg.Instructions)
             if (instruction.Destination is LocalVariable destination)
                 definitions[destination] = definitions.ContainsKey(destination) ? null : instruction;
+
+        // 中文注释：ref/out 调用会在原生层间接写回目标局部；即使 CFG 中只有一次显式 Move，
+        // 也不得沿该旧值继续折叠地址。将取址实参标成未知定义，后续仿射求值会保留数组根身份。
+        foreach (var instruction in cfg.Instructions.Where(instruction => instruction.IsCall))
+            foreach (var addressed in instruction.Operands.OfType<AddressOf>())
+                if (addressed.Target is LocalVariable local)
+                    definitions[local] = null;
 
         return definitions;
     }

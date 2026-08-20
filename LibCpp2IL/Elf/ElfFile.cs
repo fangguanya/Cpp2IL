@@ -24,6 +24,24 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     private long _globalOffset;
 
+    /// <summary>
+    /// 判断虚拟地址区间是否完整位于文件支持的只读 PT_LOAD 段。恢复原生标量字面量时
+    /// 只接受该区域，防止把可写静态存储的初始值冻结为托管常量。
+    /// </summary>
+    public bool IsReadOnlyFileBackedVirtualRange(ulong address, int byteCount)
+    {
+        if (byteCount <= 0 || address > ulong.MaxValue - (ulong)byteCount)
+            return false;
+
+        var end = address + (ulong)byteCount;
+        return _elfProgramHeaderEntries.Any(entry =>
+            entry.Type == ElfProgramEntryType.PT_LOAD
+            && (entry.Flags & ElfProgramHeaderFlags.PF_R) != 0
+            && (entry.Flags & ElfProgramHeaderFlags.PF_W) == 0
+            && address >= entry.VirtualAddress
+            && end <= entry.VirtualAddress + entry.RawSize);
+    }
+
     public ElfFile(MemoryStream input) : base(input)
     {
         _raw = input.GetBuffer();

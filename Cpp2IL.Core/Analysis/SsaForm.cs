@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -26,39 +27,229 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!);
+    {
+        var keyFunctions = method.AppContext.GetOrCreateKeyFunctionAddresses();
+        var readOnlyBoxTargets = new HashSet<ulong>(
+            new[]
+            {
+                keyFunctions.il2cpp_value_box,
+                keyFunctions.il2cpp_vm_object_box,
+                keyFunctions.il2cpp_codegen_object_box,
+            }.Where(address => address != 0));
+
+        Build(method.ControlFlowGraph!, method.DominatorInfo!, readOnlyBoxTargets);
+    }
 
     public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
+        => Build(graph, dominatorInfo, new HashSet<ulong>());
+
+    private static void Build(
+        ISILControlFlowGraph graph,
+        DominatorInfo dominatorInfo,
+        ISet<ulong> readOnlyBoxTargets)
     {
         var ssa = new SsaForm();
-        ssa.FindClobberingAddressTakes(graph);
+        ssa.FindClobberingAddressTakes(graph, readOnlyBoxTargets);
 
         graph.BuildUseDefLists(ssa._clobbering);
 
         ssa.CollectRegisters(graph);
-        ssa.InsertPhiFunctions(graph, dominatorInfo);
+        ssa.InsertPhiFunctions(graph, dominatorInfo, ComputeLiveInRegisters(graph));
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+    }
+
+    /// <summary>
+    /// 计算未版本化寄存器在每个基本块入口的活跃集合，用于构造pruned SSA。
+    /// 只按寄存器编号比较，同一物理寄存器的入口值与后续定义属于同一数据流变量。
+    /// </summary>
+    private static Dictionary<Block, HashSet<int>> ComputeLiveInRegisters(ISILControlFlowGraph graph)
+    {
+        var liveIn = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var liveOut = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var uses = graph.Blocks.ToDictionary(
+            block => block,
+            block => new HashSet<int>(block.Use.SelectMany(EnumerateOperandRegisters).Select(register => register.Number)));
+        var definitions = graph.Blocks.ToDictionary(
+            block => block,
+            block => new HashSet<int>(block.Def.OfType<Register>().Select(register => register.Number)));
+
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (var index = graph.Blocks.Count - 1; index >= 0; index--)
+            {
+                var block = graph.Blocks[index];
+                var nextOut = new HashSet<int>(block.Successors
+                    .SelectMany(successor => liveIn[successor]));
+                var nextIn = new HashSet<int>(uses[block].Concat(nextOut.Except(definitions[block])));
+
+                if (!liveOut[block].SetEquals(nextOut))
+                {
+                    liveOut[block] = nextOut;
+                    changed = true;
+                }
+
+                if (!liveIn[block].SetEquals(nextIn))
+                {
+                    liveIn[block] = nextIn;
+                    changed = true;
+                }
+            }
+        }
+
+        return liveIn;
+    }
+
+    /// <summary>
+    /// 枚举一个读取操作数携带的全部寄存器。内存基址、索引与取地址目标同样是活值；
+    /// 只检查顶层寄存器会漏掉 <c>LDR X0, [X8]</c> 对 X8 的读取，继而在条件汇合处少建Phi。
+    /// </summary>
+    private static IEnumerable<Register> EnumerateOperandRegisters(IOperand operand)
+    {
+        switch (operand)
+        {
+            case Register register:
+                yield return register;
+                break;
+            case MemoryOperand { Base: Register baseRegister, Index: Register indexRegister }:
+                yield return baseRegister;
+                yield return indexRegister;
+                break;
+            case MemoryOperand { Base: Register baseRegister }:
+                yield return baseRegister;
+                break;
+            case MemoryOperand { Index: Register indexRegister }:
+                yield return indexRegister;
+                break;
+            case AddressOf { Target: Register addressed }:
+                yield return addressed;
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var componentRegister in EnumerateOperandRegisters(component))
+                    yield return componentRegister;
+                break;
+        }
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
     private readonly HashSet<Instruction> _clobbering = [];
 
-    private void FindClobberingAddressTakes(ISILControlFlowGraph graph)
+    private void FindClobberingAddressTakes(
+        ISILControlFlowGraph graph,
+        ISet<ulong> readOnlyBoxTargets)
     {
+        RewriteImmediateAddressCarriers(graph, readOnlyBoxTargets);
+
         foreach (var block in graph.Blocks)
         {
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 var instruction = block.Instructions[i];
 
-                foreach (var operand in instruction.Operands)
+                // 纯Move/lea只计算槽地址，不会写入槽；只有把地址交给调用时才存在写回语义。
+                if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall))
+                    continue;
+
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
                 {
+                    var operand = instruction.Operands[operandIndex];
                     if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    {
+                        // Object::Box的第2个原生参数是只读数据指针；它读取调用前的槽值，绝不写回槽。
+                        if (IsReadOnlyBoxDataAddress(instruction, operandIndex, readOnlyBoxTargets))
+                            continue;
+
                         _clobbering.Add(instruction);
+                    }
                 }
             }
         }
     }
+
+    /// <summary>
+    /// 把同一基本块内紧邻调用的地址载体折回直接取址参数。ARM64 会先以
+    /// <c>ADD Xn, SP, #offset</c> 计算 ref/out 槽地址，再经过若干不改写 Xn 的初始化指令
+    /// 才调用；若 SSA 只看到载体寄存器，调用写回就不会为底层槽位生成新版本。
+    /// 最近定义不是纯取址时保持原图，避免跨重定义猜测地址来源。
+    /// </summary>
+    internal static int RewriteImmediateAddressCarriers(
+        ISILControlFlowGraph graph,
+        ISet<ulong> readOnlyBoxTargets)
+    {
+        var rewritten = 0;
+
+        foreach (var block in graph.Blocks)
+        {
+            for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
+            {
+                var instruction = block.Instructions[instructionIndex];
+                if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall))
+                    continue;
+
+                var destinationIndex = instruction.OpCode is OpCode.Call or OpCode.IndirectCall ? 1 : -1;
+                for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    if (operandIndex == destinationIndex
+                        || instruction.Operands[operandIndex] is not Register carrier
+                        || IsReadOnlyBoxDataAddress(instruction, operandIndex, readOnlyBoxTargets)
+                        || FindNearestAddressDefinition(block, instructionIndex, carrier) is not { } addressed)
+                        continue;
+
+                    instruction.SetOperand(operandIndex, new AddressOf(addressed));
+                    rewritten++;
+                }
+            }
+        }
+
+        return rewritten;
+    }
+
+    private static Register? FindNearestAddressDefinition(Block block, int beforeIndex, Register carrier)
+    {
+        for (var index = beforeIndex - 1; index >= 0; index--)
+        {
+            var candidate = block.Instructions[index];
+            if (candidate.Destination is not Register destination
+                || destination.Number != carrier.Number
+                || destination.Name != carrier.Name)
+                continue;
+
+            if (candidate is not
+            {
+                OpCode: OpCode.Move,
+                Operands: [Register, AddressOf { Target: Register addressed }]
+            })
+                return null;
+
+            // 早期阶段尚未解析被调方法签名，不能把任意原生指针实参猜成托管 ref/out。
+            // out 形态会在地址计算后、调用前显式初始化同一槽；以该写入作为唯一提交证据，
+            // 排除值类型实例接收者及复用栈区的只读地址载体。
+            return block.Instructions
+                .Skip(index + 1)
+                .Take(beforeIndex - index - 1)
+                .Any(intermediate => intermediate.Destination is Register written
+                                     && SamePhysicalRegister(written, addressed))
+                ? addressed
+                : null;
+        }
+
+        return null;
+    }
+
+    private static bool SamePhysicalRegister(Register left, Register right) =>
+        left.Number == right.Number && left.Name == right.Name;
+
+    internal static bool IsReadOnlyBoxDataAddress(
+        Instruction instruction,
+        int operandIndex,
+        ISet<ulong> readOnlyBoxTargets)
+        => instruction.OpCode == OpCode.Call
+            && operandIndex == 3
+            && instruction.Operands.Count > 3
+            && instruction.Operands[0] is Immediate target
+            && readOnlyBoxTargets.Contains(target.UnsignedValue);
 
     private static bool IsReadAfter(Block block, int index, Register register)
     {
@@ -163,10 +354,19 @@ public class SsaForm
                 if (memory.Index is Register indexRegister)
                     yield return indexRegister;
             }
+            else if (operand is HomogeneousFloatingAggregateArgument aggregate)
+            {
+                foreach (var component in aggregate.Components)
+                foreach (var componentRegister in EnumerateOperandRegisters(component))
+                    yield return componentRegister;
+            }
         }
     }
 
-    private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
+    private void InsertPhiFunctions(
+        ISILControlFlowGraph graph,
+        DominatorInfo dominance,
+        IReadOnlyDictionary<Block, HashSet<int>> liveIn)
     {
         var defSites = GetDefinitionSites(graph);
 
@@ -188,6 +388,11 @@ public class SsaForm
 
                 foreach (var frontierBlock in frontier)
                 {
+                    // 值若在汇合块入口并不活跃，该Phi只会形成寄存器重用的死环；
+                    // pruned SSA在源头省略它，而不是等待后续启发式清理。
+                    if (!liveIn[frontierBlock].Contains(regNumber))
+                        continue;
+
                     // Only one phi per (block, register).
                     if (!hasPhi.Add(frontierBlock))
                         continue;
@@ -330,6 +535,23 @@ public class SsaForm
 
                 instruction.SetOperand(i, memory); // MemoryOperand is a struct, write the copy back
             }
+            else if (operand is HomogeneousFloatingAggregateArgument aggregate)
+            {
+                for (var componentIndex = 0; componentIndex < aggregate.Components.Count; componentIndex++)
+                {
+                    var component = aggregate.Components[componentIndex];
+                    if (component is Register componentRegister)
+                        aggregate.Components[componentIndex] = CurrentVersion(componentRegister.Number);
+                    else if (component is MemoryOperand componentMemory)
+                    {
+                        if (componentMemory.Base is Register baseRegister)
+                            componentMemory.Base = CurrentVersion(baseRegister.Number);
+                        if (componentMemory.Index is Register indexRegister)
+                            componentMemory.Index = CurrentVersion(indexRegister.Number);
+                        aggregate.Components[componentIndex] = componentMemory;
+                    }
+                }
+            }
         }
     }
 
@@ -371,9 +593,15 @@ public class SsaForm
     /// </summary>
     public static void Remove(MethodAnalysisContext method)
     {
-        var cfg = method.ControlFlowGraph!;
+        Remove(method.ControlFlowGraph!);
+    }
 
-        foreach (var block in cfg.Blocks)
+    internal static void Remove(ISILControlFlowGraph cfg)
+    {
+        var edgeBlocks = new List<Block>();
+        var nextBlockId = cfg.Blocks.Count == 0 ? 0 : cfg.Blocks.Max(block => block.ID) + 1;
+
+        foreach (var block in cfg.Blocks.ToList())
         {
             var phiInstructions = block.Instructions
                 .Where(i => i.OpCode == OpCode.Phi)
@@ -399,10 +627,37 @@ public class SsaForm
                     if (Equals(destination, source))
                         continue;
 
+                    // pruned SSA 按物理寄存器编号建 Phi；同一 ARM64 寄存器在不相交生命期中
+                    // 可以先承载值类型 Enumerator，随后承载 Single。类型传播已经证明两端属于
+                    // 不同托管值时，这条 Phi 入边只是寄存器复用伪依赖，绝不能生成非法赋值。
+                    if (!ShouldEmitPhiCopy(destination, source))
+                        continue;
+
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
 
-                InsertBeforeTerminator(predecessor, moves);
+                if (moves.Count == 0)
+                    continue;
+
+                if (predecessor.Successors.Count <= 1)
+                {
+                    InsertBeforeTerminator(predecessor, moves);
+                    continue;
+                }
+
+                // 条件前驱上的Phi复制属于一条特定边；直接塞进前驱会让另一分支也执行复制。
+                // 为该边建立唯一中间块，多个Phi共享同一组复制与同一个跳转。
+                var edgeBlock = new Block
+                {
+                    ID = nextBlockId++,
+                    BlockType = BlockType.OneWay,
+                    Instructions = [.. moves, new Instruction(-1, OpCode.Jump, block)],
+                    Predecessors = [predecessor],
+                    Successors = [block]
+                };
+                RedirectEdge(predecessor, block, edgeBlock);
+                block.Predecessors[predIndex] = edgeBlock;
+                edgeBlocks.Add(edgeBlock);
             }
 
             foreach (var phi in phiInstructions)
@@ -412,8 +667,45 @@ public class SsaForm
             }
         }
 
+        cfg.Blocks.AddRange(edgeBlocks);
+
         cfg.RemoveNops();
         cfg.RemoveEmptyBlocks();
+    }
+
+    /// <summary>
+    /// 判定退 SSA 时是否应把一条 Phi 入边写成托管赋值。未知类型保留既有数据流；已知类型
+    /// 必须相同，或源引用类型可赋给目标基类/接口。不同值类型及值类型到引用类型都属于
+    /// 物理寄存器复用证据，不参与当前 Phi。
+    /// </summary>
+    internal static bool ShouldEmitPhiCopy(IOperand destination, IOperand source)
+    {
+        if (destination is not LocalVariable destinationLocal
+            || source is not LocalVariable sourceLocal
+            || destinationLocal.Type == null
+            || sourceLocal.Type == null)
+            return true;
+
+        return GenericCallRebinder.TypesEquivalent(destinationLocal.Type, sourceLocal.Type)
+               || sourceLocal.Type.IsAssignableTo(destinationLocal.Type);
+    }
+
+    /// <summary>
+    /// 把前驱到目标的单条边重定向到边块，同时修正显式真分支目标；假分支由Successors顺序保持。
+    /// </summary>
+    private static void RedirectEdge(Block predecessor, Block target, Block edgeBlock)
+    {
+        var successorIndex = predecessor.Successors.IndexOf(target);
+        if (successorIndex < 0)
+            throw new DecompilerException($"退SSA关键边缺少后继：from={predecessor.ID}，to={target.ID}");
+
+        predecessor.Successors[successorIndex] = edgeBlock;
+        if (predecessor.Instructions.LastOrDefault() is
+            { OpCode: OpCode.Jump or OpCode.ConditionalJump, Operands.Count: > 0 } terminator
+            && ReferenceEquals(terminator.Operands[0], target))
+        {
+            terminator.SetOperand(0, edgeBlock);
+        }
     }
 
     /// <summary>

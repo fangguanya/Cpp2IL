@@ -1,7 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
+using Disarm;
+using Disarm.InternalDisassembly;
+using Iced.Intel;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -13,8 +18,29 @@ namespace Cpp2IL.Core.Analysis;
 public static class ThrowHelperRecovery
 {
     private const int MaxDepth = 5;
-    private const int MaxRaiserDepth = 3;
     private const int MaxStringLength = 64;
+    private const int MaxArm64InstructionCount = 32;
+
+    internal enum Arm64ThrowHelperOperation
+    {
+        Other,
+        Adrp,
+        AddImmediate,
+        Call,
+        Branch,
+        Return,
+    }
+
+    /// <summary>
+    /// 仅保留异常辅助函数识别所需的 ARM64 指令字段，避免分析阶段重复解释完整指令语义。
+    /// </summary>
+    internal readonly record struct Arm64ThrowHelperInstruction(
+        Arm64ThrowHelperOperation Operation,
+        ulong Address = 0,
+        Arm64Register Destination = Arm64Register.INVALID,
+        Arm64Register Source = Arm64Register.INVALID,
+        long Immediate = 0,
+        ulong Target = 0);
 
     public static TypeAnalysisContext? GetThrownException(ApplicationAnalysisContext appContext, ulong address)
     {
@@ -28,44 +54,6 @@ public static class ThrowHelperRecovery
         return type == null ? null : appContext.ResolveContextForType(type);
     }
 
-    // Whether the provided method raises whatever exception it is handed
-    // e.g. il2cpp_codegen_raise_exception, il2cpp_codegen_rethrow_exception, vm::Exception::Raise
-    public static bool IsExceptionRaiser(ApplicationAnalysisContext appContext, ulong address)
-    {
-        if (address == 0)
-            return false;
-
-        if (appContext.ExceptionRaisersByAddress.TryGetValue(address, out var cached))
-            return cached;
-
-        var raise = appContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_exception_raise;
-
-        if (raise == 0)
-            return false;
-
-        // grab the c++ exception raise method from the end of il2cpp::vm::Exception::Raise
-        var nativeThrow = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, raise).CallTargets.LastOrDefault();
-
-        // and then check if we're calling it
-        var result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
-
-        appContext.ExceptionRaisersByAddress[address] = result;
-        return result;
-    }
-
-    private static bool ReachesCall(ApplicationAnalysisContext appContext, ulong address, ulong wanted, int depth, HashSet<ulong> visited)
-    {
-        if (address == wanted)
-            return true;
-
-        if (depth >= MaxRaiserDepth || !visited.Add(address))
-            return false;
-
-        var (_, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
-
-        return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
-    }
-
     private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth)
     {
         if (appContext.ThrowHelperNamesByAddress.TryGetValue(address, out var cached))
@@ -74,39 +62,193 @@ public static class ThrowHelperRecovery
         if (address == 0 || depth >= MaxDepth)
             return null;
 
-        // Insert before recursing so a cycle terminates
-        appContext.ThrowHelperNamesByAddress[address] = null;
+        return appContext.ThrowHelperNamesByAddress.Resolve(address, () => ResolveNameUncached(appContext, address, depth));
+    }
 
-        var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
+    private static string? ResolveNameUncached(ApplicationAnalysisContext appContext, ulong address, int depth)
+    {
+        if (appContext.Binary.InstructionSetId == DefaultInstructionSets.ARM_V8)
+            return ResolveArm64NameUncached(appContext, address, depth);
 
-        var name = FindExceptionName(appContext, dataReferences);
+        return ResolveX86NameUncached(appContext, address, depth);
+    }
+
+    private static string? ResolveX86NameUncached(ApplicationAnalysisContext appContext, ulong address, int depth)
+    {
+        InstructionList body;
+
+        try
+        {
+            body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, appContext.Binary);
+        }
+        catch
+        {
+            return null;
+        }
+
+        var name = FindExceptionName(appContext, body);
 
         if (name == null)
         {
-            foreach (var target in callTargets)
+            foreach (var instruction in body)
             {
-                name = ResolveName(appContext, target, depth + 1);
+                if (instruction.Mnemonic != Mnemonic.Call || instruction.Op0Kind != OpKind.NearBranch64)
+                    continue;
+
+                name = ResolveName(appContext, instruction.NearBranchTarget, depth + 1);
 
                 if (name != null)
                     break;
             }
         }
 
-        appContext.ThrowHelperNamesByAddress[address] = name;
         return name;
     }
 
-    private static string? FindExceptionName(ApplicationAnalysisContext appContext, IReadOnlyList<ulong> dataReferences)
+    private static string? ResolveArm64NameUncached(ApplicationAnalysisContext appContext, ulong address, int depth)
     {
-        foreach (var address in dataReferences)
-            if (ReadCStringAtVirtualAddress(appContext, address) is { } text && text.EndsWith("Exception", StringComparison.Ordinal))
-                return text;
+        IReadOnlyList<Arm64Instruction> body;
+
+        try
+        {
+            body = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(
+                appContext.Binary,
+                address,
+                managed: false,
+                count: MaxArm64InstructionCount);
+        }
+        catch
+        {
+            return null;
+        }
+
+        var projectedBody = new Arm64ThrowHelperInstruction[body.Count];
+
+        for (var i = 0; i < body.Count; i++)
+            projectedBody[i] = ProjectArm64Instruction(body[i]);
+
+        return FindArm64ExceptionName(
+            projectedBody,
+            candidateAddress => ReadCStringAtVirtualAddress(appContext, candidateAddress),
+            target => ResolveName(appContext, target, depth + 1));
+    }
+
+    private static Arm64ThrowHelperInstruction ProjectArm64Instruction(Arm64Instruction instruction)
+    {
+        if (instruction.Mnemonic == Arm64Mnemonic.ADRP
+            && instruction.Op0Kind == Arm64OperandKind.Register
+            && instruction.Op1Kind == Arm64OperandKind.Immediate)
+        {
+            return new(
+                Arm64ThrowHelperOperation.Adrp,
+                instruction.Address,
+                instruction.Op0Reg,
+                Immediate: instruction.Op1Imm);
+        }
+
+        if (instruction.Mnemonic == Arm64Mnemonic.ADD
+            && instruction.Op0Kind == Arm64OperandKind.Register
+            && instruction.Op1Kind == Arm64OperandKind.Register
+            && instruction.Op2Kind == Arm64OperandKind.Immediate)
+        {
+            return new(
+                Arm64ThrowHelperOperation.AddImmediate,
+                instruction.Address,
+                instruction.Op0Reg,
+                instruction.Op1Reg,
+                instruction.Op2Imm);
+        }
+
+        if (instruction.Mnemonic == Arm64Mnemonic.BL && instruction.BranchTarget != 0)
+            return new(Arm64ThrowHelperOperation.Call, instruction.Address, Target: instruction.BranchTarget);
+
+        if (instruction.Mnemonic == Arm64Mnemonic.B
+            && instruction.BranchTarget != 0
+            && NewArmV8InstructionSet.IsUnconditionalBranchCode(instruction.MnemonicConditionCode))
+        {
+            return new(Arm64ThrowHelperOperation.Branch, instruction.Address, Target: instruction.BranchTarget);
+        }
+
+        if (instruction.Mnemonic is Arm64Mnemonic.RET or Arm64Mnemonic.BR)
+            return new(Arm64ThrowHelperOperation.Return, instruction.Address);
+
+        return new(Arm64ThrowHelperOperation.Other, instruction.Address);
+    }
+
+    /// <summary>
+    /// 沿 ARM64 的 ADRP/ADD 字符串地址和直接调用链解析异常名；尾调用是当前路径的唯一后继。
+    /// </summary>
+    internal static string? FindArm64ExceptionName(
+        IReadOnlyList<Arm64ThrowHelperInstruction> body,
+        Func<ulong, string?> readCString,
+        Func<ulong, string?> resolveTarget)
+    {
+        // netstandard2.0 不提供 ThrowIfNull；显式校验保持所有发布目标的异常类型与参数名一致。
+        if (body == null)
+            throw new ArgumentNullException(nameof(body));
+        if (readCString == null)
+            throw new ArgumentNullException(nameof(readCString));
+        if (resolveTarget == null)
+            throw new ArgumentNullException(nameof(resolveTarget));
+
+        var absoluteAddresses = new Dictionary<Arm64Register, ulong>();
+
+        foreach (var instruction in body)
+        {
+            switch (instruction.Operation)
+            {
+                case Arm64ThrowHelperOperation.Adrp:
+                    absoluteAddresses[instruction.Destination] = NewArmV8InstructionSet.ResolveAdrpPageAddress(
+                        instruction.Address,
+                        instruction.Immediate);
+                    break;
+                case Arm64ThrowHelperOperation.AddImmediate:
+                    if (!absoluteAddresses.TryGetValue(instruction.Source, out var baseAddress))
+                        break;
+
+                    var stringAddress = unchecked(baseAddress + unchecked((ulong)instruction.Immediate));
+                    absoluteAddresses[instruction.Destination] = stringAddress;
+
+                    if (readCString(stringAddress) is { } text
+                        && text.EndsWith("Exception", StringComparison.Ordinal))
+                    {
+                        return text;
+                    }
+
+                    break;
+                case Arm64ThrowHelperOperation.Call:
+                    if (resolveTarget(instruction.Target) is { } calledName)
+                        return calledName;
+                    break;
+                case Arm64ThrowHelperOperation.Branch:
+                    return resolveTarget(instruction.Target);
+                case Arm64ThrowHelperOperation.Return:
+                    return null;
+            }
+        }
 
         return null;
     }
 
-    //TODO didn't we have a helper for this somewhere? Can't find it. Maybe got deleted. Maybe it's just too late
-    internal static string? ReadCStringAtVirtualAddress(ApplicationAnalysisContext appContext, ulong address, int maxLength = MaxStringLength)
+    private static string? FindExceptionName(ApplicationAnalysisContext appContext, InstructionList body)
+    {
+        foreach (var instruction in body)
+        {
+            if (instruction.Mnemonic != Mnemonic.Lea || !instruction.IsIPRelativeMemoryOperand)
+                continue;
+
+            if (ReadCStringAtVirtualAddress(appContext, instruction.IPRelativeMemoryAddress) is { } text && text.EndsWith("Exception", StringComparison.Ordinal))
+                return text;
+        }
+
+        return null;
+    }
+
+    // 在受控长度内读取原生只读区中的 ASCII 零结尾字符串。
+    internal static string? ReadCStringAtVirtualAddress(
+        ApplicationAnalysisContext appContext,
+        ulong address,
+        int maxLength = MaxStringLength)
     {
         long offset;
 

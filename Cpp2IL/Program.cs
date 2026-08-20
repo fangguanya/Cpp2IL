@@ -10,6 +10,7 @@ using CommandLine;
 using Cpp2IL.Core;
 using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Logging;
+using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 #if !DEBUG
 using Cpp2IL.Core.Exceptions;
@@ -559,6 +560,18 @@ internal static class Program
         result.OutputRootDirectory = options.OutputRootDir;
 
         result.LowMemoryMode = options.LowMemoryMode;
+        result.MaximumMethodSizeBytes = ValidateMaximumMethodSizeBytes(options.MaximumMethodSizeBytes);
+        result.IsilDumpAssemblyFilters = IsilDumpSelectionHelper.NormalizeFilters(
+            options.IsilAssemblyFilters,
+            "ISIL 程序集");
+        result.IsilDumpTypeFilters = IsilDumpSelectionHelper.NormalizeFilters(
+            options.IsilTypeFilters,
+            "ISIL 类型");
+        result.IsilDumpMethodFilters = IsilDumpSelectionHelper.NormalizeFilters(
+            options.IsilMethodFilters,
+            "ISIL 方法");
+        if (result.IsilDumpMethodFilters.Count > 0 && result.IsilDumpTypeFilters.Count == 0)
+            throw new SoftException("ISIL 方法筛选必须同时指定精确类型筛选。");
 
         // if(string.IsNullOrEmpty(options.OutputFormatId))      // throw new SoftException("No output format specified, so nothing to do!");
 
@@ -650,6 +663,8 @@ internal static class Program
         if (!runtimeArgs.Valid)
             throw new SoftException("Arguments have Valid = false");
 
+        runtimeArgs.MaximumMethodSizeBytes = ValidateMaximumMethodSizeBytes(runtimeArgs.MaximumMethodSizeBytes);
+
         Cpp2IlApi.RuntimeOptions = runtimeArgs;
 
         var executionStart = DateTime.Now;
@@ -722,6 +737,18 @@ internal static class Program
 
         Logger.InfoNewline($"Done. Total execution time: {(DateTime.Now - executionStart).TotalMilliseconds}ms");
         return 0;
+    }
+
+    private static int ValidateMaximumMethodSizeBytes(int maximumMethodSizeBytes)
+    {
+        try
+        {
+            return MethodAnalysisSizePolicy.ValidateMaximumBytes(maximumMethodSizeBytes);
+        }
+        catch (ArgumentOutOfRangeException exception)
+        {
+            throw new SoftException(exception.Message);
+        }
     }
 
     private static void RunProcessingLayers(Cpp2IlRuntimeArgs runtimeArgs, Action<Cpp2IlProcessingLayer> run)

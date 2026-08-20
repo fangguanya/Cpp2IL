@@ -66,6 +66,8 @@
     </ItemGroup>
 
     <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+      <!-- IL恢复账本在netstandard2.0目标下也使用统一JSON写入器。 -->
+      <PackageReference Include="System.Text.Json" Version="10.0.0" />
       <PackageReference Include="System.ValueTuple" Version="4.6.2" />
     </ItemGroup>
 

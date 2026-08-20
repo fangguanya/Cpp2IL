@@ -18,6 +18,71 @@ public class SsaSimplifierTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 聚合副本可传播到局部变量取地址()
+    {
+        var source = Local("source");
+        var destination = Local("destination");
+
+        var live = Run(new List<Instruction>
+        {
+            new(0, OpCode.Move, destination, source),
+            new(1, OpCode.CallVoid, Str("mutate"), new AddressOf(destination)),
+            new(2, OpCode.Return),
+        });
+
+        var call = live.Single(instruction => instruction.OpCode == OpCode.CallVoid);
+        Assert.Multiple(() =>
+        {
+            Assert.That(((AddressOf)call.Operands[1]).Target, Is.SameAs(source));
+            Assert.That(live.Any(instruction => instruction.OpCode == OpCode.Move), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一聚合副本的多个取地址使用全部传播()
+    {
+        var source = Local("source");
+        var destination = Local("destination");
+
+        var live = Run(new List<Instruction>
+        {
+            new(0, OpCode.Move, destination, source),
+            new(1, OpCode.CallVoid, Str("first"), new AddressOf(destination)),
+            new(2, OpCode.CallVoid, Str("second"), new AddressOf(destination)),
+            new(3, OpCode.Return),
+        });
+
+        var targets = live
+            .Where(instruction => instruction.OpCode == OpCode.CallVoid)
+            .Select(instruction => ((AddressOf)instruction.Operands[1]).Target)
+            .ToArray();
+        Assert.That(targets.All(target => ReferenceEquals(target, source)), Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 常量来源不得写入局部变量取地址()
+    {
+        var destination = Local("destination");
+
+        var live = Run(new List<Instruction>
+        {
+            new(0, OpCode.Move, destination, Imm(7)),
+            new(1, OpCode.CallVoid, Str("mutate"), new AddressOf(destination)),
+            new(2, OpCode.Return),
+        });
+
+        var call = live.Single(instruction => instruction.OpCode == OpCode.CallVoid);
+        Assert.Multiple(() =>
+        {
+            Assert.That(((AddressOf)call.Operands[1]).Target, Is.SameAs(destination));
+            Assert.That(live.Any(instruction => instruction.OpCode == OpCode.Move), Is.True);
+        });
+    }
+
+    [Test]
     public void ForwardsConstantThroughCopyChainToUse()
     {
         var t1 = Local("t1");

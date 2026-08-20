@@ -119,7 +119,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             return 0;
 
         var decoder = Decoder.Create(binary.is32Bit ? 32 : 64, new ByteArrayCodeReader(raw.Slice((int)rawAddress, length).ToArray()), thunkAddress);
-        
+
         for (var i = 0; i < 4; i++)
         {
             var instruction = decoder.Decode();

@@ -16,6 +16,13 @@ public static class ContextToFieldDescriptor
         return new FieldSignature(context.ToTypeSignature());
     }
 
+    private static FieldSignature ToFieldSignature(
+        this FieldAnalysisContext context,
+        ModuleDefinition parentModule)
+    {
+        return new FieldSignature(context.ToTypeSignature(parentModule));
+    }
+
     public static IFieldDescriptor ToFieldDescriptor(this FieldAnalysisContext context)
     {
         return context is ConcreteGenericFieldAnalysisContext concreteField
@@ -29,5 +36,24 @@ public static class ContextToFieldDescriptor
             context.DeclaringType.ToTypeSignature().ToTypeDefOrRef(),
             context.Name,
             context.BaseFieldContext.ToFieldSignature());
+    }
+
+    public static IFieldDescriptor ToFieldDescriptor(
+        this FieldAnalysisContext context,
+        ModuleDefinition parentModule)
+    {
+        return context is ConcreteGenericFieldAnalysisContext concreteField
+            ? concreteField.ToFieldDescriptor(parentModule)
+            : parentModule.DefaultImporter.ImportField(context.GetFieldDefinition());
+    }
+
+    public static IFieldDescriptor ToFieldDescriptor(
+        this ConcreteGenericFieldAnalysisContext context,
+        ModuleDefinition parentModule)
+    {
+        return new MemberReference(
+            context.DeclaringType.ToTypeSignature(parentModule).ToTypeDefOrRef(),
+            context.Name,
+            context.BaseFieldContext.ToFieldSignature(parentModule));
     }
 }
