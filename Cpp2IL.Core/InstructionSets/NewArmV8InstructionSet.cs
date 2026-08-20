@@ -1728,12 +1728,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var instruction = instructions[instructionIndex];
             if (instruction.OpCode is OpCode.Call or OpCode.CallVoid)
             {
-                if (Arm64CallingConventionResolver.HasRawArgumentLayout(instruction)
-                    && instruction.Operands[0] is Immediate target
+                if (instruction.Operands[0] is Immediate target
                     && methodsByAddress.TryGetValue(target.UnsignedValue, out var callees)
                     && callees.Count == 1
                     && activeFields.Any(active =>
-                        Arm64CallingConventionResolver.UsesGeneralRegisterForManagedArgumentOfType(
+                        EnumerateSourceRegisters(instruction)
+                            .Any(register => register.Name == active.Key)
+                        && Arm64CallingConventionResolver.UsesGeneralRegisterForManagedArgumentOfType(
                             callees[0],
                             active.Key,
                             active.Value.FieldType)))

@@ -387,7 +387,7 @@ public class Arm64CallingConventionResolverTests
             MethodAttributes.Public | MethodAttributes.Static,
             [stringType]);
         var callOperands = new List<IOperand> { new Immediate(targetAddress) };
-        callOperands.AddRange(Arm64CallingConventionResolver.ResolveForUnmanaged());
+        callOperands.AddRange(Arm64CallingConventionResolver.ArgumentOperands(consumeString));
         var call = new Instruction(0, OpCode.CallVoid, callOperands);
         var methodsByAddress = new Dictionary<ulong, List<MethodAnalysisContext>>
         {
@@ -424,7 +424,7 @@ public class Arm64CallingConventionResolverTests
             MethodAttributes.Public,
             []);
         var callOperands = new List<IOperand> { new Immediate(targetAddress) };
-        callOperands.AddRange(Arm64CallingConventionResolver.ResolveForUnmanaged());
+        callOperands.AddRange(Arm64CallingConventionResolver.ArgumentOperands(inspectAggregate));
         var call = new Instruction(0, OpCode.CallVoid, callOperands);
         var methodsByAddress = new Dictionary<ulong, List<MethodAnalysisContext>>
         {
