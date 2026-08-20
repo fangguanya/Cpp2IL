@@ -95,9 +95,19 @@ public static class MetadataResolver
     internal static TUsage? ResolveAbsoluteSlotUsage<TUsage>(
         ulong address,
         Func<ulong, TUsage?> directResolver,
-        Func<ulong, long, TUsage?> tableEntryResolver)
+        Func<ulong, long, TUsage?> tableEntryResolver,
+        Func<TUsage, bool>? acceptance = null)
         where TUsage : class
-        => directResolver(address) ?? tableEntryResolver(address, 0);
+    {
+        var direct = directResolver(address);
+        if (direct != null && (acceptance == null || acceptance(direct)))
+            return direct;
+
+        var tableEntry = tableEntryResolver(address, 0);
+        return tableEntry != null && (acceptance == null || acceptance(tableEntry))
+            ? tableEntry
+            : null;
+    }
 
     /// <summary>
     /// 初始化保护区裁除和首次类型传播完成后，恢复“绝对槽保存编码项地址，强类型字符串局部
@@ -107,12 +117,27 @@ public static class MetadataResolver
     public static int ResolveTypedPost27StringLoads(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
+        var instructions = method.ControlFlowGraph!.Instructions;
         var changed = ResolveTypedPost27StringLoads(
-            method.ControlFlowGraph!.Instructions,
+            instructions,
             method.AppContext.SystemTypes.SystemStringType,
             (address, offset) =>
             {
                 var usage = libContext.CheckForPost27GlobalTableEntryAt(address, offset);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+        changed += ResolvePost27ConditionalStringSelections(
+            instructions,
+            method.AppContext.SystemTypes.SystemStringType,
+            address =>
+            {
+                var usage = ResolveAbsoluteSlotUsage(
+                    address,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt,
+                    candidate => candidate.Type == MetadataUsageType.StringLiteral);
                 return usage?.Type == MetadataUsageType.StringLiteral
                     ? new StringLiteral(usage.AsLiteral())
                     : null;
@@ -124,6 +149,103 @@ public static class MetadataResolver
                 "MetadataResolver");
 
         return changed;
+    }
+
+    /// <summary>
+    /// 恢复 ARM64 的“两个字符串元数据槽经 CSEL 选择，再统一解引用”形态。两个输入槽
+    /// 必须都由元数据证明为字符串；提交后选择结果直接承载托管字符串，并只删除其零偏移
+    /// 读取用途，内存写目标和带偏移访问保持原样。
+    /// </summary>
+    internal static int ResolvePost27ConditionalStringSelections(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext stringType,
+        Func<ulong, StringLiteral?> absoluteSlotResolver)
+    {
+        var definitions = BuildUniqueDefinitions(instructions);
+        var resolvedAddresses = new Dictionary<LocalVariable, ulong?>();
+        var resolvedSlots = new Dictionary<ulong, StringLiteral?>();
+        var changed = 0;
+
+        ulong? ResolveSlotAddress(IOperand operand)
+        {
+            if (operand is MemoryOperand
+                {
+                    Base: null,
+                    Index: null,
+                    Scale: 0,
+                    Addend: >= 0
+                } absoluteSlot)
+                return (ulong)absoluteSlot.Addend;
+
+            return ResolveAbsoluteSlotAddress(operand, definitions, [], resolvedAddresses);
+        }
+
+        StringLiteral? ResolveSlot(ulong address)
+        {
+            if (!resolvedSlots.TryGetValue(address, out var resolved))
+            {
+                resolved = absoluteSlotResolver(address);
+                resolvedSlots[address] = resolved;
+            }
+
+            return resolved;
+        }
+
+        foreach (var selection in instructions)
+        {
+            if (selection is not
+                {
+                    OpCode: OpCode.ConditionalSelect,
+                    Operands:
+                    [
+                        LocalVariable destination,
+                        _,
+                        var whenTrue,
+                        var whenFalse
+                    ]
+                }
+                || ResolveSlotAddress(whenTrue) is not { } trueSlotAddress
+                || ResolveSlotAddress(whenFalse) is not { } falseSlotAddress
+                || ResolveSlot(trueSlotAddress) is not { } trueLiteral
+                || ResolveSlot(falseSlotAddress) is not { } falseLiteral)
+                continue;
+
+            selection.SetOperand(2, trueLiteral);
+            selection.SetOperand(3, falseLiteral);
+            destination.Type = stringType;
+            RewriteManagedStringDereferences(instructions, destination);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 字符串元数据槽已经提升为托管字符串后，只改写数据流中的零偏移读取。通过统一的
+    /// SourcesAndConstants 判定读取位置，避免为 Return、Move 和 Call 重复维护操作码清单。
+    /// </summary>
+    private static void RewriteManagedStringDereferences(
+        IReadOnlyList<Instruction> instructions,
+        LocalVariable managedString)
+    {
+        foreach (var instruction in instructions)
+        {
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (instruction.Operands[operandIndex] is not MemoryOperand
+                    {
+                        Base: LocalVariable baseLocal,
+                        Index: null,
+                        Scale: 0,
+                        Addend: 0
+                    } memory
+                    || !ReferenceEquals(baseLocal, managedString)
+                    || !instruction.SourcesAndConstants.Any(source => source.Equals(memory)))
+                    continue;
+
+                instruction.SetOperand(operandIndex, managedString);
+            }
+        }
     }
 
     /// <summary>

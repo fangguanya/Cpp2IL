@@ -38,7 +38,8 @@ public static class RuntimeMetadataStringTableRecovery
                 var usage = MetadataResolver.ResolveAbsoluteSlotUsage(
                     address,
                     libContext.GetAnyGlobalByAddress,
-                    libContext.CheckForPost27GlobalTableEntryAt);
+                    libContext.CheckForPost27GlobalTableEntryAt,
+                    candidate => candidate.Type == MetadataUsageType.StringLiteral);
                 return usage?.Type == MetadataUsageType.StringLiteral
                     ? new StringLiteral(usage.AsLiteral())
                     : null;

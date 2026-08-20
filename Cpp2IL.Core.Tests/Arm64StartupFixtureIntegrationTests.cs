@@ -23,30 +23,7 @@ public class Arm64StartupFixtureIntegrationTests
     [Category("fixture集成")]
     public void StartupMethodsUseElfVirtualAddressesAndCompleteBodies()
     {
-        var binaryPath = Environment.GetEnvironmentVariable(BinaryEnvironmentVariable);
-        var metadataPath = Environment.GetEnvironmentVariable(MetadataEnvironmentVariable);
-        var unityVersionText = Environment.GetEnvironmentVariable(UnityVersionEnvironmentVariable);
-        if (string.IsNullOrWhiteSpace(binaryPath) ||
-            string.IsNullOrWhiteSpace(metadataPath) ||
-            string.IsNullOrWhiteSpace(unityVersionText))
-        {
-            Assert.Ignore($"需要设置 {BinaryEnvironmentVariable}、{MetadataEnvironmentVariable} 与 {UnityVersionEnvironmentVariable}。");
-        }
-
-        Assert.That(File.Exists(binaryPath), Is.True, $"fixture 二进制不存在：{binaryPath}");
-        Assert.That(File.Exists(metadataPath), Is.True, $"fixture 元数据不存在：{metadataPath}");
-
-        // 正式路径必须使用默认 Disarm ARM64 实现，不让旧 Capstone 开关污染结果。
-        Environment.SetEnvironmentVariable("CPP2IL_LEGACY_ARM64", null);
-        Cpp2IlApi.ResetInternalState();
-        Cpp2IlApi.RuntimeOptions = new Cpp2IlRuntimeArgs
-        {
-            MaximumMethodSizeBytes = MethodAnalysisSizePolicy.DefaultMaximumBytes
-        };
-        EnsureCorePluginInitialized();
-        Cpp2IlApi.InitializeLibCpp2Il(binaryPath!, metadataPath!, UnityVersion.Parse(unityVersionText!));
-
-        var context = Cpp2IlApi.CurrentAppContext!;
+        var context = LoadFixture();
         Assert.That(context.InstructionSet, Is.TypeOf<NewArmV8InstructionSet>());
 
         var awake = FindMethod(context, 0x060036C5);
@@ -72,6 +49,65 @@ public class Arm64StartupFixtureIntegrationTests
 
         loadGameVars.Analyze();
         Assert.That(loadGameVars.ConvertedIsil, Is.Not.Null.And.Count.GreaterThanOrEqualTo(5042));
+    }
+
+    [Test]
+    [Category("fixture集成")]
+    public void 字符串元数据GOT槽经二级读取解析为字面量()
+    {
+        var context = LoadFixture();
+        var libContext = context.LibCpp2IlContext;
+        var slots = new ulong[] { 0x5A01398, 0x5A01388, 0x59EFE68, 0x59EFE58 };
+        var usages = slots.Select(address => new
+        {
+            Address = address,
+            Direct = libContext.GetAnyGlobalByAddress(address),
+            Table = libContext.CheckForPost27GlobalTableEntryAt(address, 0),
+        }).ToArray();
+
+        foreach (var usage in usages)
+        {
+            TestContext.Out.WriteLine(
+                $"slot=0x{usage.Address:X}; direct={usage.Direct?.Type}; table={usage.Table?.Type}; " +
+                $"literal={(usage.Table?.Type == MetadataUsageType.StringLiteral ? usage.Table.AsLiteral() : "<无>")}");
+        }
+
+        Assert.That(usages.Select(usage => usage.Table?.Type),
+            Is.All.EqualTo(MetadataUsageType.StringLiteral));
+        Assert.That(usages.Select(usage => usage.Table!.AsLiteral()), Is.EqualTo(new[]
+        {
+            "white",
+            "yellow",
+            "a16_darkCheckboxChecked",
+            "a16_darkCheckboxChecked-dm",
+        }));
+    }
+
+    private static ApplicationAnalysisContext LoadFixture()
+    {
+        var binaryPath = Environment.GetEnvironmentVariable(BinaryEnvironmentVariable);
+        var metadataPath = Environment.GetEnvironmentVariable(MetadataEnvironmentVariable);
+        var unityVersionText = Environment.GetEnvironmentVariable(UnityVersionEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(binaryPath) ||
+            string.IsNullOrWhiteSpace(metadataPath) ||
+            string.IsNullOrWhiteSpace(unityVersionText))
+        {
+            Assert.Ignore($"需要设置 {BinaryEnvironmentVariable}、{MetadataEnvironmentVariable} 与 {UnityVersionEnvironmentVariable}。");
+        }
+
+        Assert.That(File.Exists(binaryPath), Is.True, $"fixture 二进制不存在：{binaryPath}");
+        Assert.That(File.Exists(metadataPath), Is.True, $"fixture 元数据不存在：{metadataPath}");
+
+        // 正式路径必须使用默认 Disarm ARM64 实现，不让旧 Capstone 开关污染结果。
+        Environment.SetEnvironmentVariable("CPP2IL_LEGACY_ARM64", null);
+        Cpp2IlApi.ResetInternalState();
+        Cpp2IlApi.RuntimeOptions = new Cpp2IlRuntimeArgs
+        {
+            MaximumMethodSizeBytes = MethodAnalysisSizePolicy.DefaultMaximumBytes
+        };
+        EnsureCorePluginInitialized();
+        Cpp2IlApi.InitializeLibCpp2Il(binaryPath!, metadataPath!, UnityVersion.Parse(unityVersionText!));
+        return Cpp2IlApi.CurrentAppContext!;
     }
 
     private static void EnsureCorePluginInitialized()

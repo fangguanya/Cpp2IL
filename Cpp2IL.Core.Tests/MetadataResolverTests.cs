@@ -698,6 +698,29 @@ public class MetadataResolverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 绝对槽直接误解码为其他类型时继续读取字符串二级表项()
+    {
+        var tableCalls = 0;
+
+        var resolved = MetadataResolver.ResolveAbsoluteSlotUsage(
+            0x5A01398,
+            _ => "method",
+            (address, offset) =>
+            {
+                tableCalls++;
+                return address == 0x5A01398 && offset == 0 ? "string" : null;
+            },
+            value => value == "string");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.EqualTo("string"));
+            Assert.That(tableCalls, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 绝对槽两种布局均未解码时保持空结果()
     {
@@ -839,6 +862,151 @@ public class MetadataResolverTests
             Assert.That(instructions[7].Operands[1], Is.EqualTo(ambiguousMemory));
             Assert.That(instructions[8].Operands[1], Is.EqualTo(unresolvedMemory));
             Assert.That(instructions[9].Operands[1], Is.EqualTo(differentMemory));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 两个Post27字符串槽经条件选择后恢复字面量并删除返回解引用()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            appContext.SystemTypes.SystemBooleanType);
+        var whenTrue = new LocalVariable("whenTrue", new Register(null, "X20", 1));
+        var whenFalse = new LocalVariable("whenFalse", new Register(null, "X21", 1));
+        var selected = new LocalVariable("selected", new Register(null, "X8", 1));
+        var trueDefinition = new Instruction(0, OpCode.Move, whenTrue, new MemoryOperand(addend: 0x5A01398));
+        var falseDefinition = new Instruction(1, OpCode.Move, whenFalse, new MemoryOperand(addend: 0x5A01388));
+        var selection = new Instruction(
+            2,
+            OpCode.ConditionalSelect,
+            selected,
+            condition,
+            whenTrue,
+            whenFalse);
+        var returnedMemory = new MemoryOperand(selected);
+        var returned = new Instruction(3, OpCode.Return, returnedMemory);
+        var writeTarget = new MemoryOperand(selected);
+        var write = new Instruction(4, OpCode.Move, writeTarget, new Immediate(1));
+        var values = new Dictionary<ulong, string>
+        {
+            [0x5A01398] = "silver",
+            [0x5A01388] = "gold",
+        };
+
+        var changed = MetadataResolver.ResolvePost27ConditionalStringSelections(
+            [trueDefinition, falseDefinition, selection, returned, write],
+            appContext.SystemTypes.SystemStringType,
+            address => values.TryGetValue(address, out var value) ? new StringLiteral(value) : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(selected.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+            Assert.That(((StringLiteral)selection.Operands[2]).Value, Is.EqualTo("silver"));
+            Assert.That(((StringLiteral)selection.Operands[3]).Value, Is.EqualTo("gold"));
+            Assert.That(trueDefinition.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(falseDefinition.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(returned.Operands[0], Is.SameAs(selected));
+            Assert.That(write.Operands[0], Is.EqualTo(writeTarget));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百个同槽字符串条件选择只解析每个地址一次()
+    {
+        const int selectionCount = 400;
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            appContext.SystemTypes.SystemBooleanType);
+        var instructions = new List<Instruction>();
+        var selectedValues = new List<LocalVariable>();
+        for (var index = 0; index < selectionCount; index++)
+        {
+            var selected = new LocalVariable($"selected{index}", new Register(null, "X8", index + 1));
+            selectedValues.Add(selected);
+            instructions.Add(new Instruction(
+                index * 2,
+                OpCode.ConditionalSelect,
+                selected,
+                condition,
+                new MemoryOperand(addend: 0),
+                new MemoryOperand(addend: long.MaxValue)));
+            instructions.Add(new Instruction(index * 2 + 1, OpCode.Return, new MemoryOperand(selected)));
+        }
+
+        var resolverCalls = 0;
+        var changed = MetadataResolver.ResolvePost27ConditionalStringSelections(
+            instructions,
+            appContext.SystemTypes.SystemStringType,
+            address =>
+            {
+                resolverCalls++;
+                return new StringLiteral(address == 0 ? "minimum" : "maximum");
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(selectionCount));
+            Assert.That(resolverCalls, Is.EqualTo(2));
+            Assert.That(selectedValues.All(value => value.Type == appContext.SystemTypes.SystemStringType), Is.True);
+            Assert.That(instructions.Where(instruction => instruction.OpCode == OpCode.Return)
+                .All(instruction => instruction.Operands[0] is LocalVariable), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 条件选择任一槽未解析或含索引时保持原生地址数据流()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            appContext.SystemTypes.SystemBooleanType);
+        var unresolvedResult = new LocalVariable("unresolved", new Register(null, "X8", 1));
+        var indexedResult = new LocalVariable("indexed", new Register(null, "X8", 2));
+        var index = new LocalVariable(
+            "index",
+            new Register(null, "X9", 1),
+            appContext.SystemTypes.SystemInt32Type);
+        var unresolved = new Instruction(
+            0,
+            OpCode.ConditionalSelect,
+            unresolvedResult,
+            condition,
+            new MemoryOperand(addend: 0x1000),
+            new MemoryOperand(addend: 0x2000));
+        var indexed = new Instruction(
+            1,
+            OpCode.ConditionalSelect,
+            indexedResult,
+            condition,
+            new MemoryOperand(indexRegister: index, addend: 0x3000),
+            new MemoryOperand(addend: 0x4000));
+        var unresolvedReturn = new Instruction(2, OpCode.Return, new MemoryOperand(unresolvedResult));
+        var indexedReturn = new Instruction(3, OpCode.Return, new MemoryOperand(indexedResult));
+
+        var changed = MetadataResolver.ResolvePost27ConditionalStringSelections(
+            [unresolved, indexed, unresolvedReturn, indexedReturn],
+            appContext.SystemTypes.SystemStringType,
+            address => address == 0x1000 ? new StringLiteral("known") : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(unresolved.Operands[2], Is.TypeOf<MemoryOperand>());
+            Assert.That(unresolved.Operands[3], Is.TypeOf<MemoryOperand>());
+            Assert.That(indexed.Operands[2], Is.TypeOf<MemoryOperand>());
+            Assert.That(unresolvedReturn.Operands[0], Is.TypeOf<MemoryOperand>());
+            Assert.That(indexedReturn.Operands[0], Is.TypeOf<MemoryOperand>());
+            Assert.That(unresolvedResult.Type, Is.Null);
+            Assert.That(indexedResult.Type, Is.Null);
         });
     }
 
