@@ -113,6 +113,39 @@ public static class Arm64CallingConventionResolver
     }
 
     /// <summary>
+    /// 从共享原生地址的候选方法中选择唯一的引用聚合体返回布局原型。
+    /// 开放泛型返回值不提供具体 ABI 布局；所有已经封闭的候选必须一致地落入一至两个
+    /// 完整引用槽，否则调用点保持未投影状态，等待后续 MethodInfo 恢复精确方法身份。
+    /// </summary>
+    internal static bool TryGetReferenceRegisterAggregateReturnPrototype(
+        IReadOnlyList<MethodAnalysisContext> candidates,
+        out MethodAnalysisContext prototype)
+    {
+        prototype = null!;
+        string? expectedLayout = null;
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.ReturnType.HasAnyGenericParameters())
+                continue;
+
+            if (!TryGetReferenceRegisterAggregateFields(candidate.ReturnType, out var fields))
+                return false;
+
+            var layout = string.Join(
+                ";",
+                fields.Select(field => $"{field.Offset}:{field.Size}"));
+            if (expectedLayout != null && !string.Equals(expectedLayout, layout, StringComparison.Ordinal))
+                return false;
+
+            expectedLayout = layout;
+            prototype = candidate;
+        }
+
+        return expectedLayout != null;
+    }
+
+    /// <summary>
     /// 按 AAPCS64 C.1-C.15 计算一个已知托管方法在调用点的实参载体。
     /// 浮点标量与 HFA 使用独立的 V0-V7 序列；HFA 若不能完整放入剩余 V 寄存器，
     /// 整体进入栈参数区。整数寄存器耗尽后的引用和标量同样依序进入该栈参数区。
@@ -259,7 +292,7 @@ public static class Arm64CallingConventionResolver
     /// </summary>
     internal static bool TryGetReferenceRegisterAggregateFields(
         TypeAnalysisContext type,
-        out IReadOnlyList<FieldAnalysisContext> fields)
+        out IReadOnlyList<GenericInstanceFieldLayout.ConcreteFieldLayout> fields)
     {
         fields = [];
         if (!type.IsValueType
@@ -267,10 +300,21 @@ public static class Arm64CallingConventionResolver
             || TryGetHomogeneousFloatingAggregateFields(type, out _))
             return false;
 
-        var instanceFields = type.Fields
-            .Where(field => !field.IsStatic && (field.Attributes & FieldAttributes.Literal) == 0)
-            .OrderBy(field => field.Offset)
-            .ToArray();
+        var instanceFields = type is GenericInstanceTypeAnalysisContext genericInstance
+            ? GenericInstanceFieldLayout.GetConcreteFieldLayout(genericInstance)?
+                .OrderBy(field => field.Offset)
+                .ToArray()
+            : type.Fields
+                .Where(field => !field.IsStatic && (field.Attributes & FieldAttributes.Literal) == 0)
+                .OrderBy(field => field.Offset)
+                .Select(field => new GenericInstanceFieldLayout.ConcreteFieldLayout(
+                    field,
+                    field.Offset,
+                    PointerSize))
+                .ToArray();
+        if (instanceFields == null)
+            return false;
+
         if (instanceFields.Length is < 1 or > 2)
             return false;
 
@@ -278,8 +322,9 @@ public static class Arm64CallingConventionResolver
         {
             var field = instanceFields[index];
             if (field.Offset != index * PointerSize
-                || field.FieldType.IsValueType
-                || field.FieldType is GenericParameterTypeAnalysisContext
+                || field.Size != PointerSize
+                || field.Field.FieldType.IsValueType
+                || field.Field.FieldType is GenericParameterTypeAnalysisContext
                     or ByRefTypeAnalysisContext
                     or PointerTypeAnalysisContext
                     or RuntimeClassTypeAnalysisContext
@@ -290,7 +335,9 @@ public static class Arm64CallingConventionResolver
         }
 
         var expectedSize = checked(instanceFields.Length * PointerSize);
-        var declaredSize = TypeSizes.UnboxedSize(type, PointerSize);
+        var declaredSize = type is GenericInstanceTypeAnalysisContext
+            ? instanceFields.Max(field => field.Offset + field.Size)
+            : TypeSizes.UnboxedSize(type, PointerSize);
         if (declaredSize > 0 && declaredSize != expectedSize)
             return false;
 

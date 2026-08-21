@@ -1494,3 +1494,2563 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if (context is not ConcreteGenericMethodAnalysisContext &&
             Arm64MethodBodyReader.TryReadManagedMethodBody(binary, context.UnderlyingPointer, out var body))
             return body;
+
+        var result = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(binary, context.UnderlyingPointer);
+        var lastInsn = result.LastValid();
+
+        var start = (int)binary.MapVirtualAddressToRaw(context.UnderlyingPointer);
+        // Map the last instruction (always within segment) and add 4 (ARM64 instruction size).
+        // This avoids mapping endVa which may land exactly at a segment boundary gap.
+        var end = (int)binary.MapVirtualAddressToRaw(lastInsn.Address) + 4;
+
+        //Sanity check
+        if (start < 0 || end < 0 || start >= binary.RawLength || end >= binary.RawLength)
+            throw new Exception($"Failed to map virtual address 0x{context.UnderlyingPointer:X} to raw address for method {context!.DeclaringType?.FullName}/{context.Name} - start: 0x{start:X}, end: 0x{end:X} are out of bounds for length {binary.RawLength}.");
+
+        return new BinarySlice(binary, start, end - start);
+    }
+
+    public override List<IOperand> GetParameterOperandsFromMethod(MethodAnalysisContext context)
+    {
+        // Is this correct (?)
+        return GetArgumentOperandsForCall(context);
+    }
+
+    public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
+    {
+        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
+
+        if (TryRecoverByteJumpTableMethod(insns, context, out var jumpTableInstructions))
+            return jumpTableInstructions;
+
+        if (adrpOffsets == null!) // initializers for ThreadStatic fields only run on the first thread
+            adrpOffsets = new();
+        else
+            adrpOffsets.Clear();
+
+        var instructions = new List<Instruction>();
+        var addresses = new List<ulong>();
+        var flagState = Arm64FlagState.None;
+        var conditionalComparisonFallbackNzcv = 0L;
+
+        for (var index = 0; index < insns.Count; index++)
+        {
+            if (TryEmitPackedHalfwordPredicatePattern(
+                    insns,
+                    index,
+                    context,
+                    instructions,
+                    addresses,
+                    out var consumedInstructionCount))
+            {
+                index += consumedInstructionCount - 1;
+                continue;
+            }
+
+            var instruction = insns[index];
+            var address = ResolveInstructionAddress(
+                context.UnderlyingPointer,
+                index,
+                instruction.Mnemonic,
+                instruction.Address);
+            ConvertInstructionStatement(
+                instruction,
+                address,
+                instructions,
+                addresses,
+                context,
+                ref flagState,
+                ref conditionalComparisonFallbackNzcv);
+        }
+
+        PruneUnconsumedReturnProjections(instructions, context);
+
+        // fix branches
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var instruction = instructions[i];
+
+            if (instruction.OpCode != OpCode.Jump && instruction.OpCode != OpCode.ConditionalJump)
+                continue;
+
+            var targetAddress = ((Immediate)instruction.Operands[0]).UnsignedValue;
+            var targetIndex = addresses.FindIndex(addr => addr == targetAddress);
+
+            if (targetIndex == -1)
+            {
+                instruction.OpCode = OpCode.Invalid;
+                instruction.SetOperands(new StringLiteral($"Jump target not found in method: 0x{targetAddress:X4}"));
+                continue;
+            }
+
+            var targetInstruction = instructions[targetIndex];
+
+            instruction.SetOperand(0, targetInstruction);
+        }
+
+        adrpOffsets.Clear();
+        return instructions;
+    }
+
+    /// <summary>
+    /// 对所有调用后聚合体投影执行统一的消费者硬门。投影只是把原生 ABI 分槽重新映射到
+    /// 托管字段的候选；缺少确定后继消费者时必须恢复完整值类型语义。
+    /// </summary>
+    private static void PruneUnconsumedReturnProjections(
+        IReadOnlyList<Instruction> instructions,
+        MethodAnalysisContext context)
+    {
+        PruneUnconsumedHomogeneousFloatingReturnProjections(instructions, context);
+        PruneUnconsumedReferenceRegisterReturnProjections(instructions, context);
+    }
+
+    /// <summary>
+    /// HFA返回后的V0既代表完整值类型，也可被后续标量指令当作第一个字段读取。
+    /// 只有观察到字段分量消费者时才保留调用后投影；若调用结果直接通过128位存储写入托管字段，
+    /// 则保留完整聚合体，避免把Color等值类型错误降级为第一个Single字段。
+    /// </summary>
+    private static void PruneUnconsumedHomogeneousFloatingReturnProjections(
+        IReadOnlyList<Instruction> instructions,
+        MethodAnalysisContext context)
+    {
+        for (var callIndex = 0; callIndex < instructions.Count; callIndex++)
+        {
+            var call = instructions[callIndex];
+            if (call.OpCode != OpCode.Call
+                || call.Operands.Count < 2
+                || call.Operands[0] is not Immediate target
+                || !context.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var methods)
+                || methods.Count != 1)
+                continue;
+
+            var projections = Arm64CallingConventionResolver.ReturnProjections(methods[0]);
+            if (projections.Count == 0
+                || !MatchesReturnProjectionSequence(instructions, callIndex + 1, projections))
+                continue;
+
+            var consumerStart = callIndex + 1 + projections.Count;
+            if (HasHomogeneousFloatingComponentConsumer(instructions, consumerStart, projections))
+            {
+                callIndex += projections.Count;
+                continue;
+            }
+
+            for (var projectionIndex = callIndex + 1; projectionIndex < consumerStart; projectionIndex++)
+            {
+                instructions[projectionIndex].OpCode = OpCode.Nop;
+                instructions[projectionIndex].SetOperands();
+            }
+            callIndex += projections.Count;
+        }
+    }
+
+    private static bool MatchesReturnProjectionSequence(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        IReadOnlyList<(Register Destination, MemoryOperand Source)> projections)
+    {
+        if (startIndex < 0 || startIndex + projections.Count > instructions.Count)
+            return false;
+
+        for (var projectionIndex = 0; projectionIndex < projections.Count; projectionIndex++)
+        {
+            var expected = projections[projectionIndex];
+            var actual = instructions[startIndex + projectionIndex];
+            if (actual is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands.Count: 2
+                }
+                || actual.Operands[0] is not Register destination
+                || actual.Operands[1] is not MemoryOperand source
+                || destination.Number != expected.Destination.Number
+                || source.Base is not Register sourceBase
+                || expected.Source.Base is not Register expectedBase
+                || sourceBase.Number != expectedBase.Number
+                || source.Index != null
+                || source.Addend != expected.Source.Addend)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 引用聚合体返回既可能被原生代码按 X0/X1 字段槽消费，也可能继续作为完整值类型使用。
+    /// 仅在后继指令给出确定字段证据时保留投影：高位返回槽被读取，或已解析托管调用以同一
+    /// 物理寄存器接收精确字段类型。原始调用的宽寄存器快照、隐藏 MethodInfo 和完整聚合体
+    /// 接收者都不构成字段证据。
+    /// </summary>
+    private static void PruneUnconsumedReferenceRegisterReturnProjections(
+        IReadOnlyList<Instruction> instructions,
+        MethodAnalysisContext context)
+    {
+        for (var callIndex = 0; callIndex < instructions.Count; callIndex++)
+        {
+            var call = instructions[callIndex];
+            if (call.OpCode != OpCode.Call
+                || call.Operands.Count < 2
+                || call.Operands[0] is not Immediate target
+                || !context.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var methods))
+                continue;
+
+            var calledMethod = methods.Count == 1
+                ? methods[0]
+                : Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateReturnPrototype(
+                    methods,
+                    out var sharedPrototype)
+                    ? sharedPrototype
+                    : null;
+            if (calledMethod == null)
+                continue;
+
+            var projections = Arm64CallingConventionResolver
+                .ReferenceRegisterReturnProjections(calledMethod);
+            if (projections.Count == 0
+                || !MatchesReturnProjectionSequence(instructions, callIndex + 1, projections))
+                continue;
+
+            var consumerStart = callIndex + 1 + projections.Count;
+            if (HasReferenceRegisterAggregateFieldConsumer(
+                    instructions,
+                    consumerStart,
+                    calledMethod,
+                    context.AppContext.MethodsByAddress))
+            {
+                callIndex += projections.Count;
+                continue;
+            }
+
+            for (var projectionIndex = callIndex + 1; projectionIndex < consumerStart; projectionIndex++)
+            {
+                instructions[projectionIndex].OpCode = OpCode.Nop;
+                instructions[projectionIndex].SetOperands();
+            }
+            callIndex += projections.Count;
+        }
+    }
+
+    /// <summary>
+    /// 从投影序列之后扫描引用字段的确定消费者。两槽聚合体的 X1 没有完整值载体含义，
+    /// 因此普通指令读取 X1 即为字段证据；X0 只有在唯一托管调用声明了精确字段类型时才成立。
+    /// 所有调用均会改写易失 X 寄存器，未匹配的调用会终止当前候选的数据流。
+    /// </summary>
+    internal static bool HasReferenceRegisterAggregateFieldConsumer(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        MethodAnalysisContext returnMethod,
+        IReadOnlyDictionary<ulong, List<MethodAnalysisContext>> methodsByAddress)
+    {
+        if (!Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateFields(
+                returnMethod.ReturnType,
+                out var fields))
+            return false;
+
+        var activeFields = fields.ToDictionary(
+            field => $"X{field.Offset / sizeof(long)}",
+            field => field,
+            StringComparer.Ordinal);
+
+        for (var instructionIndex = startIndex;
+             instructionIndex < instructions.Count && activeFields.Count > 0;
+             instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid)
+            {
+                if (instruction.Operands[0] is Immediate target
+                    && methodsByAddress.TryGetValue(target.UnsignedValue, out var callees)
+                    && callees.Count == 1
+                    && activeFields.Any(active =>
+                        EnumerateSourceRegisters(instruction)
+                            .Any(register => register.Name == active.Key)
+                        && Arm64CallingConventionResolver.UsesGeneralRegisterForManagedArgumentOfType(
+                            callees[0],
+                            active.Key,
+                            active.Value.Field.FieldType)))
+                    return true;
+
+                activeFields.Clear();
+                continue;
+            }
+
+            if (instruction.OpCode == OpCode.IndirectCall)
+            {
+                activeFields.Clear();
+                continue;
+            }
+
+            var readRegisterNames = new HashSet<string>(
+                EnumerateSourceRegisters(instruction).Select(register => register.Name),
+                StringComparer.Ordinal);
+            if (activeFields.Keys.Any(registerName =>
+                    registerName != "X0" && readRegisterNames.Contains(registerName)))
+                return true;
+
+            if (TryGetDirectDestinationRegister(instruction, out var destination))
+                activeFields.Remove(destination.Name);
+
+            if (instruction.OpCode is OpCode.Return or OpCode.Throw or OpCode.IndirectJump)
+                activeFields.Clear();
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 判断投影寄存器在下一次定义前是否以字段分量身份被读取。
+    /// V1及更高寄存器天然只承载后续字段；V0则根据HFA实参、标量运算、标量存储或直接标量调用区分。
+    /// </summary>
+    internal static bool HasHomogeneousFloatingComponentConsumer(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        IReadOnlyList<(Register Destination, MemoryOperand Source)> projections)
+    {
+        if (IsCompleteHomogeneousFloatingAggregateStore(instructions, startIndex, projections))
+            return false;
+
+        var activeRegisters = new HashSet<int>(projections
+            .Select(projection => projection.Destination.Number));
+        var aggregateCarrier = ((Register)projections[^1].Source.Base!).Number;
+
+        for (var instructionIndex = startIndex;
+             instructionIndex < instructions.Count && activeRegisters.Count > 0;
+             instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            var readRegisters = new HashSet<int>(EnumerateSourceRegisters(instruction)
+                .Select(register => register.Number));
+
+            if (readRegisters.Any(register =>
+                    register != aggregateCarrier && activeRegisters.Contains(register))
+                || activeRegisters.Contains(aggregateCarrier)
+                && ReadsAggregateCarrierAsScalar(instruction, aggregateCarrier))
+                return true;
+
+            if (TryGetDirectDestinationRegister(instruction, out var destination))
+                activeRegisters.Remove(destination.Number);
+
+            // 分支前尚未得到确定消费者时保守保留投影，跨边数据流交给后续CFG/SSA处理。
+            if (instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 识别编译器把一个HFA返回值按字段拆成连续标量存储的完整聚合体赋值。
+    /// 所有V分量必须各出现一次、写入同一基址且“目标偏移减源字段偏移”完全一致；
+    /// 缺字段、重复字段、额外消费者和基址漂移均保持标量投影。
+    /// </summary>
+    private static bool IsCompleteHomogeneousFloatingAggregateStore(
+        IReadOnlyList<Instruction> instructions,
+        int startIndex,
+        IReadOnlyList<(Register Destination, MemoryOperand Source)> projections)
+    {
+        var fieldOffsets = projections.ToDictionary(
+            projection => projection.Destination.Number,
+            projection => projection.Source.Addend);
+        var remaining = new HashSet<int>(fieldOffsets.Keys);
+        int? destinationBase = null;
+        long? aggregateOffset = null;
+
+        for (var instructionIndex = startIndex;
+             instructionIndex < instructions.Count && remaining.Count > 0;
+             instructionIndex++)
+        {
+            var instruction = instructions[instructionIndex];
+            var componentReads = EnumerateSourceRegisters(instruction)
+                .Select(register => register.Number)
+                .Where(remaining.Contains)
+                .Distinct()
+                .ToArray();
+
+            if (componentReads.Length == 0)
+            {
+                if (TryGetDirectDestinationRegister(instruction, out var destination)
+                    && remaining.Contains(destination.Number))
+                    return false;
+                if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
+                    or OpCode.Jump or OpCode.ConditionalJump or OpCode.Return or OpCode.Throw)
+                    return false;
+                continue;
+            }
+
+            if (componentReads.Length != 1
+                || instruction is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands.Count: 2
+                }
+                || instruction.Operands[0] is not MemoryOperand
+                {
+                    Base: Register memoryBase,
+                    Index: null,
+                    Scale: 0
+                } memory
+                || instruction.Operands[1] is not Register source
+                || source.Number != componentReads[0]
+                || instruction.MemoryAccessWidthBits is not (32 or 64))
+                return false;
+
+            long candidateAggregateOffset;
+            try
+            {
+                candidateAggregateOffset = checked(memory.Addend - fieldOffsets[source.Number]);
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+            destinationBase ??= memoryBase.Number;
+            aggregateOffset ??= candidateAggregateOffset;
+            if (destinationBase.Value != memoryBase.Number
+                || aggregateOffset.Value != candidateAggregateOffset)
+                return false;
+
+            remaining.Remove(source.Number);
+        }
+
+        return remaining.Count == 0;
+    }
+
+    private static bool ReadsAggregateCarrierAsScalar(Instruction instruction, int aggregateCarrier)
+    {
+        foreach (var aggregate in instruction.Operands.OfType<HomogeneousFloatingAggregateArgument>())
+            if (aggregate.Components
+                .SelectMany(EnumerateOperandRegisters)
+                .Any(register => register.Number == aggregateCarrier))
+                return true;
+
+        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+        {
+            var argumentBase = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+            if (instruction.Operands
+                .Skip(argumentBase)
+                .OfType<Register>()
+                .Any(register => register.Number == aggregateCarrier))
+                return true;
+        }
+
+        if (instruction.OpCode == OpCode.Move
+            && instruction.Operands.Count > 1
+            && instruction.Operands[1] is Register moveSource
+            && moveSource.Number == aggregateCarrier)
+        {
+            if (instruction.MemoryAccessWidthBits is 32 or 64)
+                return true;
+            if (instruction.MemoryAccessWidthBits >= 128)
+                return false;
+            return instruction.Operands[0] is Register;
+        }
+
+        return instruction.OpCode is
+            OpCode.ConditionalSelect or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+            or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
+            or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+            or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
+            or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+            or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+            or OpCode.ReinterpretIntegerBitsAsFloat
+            or OpCode.ReinterpretFloatBitsAsInteger or OpCode.RoundFloatTowardPositiveInfinity
+            or OpCode.RoundFloatTowardNegativeInfinity
+            or >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned;
+    }
+
+    /// <summary>
+    /// 在CFG构建前从原始操作数安全枚举读取寄存器。部分尚未恢复的原生指令会以缺操作数的
+    /// Move或比较形态存在，此阶段不得调用要求完整形态的Instruction.Sources。
+    /// </summary>
+    private static IEnumerable<Register> EnumerateSourceRegisters(Instruction instruction)
+    {
+        var destinationIndex = TryGetDestinationOperandIndex(instruction, out var index)
+            ? index
+            : -1;
+        for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+        {
+            var operand = instruction.Operands[operandIndex];
+            // 直接寄存器目标只写不读；内存目标仍需枚举其基址和索引。
+            if (operandIndex == destinationIndex && operand is Register)
+                continue;
+
+            foreach (var register in EnumerateOperandRegisters(operand))
+                yield return register;
+        }
+    }
+
+    private static bool TryGetDirectDestinationRegister(
+        Instruction instruction,
+        out Register destination)
+    {
+        if (TryGetDestinationOperandIndex(instruction, out var destinationIndex)
+            && instruction.Operands[destinationIndex] is Register register)
+        {
+            destination = register;
+            return true;
+        }
+
+        destination = default;
+        return false;
+    }
+
+    /// <summary>
+    /// 安全取得目标操作数位置；缺少目标槽的畸形指令返回false并保持保守读取语义。
+    /// </summary>
+    private static bool TryGetDestinationOperandIndex(
+        Instruction instruction,
+        out int destinationIndex)
+    {
+        destinationIndex = instruction.OpCode switch
+        {
+            OpCode.Call or OpCode.IndirectCall => 1,
+            OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
+                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned or OpCode.And or OpCode.Or
+                or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.AbsoluteNumber
+                or OpCode.AbsoluteDifference or OpCode.MaximumNumber
+                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+                or OpCode.ReinterpretIntegerBitsAsFloat
+                or OpCode.ReinterpretFloatBitsAsInteger or OpCode.VectorDuplicate
+                or OpCode.VectorWidenUnsignedInt16ToInt32 or OpCode.VectorShiftLeft
+                or OpCode.VectorCompareLessThanZero or OpCode.VectorBitwiseSelect
+                or OpCode.VectorMultiplyByElement or OpCode.VectorAllLanesPredicate
+                or OpCode.VectorExtractUnsignedInt16 or OpCode.RoundFloatTowardPositiveInfinity
+                or OpCode.RoundFloatTowardNegativeInfinity
+                or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
+                or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+                or OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned
+                or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned
+                or OpCode.Newobj or OpCode.Box or OpCode.Unbox or OpCode.CastClass or OpCode.IsInst => 0,
+            _ => -1
+        };
+        return destinationIndex >= 0 && instruction.Operands.Count > destinationIndex;
+    }
+
+    private static IEnumerable<Register> EnumerateOperandRegisters(IOperand operand)
+    {
+        switch (operand)
+        {
+            case Register register:
+                yield return register;
+                break;
+            case MemoryOperand { Base: Register baseRegister, Index: Register indexRegister }:
+                yield return baseRegister;
+                yield return indexRegister;
+                break;
+            case MemoryOperand { Base: Register baseRegister }:
+                yield return baseRegister;
+                break;
+            case MemoryOperand { Index: Register indexRegister }:
+                yield return indexRegister;
+                break;
+            case AddressOf { Target: Register addressed }:
+                yield return addressed;
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var componentRegister in EnumerateOperandRegisters(component))
+                    yield return componentRegister;
+                break;
+        }
+    }
+
+    private bool TryRecoverByteJumpTableMethod(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        MethodAnalysisContext context,
+        out List<Instruction> instructions)
+    {
+        instructions = [];
+        for (var branchIndex = 4; branchIndex < nativeInstructions.Count; branchIndex++)
+        {
+            var branch = nativeInstructions[branchIndex];
+            if (branch.Mnemonic != Arm64Mnemonic.BR
+                || nativeInstructions[branchIndex - 1].Mnemonic != Arm64Mnemonic.ADD
+                || nativeInstructions[branchIndex - 2].Mnemonic != Arm64Mnemonic.LDRB
+                || nativeInstructions[branchIndex - 3].Mnemonic != Arm64Mnemonic.ADR)
+                continue;
+
+            var tableLoad = nativeInstructions[branchIndex - 2];
+            var branchBaseLoad = nativeInstructions[branchIndex - 3];
+            if (branch.Op0Reg != nativeInstructions[branchIndex - 1].Op0Reg
+                || nativeInstructions[branchIndex - 1].Op1Reg != branchBaseLoad.Op0Reg
+                || tableLoad.Op0Kind != Arm64OperandKind.Register
+                || tableLoad.Op1Kind != Arm64OperandKind.Memory
+                || tableLoad.MemAddendReg == Arm64Register.INVALID
+                || branchBaseLoad.Op1Kind is not (
+                    Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative))
+                continue;
+
+            var tableBaseAdd = nativeInstructions
+                .Take(branchIndex - 2)
+                .LastOrDefault(candidate =>
+                    candidate.Mnemonic == Arm64Mnemonic.ADD
+                    && candidate.Op0Reg == tableLoad.MemBase
+                    && candidate.Op1Reg == tableLoad.MemBase
+                    && candidate.Op2Kind == Arm64OperandKind.Immediate);
+            if (tableBaseAdd.Mnemonic != Arm64Mnemonic.ADD)
+                continue;
+
+            var tablePageLoad = nativeInstructions
+                .TakeWhile(candidate => candidate.Address < tableBaseAdd.Address)
+                .LastOrDefault(candidate =>
+                    candidate.Mnemonic == Arm64Mnemonic.ADRP
+                    && candidate.Op0Reg == tableLoad.MemBase);
+            if (tablePageLoad.Mnemonic != Arm64Mnemonic.ADRP)
+                continue;
+
+            var indexAdjust = nativeInstructions
+                .Take(branchIndex - 3)
+                .LastOrDefault(candidate =>
+                    candidate.Mnemonic == Arm64Mnemonic.ADD
+                    && Arm64RegisterHelper.CanonicalName(candidate.Op0Reg)
+                        == Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg)
+                    && Arm64RegisterHelper.CanonicalName(candidate.Op1Reg)
+                        == Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg)
+                    && candidate.Op2Kind == Arm64OperandKind.Immediate);
+            if (indexAdjust.Mnemonic != Arm64Mnemonic.ADD)
+                continue;
+
+            var tableAddress = checked(
+                ResolveAdrpPageAddress(tablePageLoad.Address, tablePageLoad.Op1Imm)
+                + (ulong)tableBaseAdd.Op2Imm);
+            var branchBaseAddress = ResolveAdrAddress(branchBaseLoad.Address, branchBaseLoad.Op1Imm);
+            var methodEnd = checked(context.UnderlyingPointer + (ulong)context.RawBytes.Length);
+            var maximumEntryCount = checked((int)Math.Min(
+                256UL,
+                methodEnd > branchBaseAddress ? (methodEnd - branchBaseAddress) / sizeof(uint) : 0));
+            if (maximumEntryCount == 0)
+                continue;
+
+            byte[] table;
+            try
+            {
+                var rawTableAddress = context.AppContext.Binary.MapVirtualAddressToRaw(tableAddress);
+                table = context.AppContext.Binary.Reader.ReadByteArrayAtRawAddress(
+                    rawTableAddress,
+                    maximumEntryCount);
+            }
+            catch
+            {
+                continue;
+            }
+
+            var targetAddresses = new List<ulong>();
+            foreach (var entry in table)
+            {
+                var target = checked(branchBaseAddress + (ulong)entry * sizeof(uint));
+                if (target < context.UnderlyingPointer
+                    || target >= methodEnd
+                    || (target - context.UnderlyingPointer) % sizeof(uint) != 0)
+                    break;
+                targetAddresses.Add(target);
+            }
+
+            if (targetAddresses.Count < 2
+                || !TryResolveByteJumpTableTargets(
+                    table.AsSpan(0, targetAddresses.Count),
+                    branchBaseAddress,
+                    context.UnderlyingPointer,
+                    methodEnd,
+                    out var validatedTargets))
+                continue;
+
+            var convertedPrefix = new List<Instruction>();
+            var convertedAddresses = new List<ulong>();
+            var prefixFlagState = Arm64FlagState.None;
+            var prefixFallbackNzcv = 0L;
+            for (var index = 0; index <= branchIndex - 4; index++)
+            {
+                var native = nativeInstructions[index];
+                ConvertInstructionStatement(
+                    native,
+                    native.Address,
+                    convertedPrefix,
+                    convertedAddresses,
+                    context,
+                    ref prefixFlagState,
+                    ref prefixFallbackNzcv);
+            }
+
+            var targetAnchors = validatedTargets
+                .Distinct()
+                .ToDictionary(target => target, _ => new Instruction(0, OpCode.Nop));
+            var result = new List<Instruction>(convertedPrefix);
+            var resultAddresses = new List<ulong>(convertedAddresses);
+            var indexOperand = new Register(null, Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg));
+            for (var tableIndex = 0; tableIndex < validatedTargets.Length; tableIndex++)
+            {
+                var condition = new Register(null, $"JUMP_TABLE_CASE_{tableIndex}");
+                result.Add(new Instruction(result.Count, OpCode.CheckEqual, condition, indexOperand, Imm(tableIndex)));
+                resultAddresses.Add(branch.Address);
+                result.Add(new Instruction(
+                    result.Count,
+                    OpCode.ConditionalJump,
+                    targetAnchors[validatedTargets[tableIndex]],
+                    condition));
+                resultAddresses.Add(branch.Address);
+            }
+
+            result.Add(new Instruction(result.Count, OpCode.Jump, targetAnchors[validatedTargets[^1]]));
+            resultAddresses.Add(branch.Address);
+            var suffixFlagState = prefixFlagState;
+            var suffixFallbackNzcv = prefixFallbackNzcv;
+            for (var index = branchIndex + 1; index < nativeInstructions.Count; index++)
+            {
+                var native = nativeInstructions[index];
+                if (targetAnchors.TryGetValue(native.Address, out var anchor))
+                {
+                    anchor.Index = result.Count;
+                    result.Add(anchor);
+                    resultAddresses.Add(native.Address);
+                }
+
+                ConvertInstructionStatement(
+                    native,
+                    native.Address,
+                    result,
+                    resultAddresses,
+                    context,
+                    ref suffixFlagState,
+                    ref suffixFallbackNzcv);
+            }
+
+            for (var index = 0; index < result.Count; index++)
+            {
+                result[index].Index = index;
+                if (result[index].OpCode is not (OpCode.Jump or OpCode.ConditionalJump)
+                    || result[index].Operands[0] is not Immediate immediate)
+                    continue;
+
+                var targetIndex = resultAddresses.FindIndex(candidate => candidate == immediate.UnsignedValue);
+                if (targetIndex < 0)
+                {
+                    instructions = [];
+                    return false;
+                }
+
+                result[index].SetOperand(0, result[targetIndex]);
+            }
+            PruneUnconsumedReturnProjections(result, context);
+            instructions = result;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryEmitPackedHalfwordPredicatePattern(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        int startIndex,
+        MethodAnalysisContext context,
+        List<Instruction> instructions,
+        List<ulong> addresses,
+        out int consumedInstructionCount)
+    {
+        const int patternLength = 13;
+        if (startIndex < 0 || startIndex + patternLength > nativeInstructions.Count)
+        {
+            consumedInstructionCount = 0;
+            return false;
+        }
+
+        Span<uint> machineCodes = stackalloc uint[patternLength];
+        Span<ulong> nativeAddresses = stackalloc ulong[patternLength];
+        for (var offset = 0; offset < patternLength; offset++)
+        {
+            var nativeInstruction = nativeInstructions[startIndex + offset];
+            var nativeAddress = ResolveInstructionAddress(
+                context.UnderlyingPointer,
+                startIndex + offset,
+                nativeInstruction.Mnemonic,
+                nativeInstruction.Address);
+            nativeAddresses[offset] = nativeAddress;
+            machineCodes[offset] = ReadMachineCodeAtAddress(context, nativeAddress);
+        }
+
+        if (!TryDecodePackedHalfwordPredicatePattern(machineCodes, out var pattern))
+        {
+            consumedInstructionCount = 0;
+            return false;
+        }
+
+        var constantLoad = nativeInstructions[startIndex + 1];
+        if (!adrpOffsets.TryGetValue(constantLoad.MemBase, out var constantPage))
+        {
+            consumedInstructionCount = 0;
+            return false;
+        }
+
+        var constantAddress = checked(constantPage + (ulong)pattern.ConstantByteOffset);
+        var constantRawAddress = context.AppContext.Binary.MapVirtualAddressToRaw(constantAddress);
+        var constantBytes = context.AppContext.Binary.Reader.ReadByteArrayAtRawAddress(
+            constantRawAddress,
+            sizeof(int) * 4);
+        Span<int> constants = stackalloc int[4];
+        for (var lane = 0; lane < constants.Length; lane++)
+            constants[lane] = BinaryPrimitives.ReadInt32LittleEndian(
+                constantBytes.AsSpan(lane * sizeof(int), sizeof(int)));
+
+        // 为每个被折叠的原生地址保留可跳转锚点；真实谓词只在最终FMOV地址计算一次。
+        for (var offset = 0; offset < patternLength - 1; offset++)
+        {
+            addresses.Add(nativeAddresses[offset]);
+            instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
+        }
+
+        var accumulatorLoad = nativeInstructions[startIndex + 7];
+        var accumulator = new MemoryOperand(
+            new Register(null, Arm64RegisterHelper.CanonicalName(accumulatorLoad.MemBase)),
+            addend: pattern.AccumulatorByteOffset);
+        var predicate = new Instruction(
+            instructions.Count,
+            OpCode.VectorAllLanesPredicate,
+            ConvertOperand(nativeInstructions[startIndex + 12], 0),
+            accumulator,
+            new Register(null, $"X{pattern.ScalarSourceRegister}"),
+            Imm(constants[0]),
+            Imm(constants[1]),
+            Imm(constants[2]),
+            Imm(constants[3]),
+            Imm(pattern.ReverseLaneMask));
+        addresses.Add(nativeAddresses[patternLength - 1]);
+        instructions.Add(predicate);
+        consumedInstructionCount = patternLength;
+        return true;
+    }
+
+    private void ConvertInstructionStatement(
+        Arm64Instruction instruction,
+        ulong address,
+        List<Instruction> instructions,
+        List<ulong> addresses,
+        MethodAnalysisContext context,
+        ref Arm64FlagState flagState,
+        ref long conditionalComparisonFallbackNzcv)
+    {
+        var inputFlagState = flagState;
+        var inputConditionalComparisonFallbackNzcv = conditionalComparisonFallbackNzcv;
+
+        Instruction Add(ulong address, OpCode opCode, params List<IOperand> operands)
+        {
+            addresses.Add(address);
+            var newInstruction = new Instruction(instructions.Count, opCode, operands);
+            instructions.Add(newInstruction);
+            return newInstruction;
+        }
+
+        Instruction AddInteger(ulong address, OpCode opCode, params List<IOperand> operands)
+        {
+            var emitted = Add(address, opCode, operands);
+            if (TryGetSignedIntegerWidthBits(instruction.Op0Reg, out var widthBits))
+                emitted.IntegerWidthBits = widthBits;
+            return emitted;
+        }
+
+        Instruction AddMemory(
+            ulong address,
+            int widthBits,
+            OpCode opCode,
+            params List<IOperand> operands)
+        {
+            var emitted = Add(address, opCode, operands);
+            emitted.MemoryAccessWidthBits = widthBits;
+            return emitted;
+        }
+
+        void AddCall(MethodAnalysisContext context, ulong address, ulong target)
+        {
+            var hasObservedIndirectReturnBuffer =
+                TryFindObservedIndirectReturnBuffer(instructions, out _);
+
+            if (!context.AppContext.MethodsByAddress.TryGetValue(target, out var methodsAtAddress))
+            {
+                // 原生目标的签名尚未解析时保留 X0 返回值与全部 AAPCS64 参数，供后续 key function、
+                // 接口分派和委托恢复器统一裁决；未使用的返回值会由死代码消除器删除。
+                var unknownCall = Add(
+                    address,
+                    OpCode.Call,
+                    Imm(target),
+                    new Register(null, nameof(Arm64Register.X0)));
+                unknownCall.AddOperands(Arm64CallingConventionResolver.ResolveForUnmanaged());
+                if (hasObservedIndirectReturnBuffer)
+                {
+                    // 共享泛型体可能尚未进入地址索引；仍按调用点事实保留X8，供MethodInfo解析后绑定。
+                    unknownCall.AddOperands([new Register(null, nameof(Arm64Register.X8))]);
+                }
+                return;
+            }
+
+            var calledMethod = methodsAtAddress.Count == 1 ? methodsAtAddress[0] : context;
+            // 某些 Unity 6 构建会让接口慢查表助手与 List<T>.AddWithResize 共用原生地址。
+            // 前者真实返回 VirtualInvokeData*，后者为 void；在 CFG/SSA 消费关系建立前不能丢掉 X0。
+            // 仅对该已知共享身份保留原始返回槽，MetadataResolver 会删除普通 void 的伪返回值，
+            // InterfaceDispatchRecovery 则以 Phi、零偏移 methodPtr 和 vtable 链完成最终裁决。
+            var preservePotentialInterfaceLookupResult = calledMethod.IsVoid
+                && methodsAtAddress.Any(InterfaceDispatchRecovery.IsSharedAddWithResizeCandidate)
+                && HasRecentSmallImmediateArgument(instructions, "X2", ushort.MaxValue);
+            Register? returnRegister = preservePotentialInterfaceLookupResult
+                ? new Register(null, nameof(Arm64Register.X0))
+                : calledMethod.IsVoid
+                    ? null
+                    : Arm64CallingConventionResolver.ReturnRegister(calledMethod);
+            var call = returnRegister == null
+                ? Add(address, OpCode.CallVoid, Imm(target))
+                : Add(address, OpCode.Call, Imm(target), returnRegister);
+
+            call.AddOperands(GetArgumentOperandsForCall(methodsAtAddress.First()));
+            if (returnRegister != null
+                && hasObservedIndirectReturnBuffer)
+            {
+                // 调用点已观察到X8=&stack且目标返回值类型；先保留候选，待SSA后绑定到唯一栈局部。
+                call.AddOperands([new Register(null, nameof(Arm64Register.X8))]);
+            }
+
+            if (methodsAtAddress.Count == 1)
+            {
+                // HFA调用在托管CIL中返回一个完整值类型，在AAPCS64中则会改写连续V寄存器。
+                // 逆序字段投影让SSA同时看到V0..Vn的新定义，并保证所有字段都从尚未覆盖的V0
+                // 聚合体载体读取；后续字段偏移解析会把这些内存形态精确绑定到值类型字段。
+                foreach (var projection in Arm64CallingConventionResolver.ReturnProjections(calledMethod))
+                    Add(address, OpCode.Move, projection.Destination, projection.Source);
+
+            }
+
+            // 普通小结构体会把一至两个完整托管引用槽分别返回在X0/X1。唯一目标直接使用
+            // 其签名；共享泛型体只在全部封闭候选具有同一引用槽布局时使用该布局原型。
+            var referenceReturnPrototype = methodsAtAddress.Count == 1
+                ? calledMethod
+                : Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateReturnPrototype(
+                    methodsAtAddress,
+                    out var sharedPrototype)
+                    ? sharedPrototype
+                    : null;
+            if (referenceReturnPrototype != null)
+            {
+                foreach (var projection in Arm64CallingConventionResolver
+                             .ReferenceRegisterReturnProjections(referenceReturnPrototype))
+                    Add(address, OpCode.Move, projection.Destination, projection.Source);
+            }
+        }
+
+        void AddIndirectTransfer(Arm64Mnemonic mnemonic, ulong address, IOperand target)
+        {
+            var opCode = GetIndirectBranchOpCode(mnemonic)
+                         ?? throw new ArgumentOutOfRangeException(nameof(mnemonic));
+            var transfer = Add(
+                address,
+                opCode,
+                target,
+                new Register(null, nameof(Arm64Register.X0)));
+            transfer.AddOperands(Arm64CallingConventionResolver.ResolveForUnmanaged());
+        }
+
+        bool TryEmitCondition(
+            Arm64ConditionCode conditionCode,
+            string registerPrefix,
+            out IOperand condition)
+        {
+            if (inputFlagState == Arm64FlagState.ConditionalComparison
+                && GetConditionalComparisonOpCode(conditionCode) is { } comparisonOpCode
+                && TryEvaluateConditionFromNzcv(
+                    conditionCode,
+                    inputConditionalComparisonFallbackNzcv,
+                    out var fallbackResult))
+            {
+                var comparedCondition = new Register(null, registerPrefix + "_CCMP_COMPARED");
+                var selectedCondition = new Register(null, registerPrefix + "_CCMP_SELECTED");
+                Add(
+                    address,
+                    comparisonOpCode,
+                    comparedCondition,
+                    new Register(null, "CCMP_COMPARE_LEFT"),
+                    new Register(null, "CCMP_COMPARE_RIGHT"));
+                Add(
+                    address,
+                    OpCode.ConditionalSelect,
+                    selectedCondition,
+                    new Register(null, "CCMP_GATE"),
+                    comparedCondition,
+                    Imm(fallbackResult ? 1 : 0));
+                condition = selectedCondition;
+                return true;
+            }
+
+            var invertZeroFlag = ShouldInvertZeroFlag(conditionCode);
+            if (invertZeroFlag is not null)
+            {
+                condition = new Register(null, "Z");
+                if (invertZeroFlag.Value)
+                {
+                    var inverted = new Register(null, registerPrefix + "_NOT_ZERO");
+                    Add(address, OpCode.Not, inverted, condition);
+                    condition = inverted;
+                }
+
+                return inputFlagState != Arm64FlagState.None;
+            }
+
+            var invertSignFlag = ShouldInvertSignFlag(conditionCode);
+            if (inputFlagState == Arm64FlagState.Comparison &&
+                invertSignFlag is not null)
+            {
+                condition = new Register(null, "N");
+                if (invertSignFlag.Value)
+                {
+                    var inverted = new Register(null, registerPrefix + "_NOT_NEGATIVE");
+                    Add(address, OpCode.Not, inverted, condition);
+                    condition = inverted;
+                }
+
+                return true;
+            }
+
+            if (inputFlagState == Arm64FlagState.FloatingComparison &&
+                invertSignFlag is not null)
+            {
+                var less = new Register(null, registerPrefix + "_LESS");
+                Add(
+                    address,
+                    OpCode.CheckLess,
+                    less,
+                    new Register(null, "FLAG_COMPARE_LEFT"),
+                    new Register(null, "FLAG_COMPARE_RIGHT"));
+                if (invertSignFlag.Value)
+                {
+                    var notLess = new Register(null, registerPrefix + "_NOT_LESS");
+                    Add(address, OpCode.Not, notLess, less);
+                    condition = notLess;
+                }
+                else
+                {
+                    condition = less;
+                }
+                return true;
+            }
+
+            if (CanEmitCarryZeroCondition(conditionCode, inputFlagState))
+            {
+                var carry = new Register(null, "C");
+                var zero = new Register(null, "Z");
+                switch (conditionCode)
+                {
+                    case Arm64ConditionCode.CS:
+                        condition = carry;
+                        return true;
+                    case Arm64ConditionCode.CC:
+                    {
+                        var notCarry = new Register(null, registerPrefix + "_NOT_CARRY");
+                        Add(address, OpCode.Not, notCarry, carry);
+                        condition = notCarry;
+                        return true;
+                    }
+                    case Arm64ConditionCode.HI:
+                    {
+                        var notZero = new Register(null, registerPrefix + "_NOT_ZERO");
+                        var higher = new Register(null, registerPrefix + "_HIGHER");
+                        Add(address, OpCode.Not, notZero, zero);
+                        Add(address, OpCode.And, higher, carry, notZero);
+                        condition = higher;
+                        return true;
+                    }
+                    case Arm64ConditionCode.LS:
+                    {
+                        var notCarry = new Register(null, registerPrefix + "_NOT_CARRY");
+                        var lowerOrSame = new Register(null, registerPrefix + "_LOWER_OR_SAME");
+                        Add(address, OpCode.Not, notCarry, carry);
+                        Add(address, OpCode.Or, lowerOrSame, notCarry, zero);
+                        condition = lowerOrSame;
+                        return true;
+                    }
+                }
+            }
+
+            var relationalOpCode = GetConditionalSetRelationalOpCode(
+                conditionCode,
+                inputFlagState);
+            if (relationalOpCode is not null)
+            {
+                var relational = new Register(null, registerPrefix + "_RELATIONAL");
+                Add(
+                    address,
+                    relationalOpCode.Value,
+                    relational,
+                    new Register(null, "FLAG_COMPARE_LEFT"),
+                    new Register(null, "FLAG_COMPARE_RIGHT"));
+                condition = relational;
+                return true;
+            }
+
+            condition = null!;
+            return false;
+        }
+
+        bool TryEmitConditionalSelect(string registerPrefix)
+        {
+            // CSEL/FCSEL 的目标是新值，旧 ADRP 页基址到这里已经死亡。必须在条件解析前失效，
+            // 这样即使条件暂未建模，后续 LDR 也不会把动态选择结果错误折叠成陈旧绝对地址。
+            InvalidateAdrpRegisterWrite(adrpOffsets, instruction.Op0Kind, instruction.Op0Reg);
+
+            if (!TryEmitCondition(
+                    instruction.FinalOpConditionCode,
+                    registerPrefix + "_CONDITION",
+                    out var condition))
+                return false;
+
+            var destination = ConvertOperand(instruction, 0);
+            var preservedTrue = new Register(null, registerPrefix + "_TRUE");
+            var preservedFalse = new Register(null, registerPrefix + "_FALSE");
+            Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
+            Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+            // 条件选择是单条值指令，不是原生控制流。把它提升成跨地址跳转会制造伪基本块，
+            // 特别是在同一地址连续生成多条 ISIL 时形成自环；保留为原子值选择供 CIL 内部展开。
+            Add(address, OpCode.ConditionalSelect, destination, condition, preservedTrue, preservedFalse);
+            return true;
+        }
+
+        bool TryEmitRecoveredVectorInstruction(uint machineCode)
+        {
+            if (!TryDecodeRecoveredVectorInstruction(machineCode, out var decoded))
+                return false;
+
+            var destination = new Register(null, $"V{decoded.DestinationRegister}");
+            var firstVectorSource = new Register(null, $"V{decoded.FirstSourceRegister}");
+            switch (decoded.Operation)
+            {
+                case Arm64RecoveredVectorOperation.DuplicateInt16:
+                    Add(
+                        address,
+                        OpCode.VectorDuplicate,
+                        destination,
+                        new Register(null, $"W{decoded.FirstSourceRegister}"),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.WidenUnsignedInt16ToInt32:
+                    Add(
+                        address,
+                        OpCode.VectorWidenUnsignedInt16ToInt32,
+                        destination,
+                        firstVectorSource,
+                        Imm(decoded.LaneCount));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.ShiftLeftInt32:
+                    Add(
+                        address,
+                        OpCode.VectorShiftLeft,
+                        destination,
+                        firstVectorSource,
+                        Imm(decoded.Immediate),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.CompareLessThanZeroInt32:
+                    Add(
+                        address,
+                        OpCode.VectorCompareLessThanZero,
+                        destination,
+                        firstVectorSource,
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.BitwiseSelect128:
+                    Add(
+                        address,
+                        OpCode.VectorBitwiseSelect,
+                        destination,
+                        destination,
+                        firstVectorSource,
+                        new Register(null, $"V{decoded.SecondSourceRegister}"),
+                        Imm(decoded.LaneCount * decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.MultiplyFloat32ByElement:
+                    Add(
+                        address,
+                        OpCode.VectorMultiplyByElement,
+                        destination,
+                        firstVectorSource,
+                        new Register(
+                            null,
+                            $"V{decoded.SecondSourceRegister}.S[{decoded.Immediate}]"),
+                        Imm(decoded.Immediate),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(decoded.Operation));
+            }
+        }
+
+        switch (instruction.Mnemonic)
+        {
+            case Arm64Mnemonic.MOV:
+            case Arm64Mnemonic.MOVZ:
+            case Arm64Mnemonic.FMOV:
+            case Arm64Mnemonic.SXTW: // move and sign extend Wn to Xd
+            case var scalarLoad when IsScalarLoadMnemonic(scalarLoad):
+                //Load and move are (dest, src)
+
+                if (instruction.Op1Kind == Arm64OperandKind.Memory)
+                {
+                    var vectorMemoryCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeUnsignedVector128Memory(
+                            vectorMemoryCode,
+                            out var isVectorLoad,
+                            out _,
+                            out _,
+                            out var vectorByteOffset)
+                        && isVectorLoad)
+                    {
+                        IOperand vectorSource;
+                        if (TryCreateStackOffset(
+                                instruction.MemBase,
+                                instruction.MemAddendReg,
+                                vectorByteOffset,
+                                out var vectorStackOffset))
+                        {
+                            // Q寄存器栈加载必须与标量栈加载使用相同槽位身份；否则16字节聚合复制会退化为普通指针内存。
+                            vectorSource = vectorStackOffset;
+                        }
+                        else if (adrpOffsets.TryGetValue(instruction.MemBase, out var vectorPage)
+                            && instruction.MemAddendReg == Arm64Register.INVALID)
+                        {
+                            vectorSource = new MemoryOperand(
+                                addend: checked((long)vectorPage + vectorByteOffset));
+                        }
+                        else
+                        {
+                            vectorSource = new MemoryOperand(
+                                new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase)),
+                                addend: vectorByteOffset);
+                        }
+
+                        if (instruction.Op0Kind == Arm64OperandKind.Register)
+                            adrpOffsets.Remove(instruction.Op0Reg);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), vectorSource);
+                        break;
+                    }
+                }
+
+                if (instruction.MemIsPreIndexed) //  such as  X8, [X19,#0x30]!
+                {
+                    //Regardless of anything else, we're trashing any possible ADRP offsets in the dest here, so let's clear that
+                    if (instruction.Op0Kind == Arm64OperandKind.Register)
+                        adrpOffsets.Remove(instruction.Op0Reg);
+
+                    var operate = ConvertOperand(instruction, 1);
+                    if (operate is MemoryOperand operand)
+                    {
+                        var register = (Register)operand.Base!;
+                        // X19= X19, #0x30
+                        Add(address, OpCode.Add, register, register, Imm(operand.Addend));
+                        //X8 = [X19]
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), new MemoryOperand(new Register(null, register.ToString()!.ToUpperInvariant())));
+                        break;
+                    }
+                }
+
+                if (instruction.Op1Kind == Arm64OperandKind.Memory
+                    && TryCreateAdrpMemoryOperand(
+                        adrpOffsets,
+                        instruction.MemBase,
+                        instruction.MemAddendReg,
+                        instruction.MemOffset,
+                        out var absoluteLoadSource))
+                {
+                    // ADRP后的标量LDR无论页内偏移是否为零都属于绝对地址加载；与存储路径
+                    // 共用同一解析函数，避免零偏移槽退化为“页地址再解引用”的动态内存链。
+                    if (instruction.Op0Kind == Arm64OperandKind.Register)
+                        adrpOffsets.Remove(instruction.Op0Reg);
+
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), absoluteLoadSource);
+                    break;
+                }
+
+                //And again here we're trashing any possible ADRP offsets in the dest here, so let's clear that
+                if (instruction.Op0Kind == Arm64OperandKind.Register)
+                    adrpOffsets.Remove(instruction.Op0Reg);
+
+                if (instruction.Mnemonic == Arm64Mnemonic.FMOV
+                    && TryGetFmovBitReinterpretation(
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        out var reinterpretOpCode,
+                        out var reinterpretWidthBits))
+                {
+                    Add(
+                        address,
+                        reinterpretOpCode,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(reinterpretWidthBits));
+                    break;
+                }
+
+                IOperand moveSource;
+                if (instruction.Mnemonic == Arm64Mnemonic.FMOV
+                    && instruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate)
+                {
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (!TryDecodeScalarFloatingPointImmediate(
+                            machineCode,
+                            out var precisionBits,
+                            out var floatingImmediate))
+                    {
+                        throw new InvalidOperationException(
+                            $"FMOV浮点立即数原始编码无效：0x{machineCode:X8} @ 0x{address:X}");
+                    }
+
+                    // FMOV S 与 FMOV D 的立即数编码都由解码器返回 double 承载，但 ISIL
+                    // 字面量必须保持目标原生精度，避免 S 寄存器先被错误定型为 System.Double。
+                    moveSource = precisionBits == 32
+                        ? new FloatLiteral((float)floatingImmediate)
+                        : new DoubleLiteral(floatingImmediate);
+                }
+                else
+                {
+                    moveSource = ConvertMoveSourceOperand(instruction);
+                }
+
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), moveSource);
+                // MOV、FMOV、SXTW 与 LDR 家族均不写 NZCV。保留此前 CMP/TST 等标志生产者，
+                // 使跨加载的 CSEL/条件分支继续读取原生指令流中的真实条件。
+                break;
+            case Arm64Mnemonic.MOVK:
+                {
+                    // MOVK 保留目标寄存器其他半字；必须读原始编码的 hw 字段，不能从已移位的显示立即数反推。
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (!TryDecodeMoveKeepImmediate(
+                            machineCode,
+                            out _,
+                            out _,
+                            out var clearMask,
+                            out var shiftedImmediate))
+                    {
+                        throw new InvalidOperationException(
+                            $"MOVK原始编码无效：0x{machineCode:X8} @ 0x{address:X}");
+                    }
+
+                    if (instruction.Op0Kind == Arm64OperandKind.Register)
+                        adrpOffsets.Remove(instruction.Op0Reg);
+
+                    var destination = ConvertOperand(instruction, 0);
+                    Add(address, OpCode.And, destination, destination, Imm(clearMask));
+                    Add(address, OpCode.Or, destination, destination, Imm(shiftedImmediate));
+                    break;
+                }
+            case Arm64Mnemonic.MOVN:
+                {
+                    // dest = ~src
+
+                    //See above re: ADRP offsets
+                    if (instruction.Op0Kind == Arm64OperandKind.Register)
+                        adrpOffsets.Remove(instruction.Op0Reg);
+
+                    var temp2 = new Register(null, "TEMP");
+                    Add(address, OpCode.Move, temp2, ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Not, temp2, temp2);
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), temp2);
+                    break;
+                }
+            case Arm64Mnemonic.MOVI:
+                {
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeReplicatedVectorMoveImmediate16(
+                            machineCode,
+                            out var vectorWidthBits16,
+                            out var laneCount16,
+                            out var elementBits16))
+                    {
+                        if (vectorWidthBits16 != 64 || laneCount16 != 4)
+                        {
+                            Add(address, OpCode.NotImplemented, new StringLiteral(
+                                $"Instruction MOVI {laneCount16}H requires 128-bit storage."));
+                            break;
+                        }
+
+                        ulong packed = 0;
+                        for (var lane = 0; lane < laneCount16; lane++)
+                            packed |= (ulong)elementBits16 << (lane * 16);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(packed));
+                        break;
+                    }
+
+                    if (TryDecodeReplicatedVectorMoveImmediate32(
+                            machineCode,
+                            out _,
+                            out _,
+                            out var elementBits))
+                    {
+                        // 同一位型被复制到全部 S 通道；FloatLiteral 保留后续标量读取的精确 IEEE-754 语义。
+                        var elementValue = BitConverter.ToSingle(BitConverter.GetBytes(elementBits), 0);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), new FloatLiteral(elementValue));
+                        break;
+                    }
+
+                    // 其他已确认的零立即数仍可由托管零精确表达。
+                    if (!IsExactlyRepresentableMovi(instruction.Op1Kind, instruction.Op1Imm))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction MOVI immediate {instruction.Op1Imm} not yet implemented."));
+                        break;
+                    }
+
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(0));
+                    break;
+                }
+            case var scalarStore when IsScalarStoreMnemonic(scalarStore):
+                //Store is (src, dest)
+                {
+                    var storeWidthBits = GetScalarStoreWidthBits(
+                        instruction.Mnemonic,
+                        instruction.Op0Reg);
+                    var vectorMemoryCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeUnsignedVector128Memory(
+                            vectorMemoryCode,
+                            out var isVectorLoad,
+                            out _,
+                            out _,
+                            out var vectorByteOffset)
+                        && !isVectorLoad)
+                    {
+                        IOperand vectorDestination = TryCreateStackOffset(
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            vectorByteOffset,
+                            out var vectorStackOffset)
+                            ? vectorStackOffset
+                            : new MemoryOperand(
+                                new Register(null, Arm64RegisterHelper.CanonicalName(instruction.MemBase)),
+                                addend: vectorByteOffset);
+                        AddMemory(
+                            address,
+                            128,
+                            OpCode.Move,
+                            vectorDestination,
+                            ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
+                    if (!instruction.MemIsPreIndexed
+                        && TryCreateAdrpMemoryOperand(
+                            adrpOffsets,
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            instruction.MemOffset,
+                            out var absoluteStoreDestination))
+                    {
+                        AddMemory(
+                            address,
+                            storeWidthBits,
+                            OpCode.Move,
+                            absoluteStoreDestination,
+                            ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
+                    if (instruction.MemIsPreIndexed
+                        && TryCreateStackOffset(
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            instruction.MemOffset,
+                            out var preIndexedStoreOffset))
+                    {
+                        // 预索引先调整SP，再把值写入新SP的零偏移槽位。
+                        Add(address, OpCode.ShiftStack, Imm(preIndexedStoreOffset.Offset));
+                        AddMemory(
+                            address,
+                            storeWidthBits,
+                            OpCode.Move,
+                            new StackOffset(0),
+                            ConvertStoreSourceOperand(instruction));
+                        break;
+                    }
+
+                    if (TryDecodePreIndexedRegisterWriteback(
+                            instruction.MemIndexMode,
+                            instruction.MemBase,
+                            instruction.MemAddendReg,
+                            out var preIndexedWritebackRegister))
+                    {
+                        // 普通寄存器前索引必须显式产生基址写回；否则后续 [Xn] 会继续读取旧对象。
+                        // 先更新基址再访问零偏移内存，精确对应 ARM64 的 pre-index 语义。
+                        Add(
+                            address,
+                            OpCode.Add,
+                            preIndexedWritebackRegister,
+                            preIndexedWritebackRegister,
+                            Imm(instruction.MemOffset));
+                        AddMemory(
+                            address,
+                            storeWidthBits,
+                            OpCode.Move,
+                            new MemoryOperand(new Register(null, preIndexedWritebackRegister.Name)),
+                            ConvertStoreSourceOperand(instruction));
+
+                        if (adrpOffsets.TryGetValue(instruction.MemBase, out var knownBaseAddress))
+                            adrpOffsets[instruction.MemBase] = unchecked(knownBaseAddress + (ulong)instruction.MemOffset);
+                        break;
+                    }
+
+                    AddMemory(
+                        address,
+                        storeWidthBits,
+                        OpCode.Move,
+                        ConvertOperand(instruction, 1),
+                        ConvertStoreSourceOperand(instruction));
+                    break;
+                }
+            case Arm64Mnemonic.STP:
+                // store pair of registers (reg1, reg2, dest)
+                {
+                    var dest3 = ConvertOperand(instruction, 2);
+                    if (dest3 is StackOffset stackOffset)
+                    {
+                        if (instruction.MemIsPreIndexed)
+                        {
+                            Add(address, OpCode.ShiftStack, Imm(stackOffset.Offset));
+                            stackOffset = new StackOffset(0);
+                        }
+
+                        var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
+                        AddMemory(
+                            address,
+                            size * 8,
+                            OpCode.Move,
+                            stackOffset,
+                            ConvertStorePairSourceOperand(instruction, 0));
+                        AddMemory(
+                            address,
+                            size * 8,
+                            OpCode.Move,
+                            new StackOffset(stackOffset.Offset + size),
+                            ConvertStorePairSourceOperand(instruction, 1));
+                    }
+                    else if (dest3 is MemoryOperand memory)
+                    {
+                        var firstRegister = ConvertOperand(instruction, 0);
+                        var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
+                        AddMemory(address, size * 8, OpCode.Move, dest3, firstRegister); // [REG + offset] = REG1
+                        memory = new MemoryOperand((Register)memory.Base!, addend: memory.Addend + size);
+                        dest3 = memory;
+                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertOperand(instruction, 1)); // [REG + offset + size] = REG2
+                    }
+                    else // reg pointer
+                    {
+                        var firstRegister = ConvertOperand(instruction, 0);
+                        var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
+                        AddMemory(address, size * 8, OpCode.Move, dest3, firstRegister);
+                        Add(address, OpCode.Add, dest3, dest3, Imm(size));
+                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertOperand(instruction, 1));
+                    }
+                }
+                break;
+            case Arm64Mnemonic.ADRP:
+                // ADRP立即数相对当前指令页；ISIL局部量与后续内存折叠统一保存绝对页地址。
+                var absolutePageAddress = ResolveAdrpPageAddress(address, instruction.Op1Imm);
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(absolutePageAddress));
+                adrpOffsets[instruction.Op0Reg] = absolutePageAddress;
+                break;
+            case Arm64Mnemonic.LDP when instruction.Op2Kind == Arm64OperandKind.Memory:
+                //LDP (dest1, dest2, [mem]) - basically just treat as two loads, with the second offset by the length of the first
+                var destRegSize = instruction.Op0Reg switch
+                {
+                    //vector (128 bit)
+                    >= Arm64Register.V0 and <= Arm64Register.V31 => 16, //TODO check if this is accurate
+                    //double
+                    >= Arm64Register.D0 and <= Arm64Register.D31 => 8,
+                    //single
+                    >= Arm64Register.S0 and <= Arm64Register.S31 => 4,
+                    //half
+                    >= Arm64Register.H0 and <= Arm64Register.H31 => 2,
+                    //word
+                    >= Arm64Register.W0 and <= Arm64Register.W31 => 4,
+                    //x
+                    >= Arm64Register.X0 and <= Arm64Register.X31 => 8,
+                    _ => throw new($"Unknown register size for LDP: {instruction.Op0Reg}")
+                };
+
+                var dest1 = ConvertOperand(instruction, 0);
+                var dest2 = ConvertOperand(instruction, 1);
+                var mem = ConvertOperand(instruction, 2);
+
+                IOperand mem2;
+                if (mem is StackOffset stackOffset2)
+                {
+                    if (instruction.MemIsPreIndexed)
+                    {
+                        Add(address, OpCode.ShiftStack, Imm(stackOffset2.Offset));
+                        stackOffset2 = new StackOffset(0);
+                        mem = stackOffset2;
+                    }
+
+                    mem2 = new StackOffset(stackOffset2.Offset + destRegSize);
+                }
+                else
+                {
+                    // 非栈内存继续保持基址和第二寄存器宽度的精确偏移。
+                    var memInternal = (MemoryOperand)mem;
+                    mem2 = new MemoryOperand((Register)memInternal.Base!, addend: memInternal.Addend + destRegSize);
+                }
+
+                Add(address, OpCode.Move, dest1, mem);
+                Add(address, OpCode.Move, dest2, mem2);
+                if (TryDecodePostIndexedStackAdjustment(
+                        instruction.MemIndexMode,
+                        instruction.MemBase,
+                        instruction.MemOffset,
+                        out var postIndexedStackDelta))
+                    Add(address, OpCode.ShiftStack, Imm(postIndexedStackDelta));
+                break;
+            case Arm64Mnemonic.BL:
+                AddCall(context, address, instruction.BranchTarget);
+                break;
+            case Arm64Mnemonic.RET:
+                Add(address, OpCode.Return, GetReturnOperandsForContext(context));
+                break;
+            case Arm64Mnemonic.B:
+                var target = instruction.BranchTarget;
+                var branchConditionCode = instruction.MnemonicConditionCode;
+
+                if (!IsUnconditionalBranchCode(branchConditionCode))
+                {
+                    if (IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Conditional branch {branchConditionCode} leaves the current method."));
+                        break;
+                    }
+
+                    if (!CanEmitConditionalBranch(branchConditionCode, inputFlagState))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Conditional branch {branchConditionCode} has no exactly modeled flag producer."));
+                        break;
+                    }
+
+                    if (!TryEmitCondition(
+                            branchConditionCode,
+                            "BRANCH_CONDITION",
+                            out var branchCondition))
+                        throw new InvalidOperationException("条件分支的可发射判定与条件构造结果不一致。");
+
+                    Add(address, OpCode.ConditionalJump, Imm(target), branchCondition);
+                    break;
+                }
+
+                if (IsSelfTailBranch(target, context.UnderlyingPointer, address)
+                    || IsBranchOutsideMethod(target, context.UnderlyingPointer, context.RawBytes.Length))
+                {
+                    // 跳到相邻方法首地址或自身原生序言均属于尾调用，随后返回当前托管方法。
+                    var returnOperands = GetReturnOperandsForContext(context);
+                    AddCall(context, address, target);
+                    Add(address, OpCode.Return, returnOperands);
+                }
+                else
+                {
+                    Add(address, OpCode.Jump, Imm(instruction.BranchTarget));
+                }
+
+                break;
+            case Arm64Mnemonic.BLR:
+            case Arm64Mnemonic.BR:
+                // BLR 是带返回地址的间接调用；BR 是不返回当前点的间接尾跳转。
+                AddIndirectTransfer(instruction.Mnemonic, address, ConvertOperand(instruction, 0));
+                break;
+            case Arm64Mnemonic.CBNZ:
+            case Arm64Mnemonic.CBZ:
+                {
+                    // CBZ/CBNZ 不写 NZCV，因此使用独立条件寄存器，保留此前 CMP/SUBS 的标志状态。
+                    var targetAddr = (ulong)((long)instruction.Address + instruction.Op1Imm);
+                    var conditionRegister = new Register(null, "COMPARE_AND_BRANCH_CONDITION");
+                    var comparisonOpCode = instruction.Mnemonic == Arm64Mnemonic.CBZ
+                        ? OpCode.CheckEqual
+                        : OpCode.CheckNotEqual;
+                    Add(address, comparisonOpCode, conditionRegister, ConvertOperand(instruction, 0), Imm(0));
+                    Add(address, OpCode.ConditionalJump, Imm(targetAddr), conditionRegister);
+                }
+                break;
+
+            case Arm64Mnemonic.CMP:
+            case Arm64Mnemonic.FCMP:
+                var compareLeft = new Register(null, "FLAG_COMPARE_LEFT");
+                var compareRight = new Register(null, "FLAG_COMPARE_RIGHT");
+                Add(address, OpCode.Move, compareLeft, ConvertOperand(instruction, 0));
+                Add(address, OpCode.Move, compareRight, ConvertOperand(instruction, 1));
+                Add(address, OpCode.CheckEqual, new Register(null, "Z"), compareLeft, compareRight);
+                if (instruction.Mnemonic == Arm64Mnemonic.CMP)
+                {
+                    // CMP 是丢弃结果的 SUBS；保留固定宽度减法结果可精确重建 N 标志，不能把 MI 简化为 LT。
+                    var comparisonDifference = new Register(null, "FLAG_COMPARE_DIFFERENCE");
+                    Add(address, OpCode.Subtract, comparisonDifference, compareLeft, compareRight);
+                    Add(address, OpCode.CheckLess, new Register(null, "N"), comparisonDifference, Imm(0));
+                }
+                flagState = instruction.Mnemonic == Arm64Mnemonic.FCMP
+                    ? Arm64FlagState.FloatingComparison
+                    : Arm64FlagState.Comparison;
+                break;
+
+            case Arm64Mnemonic.CCMP:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CCMP_CONDITION",
+                            out var ccmpCondition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CCMP condition {instruction.FinalOpConditionCode} has no exactly modeled flag producer."));
+                        break;
+                    }
+
+                    // CCMP 必须把门条件、比较两端与回退 NZCV 一并冻结；后继分支或 CSEL
+                    // 按自身条件码只计算一次比较，再原子选择真实比较结果或回退标志结果。
+                    Add(
+                        address,
+                        OpCode.Move,
+                        new Register(null, "CCMP_GATE"),
+                        ccmpCondition);
+                    Add(
+                        address,
+                        OpCode.Move,
+                        new Register(null, "CCMP_COMPARE_LEFT"),
+                        ConvertOperand(instruction, 0));
+                    Add(
+                        address,
+                        OpCode.Move,
+                        new Register(null, "CCMP_COMPARE_RIGHT"),
+                        ConvertOperand(instruction, 1));
+                    conditionalComparisonFallbackNzcv = instruction.Op2Imm & 0xF;
+                    flagState = Arm64FlagState.ConditionalComparison;
+                    break;
+                }
+
+            case Arm64Mnemonic.CSET:
+                {
+                    var destination = ConvertOperand(instruction, 0);
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CSET_CONDITION",
+                            out var condition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSET condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    Add(address, OpCode.Move, destination, condition);
+                    break;
+                }
+
+            case Arm64Mnemonic.CSEL:
+                {
+                    if (!TryEmitConditionalSelect("CSEL"))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSEL condition {instruction.FinalOpConditionCode} not yet implemented."));
+                    }
+                    break;
+                }
+
+            case Arm64Mnemonic.FCSEL:
+                {
+                    if (!TryEmitConditionalSelect("FCSEL"))
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction FCSEL condition {instruction.FinalOpConditionCode} not yet implemented."));
+                    break;
+                }
+
+            case Arm64Mnemonic.FCVT:
+                {
+                    if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FCVT register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.ConvertFloatingPointPrecision,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits),
+                        Imm(sourceBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FCVTZS:
+                {
+                    if (!TryGetSignedIntegerPayloadWidthBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FCVTZS register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.ConvertFloatToSignedInteger,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits),
+                        Imm(sourceBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.SCVTF:
+                {
+                    if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetSignedIntegerPayloadWidthBits(instruction.Op1Reg, out var sourceBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction SCVTF register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.ConvertSignedIntegerToFloat,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits),
+                        Imm(sourceBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FRINTP:
+            case Arm64Mnemonic.FRINTM:
+                {
+                    if (!TryGetFloatingPointPrecisionBits(instruction.Op0Reg, out var destinationBits) ||
+                        !TryGetFloatingPointPrecisionBits(instruction.Op1Reg, out var sourceBits) ||
+                        destinationBits != sourceBits)
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} register widths not yet implemented."));
+                        break;
+                    }
+
+                    var opCode = instruction.Mnemonic == Arm64Mnemonic.FRINTP
+                        ? OpCode.RoundFloatTowardPositiveInfinity
+                        : OpCode.RoundFloatTowardNegativeInfinity;
+                    Add(
+                        address,
+                        opCode,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(destinationBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.CSINC:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CSINC_CONDITION",
+                            out var condition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CSINC condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var preservedTrue = new Register(null, "CSINC_TRUE");
+                    var preservedFalse = new Register(null, "CSINC_FALSE");
+                    var incrementedFalse = new Register(null, "CSINC_FALSE_INCREMENTED");
+                    Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Add, incrementedFalse, preservedFalse, Imm(1));
+                    Add(address, OpCode.Move, destination, preservedTrue);
+                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
+                    Add(address, OpCode.Move, destination, incrementedFalse);
+                    break;
+                }
+
+            case Arm64Mnemonic.CSNEG:
+            case Arm64Mnemonic.CSINV:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            instruction.Mnemonic + "_CONDITION",
+                            out var condition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var preservedTrue = new Register(null, instruction.Mnemonic + "_TRUE");
+                    var preservedFalse = new Register(null, instruction.Mnemonic + "_FALSE");
+                    var transformedFalse = new Register(null, instruction.Mnemonic + "_FALSE_TRANSFORMED");
+                    Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
+                    Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+                    var falseTransform = GetConditionalFalseTransformOpCode(instruction.Mnemonic)
+                        ?? throw new InvalidOperationException($"条件变换指令未映射：{instruction.Mnemonic}");
+                    Add(
+                        address,
+                        falseTransform,
+                        transformedFalse,
+                        preservedFalse);
+                    Add(address, OpCode.ConditionalSelect, destination, condition, preservedTrue, transformedFalse);
+                    break;
+                }
+
+            case Arm64Mnemonic.CINC:
+                {
+                    if (!TryEmitCondition(
+                            instruction.FinalOpConditionCode,
+                            "CINC_CONDITION",
+                            out var condition))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction CINC condition {instruction.FinalOpConditionCode} not yet implemented."));
+                        break;
+                    }
+
+                    var destination = ConvertOperand(instruction, 0);
+                    var preservedSource = new Register(null, "CINC_SOURCE");
+                    var incrementedSource = new Register(null, "CINC_INCREMENTED");
+                    Add(address, OpCode.Move, preservedSource, ConvertOperand(instruction, 1));
+                    AddInteger(address, OpCode.Add, incrementedSource, preservedSource, Imm(1));
+                    Add(address, OpCode.Move, destination, incrementedSource);
+                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
+                    Add(address, OpCode.Move, destination, preservedSource);
+                    break;
+                }
+
+            case Arm64Mnemonic.TBNZ:
+            // TBNZ R<t>, #imm, label
+            // test bit and branch if NonZero
+            case Arm64Mnemonic.TBZ:
+                // TBZ R<t>, #imm, label
+                // test bit and branch if Zero
+                {
+                    var targetAddr = (ulong)((long)instruction.Address + instruction.Op2Imm);
+                    var bit = 1L << (int)instruction.Op1Imm;
+                    var maskedBit = new Register(null, "TEST_BIT_VALUE");
+                    var conditionRegister = new Register(null, "TEST_BIT_CONDITION");
+                    var src = ConvertOperand(instruction, 0);
+                    Add(address, OpCode.And, maskedBit, src, Imm(bit));
+                    var comparisonOpCode = instruction.Mnemonic == Arm64Mnemonic.TBZ
+                        ? OpCode.CheckEqual
+                        : OpCode.CheckNotEqual;
+                    Add(address, comparisonOpCode, conditionRegister, maskedBit, Imm(0));
+                    Add(address, OpCode.ConditionalJump, Imm(targetAddr), conditionRegister);
+                }
+                break;
+            case Arm64Mnemonic.UBFM:
+            case Arm64Mnemonic.LSR:
+            case Arm64Mnemonic.UBFIZ:
+                {
+                    if (!TryCreateUnsignedBitfieldMoveInstructions(instruction, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction UBFM operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                }
+                break;
+
+            case Arm64Mnemonic.MUL:
+                // 整数乘法保留目标寄存器位宽，供退SSA后的标量载体定型。
+                AddInteger(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+            case Arm64Mnemonic.SMADDL:
+            case Arm64Mnemonic.SMULL:
+                {
+                    if (!TryCreateSignedMultiplyAddLongInstructions(instruction, address, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction SMADDL operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                    break;
+                }
+            case Arm64Mnemonic.FMUL:
+                Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.FDIV:
+                Add(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.FABS:
+                {
+                    if (!TryGetMatchingScalarFloatingWidth(
+                            [
+                                (instruction.Op0Kind, instruction.Op0Reg),
+                                (instruction.Op1Kind, instruction.Op1Reg),
+                            ],
+                            out var widthBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABS register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.AbsoluteNumber,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        Imm(widthBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FABD:
+                {
+                    if (!TryGetMatchingScalarFloatingWidth(
+                            [
+                                (instruction.Op0Kind, instruction.Op0Reg),
+                                (instruction.Op1Kind, instruction.Op1Reg),
+                                (instruction.Op2Kind, instruction.Op2Reg),
+                            ],
+                            out var widthBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABD register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.AbsoluteDifference,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        ConvertOperand(instruction, 2),
+                        Imm(widthBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FMAXNM:
+                {
+                    if (!TryGetMatchingScalarFloatingWidth(
+                            [
+                                (instruction.Op0Kind, instruction.Op0Reg),
+                                (instruction.Op1Kind, instruction.Op1Reg),
+                                (instruction.Op2Kind, instruction.Op2Reg),
+                            ],
+                            out var widthBits))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FMAXNM register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.MaximumNumber,
+                        ConvertOperand(instruction, 0),
+                        ConvertOperand(instruction, 1),
+                        ConvertOperand(instruction, 2),
+                        Imm(widthBits));
+                    break;
+                }
+
+            case Arm64Mnemonic.FNEG:
+                {
+                    if (!CanEmitScalarFloatingNegate(
+                            instruction.Op0Kind,
+                            instruction.Op0Reg,
+                            instruction.Op1Kind,
+                            instruction.Op1Reg))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FNEG register widths not yet implemented."));
+                        break;
+                    }
+
+                    Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    break;
+                }
+
+            case Arm64Mnemonic.FNMUL:
+                {
+                    var product = new Register(null, $"FNMUL_PRODUCT_{address:X}");
+                    Add(address, OpCode.Multiply, product, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Negate, ConvertOperand(instruction, 0), product);
+                    break;
+                }
+
+            case Arm64Mnemonic.ADD:
+                if (TryDecodeStackPointerAdjustment(
+                        instruction.Mnemonic,
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        instruction.Op2Kind,
+                        instruction.Op2Imm,
+                        out var addStackDelta))
+                {
+                    Add(address, OpCode.ShiftStack, Imm(addStackDelta));
+                    break;
+                }
+
+                if (TryCreateStackAddressOffset(
+                        instruction.Mnemonic,
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        instruction.Op2Kind,
+                        instruction.Op2Imm,
+                        out var addressedStackOffset))
+                {
+                    Add(
+                        address,
+                        OpCode.Move,
+                        ConvertOperand(instruction, 0),
+                        new AddressOf(addressedStackOffset));
+                    break;
+                }
+
+                // ADD 的扩展寄存器和移位寄存器格式必须先恢复第三操作数语义。
+                if (!Arm64AddOperandHelper.TryEmit(
+                        instruction,
+                        ConvertOperand(instruction, 2),
+                        (opCode, operands) => Add(address, opCode, operands),
+                        out var addRight))
+                {
+                    Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction ADD modifier {instruction.FinalOpExtendType}/{instruction.FinalOpShiftType} is not exactly modeled."));
+                    break;
+                }
+
+                AddInteger(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), addRight);
+                break;
+            case Arm64Mnemonic.FADD:
+                // 浮点加法没有整数扩展寄存器格式。
+                Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.SUB:
+                if (TryDecodeStackPointerAdjustment(
+                        instruction.Mnemonic,
+                        instruction.Op0Kind,
+                        instruction.Op0Reg,
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        instruction.Op2Kind,
+                        instruction.Op2Imm,
+                        out var subtractStackDelta))
+                {
+                    Add(address, OpCode.ShiftStack, Imm(subtractStackDelta));
+                    break;
+                }
+
+                AddInteger(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+            case Arm64Mnemonic.FSUB:
+                //Sub is (dest, src1, src2)
+                Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.AND:
+                //And is (dest, src1, src2)
+                AddInteger(address, OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.ADDS:
+            case Arm64Mnemonic.SUBS:
+            case Arm64Mnemonic.ANDS:
+                {
+                    var dest = ConvertOperand(instruction, 0);
+                    var src1 = ConvertOperand(instruction, 1);
+                    var src2 = ConvertOperand(instruction, 2);
+
+                    if (instruction.Mnemonic == Arm64Mnemonic.ADDS
+                        && TryDecodeCmnSignedThreshold(
+                            instruction.Op0Reg,
+                            instruction.Op2Kind,
+                            instruction.Op2Imm,
+                            out _,
+                            out var signedThreshold))
+                    {
+                        // CMN 不写通用寄存器；直接冻结比较两端，同时恢复 Z/N 供 EQ/NE/MI/PL 使用。
+                        // GT/LE/GE/LT 由同一对 FLAG_COMPARE 操作数恢复，完整保留加法溢出的有符号语义。
+                        var cmnCompareLeft = new Register(null, "FLAG_COMPARE_LEFT");
+                        var cmnCompareRight = new Register(null, "FLAG_COMPARE_RIGHT");
+                        var cmnDifference = new Register(null, "FLAG_COMPARE_DIFFERENCE");
+                        Add(address, OpCode.Move, cmnCompareLeft, src1);
+                        Add(address, OpCode.Move, cmnCompareRight, Imm(signedThreshold));
+                        Add(address, OpCode.Subtract, cmnDifference, cmnCompareLeft, cmnCompareRight);
+                        Add(address, OpCode.CheckEqual, new Register(null, "Z"), cmnCompareLeft, cmnCompareRight);
+                        Add(address, OpCode.CheckLess, new Register(null, "N"), cmnDifference, Imm(0));
+                        flagState = Arm64FlagState.Comparison;
+                        break;
+                    }
+
+                    var opCode = instruction.Mnemonic switch
+                    {
+                        Arm64Mnemonic.ADDS => OpCode.Add,
+                        Arm64Mnemonic.SUBS => OpCode.Subtract,
+                        Arm64Mnemonic.ANDS => OpCode.And,
+                        _ => OpCode.Invalid
+                    };
+
+                    if (instruction.Mnemonic == Arm64Mnemonic.SUBS)
+                    {
+                        // SUBS 的目标寄存器可能覆盖源寄存器，必须在运算前保存比较操作数。
+                        var subsCompareLeft = new Register(null, "FLAG_COMPARE_LEFT");
+                        var subsCompareRight = new Register(null, "FLAG_COMPARE_RIGHT");
+                        Add(address, OpCode.Move, subsCompareLeft, src1);
+                        Add(address, OpCode.Move, subsCompareRight, src2);
+                        AddInteger(address, opCode, dest, subsCompareLeft, subsCompareRight);
+                        Add(address, OpCode.CheckLess, new Register(null, "N"), dest, Imm(0));
+                        flagState = Arm64FlagState.Comparison;
+                    }
+                    else
+                    {
+                        AddInteger(address, opCode, dest, src1, src2);
+                        flagState = Arm64FlagState.ZeroOnly;
+                    }
+
+                    Add(address, OpCode.CheckEqual, new Register(null, "Z"), dest, Imm(0));
+                    break;
+                }
+
+            case Arm64Mnemonic.ORR:
+                //Orr is (dest, src1, src2)
+                AddInteger(address, OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.EOR:
+                //Eor (aka xor) is (dest, src1, src2)
+                AddInteger(address, OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.UMOV:
+            case Arm64Mnemonic.INVALID:
+            case Arm64Mnemonic.UNIMPLEMENTED:
+                {
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (TryDecodeDisassembledUnsignedHalfwordMoveToGeneral(
+                            instruction.Mnemonic,
+                            machineCode,
+                            out var generalRegister,
+                            out var vectorRegister,
+                            out var laneIndex))
+                    {
+                        Add(
+                            address,
+                            OpCode.VectorExtractUnsignedInt16,
+                            new Register(null, $"X{generalRegister}"),
+                            new Register(null, $"V{vectorRegister}"),
+                            Imm(laneIndex));
+                        break;
+                    }
+
+                    if (TryEmitRecoveredVectorInstruction(machineCode))
+                        break;
+
+                    if (!TryDecodeVectorFloatingMultiply(
+                            machineCode,
+                            out _,
+                            out _,
+                            out _,
+                            out var destinationRegister,
+                            out var leftRegister,
+                            out var rightRegister))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} 0x{machineCode:X8} not yet implemented."));
+                        break;
+                    }
+
+                    Add(
+                        address,
+                        OpCode.Multiply,
+                        new Register(null, $"V{destinationRegister}"),
+                        new Register(null, $"V{leftRegister}"),
+                        new Register(null, $"V{rightRegister}"));
+                    break;
+                }
+
+            default:
+                Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 在当前基本块内读取最近一次整数参数寄存器赋值。
+    /// 接口慢查表第三实参是较小的虚表槽号；真实 AddWithResize 的 X2 则承载 MethodInfo 指针。
+    /// 一旦跨越调用或控制流边界，AAPCS64 参数寄存器内容便不再属于当前调用点，因此立即停止追踪。
+    /// </summary>
+    internal static bool HasRecentSmallImmediateArgument(
+        IReadOnlyList<Instruction> instructions,
+        string registerName,
+        long maximumValue)
+    {
+        if (string.IsNullOrWhiteSpace(registerName) || maximumValue < 0)
+            return false;
+
+        for (var index = instructions.Count - 1; index >= 0; index--)
+        {
+            var instruction = instructions[index];
+            if (instruction.IsCall || !instruction.IsFallThrough)
+                return false;
+
+            if (instruction.Destination is not Register destination
+                || !string.Equals(destination.Name, registerName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return instruction.OpCode == OpCode.Move
+                   && instruction.Operands.Count >= 2
+                   && instruction.Operands[1] is Immediate { Value: >= 0 } immediate
+                   && immediate.Value <= maximumValue;
+        }
+
+        return false;
+    }
+
+    private IOperand ConvertOperand(Arm64Instruction instruction, int operand)
+    {
+        var kind = operand switch
+        {
+            0 => instruction.Op0Kind,
+            1 => instruction.Op1Kind,
+            2 => instruction.Op2Kind,
+            3 => instruction.Op3Kind,
+            _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
+        };
+
+        if (kind is Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative)
+        {
+            var imm = operand switch
+            {
+                0 => instruction.Op0Imm,
+                1 => instruction.Op1Imm,
+                2 => instruction.Op2Imm,
+                3 => instruction.Op3Imm,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
+            };
+
+            if (kind == Arm64OperandKind.ImmediatePcRelative)
+                imm += (long)instruction.Address + 4; //Add 4 to the address to get the address of the next instruction (PC-relative addressing is relative to the address of the next instruction, not the current one
+
+            return new Immediate(imm);
+        }
+
+        if (kind == Arm64OperandKind.FloatingPointImmediate)
+        {
+            var imm = operand switch
+            {
+                0 => instruction.Op0FpImm,
+                1 => instruction.Op1FpImm,
+                2 => instruction.Op2FpImm,
+                3 => instruction.Op3FpImm,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
+            };
+
+            return new DoubleLiteral(imm);
+        }
+
+        if (kind == Arm64OperandKind.Register)
+        {
+            var reg = operand switch
+            {
+                0 => instruction.Op0Reg,
+                1 => instruction.Op1Reg,
+                2 => instruction.Op2Reg,
+                3 => instruction.Op3Reg,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
+            };
+
+            return new Register(null, Arm64RegisterHelper.CanonicalName(reg));
+        }
+
+        if (kind == Arm64OperandKind.Memory)
+        {
+            var reg = instruction.MemBase;
+            var offset = instruction.MemOffset;
+
+            if (reg == Arm64Register.INVALID)
+                //Offset only
+                return new MemoryOperand(addend: offset);
+
+            if (TryCreateStackOffset(
+                    reg,
+                    instruction.MemAddendReg,
+                    offset,
+                    out var stackOffset))
+                return stackOffset;
+
+            return CreateMemoryOperand(instruction);
+        }
+
+        if (kind == Arm64OperandKind.VectorRegisterElement)
+        {
+            var reg = operand switch
+            {
+                0 => instruction.Op0Reg,
+                1 => instruction.Op1Reg,
+                2 => instruction.Op2Reg,
+                3 => instruction.Op3Reg,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
+            };
+
+            var vectorElement = operand switch
+            {
+                0 => instruction.Op0VectorElement,
+                1 => instruction.Op1VectorElement,
+                2 => instruction.Op2VectorElement,
+                3 => instruction.Op3VectorElement,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand), $"Operand must be between 0 and 3, inclusive. Got {operand}")
+            };
+
+            var width = vectorElement.Width switch
+            {
+                Arm64VectorElementWidth.B => "B",
+                Arm64VectorElementWidth.H => "H",
+                Arm64VectorElementWidth.S => "S",
+                Arm64VectorElementWidth.D => "D",
+                _ => throw new ArgumentOutOfRangeException(nameof(vectorElement.Width), $"Unknown vector element width {vectorElement.Width}")
+            };
+
+            var name = $"{reg.ToString().ToUpperInvariant()}.{width}{vectorElement.Index}";
+            return new Register(null, name);
+        }
+
+        return new StringLiteral($"<UNIMPLEMENTED OPERAND TYPE {kind}>");
+    }
+
+    private IOperand ConvertMoveSourceOperand(Arm64Instruction instruction)
+    {
+        if (instruction.Op1Kind == Arm64OperandKind.Register
+            && Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg))
+            return Imm(0);
+
+        return ConvertOperand(instruction, 1);
+    }
+
+    private IOperand ConvertStoreSourceOperand(Arm64Instruction instruction)
+    {
+        if (instruction.Op0Kind == Arm64OperandKind.Register
+            && Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+            return Imm(0);
+
+        return ConvertOperand(instruction, 0);
+    }
+
+    private IOperand ConvertStorePairSourceOperand(Arm64Instruction instruction, int operand)
+    {
+        var kind = operand switch
+        {
+            0 => instruction.Op0Kind,
+            1 => instruction.Op1Kind,
+            _ => throw new ArgumentOutOfRangeException(nameof(operand), operand, "STP源操作数只能是0或1。")
+        };
+        var register = operand switch
+        {
+            0 => instruction.Op0Reg,
+            1 => instruction.Op1Reg,
+            _ => Arm64Register.INVALID
+        };
+
+        // STP的源位置把31号通用寄存器解释为XZR/WZR，必须写入常量零。
+        if (kind == Arm64OperandKind.Register && Arm64RegisterHelper.IsZeroRegister(register))
+            return Imm(0);
+
+        return ConvertOperand(instruction, operand);
+    }
+
+    public override BaseKeyFunctionAddresses CreateKeyFunctionAddressesInstance() => new NewArm64KeyFunctionAddresses();
+
+    public override string PrintAssembly(MethodAnalysisContext context)
+    {
+        if (context.RawBytes.Length <= 0)
+            return "";
+
+        var raw = context.RawBytes.AsSpan();
+        var disassembled = Disassembler.Disassemble(
+            raw,
+            context.UnderlyingPointer,
+            new Disassembler.Options(true, true, false)).ToList();
+        var lines = new List<string>(disassembled.Count);
+        for (var index = 0; index < disassembled.Count && index * sizeof(uint) + sizeof(uint) <= raw.Length; index++)
+        {
+            var decodedInstruction = disassembled[index];
+            var machineCode = BinaryPrimitives.ReadUInt32LittleEndian(
+                raw.Slice(index * sizeof(uint), sizeof(uint)));
+            var address = checked(context.UnderlyingPointer + (ulong)index * sizeof(uint));
+            if (decodedInstruction.Mnemonic is not (
+                    Arm64Mnemonic.INVALID or Arm64Mnemonic.UNIMPLEMENTED))
+            {
+                if (decodedInstruction.Mnemonic == Arm64Mnemonic.FMOV
+                    && decodedInstruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate
+                    && TryDecodeScalarFloatingPointImmediate(
+                        machineCode,
+                        out _,
+                        out var floatingImmediate))
+                {
+                    lines.Add(
+                        $"0x{address:X8} FMOV "
+                        + $"{decodedInstruction.Op0Reg.ToString().ToUpperInvariant()}, "
+                        + floatingImmediate.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    continue;
+                }
+
+                lines.Add(decodedInstruction.ToString());
+                continue;
+            }
+
+            if (TryFormatRecoveredVectorInstruction(
+                    machineCode,
+                    address,
+                    out var recoveredVectorInstruction))
+            {
+                lines.Add(recoveredVectorInstruction);
+                continue;
+            }
+
+            if (!TryDecodeVectorFloatingMultiply(
+                    machineCode,
+                    out _,
+                    out var elementWidthBits,
+                    out var laneCount,
+                    out var destinationRegister,
+                    out var leftRegister,
+                    out var rightRegister))
+            {
+                lines.Add(decodedInstruction.ToString());
+                continue;
+            }
+
+            var elementSuffix = elementWidthBits == 32 ? "S" : "D";
+            lines.Add($"0x{address:X8} FMUL V{destinationRegister}.{laneCount}{elementSuffix}, V{leftRegister}.{laneCount}{elementSuffix}, V{rightRegister}.{laneCount}{elementSuffix}");
+        }
+
+        return string.Join("\n", lines);
+    }
+
+    private static uint ReadMachineCodeAtAddress(MethodAnalysisContext context, ulong address)
+    {
+        var binary = context.AppContext.Binary;
+        var rawAddress = binary.MapVirtualAddressToRaw(address);
+        var machineCodeBytes = binary.Reader.ReadByteArrayAtRawAddress(rawAddress, sizeof(uint));
+        if (BitConverter.IsLittleEndian != binary.Reader.IsLittleEndian)
+            Array.Reverse(machineCodeBytes);
+        return BitConverter.ToUInt32(machineCodeBytes, 0);
+    }
+
+    private static List<IOperand> GetReturnOperandsForContext(MethodAnalysisContext context)
+        => Arm64CallingConventionResolver.ReturnOperands(context).ToList();
+
+    private List<IOperand> GetArgumentOperandsForCall(MethodAnalysisContext contextBeingCalled)
+        => Arm64CallingConventionResolver.ArgumentOperands(contextBeingCalled).ToList();
+
+    private List<IOperand> GetArgumentOperandsForCall(MethodAnalysisContext contextBeingAnalyzed, ulong callAddr)
+    {
+        if (!contextBeingAnalyzed.AppContext.MethodsByAddress.TryGetValue(callAddr, out var methodsAtAddress))
+            //TODO
+            return [];
+
+        return GetArgumentOperandsForCall(methodsAtAddress.First());
+    }
+}

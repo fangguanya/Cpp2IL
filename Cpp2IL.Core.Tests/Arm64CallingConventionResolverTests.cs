@@ -272,6 +272,103 @@ public class Arm64CallingConventionResolverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 封闭KeyValuePair按具体键值类型生成两个引用返回槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pairDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var pair = pairDefinition.MakeGenericInstanceType([
+            app.SystemTypes.SystemStringType,
+            app.SystemTypes.SystemStringType,
+        ]);
+        var method = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "First",
+            pair,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        var projections = Arm64CallingConventionResolver.ReferenceRegisterReturnProjections(method);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                projections.Select(projection => projection.Destination.Name),
+                Is.EqualTo(new[] { "X1", "X0" }));
+            Assert.That(
+                projections.Select(projection => projection.Source.Addend),
+                Is.EqualTo(new long[] { sizeof(long), 0 }));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 开放泛型与单一封闭KeyValuePair共享地址时选择封闭布局原型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pairDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var pair = pairDefinition.MakeGenericInstanceType([
+            app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemObjectType,
+        ]);
+        var openMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "First",
+            pairDefinition.GenericParameters[0],
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var closedMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "First",
+            pair,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        var resolved = Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateReturnPrototype(
+            [openMethod, closedMethod],
+            out var prototype);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(prototype, Is.SameAs(closedMethod));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 共享地址含封闭非聚合返回候选时拒绝引用槽原型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pairDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var pair = pairDefinition.MakeGenericInstanceType([
+            app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemObjectType,
+        ]);
+        var pairMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "First",
+            pair,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var stringMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "First",
+            app.SystemTypes.SystemStringType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+
+        Assert.That(
+            Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateReturnPrototype(
+                [pairMethod, stringMethod],
+                out _),
+            Is.False);
+    }
+
+    [Test]
     [Category("边界值")]
     public void 单引用字段只投影X0零偏移槽()
     {
