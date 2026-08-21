@@ -692,7 +692,7 @@ public static class ListAddRecovery
                 },
                 {
                     OpCode: OpCode.Move,
-                    Operands: [var sizeState, MemoryOperand sizeLoad],
+                    Operands: [var sizeState, var sizeLoad],
                 },
                 {
                     OpCode: OpCode.CheckGreaterOrEqualUnsigned,
@@ -706,10 +706,9 @@ public static class ListAddRecovery
             || !ReferenceEquals(sizeAddress, pattern.SizeAddress)
             || !AreEquivalentValue(addressBase, publicReceiver)
             || !ReferenceEquals(sizeState, pattern.SizeState)
-            || !AreSameMemoryOperand(sizeLoad, pattern.SizeMemory)
+            || !IsSharedSizeSource(sizeLoad, publicReceiver, pattern.SizeMemory)
             || !(ReferenceEquals(checkedSize, pattern.SizeState)
-                 || checkedSize is MemoryOperand checkedMemory
-                 && AreSameMemoryOperand(checkedMemory, pattern.SizeMemory))
+                 || IsSharedSizeSource(checkedSize, publicReceiver, pattern.SizeMemory))
             || !ReferenceEquals(length.Array, pattern.Items)
             || !ReferenceEquals(condition, branchCondition)
             || !ReferenceEquals(target, slowBlock))
@@ -717,6 +716,21 @@ public static class ListAddRecovery
 
         return true;
     }
+
+    /// <summary>
+    /// 共享快尾仍以原生地址写回 <c>_size</c> 时，容量头可能已由字段解析器恢复成同一接收者
+    /// 的具体字段读取。两种表示只有在原生地址已经闭合为“接收者 + 24”且字段名精确为
+    /// <c>_size</c> 时才视为同一状态，避免把任意整数业务字段误接到集合容量菱形。
+    /// </summary>
+    private static bool IsSharedSizeSource(
+        IOperand operand,
+        IOperand publicReceiver,
+        MemoryOperand sizeMemory)
+        => operand is MemoryOperand memory
+           && AreSameMemoryOperand(memory, sizeMemory)
+           || publicReceiver is LocalVariable localReceiver
+           && operand is FieldReference field
+           && IsField(field, localReceiver, "_size");
 
     private static bool TryMatchSharedStatePrefix(
         Block capacityHead,
@@ -735,6 +749,47 @@ public static class ListAddRecovery
 
         var aliasInstructions = PatternInstructions(aliasBlock);
         var itemsInstructions = PatternInstructions(itemsBlock);
+        var compactAliasInstructions = aliasInstructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block compactAliasTarget] }
+            && ReferenceEquals(compactAliasTarget, itemsBlock)
+                ? aliasInstructions.Take(aliasInstructions.Count - 1).ToList()
+                : aliasInstructions;
+        var compactItemsInstructions = itemsInstructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block compactItemsTarget] }
+            && ReferenceEquals(compactItemsTarget, capacityHead)
+                ? itemsInstructions.Take(itemsInstructions.Count - 1).ToList()
+                : itemsInstructions;
+        // 中文注释：字段解析与空分支常量裁剪完成后，原生的两级空检查会收敛为
+        // “精确 List<T> 别名 -> items/version 状态 -> 容量头”。别名定义必须保留，
+        // 因此从 items 块开始改写；三项状态和两段单后继拓扑缺一不可。
+        if (compactAliasInstructions is
+            [
+                { OpCode: OpCode.Move, Operands: [LocalVariable compactReceiver, var compactSource] },
+            ]
+            && ReferenceEquals(compactReceiver, publicReceiver)
+            && HaveSameConcreteListType(compactReceiver, compactSource)
+            && compactItemsInstructions is
+            [
+                { OpCode: OpCode.Move, Operands: [var compactItems, FieldReference compactItemsField] } compactRewriteStart,
+                { OpCode: OpCode.Add, Operands: [LocalVariable compactVersion, FieldReference compactVersionSource, Immediate { Value: 1 }] },
+                { OpCode: OpCode.Move, Operands: [FieldReference compactVersionDestination, var compactWrittenVersion] },
+            ]
+            && ReferenceEquals(compactItems, items)
+            && IsField(compactItemsField, compactReceiver, "_items")
+            && IsField(compactVersionSource, compactReceiver, "_version")
+            && IsField(compactVersionDestination, compactReceiver, "_version")
+            && ReferenceEquals(compactVersion, compactWrittenVersion)
+            && aliasBlock.Successors is [var compactItemsSuccessor]
+            && ReferenceEquals(compactItemsSuccessor, itemsBlock)
+            && itemsBlock.Successors is [var compactCapacitySuccessor]
+            && ReferenceEquals(compactCapacitySuccessor, capacityHead))
+        {
+            rewriteHead = itemsBlock;
+            headPath = [itemsBlock, capacityHead];
+            rewriteStart = compactRewriteStart;
+            return true;
+        }
+
         if (aliasInstructions is not
             [
                 { OpCode: OpCode.Move, Operands: [LocalVariable stateReceiver, var receiverSource] } aliasMove,
@@ -773,6 +828,22 @@ public static class ListAddRecovery
         headPath = [aliasBlock, itemsBlock, capacityHead];
         rewriteStart = aliasMove;
         return true;
+    }
+
+    private static bool HaveSameConcreteListType(LocalVariable destination, IOperand source)
+    {
+        var sourceType = source switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            _ => null,
+        };
+        return destination.Type is GenericInstanceTypeAnalysisContext
+               {
+                   GenericType.FullName: "System.Collections.Generic.List`1",
+               } listType
+               && sourceType != null
+               && string.Equals(listType.FullName, sourceType.FullName, StringComparison.Ordinal);
     }
 
     private static bool ContainsNullReferenceThrow(Block block)

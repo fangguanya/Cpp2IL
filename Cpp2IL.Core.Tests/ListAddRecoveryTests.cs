@@ -1248,6 +1248,75 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 字段解析后的紧凑状态前缀与共享快尾恢复公开Add()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [6, 1],
+            useResolvedCompactPrefix: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var calls = fixture.Graph.Blocks.SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.IsCall)
+            .ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 紧凑状态前缀的三个共享追加保留最小值零值与最大值()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [int.MinValue, 0, int.MaxValue],
+            useResolvedCompactPrefix: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var values = fixture.Graph.Blocks.SelectMany(block => block.Instructions).Where(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" })
+            .Select(instruction => ((Immediate)instruction.Operands[2]).Value)
+            .ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(3));
+            Assert.That(values, Is.EquivalentTo(new long[] { int.MinValue, 0, int.MaxValue }));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 紧凑状态前缀的别名来源类型不一致时保留原图()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [6, 1],
+            useResolvedCompactPrefix: true,
+            mismatchResolvedAliasType: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.SharedFastTail));
+            Assert.That(fixture.Graph.Blocks.SelectMany(block => block.Instructions).Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.EqualTo(2));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 共享快速尾某项快慢值不同时仅保留该项原容量控制流()
     {
@@ -2488,7 +2557,9 @@ public class ListAddRecoveryTests
     private static SharedFastTailFixture CreateSharedFastTailFixture(
         IReadOnlyList<int> values,
         int mismatchFastValueAt = -1,
-        int omitExplicitStagingJumpAt = -1)
+        int omitExplicitStagingJumpAt = -1,
+        bool useResolvedCompactPrefix = false,
+        bool mismatchResolvedAliasType = false)
     {
         if (values.Count < 2)
             throw new ArgumentOutOfRangeException(nameof(values));
@@ -2519,6 +2590,11 @@ public class ListAddRecoveryTests
             app.SystemTypes.SystemInt32Type,
             System.Reflection.FieldAttributes.Private,
             listDefinition);
+        var sizeField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
         var listHolderField = new InjectedFieldAnalysisContext(
             "_targetList",
             listType,
@@ -2526,6 +2602,7 @@ public class ListAddRecoveryTests
             listDefinition);
 
         var owner = Local("owner", listType);
+        var wrongAliasSource = Local("wrongAliasSource", app.SystemTypes.SystemObjectType);
         var items = Local("sharedItems", elementType.MakeSzArrayType());
         var sizeState = Local("sharedSize", app.SystemTypes.SystemInt32Type);
         var sizeAddress = Local("sharedSizeAddress", app.SystemTypes.SystemIntPtrType);
@@ -2539,8 +2616,8 @@ public class ListAddRecoveryTests
         var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
         var instructions = new List<Instruction>();
         var targets = new List<(
-            Instruction ReceiverNullBranch,
-            Instruction ItemsNullBranch,
+            Instruction? ReceiverNullBranch,
+            Instruction? ItemsNullBranch,
             Instruction CapacityBranch,
             Instruction StagingJump,
             Instruction SlowCall,
@@ -2555,20 +2632,38 @@ public class ListAddRecoveryTests
             var itemsNull = Local($"itemsNull{index}", app.SystemTypes.SystemBooleanType);
             var capacity = Local($"capacity{index}", app.SystemTypes.SystemBooleanType);
 
-            instructions.Add(new Instruction(instructions.Count, OpCode.Move, stateReceiver, PublicReceiver()));
-            instructions.Add(new Instruction(instructions.Count, OpCode.CheckEqual, receiverNull, PublicReceiver(), new Immediate(0)));
-            var receiverNullBranch = new Instruction(
-                instructions.Count,
-                OpCode.ConditionalJump,
-                new Immediate(-1),
-                receiverNull);
-            instructions.Add(receiverNullBranch);
+            var aliasSource = useResolvedCompactPrefix && mismatchResolvedAliasType
+                ? wrongAliasSource
+                : (IOperand)PublicReceiver();
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, stateReceiver, aliasSource));
+            Instruction? compactAliasJump = null;
+            if (useResolvedCompactPrefix)
+            {
+                compactAliasJump = new Instruction(
+                    instructions.Count,
+                    OpCode.Jump,
+                    new Immediate(-1));
+                instructions.Add(compactAliasJump);
+            }
+            Instruction? receiverNullBranch = null;
+            if (!useResolvedCompactPrefix)
+            {
+                instructions.Add(new Instruction(instructions.Count, OpCode.CheckEqual, receiverNull, PublicReceiver(), new Immediate(0)));
+                receiverNullBranch = new Instruction(
+                    instructions.Count,
+                    OpCode.ConditionalJump,
+                    new Immediate(-1),
+                    receiverNull);
+                instructions.Add(receiverNullBranch);
+            }
 
-            instructions.Add(new Instruction(
+            var itemsStart = new Instruction(
                 instructions.Count,
                 OpCode.Move,
                 items,
-                new FieldReference(itemsField, stateReceiver, 0)));
+                new FieldReference(itemsField, stateReceiver, 0));
+            instructions.Add(itemsStart);
+            compactAliasJump?.SetOperand(0, itemsStart);
             instructions.Add(new Instruction(
                 instructions.Count,
                 OpCode.Add,
@@ -2580,35 +2675,58 @@ public class ListAddRecoveryTests
                 OpCode.Move,
                 new FieldReference(versionField, stateReceiver, 0),
                 version));
-            instructions.Add(new Instruction(
-                instructions.Count,
-                OpCode.CheckEqual,
-                itemsNull,
-                new FieldReference(itemsField, stateReceiver, 0),
-                new Immediate(0)));
-            var itemsNullBranch = new Instruction(
-                instructions.Count,
-                OpCode.ConditionalJump,
-                new Immediate(-1),
-                itemsNull);
-            instructions.Add(itemsNullBranch);
+            Instruction? compactItemsJump = null;
+            if (useResolvedCompactPrefix)
+            {
+                compactItemsJump = new Instruction(
+                    instructions.Count,
+                    OpCode.Jump,
+                    new Immediate(-1));
+                instructions.Add(compactItemsJump);
+            }
+            Instruction? itemsNullBranch = null;
+            if (!useResolvedCompactPrefix)
+            {
+                instructions.Add(new Instruction(
+                    instructions.Count,
+                    OpCode.CheckEqual,
+                    itemsNull,
+                    new FieldReference(itemsField, stateReceiver, 0),
+                    new Immediate(0)));
+                itemsNullBranch = new Instruction(
+                    instructions.Count,
+                    OpCode.ConditionalJump,
+                    new Immediate(-1),
+                    itemsNull);
+                instructions.Add(itemsNullBranch);
+            }
 
-            instructions.Add(new Instruction(
+            var activeReceiver = useResolvedCompactPrefix
+                ? (IOperand)stateReceiver
+                : PublicReceiver();
+
+            var capacityStart = new Instruction(
                 instructions.Count,
                 OpCode.Add,
                 sizeAddress,
-                PublicReceiver(),
-                new Immediate(24)));
+                activeReceiver,
+                new Immediate(24));
+            instructions.Add(capacityStart);
+            compactItemsJump?.SetOperand(0, capacityStart);
             instructions.Add(new Instruction(
                 instructions.Count,
                 OpCode.Move,
                 sizeState,
-                new MemoryOperand(sizeAddress)));
+                useResolvedCompactPrefix
+                    ? new FieldReference(sizeField, stateReceiver, 0)
+                    : new MemoryOperand(sizeAddress)));
             instructions.Add(new Instruction(
                 instructions.Count,
                 OpCode.CheckGreaterOrEqualUnsigned,
                 capacity,
-                new MemoryOperand(sizeAddress),
+                useResolvedCompactPrefix
+                    ? new FieldReference(sizeField, stateReceiver, 0)
+                    : new MemoryOperand(sizeAddress),
                 new ArrayLength(items)));
             var capacityBranch = new Instruction(
                 instructions.Count,
@@ -2638,7 +2756,7 @@ public class ListAddRecoveryTests
                 instructions.Count,
                 OpCode.CallVoid,
                 addWithResizeTarget,
-                PublicReceiver(),
+                activeReceiver,
                 new Immediate(values[index]));
             instructions.Add(slowCall);
             // 该载体在汇合点以后无引用，模拟原生调用隐藏参数覆盖，恢复后应删除。
@@ -2697,8 +2815,8 @@ public class ListAddRecoveryTests
 
         for (var index = 0; index < targets.Count; index++)
         {
-            targets[index].ReceiverNullBranch.SetOperand(0, nullThrows[index]);
-            targets[index].ItemsNullBranch.SetOperand(0, nullThrows[index]);
+            targets[index].ReceiverNullBranch?.SetOperand(0, nullThrows[index]);
+            targets[index].ItemsNullBranch?.SetOperand(0, nullThrows[index]);
             targets[index].CapacityBranch.SetOperand(0, targets[index].SlowCall);
             targets[index].StagingJump.SetOperand(0, sharedTailStart);
             targets[index].SlowJump.SetOperand(0, merge);
