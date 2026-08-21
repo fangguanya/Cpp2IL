@@ -607,6 +607,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 这是三类直接辅助ABI唯一执行点，避免早期不完整操作数造成局部恢复和重复扫描。
         DirectRuntimeHelperRecovery.Run(this);
 
+        // 中文注释：字段、聚合接收者和直接辅助调用现已全部稳定；只重绑仍以 object 共享实例为
+        // 目标、但接收者已具体化的调用，修正晚期 Enumerator<T>.MoveNext/Dispose，不重放泛型推断。
+        GenericCallRebinder.RunLateSharedReceiverTargets(this);
+
         LocalVariables.RemoveUnused(this);
     }
 

@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -66,6 +67,97 @@ public class GenericCallRebinderTests
         Assert.Multiple(() =>
         {
             Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
+            Assert.That(call.Operands[0], Is.SameAs(target));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 晚期共享EnumeratorDispose按具体取址接收者重绑定()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var dispose = enumeratorDefinition.Methods.Single(method =>
+            method.Name == "Dispose" && method.Parameters.Count == 0);
+        var objectType = app.SystemTypes.SystemObjectType;
+        var stringType = app.SystemTypes.SystemStringType;
+        var target = new ConcreteGenericMethodAnalysisContext(dispose, [objectType], []);
+        var receiver = new LocalVariable(
+            "enumerator",
+            new Register(null, "stack_-80"),
+            enumeratorDefinition.MakeGenericInstanceType([stringType]));
+        var call = new Instruction(0, OpCode.CallVoid, target, new AddressOf(receiver));
+        var caller = CreateCaller(call);
+
+        var changed = GenericCallRebinder.RunLateSharedReceiverTargets(caller);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(rebound.TypeGenericParameters, Is.EqualTo(new[] { stringType }));
+            Assert.That(call.Operands[1], Is.TypeOf<AddressOf>());
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 晚期共享EnumeratorMoveNext保留布尔返回槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var moveNext = enumeratorDefinition.Methods.Single(method =>
+            method.Name == "MoveNext" && method.Parameters.Count == 0);
+        var objectType = app.SystemTypes.SystemObjectType;
+        var stringType = app.SystemTypes.SystemStringType;
+        var target = new ConcreteGenericMethodAnalysisContext(moveNext, [objectType], []);
+        var receiver = new LocalVariable(
+            "enumerator",
+            new Register(null, "stack_-80"),
+            enumeratorDefinition.MakeGenericInstanceType([stringType]));
+        var result = new LocalVariable(
+            "moved",
+            new Register(null, "W0"),
+            app.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, target, result, new AddressOf(receiver));
+        var caller = CreateCaller(call);
+
+        var changed = GenericCallRebinder.RunLateSharedReceiverTargets(caller);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(rebound.TypeGenericParameters, Is.EqualTo(new[] { stringType }));
+            Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 晚期不同具体Enumerator目标与接收者保持冲突红门()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var dispose = enumeratorDefinition.Methods.Single(method =>
+            method.Name == "Dispose" && method.Parameters.Count == 0);
+        var stringType = app.SystemTypes.SystemStringType;
+        var target = new ConcreteGenericMethodAnalysisContext(dispose, [stringType], []);
+        var receiver = new LocalVariable(
+            "enumerator",
+            new Register(null, "stack_-80"),
+            enumeratorDefinition.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]));
+        var call = new Instruction(0, OpCode.CallVoid, target, new AddressOf(receiver));
+        var caller = CreateCaller(call);
+
+        var changed = GenericCallRebinder.RunLateSharedReceiverTargets(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
             Assert.That(call.Operands[0], Is.SameAs(target));
         });
     }
@@ -366,5 +458,26 @@ public class GenericCallRebinderTests
         var call = new Instruction(0, OpCode.Call, target, result, value);
 
         Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
+    }
+
+    private static MethodAnalysisContext CreateCaller(Instruction call)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "LateGenericCallOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var caller = owner.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            call,
+            new Instruction(1, OpCode.Return),
+        ]);
+        return caller;
     }
 }

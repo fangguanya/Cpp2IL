@@ -32,6 +32,46 @@ public static class GenericCallRebinder
         return changed;
     }
 
+    /// <summary>
+    /// 在所有晚期接收者恢复完成后，只扫描仍以 object 共享实例为声明目标的实例调用。
+    /// 该入口复用唯一的 TryRebind 裁决，不再次执行字段定义链或实参泛型推断。
+    /// </summary>
+    internal static int RunLateSharedReceiverTargets(MethodAnalysisContext method)
+    {
+        var reboundCount = 0;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (!TryRebindLateSharedReceiverTarget(instruction))
+                continue;
+
+            reboundCount++;
+        }
+
+        return reboundCount;
+    }
+
+    /// <summary>
+    /// 仅当调用目标是共享 object 泛型实例、接收者是同一泛型定义的具体实例时执行末次重绑定。
+    /// 已经具体化但互相冲突的目标与接收者保持原样，避免末次扫描覆盖业务侧具体类型。
+    /// </summary>
+    internal static bool TryRebindLateSharedReceiverTarget(Instruction call)
+    {
+        if (!call.IsCall
+            || call.Operands.Count < 2
+            || call.Operands[0] is not ConcreteGenericMethodAnalysisContext current
+            || current.IsStatic)
+            return false;
+
+        var firstArgument = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (firstArgument >= call.Operands.Count
+            || OperandType(call.Operands[firstArgument], null) is not GenericInstanceTypeAnalysisContext receiver
+            || current.DeclaringType is not GenericInstanceTypeAnalysisContext currentOwner
+            || !IsSharedObjectPlaceholder(currentOwner, receiver))
+            return false;
+
+        return TryRebind(call);
+    }
+
     internal static bool TryRebind(Instruction call)
         => TryRebind(call, null);
 
