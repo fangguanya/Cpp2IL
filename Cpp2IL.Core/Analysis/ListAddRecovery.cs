@@ -1754,7 +1754,10 @@ public static class ListAddRecovery
         var prefix = hasExplicitJump
             ? stagingInstructions.Take(stagingInstructions.Count - 1).ToList()
             : stagingInstructions;
-        if (prefix.Count == 0)
+        // 纯跳转块也可能是容量分支到多前驱共享快尾的真实边中继。
+        // 这里仅放行已经校验目标的显式跳转；共享快尾本体仍由后续完整
+        // 数组写入、大小更新、快慢元素一致性与唯一汇合验证共同约束。
+        if (prefix.Count == 0 && !hasExplicitJump)
             return false;
 
         fastBody = successor;

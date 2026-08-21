@@ -1490,6 +1490,51 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 共享快尾的纯跳转空边中继按原始多前驱身份逐项恢复()
+    {
+        var fixture = CreateStandardStagedSharedFastTailFixture(
+            useWrongThrowType: false,
+            includeEdgeCarrier: false);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var instructions = fixture.Graph.Blocks.SelectMany(block => block.Instructions).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 三个空边中继在共享快尾降为单前驱时仍全部恢复()
+    {
+        var fixture = CreateStandardStagedSharedFastTailFixture(
+            useWrongThrowType: false,
+            includeEdgeCarrier: false,
+            branchCount: 3);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var instructions = fixture.Graph.Blocks.SelectMany(block => block.Instructions).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(3));
+            Assert.That(instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(3));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void Typeof运行时类载体死亡时仍恢复公开Add()
     {
@@ -1513,6 +1558,29 @@ public class ListAddRecoveryTests
     public void Items空守卫抛出非空引用异常时保留共享快尾()
     {
         var fixture = CreateStandardStagedSharedFastTailFixture(useWrongThrowType: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.SharedFastTail));
+            Assert.That(fixture.Graph.Blocks.SelectMany(block => block.Instructions).Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.EqualTo(2));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 空边中继共享快尾的快慢元素不一致时保持原图()
+    {
+        var fixture = CreateStandardStagedSharedFastTailFixture(
+            useWrongThrowType: false,
+            includeEdgeCarrier: false,
+            mismatchSharedFastValue: true);
         var originalBlockCount = fixture.Graph.Blocks.Count;
 
         var recovered = ListAddRecovery.Run(fixture.Method);
@@ -2831,11 +2899,15 @@ public class ListAddRecoveryTests
     }
 
     /// <summary>
-    /// 构造两个标准 List.Add 容量菱形：两条快边先经过边载体 staging，
+    /// 构造多个标准 List.Add 容量菱形：快边先经过可选边载体 staging，
     /// 再共享同一个数组写入快尾。首项使用 <c>&gt;=</c> 跳慢边，次项使用
     /// <c>&lt;</c> 跳快边，同时覆盖严格 items 空守卫与 Count 并行局部。
     /// </summary>
-    private static SharedFastTailFixture CreateStandardStagedSharedFastTailFixture(bool useWrongThrowType)
+    private static SharedFastTailFixture CreateStandardStagedSharedFastTailFixture(
+        bool useWrongThrowType,
+        bool includeEdgeCarrier = true,
+        bool mismatchSharedFastValue = false,
+        int branchCount = 2)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -2871,6 +2943,7 @@ public class ListAddRecoveryTests
 
         var receiver = Local("standardSharedList", listType);
         var value = Local("standardSharedValue", elementType);
+        var otherValue = Local("standardSharedOtherValue", elementType);
         var items = Local("standardSharedItems", elementType.MakeSzArrayType());
         var sizeState = Local("standardSharedSize", app.SystemTypes.SystemInt32Type);
         var carrier = Local("standardSharedCarrier", app.SystemTypes.SystemInt32Type);
@@ -2895,15 +2968,19 @@ public class ListAddRecoveryTests
 
         (Instruction Start, Instruction Jump) AppendStaging(int index)
         {
-            var start = new Instruction(
-                instructions.Count,
-                OpCode.Move,
-                carrier,
-                new Immediate(index + 1));
-            instructions.Add(start);
+            Instruction? start = null;
+            if (includeEdgeCarrier)
+            {
+                start = new Instruction(
+                    instructions.Count,
+                    OpCode.Move,
+                    carrier,
+                    new Immediate(index + 1));
+                instructions.Add(start);
+            }
             var jump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
             instructions.Add(jump);
-            return (start, jump);
+            return (start ?? jump, jump);
         }
 
         (Instruction Start, Instruction Jump) AppendSlow(int index)
@@ -2915,17 +2992,20 @@ public class ListAddRecoveryTests
                 receiver,
                 value);
             instructions.Add(start);
-            instructions.Add(new Instruction(
-                instructions.Count,
-                OpCode.Move,
-                carrier,
-                new Immediate(index + 1)));
+            if (includeEdgeCarrier)
+            {
+                instructions.Add(new Instruction(
+                    instructions.Count,
+                    OpCode.Move,
+                    carrier,
+                    new Immediate(index + 1)));
+            }
             var jump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
             instructions.Add(jump);
             return (start, jump);
         }
 
-        for (var index = 0; index < 2; index++)
+        for (var index = 0; index < branchCount; index++)
         {
             var version = Local($"standardSharedVersion{index}", app.SystemTypes.SystemInt32Type);
             var itemsNull = Local($"standardSharedItemsNull{index}", app.SystemTypes.SystemBooleanType);
@@ -2957,7 +3037,7 @@ public class ListAddRecoveryTests
                 OpCode.Move,
                 sizeState,
                 new ListCount(receiver, listType)));
-            var reversed = index == 1;
+            var reversed = index % 2 == 1;
             instructions.Add(new Instruction(
                 instructions.Count,
                 reversed ? OpCode.CheckLessUnsigned : OpCode.CheckGreaterOrEqualUnsigned,
@@ -3010,7 +3090,7 @@ public class ListAddRecoveryTests
             instructions.Count,
             OpCode.Move,
             new MemoryOperand(elementAddress, null, 0x20),
-            value));
+            mismatchSharedFastValue ? otherValue : value));
         var sharedTailJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
         instructions.Add(sharedTailJump);
 
