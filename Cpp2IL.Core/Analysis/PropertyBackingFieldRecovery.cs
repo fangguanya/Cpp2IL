@@ -29,18 +29,23 @@ public static class PropertyBackingFieldRecovery
             {
                 var instruction = block.Instructions[instructionIndex];
                 if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, FieldReference source] }
-                    && TryResolveAccessor(method.DeclaringType, source.Field, read: true, out var getter))
+                    && TryResolveAccessor(method.DeclaringType, source, read: true, out var getter))
                 {
                     instruction.OpCode = OpCode.Call;
                     instruction.SetOperands(source.Field.IsStatic
                         ? [getter, destination]
                         : [getter, destination, source.Local]);
+                    // 中文注释：共享泛型字段可能早期把 Current 结果登记为 object；
+                    // 具体 getter 已由 Enumerator<T> 接收者唯一闭合时，同步返回局部类型。
+                    if (destination.Type == null
+                        || GenericCallRebinder.TypesEquivalent(destination.Type, source.Field.FieldType))
+                        destination.Type = getter.ReturnType;
                     recovered++;
                     continue;
                 }
 
                 if (instruction is { OpCode: OpCode.Move, Operands: [FieldReference fieldDestination, var sourceValue] }
-                    && TryResolveAccessor(method.DeclaringType, fieldDestination.Field, read: false, out var setter))
+                    && TryResolveAccessor(method.DeclaringType, fieldDestination, read: false, out var setter))
                 {
                     instruction.OpCode = OpCode.CallVoid;
                     instruction.SetOperands(fieldDestination.Field.IsStatic
@@ -58,13 +63,13 @@ public static class PropertyBackingFieldRecovery
                 {
                     if (instruction.Operands[operandIndex] is not FieldReference embedded
                         || !IsSourceOperand(instruction, operandIndex)
-                        || !TryResolveAccessor(method.DeclaringType, embedded.Field, read: true, out var embeddedGetter))
+                        || !TryResolveAccessor(method.DeclaringType, embedded, read: true, out var embeddedGetter))
                         continue;
 
                     var temporary = new LocalVariable(
                         $"propertyValue{temporaryIndex}",
                         new Register(null, $"PROPERTY_VALUE_{temporaryIndex}"),
-                        embedded.Field.FieldType);
+                        embeddedGetter.ReturnType);
                     temporaryIndex++;
                     var getterCall = new Instruction(
                         instruction.Index,
@@ -95,16 +100,19 @@ public static class PropertyBackingFieldRecovery
     /// </summary>
     private static bool TryResolveAccessor(
         TypeAnalysisContext callerType,
-        FieldAnalysisContext field,
+        FieldReference reference,
         bool read,
         out MethodAnalysisContext accessor)
     {
         accessor = null!;
+        var field = reference.Field;
         if (field.Visibility != FieldAttributes.Private
             || SharesPrivateAccessScope(callerType, field.DeclaringType))
             return false;
 
-        var owner = field.DeclaringType;
+        if (!TryResolveAccessorOwner(field.DeclaringType, reference.Local.Type, out var owner,
+                out var ownerConcretized))
+            return false;
         var definitionOwner = owner is GenericInstanceTypeAnalysisContext genericOwner
             ? genericOwner.GenericType
             : owner;
@@ -112,7 +120,11 @@ public static class PropertyBackingFieldRecovery
         var properties = definitionOwner.Properties
             .Where(property => candidateNames.Contains(property.Name, StringComparer.Ordinal))
             .Where(property => property.IsStatic == field.IsStatic)
-            .Where(property => PropertyTypeMatchesField(property, owner, field.FieldType))
+            .Where(property => PropertyTypeMatchesField(
+                property,
+                owner,
+                field.FieldType,
+                ownerConcretized))
             .ToArray();
         if (properties.Length != 1)
             return false;
@@ -124,6 +136,34 @@ public static class PropertyBackingFieldRecovery
             return false;
 
         accessor = InstantiateAccessor(selected, owner);
+        return true;
+    }
+
+    /// <summary>
+    /// 以字段声明类型为基准；仅当接收者是同一泛型定义的更具体实例时闭合 owner。
+    /// </summary>
+    private static bool TryResolveAccessorOwner(
+        TypeAnalysisContext declaredOwner,
+        TypeAnalysisContext? receiverType,
+        out TypeAnalysisContext owner,
+        out bool ownerConcretized)
+    {
+        owner = declaredOwner;
+        ownerConcretized = false;
+        if (declaredOwner is not GenericInstanceTypeAnalysisContext declaredGeneric
+            || receiverType is not GenericInstanceTypeAnalysisContext receiverGeneric
+            || !GenericCallRebinder.TypesEquivalent(
+                declaredGeneric.GenericType,
+                receiverGeneric.GenericType))
+            return true;
+
+        if (GenericCallRebinder.TypesEquivalent(declaredGeneric, receiverGeneric))
+            return true;
+        if (!GenericCallRebinder.IsSharedObjectPlaceholder(declaredGeneric, receiverGeneric))
+            return false;
+
+        owner = receiverGeneric;
+        ownerConcretized = true;
         return true;
     }
 
@@ -156,12 +196,16 @@ public static class PropertyBackingFieldRecovery
     private static bool PropertyTypeMatchesField(
         PropertyAnalysisContext property,
         TypeAnalysisContext owner,
-        TypeAnalysisContext fieldType)
+        TypeAnalysisContext fieldType,
+        bool ownerConcretized)
     {
         var propertyType = owner is GenericInstanceTypeAnalysisContext genericOwner
             ? GenericInstantiation.Instantiate(property.PropertyType, genericOwner.GenericArguments, [])
             : property.PropertyType;
-        return GenericCallRebinder.TypesEquivalent(propertyType, fieldType);
+        return GenericCallRebinder.TypesEquivalent(propertyType, fieldType)
+               || ownerConcretized
+               && (fieldType.FullName == "System.Object"
+                   || GenericCallRebinder.IsSharedObjectPlaceholder(fieldType, propertyType));
     }
 
     /// <summary>

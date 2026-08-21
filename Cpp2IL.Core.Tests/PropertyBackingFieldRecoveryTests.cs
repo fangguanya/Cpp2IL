@@ -55,6 +55,66 @@ public class PropertyBackingFieldRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 共享EnumeratorObject字段按String接收者恢复具体Getter()
+    {
+        var fixture = CreateSharedEnumeratorFixture(embedded: false);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        var target = (ConcreteGenericMethodAnalysisContext)fixture.Access.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(target.TypeGenericParameters, Is.EqualTo(new[] { fixture.StringType }));
+            Assert.That(target.ReturnType, Is.SameAs(fixture.StringType));
+            Assert.That(fixture.Value.Type, Is.SameAs(fixture.StringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 嵌套比较中的共享Enumerator字段物化StringGetter局部()
+    {
+        var fixture = CreateSharedEnumeratorFixture(embedded: true);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+        var instructions = fixture.Caller.ControlFlowGraph!.Instructions;
+        var getterCall = instructions[0];
+        var target = (ConcreteGenericMethodAnalysisContext)getterCall.Operands[0];
+        var temporary = (LocalVariable)getterCall.Operands[1];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(instructions, Has.Count.EqualTo(3));
+            Assert.That(target.TypeGenericParameters, Is.EqualTo(new[] { fixture.StringType }));
+            Assert.That(temporary.Type, Is.SameAs(fixture.StringType));
+            Assert.That(fixture.Access.Operands[2], Is.SameAs(temporary));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Enumerator字段与接收者均为不同具体实例时保留字段红门()
+    {
+        var fixture = CreateSharedEnumeratorFixture(embedded: false, declaredString: true);
+        fixture.Receiver.Type = fixture.EnumeratorDefinition.MakeGenericInstanceType([
+            fixture.Caller.AppContext.SystemTypes.SystemInt32Type,
+        ]);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(fixture.Access.Operands.OfType<FieldReference>(), Has.Exactly(1).Items);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 可覆盖虚Getter保持字段红门()
     {
@@ -273,10 +333,69 @@ public class PropertyBackingFieldRecoveryTests
         return new Fixture(caller, getter, setter, receiver, value, access);
     }
 
+    private static SharedEnumeratorFixture CreateSharedEnumeratorFixture(
+        bool embedded,
+        bool declaredString = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var enumeratorDefinition = assembly
+            .GetTypeByFullName("System.Collections.Generic.List`1+Enumerator")!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var declaredElementType = declaredString ? stringType : app.SystemTypes.SystemObjectType;
+        var declaredEnumerator = enumeratorDefinition.MakeGenericInstanceType([declaredElementType]);
+        var receiverEnumerator = enumeratorDefinition.MakeGenericInstanceType([stringType]);
+        var field = GenericInstanceFieldLayout.FindConcreteFieldAtOffset(declaredEnumerator, 0x10)!;
+        var callerType = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "EnumeratorCaller",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var caller = callerType.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static);
+        var receiver = new LocalVariable("enumerator", new Register(null, "stack_-80"), receiverEnumerator);
+        var value = new LocalVariable("value", new Register(null, "X0"), field.FieldType);
+        var fieldReference = new FieldReference(field, receiver, 0x10);
+        Instruction access;
+        if (embedded)
+        {
+            var equals = app.SystemTypes.SystemStringType.Methods.Single(method =>
+                method.Name == "op_Equality" && method.Parameters.Count == 2);
+            var result = new LocalVariable("equal", new Register(null, "W0"), app.SystemTypes.SystemBooleanType);
+            access = new Instruction(0, OpCode.Call, equals, result, fieldReference, new StringLiteral("circuit"));
+        }
+        else
+        {
+            access = new Instruction(0, OpCode.Move, value, fieldReference);
+        }
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            access,
+            new Instruction(1, OpCode.Return),
+        ]);
+        return new SharedEnumeratorFixture(
+            caller,
+            enumeratorDefinition,
+            stringType,
+            receiver,
+            value,
+            access);
+    }
+
     private sealed record Fixture(
         MethodAnalysisContext Caller,
         MethodAnalysisContext Getter,
         MethodAnalysisContext Setter,
+        LocalVariable Receiver,
+        LocalVariable Value,
+        Instruction Access);
+
+    private sealed record SharedEnumeratorFixture(
+        MethodAnalysisContext Caller,
+        TypeAnalysisContext EnumeratorDefinition,
+        TypeAnalysisContext StringType,
         LocalVariable Receiver,
         LocalVariable Value,
         Instruction Access);
