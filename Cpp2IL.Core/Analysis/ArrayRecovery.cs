@@ -851,7 +851,18 @@ public static class ArrayRecovery
 
         foreach (var instruction in cfg.Instructions)
             if (instruction.Destination is LocalVariable destination)
-                definitions[destination] = definitions.ContainsKey(destination) ? null : instruction;
+            {
+                if (!definitions.TryGetValue(destination, out var existing))
+                {
+                    definitions[destination] = instruction;
+                    continue;
+                }
+
+                // 中文注释：退 SSA 会把同一个循环不变量地址在入口和回边各复制一次；只在两次
+                // 定义都是从同一个局部量进行完全相同的 Move 时合并，其他多定义继续保持未知。
+                if (existing == null || !AreEquivalentRepeatedCopies(existing, instruction, destination))
+                    definitions[destination] = null;
+            }
 
         // 中文注释：ref/out 调用会在原生层间接写回目标局部；即使 CFG 中只有一次显式 Move，
         // 也不得沿该旧值继续折叠地址。将取址实参标成未知定义，后续仿射求值会保留数组根身份。
@@ -862,6 +873,16 @@ public static class ArrayRecovery
 
         return definitions;
     }
+
+    private static bool AreEquivalentRepeatedCopies(
+        Instruction first,
+        Instruction second,
+        LocalVariable destination)
+        => first is { OpCode: OpCode.Move, Operands: [LocalVariable firstDestination, LocalVariable firstSource] }
+           && second is { OpCode: OpCode.Move, Operands: [LocalVariable secondDestination, LocalVariable secondSource] }
+           && ReferenceEquals(firstDestination, destination)
+           && ReferenceEquals(secondDestination, destination)
+           && ReferenceEquals(firstSource, secondSource);
 
     private static Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> CollectUses(ISILControlFlowGraph cfg)
     {

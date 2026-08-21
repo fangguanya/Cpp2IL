@@ -54,6 +54,51 @@ public class ArrayRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 同源重复数据区基址复制恢复为索引元素访问()
+    {
+        var fixture = CreateRepeatedDataBaseFixture(conflictingSource: false, copyAfterRead: false);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        Assert.That(fixture.Read.Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)fixture.Read.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(access.Array, Is.SameAs(fixture.Array));
+            Assert.That(access.Index, Is.SameAs(fixture.Index));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 循环尾同源数据区基址复制不阻断先前元素读取()
+    {
+        var fixture = CreateRepeatedDataBaseFixture(conflictingSource: false, copyAfterRead: true);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        Assert.That(fixture.Read.Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)fixture.Read.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(access.Array, Is.SameAs(fixture.Array));
+            Assert.That(access.Index, Is.SameAs(fixture.Index));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同数组根写入同一数据区基址时保留内存读取()
+    {
+        var fixture = CreateRepeatedDataBaseFixture(conflictingSource: true, copyAfterRead: false);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        Assert.That(fixture.Read.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void Out调用写回后的数组不得沿调用前空值折叠()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -345,6 +390,42 @@ public class ArrayRecoveryTests
         var read = new Instruction(1, OpCode.Move, value, memory);
         instructions.Add(read);
         instructions.Add(new Instruction(2, OpCode.Return, value));
+
+        var graph = new ISILControlFlowGraph(instructions);
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new Fixture(method, graph, read, array, index);
+    }
+
+    private static Fixture CreateRepeatedDataBaseFixture(bool conflictingSource, bool copyAfterRead)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = app.SystemTypes.SystemStringType.MakeSzArrayType();
+        var array = new LocalVariable("array", new Register(null, "X0"), arrayType);
+        var otherArray = new LocalVariable("otherArray", new Register(null, "X1"), arrayType);
+        var index = new LocalVariable("index", new Register(null, "X2"), app.SystemTypes.SystemInt32Type);
+        var data = new LocalVariable("data", new Register(null, "X3"), app.SystemTypes.SystemIntPtrType);
+        var repeatedData = new LocalVariable("repeatedData", new Register(null, "X4"), app.SystemTypes.SystemIntPtrType);
+        var conflictingData = new LocalVariable("conflictingData", new Register(null, "X5"), app.SystemTypes.SystemIntPtrType);
+        var value = new LocalVariable("value", new Register(null, "X6"), app.SystemTypes.SystemStringType);
+        var read = new Instruction(4, OpCode.Move, value, new MemoryOperand(repeatedData, index, 0, 8));
+        var secondCopy = new Instruction(
+            5,
+            OpCode.Move,
+            repeatedData,
+            conflictingSource ? conflictingData : data);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Add, data, array, new Immediate(32)),
+            new(1, OpCode.Add, conflictingData, otherArray, new Immediate(32)),
+            new(2, OpCode.Move, repeatedData, data),
+        };
+        if (!copyAfterRead)
+            instructions.Add(secondCopy);
+        instructions.Add(read);
+        if (copyAfterRead)
+            instructions.Add(secondCopy);
+        instructions.Add(new Instruction(6, OpCode.Return, value));
 
         var graph = new ISILControlFlowGraph(instructions);
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
