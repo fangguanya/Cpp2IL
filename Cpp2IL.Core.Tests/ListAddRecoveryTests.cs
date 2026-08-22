@@ -1537,6 +1537,66 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 多路值定义汇入共享集合状态前缀时恢复公开Add()
+    {
+        var fixture = CreateMergedStatePrefixFixture();
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 分支值在状态块前的线性块定义时仍恢复公开Add()
+    {
+        var fixture = CreateMergedStatePrefixFixture(splitFirstValueDefinition: true);
+
+        ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 任一汇入路径缺失元素定义时保留原容量菱形()
+    {
+        var fixture = CreateMergedStatePrefixFixture(omitFirstValueDefinition: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 集合状态更新前夹有业务赋值时保留赋值并闭合Add()
     {
         var fixture = CreateInterleavedHeadFixture(touchesReceiver: false);
@@ -2393,6 +2453,137 @@ public class ListAddRecoveryTests
         foreach (var block in definitionPath.Append(relay))
             block.CalculateBlockType();
         return relay;
+    }
+
+    /// <summary>
+    /// 构造两条业务路径分别确定元素值和同一 List 状态，再汇入共享
+    /// version/容量/快慢尾的 ARM64 形态。
+    /// </summary>
+    private static MergedStatePrefixFixture CreateMergedStatePrefixFixture(
+        bool splitFirstValueDefinition = false,
+        bool omitFirstValueDefinition = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var elementType = app.SystemTypes.SystemStringType;
+        var listType = listDefinition.MakeGenericInstanceType([elementType]);
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [genericElement]);
+        var addWithResizeTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [elementType],
+            []);
+        var itemsField = new InjectedFieldAnalysisContext(
+            "_items",
+            genericElement.MakeSzArrayType(),
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var sizeField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var versionField = new InjectedFieldAnalysisContext(
+            "_version",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+
+        var receiver = Local("mergedList", listType);
+        var value = Local("mergedValue", elementType);
+        var items = Local("mergedItems", elementType.MakeSzArrayType());
+        var oldVersion = Local("mergedOldVersion", app.SystemTypes.SystemInt32Type);
+        var newVersion = Local("mergedNewVersion", app.SystemTypes.SystemInt32Type);
+        var dispatch = Local("mergedDispatch", app.SystemTypes.SystemBooleanType);
+        var capacity = Local("mergedCapacity", app.SystemTypes.SystemBooleanType);
+        var newSize = Local("mergedNewSize", app.SystemTypes.SystemInt32Type);
+        FieldReference Field(FieldAnalysisContext field) => new(field, receiver, 0);
+        ListCount Count() => new(receiver, listType);
+
+        var instructions = new List<Instruction>();
+        var dispatchJump = new Instruction(instructions.Count, OpCode.ConditionalJump, new Immediate(-1), dispatch);
+        instructions.Add(dispatchJump);
+
+        Instruction? firstValueDefinition = null;
+        if (!omitFirstValueDefinition)
+        {
+            firstValueDefinition = new Instruction(instructions.Count, OpCode.Newobj, value, elementType);
+            instructions.Add(firstValueDefinition);
+        }
+
+        Instruction? firstStateEntry = null;
+        if (splitFirstValueDefinition)
+        {
+            var firstStateJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+            instructions.Add(firstStateJump);
+            firstStateEntry = new Instruction(instructions.Count, OpCode.Move, oldVersion, Field(versionField));
+            instructions.Add(firstStateEntry);
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, items, Field(itemsField)));
+            var firstSharedJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+            instructions.Add(firstSharedJump);
+            firstStateJump.SetOperand(0, firstStateEntry);
+        }
+        else
+        {
+            firstStateEntry = new Instruction(instructions.Count, OpCode.Move, oldVersion, Field(versionField));
+            instructions.Add(firstStateEntry);
+            instructions.Add(new Instruction(instructions.Count, OpCode.Move, items, Field(itemsField)));
+            instructions.Add(new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1)));
+        }
+
+        var secondValueDefinition = new Instruction(instructions.Count, OpCode.Newobj, value, elementType);
+        instructions.Add(secondValueDefinition);
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, oldVersion, Field(versionField)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, items, Field(itemsField)));
+        var secondSharedJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(secondSharedJump);
+
+        var sharedStateStart = new Instruction(instructions.Count, OpCode.Add, newVersion, oldVersion, new Immediate(1));
+        instructions.Add(sharedStateStart);
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(versionField), newVersion));
+        var sharedCapacityJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(sharedCapacityJump);
+        var capacityStart = new Instruction(instructions.Count, OpCode.CheckGreaterOrEqualUnsigned, capacity, Count(), new ArrayLength(items));
+        instructions.Add(capacityStart);
+        var capacityJump = new Instruction(instructions.Count, OpCode.ConditionalJump, new Immediate(-1), capacity);
+        instructions.Add(capacityJump);
+
+        instructions.Add(new Instruction(instructions.Count, OpCode.Add, newSize, Count(), new Immediate(1)));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, Field(sizeField), newSize));
+        instructions.Add(new Instruction(instructions.Count, OpCode.Move, new ArrayAccess(items, Count()), value));
+        var fastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(fastJump);
+
+        var slowCall = new Instruction(instructions.Count, OpCode.CallVoid, addWithResizeTarget, receiver, value);
+        instructions.Add(slowCall);
+        var slowJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(slowJump);
+        var merge = new Instruction(instructions.Count, OpCode.Return, receiver);
+        instructions.Add(merge);
+
+        dispatchJump.SetOperand(0, secondValueDefinition);
+        sharedCapacityJump.SetOperand(0, capacityStart);
+        foreach (var jump in instructions.Where(instruction =>
+                     instruction is { OpCode: OpCode.Jump, Operands: [Immediate { Value: -1 }] }).ToList())
+        {
+            if (ReferenceEquals(jump, fastJump) || ReferenceEquals(jump, slowJump))
+                jump.SetOperand(0, merge);
+            else
+                jump.SetOperand(0, sharedStateStart);
+        }
+        capacityJump.SetOperand(0, slowCall);
+
+        var graph = new ISILControlFlowGraph(instructions);
+        graph.MergeCallBlocks();
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new MergedStatePrefixFixture(method, graph, receiver, value);
     }
 
     private static Fixture CreateCarriedStateFixture(
@@ -3816,4 +4007,10 @@ public class ListAddRecoveryTests
         MethodAnalysisContext Method,
         ISILControlFlowGraph Graph,
         Block SharedFastTail);
+
+    private sealed record MergedStatePrefixFixture(
+        MethodAnalysisContext Method,
+        ISILControlFlowGraph Graph,
+        LocalVariable Receiver,
+        LocalVariable Value);
 }

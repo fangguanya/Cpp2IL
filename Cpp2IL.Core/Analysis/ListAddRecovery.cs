@@ -194,6 +194,17 @@ public static class ListAddRecovery
         var recovered = 0;
         foreach (var slowBlock in graph.Blocks.ToList())
         {
+            if (graph.Blocks.Contains(slowBlock)
+                && TryRecoverMergedStatePrefix(
+                    graph,
+                    slowBlock,
+                    originalSharedFastTails,
+                    compactArrayAccessOnly))
+            {
+                recovered++;
+                continue;
+            }
+
             var sharedSlowRecovered = 0;
             while (graph.Blocks.Contains(slowBlock)
                    && TryRecoverSharedSlowTail(
@@ -490,6 +501,283 @@ public static class ListAddRecovery
 
         branchValue = sharedSlowValue;
         return true;
+    }
+
+    /// <summary>
+    /// 恢复多条业务路径先分别写入同一元素局部和 List 状态载体，再汇入一个
+    /// 共享 version/容量快慢尾的 ARM64 形态。
+    /// </summary>
+    /// <remarks>
+    /// Phi 消除会让每条业务边分别写入同一元素局部，因此不能使用“全图唯一定义”。
+    /// 本规则要求每个汇入前驱都从同一精确 List 读取 items/version，元素值在到达
+    /// 共享前缀的所有路径上均已定义，且快慢尾对该值完全等价。
+    /// </remarks>
+    private static bool TryRecoverMergedStatePrefix(
+        ISILControlFlowGraph graph,
+        Block slowBlock,
+        HashSet<Block> originalSharedFastTails,
+        bool compactArrayAccessOnly)
+    {
+        if (!TryMatchSlowPath(
+                slowBlock,
+                out var slowCall,
+                out var addWithResize,
+                out var receiver,
+                out var value,
+                out var slowTail)
+            || slowBlock.Predecessors is not [var capacityHead]
+            || capacityHead.Predecessors is not [var sharedStatePrefix]
+            || sharedStatePrefix.Predecessors.Count < 2
+            || sharedStatePrefix.Successors is not [var sharedSuccessor]
+            || !ReferenceEquals(sharedSuccessor, capacityHead)
+            || !TryGetMergeBlock(graph, slowBlock, out var merge)
+            || !TryMatchMergedStatePrefix(
+                graph,
+                sharedStatePrefix,
+                capacityHead,
+                slowBlock,
+                receiver,
+                value,
+                slowTail,
+                out var items,
+                out var sizeState,
+                out var versionResult,
+                out var versionSource,
+                out var predecessorStateLoads)
+            || !TryGetFastRoute(
+                capacityHead,
+                slowBlock,
+                merge,
+                originalSharedFastTails,
+                out var fastEntry,
+                out var fastBody,
+                out var fastPrefix)
+            || !TryMatchFastPath(
+                graph,
+                fastBody,
+                fastPrefix,
+                merge,
+                receiver,
+                items,
+                sizeState,
+                versionResult,
+                versionSource,
+                value,
+                slowTail,
+                addWithResize.AppContext,
+                addWithResize.TypeGenericParameters.Single(),
+                compactArrayAccessOnly,
+                out var publicValue,
+                out var preservedSlowTail)
+            || !TryCreatePublicAddTarget(addWithResize, out var addTarget))
+            return false;
+
+        RewriteMergedStatePrefix(
+            graph,
+            sharedStatePrefix,
+            capacityHead,
+            fastEntry,
+            fastBody,
+            slowBlock,
+            merge,
+            predecessorStateLoads,
+            slowCall,
+            preservedSlowTail,
+            addTarget,
+            receiver,
+            publicValue);
+        return true;
+    }
+
+    /// <summary>
+    /// 验证多前驱共享状态前缀：每条汇入边必须读取同一接收者的 items/version，
+    /// 共享块只执行 version 加一和回写，紧随的容量块必须以同一 items 长度分流。
+    /// </summary>
+    private static bool TryMatchMergedStatePrefix(
+        ISILControlFlowGraph graph,
+        Block sharedStatePrefix,
+        Block capacityHead,
+        Block slowBlock,
+        LocalVariable receiver,
+        IOperand value,
+        IReadOnlyList<Instruction> slowTail,
+        out LocalVariable items,
+        out IOperand sizeState,
+        out LocalVariable versionResult,
+        out IOperand versionSource,
+        out List<Instruction> predecessorStateLoads)
+    {
+        items = null!;
+        sizeState = null!;
+        versionResult = null!;
+        versionSource = null!;
+        predecessorStateLoads = [];
+
+        var sharedInstructions = PatternInstructions(sharedStatePrefix);
+        if (sharedInstructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block sharedTarget] })
+        {
+            if (!ReferenceEquals(sharedTarget, capacityHead))
+                return false;
+            sharedInstructions = sharedInstructions.Take(sharedInstructions.Count - 1).ToList();
+        }
+        if (sharedInstructions is not
+            [
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable candidateVersionResult, var candidateVersionSource, Immediate { Value: 1 }],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [FieldReference versionDestination, var writtenVersion],
+                },
+            ]
+            || !IsField(versionDestination, receiver, "_version")
+            || !ReferenceEquals(candidateVersionResult, writtenVersion))
+            return false;
+
+        var capacityInstructions = PatternInstructions(capacityHead);
+        if (capacityInstructions is not
+            [
+                {
+                    OpCode: OpCode.CheckGreaterOrEqualUnsigned,
+                    Operands: [LocalVariable condition, var checkedSize, ArrayLength length],
+                },
+                {
+                    OpCode: OpCode.ConditionalJump,
+                    Operands: [Block capacityTarget, var branchCondition],
+                },
+            ]
+            || !ReferenceEquals(capacityTarget, slowBlock)
+            || !ReferenceEquals(condition, branchCondition)
+            || length.Array is not LocalVariable candidateItems
+            || !IsDirectStateOperand(checkedSize, receiver, "_size")
+            || candidateVersionSource is not LocalVariable sharedVersionSource)
+            return false;
+
+        foreach (var predecessor in sharedStatePrefix.Predecessors)
+        {
+            if (predecessor.Successors is not [var successor]
+                || !ReferenceEquals(successor, sharedStatePrefix))
+                return false;
+
+            var instructions = PatternInstructions(predecessor);
+            var stateLoads = instructions.Where(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [var destination, FieldReference field] }
+                && (ReferenceEquals(destination, candidateItems) && IsField(field, receiver, "_items")
+                    || ReferenceEquals(destination, sharedVersionSource) && IsField(field, receiver, "_version")))
+                .ToList();
+            if (stateLoads.Count != 2
+                || stateLoads.Count(instruction => ReferenceEquals(instruction.Destination, candidateItems)) != 1
+                || stateLoads.Count(instruction => ReferenceEquals(instruction.Destination, sharedVersionSource)) != 1
+                || instructions.Any(instruction =>
+                    !stateLoads.Contains(instruction)
+                    && (ReferenceEquals(instruction.Destination, candidateItems)
+                        || ReferenceEquals(instruction.Destination, sharedVersionSource)))
+                || instructions.Where(instruction => !stateLoads.Contains(instruction)).Any(instruction =>
+                    instruction.Operands.Any(operand =>
+                        ReferencesLocal(operand, candidateItems)
+                        || ReferencesLocal(operand, sharedVersionSource))))
+                return false;
+
+            predecessorStateLoads.AddRange(stateLoads);
+        }
+
+        if (!IsDefinitelyDefinedOnEveryIncomingPath(graph, sharedStatePrefix, value)
+            || slowTail.Any(instruction => instruction.Operands.Any(operand =>
+                ReferencesLocal(operand, candidateItems)
+                || ReferencesLocal(operand, sharedVersionSource)
+                || ReferencesLocal(operand, candidateVersionResult))))
+            return false;
+
+        items = candidateItems;
+        sizeState = checkedSize;
+        versionResult = candidateVersionResult;
+        versionSource = candidateVersionSource;
+        return true;
+    }
+
+    /// <summary>
+    /// 证明操作数在进入目标块前的每条 CFG 路径上均已定义。对全图没有定义的局部
+    /// 按方法参数/入口载体处理；其余局部执行保守的全前驱数据流验证。
+    /// </summary>
+    private static bool IsDefinitelyDefinedOnEveryIncomingPath(
+        ISILControlFlowGraph graph,
+        Block target,
+        IOperand operand)
+    {
+        if (operand is not LocalVariable local)
+            return true;
+        if (!graph.Instructions.Any(instruction => ReferenceEquals(instruction.Destination, local)))
+            return true;
+
+        var memo = new Dictionary<Block, bool>();
+        var active = new HashSet<Block>();
+        bool IsDefinedAtExit(Block block)
+        {
+            if (PatternInstructions(block).Any(instruction =>
+                    ReferenceEquals(instruction.Destination, local)))
+                return true;
+            if (memo.TryGetValue(block, out var cached))
+                return cached;
+            if (!active.Add(block))
+                return false;
+
+            var result = block.Predecessors.Count > 0
+                         && block.Predecessors.All(IsDefinedAtExit);
+            active.Remove(block);
+            memo[block] = result;
+            return result;
+        }
+
+        return target.Predecessors.Count > 0
+               && target.Predecessors.All(IsDefinedAtExit);
+    }
+
+    /// <summary>
+    /// 用一次公开 Add 替换共享状态与容量快慢尾，并从每条汇入边删除已证明
+    /// 只为该内联实现服务的 items/version 私有状态读取。
+    /// </summary>
+    private static void RewriteMergedStatePrefix(
+        ISILControlFlowGraph graph,
+        Block sharedStatePrefix,
+        Block capacityHead,
+        Block fastEntry,
+        Block fastBody,
+        Block slowBlock,
+        Block merge,
+        IReadOnlyList<Instruction> predecessorStateLoads,
+        Instruction slowCall,
+        IReadOnlyList<Instruction> preservedSlowTail,
+        ConcreteGenericMethodAnalysisContext addTarget,
+        LocalVariable receiver,
+        IOperand value)
+    {
+        foreach (var stateLoad in predecessorStateLoads)
+        {
+            var owner = graph.Blocks.Single(block => block.Instructions.Contains(stateLoad));
+            owner.Instructions.Remove(stateLoad);
+            owner.CalculateBlockType();
+        }
+
+        sharedStatePrefix.Instructions.Clear();
+        sharedStatePrefix.Instructions.Add(
+            new Instruction(slowCall.Index, OpCode.CallVoid, addTarget, receiver, value));
+        sharedStatePrefix.Instructions.AddRange(preservedSlowTail.Select(CloneInstruction));
+
+        Detach(graph, capacityHead);
+        Detach(graph, fastEntry);
+        Detach(graph, slowBlock);
+        if (!ReferenceEquals(fastBody, fastEntry) && fastBody.Predecessors.Count == 0)
+            Detach(graph, fastBody);
+
+        foreach (var successor in sharedStatePrefix.Successors.ToList())
+            successor.Predecessors.Remove(sharedStatePrefix);
+        sharedStatePrefix.Successors.Clear();
+        sharedStatePrefix.Successors.Add(merge);
+        if (!merge.Predecessors.Contains(sharedStatePrefix))
+            merge.Predecessors.Add(sharedStatePrefix);
+        sharedStatePrefix.CalculateBlockType();
     }
 
     /// <summary>
