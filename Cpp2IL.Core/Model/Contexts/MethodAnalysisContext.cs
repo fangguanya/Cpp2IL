@@ -571,12 +571,15 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveRecoveredLengthComparisonCarrierTypes(this);
         EmptyArrayRecovery.Run(this);
         PropertyBackingFieldRecovery.Run(this);
-        // 中文注释：公开getter在上一行才替换跨类型私有字段；仅消费新getter的标量结果，
-        // 为循环归纳变量补回精确类型，避免再次扫描原生位宽、数组和集合恢复链。
-        LocalVariables.ResolveRecoveredPropertyComparisonCarrierTypes(this);
+        // 中文注释：公开getter在上一行才替换跨类型私有字段；单次消费新getter的标量结果，
+        // 为比较归纳变量和普通整数算术结果补回精确类型，避免重复扫描属性、数组和集合恢复链。
+        LocalVariables.ResolveRecoveredPropertyScalarCarrierTypes(this);
         // 中文注释：集合长度与公开属性已提供最后一批精确标量种子；沿退 SSA Move 连通分量
         // 一次性回填其上游 Not/Phi 载体，避免在 IL 生成阶段把 Int32 仍声明成 Object。
         LocalVariables.ResolveFinalScalarCopyCarrierTypes(this);
+        // 中文注释：条件选择与退 SSA 边复制会用 Boolean 叶和非布尔状态码构造异常/短路控制状态；
+        // 仅在定义与比较消费者完全闭合时恢复 Int32，引用和普通业务数值仍保持原类型。
+        LocalVariables.ResolveFinalIntegerControlStateCarrierTypes(this);
         // 中文注释：退 SSA 的布尔边复制在此已稳定；只闭合由权威 Boolean 叶、0/1 复制和
         // 小位逻辑组成的分量，引用类型或非布尔掩码会使整个分量失败关闭。
         LocalVariables.ResolveFinalBooleanBitwiseCarrierTypes(this);

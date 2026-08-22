@@ -1505,10 +1505,10 @@ public static class LocalVariables
         IsFinalScalarType(type) || type?.FullName is "System.IntPtr" or "System.UIntPtr";
 
     /// <summary>
-    /// 私有字段在布局恢复后可能被重新物化为公开属性getter；仅消费这些新产生的精确标量结果，
-    /// 为同一比较中的退SSA占位局部补回数值类型，不重复早期原生位宽与字段推导。
+    /// 私有字段在布局恢复后可能被重新物化为公开属性getter；单次收集这些新产生的精确标量结果，
+    /// 同时回填比较操作数和普通整数算术结果，不重复早期原生位宽、字段或属性扫描。
     /// </summary>
-    public static bool ResolveRecoveredPropertyComparisonCarrierTypes(MethodAnalysisContext method)
+    public static bool ResolveRecoveredPropertyScalarCarrierTypes(MethodAnalysisContext method)
     {
         var instructions = method.ControlFlowGraph!.Instructions;
         var getterResults = new HashSet<LocalVariable>(instructions
@@ -1517,7 +1517,7 @@ public static class LocalVariables
                 OpCode: OpCode.Call,
                 Operands: [MethodAnalysisContext { Name: var name }, LocalVariable { Type: { } type }, ..]
             } && name.StartsWith("get_", StringComparison.Ordinal)
-              && IsFinalScalarType(type))
+              && (IsFinalScalarType(type) || type.FullName == "System.Boolean"))
             .Select(instruction => (LocalVariable)instruction.Operands[1]));
         if (getterResults.Count == 0)
             return false;
@@ -1525,11 +1525,15 @@ public static class LocalVariables
         var changed = false;
         foreach (var instruction in instructions)
         {
-            if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
-                || instruction.Operands.Count != 3
-                || !instruction.Operands.Skip(1).OfType<LocalVariable>().Any(getterResults.Contains))
+            if (!instruction.Operands
+                .Skip(instruction.Destination is LocalVariable ? 1 : 0)
+                .OfType<LocalVariable>()
+                .Any(getterResults.Contains))
                 continue;
-            changed |= BindFinalComparisonOperandTypes(instruction, method.AppContext);
+            if (instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned)
+                changed |= BindFinalComparisonOperandTypes(instruction, method.AppContext);
+            else
+                changed |= BindSizedIntegerOperationTypes(instruction, method.AppContext);
         }
         return changed;
     }
@@ -1739,13 +1743,138 @@ public static class LocalVariables
             method.AppContext.SystemTypes.SystemBooleanType);
 
     /// <summary>
-    /// 退 SSA 后，只有 0/1 两个定义且仅被相等比较消费的局部表示控制流布尔状态。
-    /// 该规则不接受算术、字段、调用或引用定义，因此不会把普通计数器或对象槽猜成布尔值。
+    /// 退 SSA 后，由权威 Boolean 来源或完整 0/1 定义组成，且只被布尔分支消费的局部表示控制流布尔状态。
+    /// 该规则不接受算术、字段、调用、引用或非布尔状态码定义，因此不会把普通计数器或对象槽猜成布尔值。
     /// </summary>
     public static bool ResolveFinalBooleanBranchCarrierTypes(MethodAnalysisContext method) =>
         BindFinalBooleanBranchCarrierTypes(
             method.ControlFlowGraph!.Instructions,
             method.AppContext.SystemTypes.SystemBooleanType);
+
+    /// <summary>
+    /// ARM64 的条件选择与退 SSA 边复制会把布尔条件和非布尔状态码汇合到同一物理寄存器。
+    /// 只有全部定义均由 Int32 范围字面量或 Boolean 值组成、至少存在一个非布尔状态码，且
+    /// 全部读取都只是与这些状态码或零比较时，才把最终载体恢复成 Int32。引用、算术、调用、
+    /// 越界字面量和其它消费者会否决该局部，避免覆盖同一寄存器的独立托管生命期。
+    /// </summary>
+    public static bool ResolveFinalIntegerControlStateCarrierTypes(MethodAnalysisContext method) =>
+        BindFinalIntegerControlStateCarrierTypes(
+            method.ControlFlowGraph!.Instructions,
+            method.AppContext.SystemTypes.SystemInt32Type,
+            method.AppContext.SystemTypes.SystemBooleanType);
+
+    internal static bool BindFinalIntegerControlStateCarrierTypes(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext int32Type,
+        TypeAnalysisContext booleanType)
+    {
+        var definitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var changed = false;
+
+        foreach (var pair in definitions)
+        {
+            var local = pair.Key;
+            if (!IsReplaceableFinalIntegerCarrier(local.Type, int32Type, booleanType)
+                || !TryCollectClosedInt32ControlStateValues(
+                    pair.Value,
+                    booleanType,
+                    out var stateValues)
+                || !stateValues.Any(value => value is < 0 or > 1))
+                continue;
+
+            var uses = instructions
+                .Where(instruction => instruction.Operands
+                    .Skip(instruction.Destination is LocalVariable ? 1 : 0)
+                    .Any(operand => ReferenceEquals(operand, local)))
+                .ToArray();
+            if (uses.Length == 0
+                || uses.Any(use => !IsClosedInt32ControlStateComparison(
+                    use,
+                    local,
+                    stateValues)))
+                continue;
+
+            local.Type = int32Type;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static bool TryCollectClosedInt32ControlStateValues(
+        IReadOnlyList<Instruction> definitions,
+        TypeAnalysisContext booleanType,
+        out HashSet<long> stateValues)
+    {
+        var collectedStateValues = new HashSet<long>();
+        foreach (var definition in definitions)
+        {
+            IEnumerable<IOperand> values = definition switch
+            {
+                { OpCode: OpCode.Move, Operands.Count: 2 } => definition.Operands.Skip(1),
+                { OpCode: OpCode.ConditionalSelect, Operands.Count: 4 } => definition.Operands.Skip(2),
+                _ => [],
+            };
+            var materializedValues = values.ToArray();
+            if (materializedValues.Length == 0
+                || materializedValues.Any(value => !IsClosedInt32ControlStateValue(
+                    value,
+                    booleanType,
+                    collectedStateValues)))
+            {
+                stateValues = [];
+                return false;
+            }
+        }
+
+        stateValues = collectedStateValues;
+        return true;
+    }
+
+    private static bool IsClosedInt32ControlStateValue(
+        IOperand value,
+        TypeAnalysisContext booleanType,
+        ISet<long> stateValues)
+    {
+        if (value is Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate)
+        {
+            stateValues.Add(immediate.Value);
+            return true;
+        }
+
+        return value is LocalVariable source
+            && GenericCallRebinder.TypesEquivalent(source.Type, booleanType);
+    }
+
+    private static bool IsClosedInt32ControlStateComparison(
+        Instruction instruction,
+        LocalVariable local,
+        ISet<long> stateValues)
+    {
+        if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
+            || instruction.Operands.Count != 3)
+            return false;
+
+        var comparedValues = instruction.Operands
+            .Skip(1)
+            .Where(operand => !ReferenceEquals(operand, local))
+            .ToArray();
+        return comparedValues.Length == 1
+            && comparedValues[0] is Immediate { Value: var value }
+            && (value == 0 || stateValues.Contains(value));
+    }
+
+    private static bool IsReplaceableFinalIntegerCarrier(
+        TypeAnalysisContext? type,
+        TypeAnalysisContext int32Type,
+        TypeAnalysisContext booleanType) =>
+        type == null
+        || GenericCallRebinder.TypesEquivalent(type, int32Type)
+        || GenericCallRebinder.TypesEquivalent(type, booleanType)
+        || type.FullName == "System.Object";
 
     internal static bool BindFinalBooleanBranchCarrierTypes(
         IReadOnlyList<Instruction> instructions,
@@ -1760,17 +1889,57 @@ public static class LocalVariables
         foreach (var pair in definitions)
         {
             var local = pair.Key;
-            if (!IsReplaceableFinalBooleanCarrier(local.Type, booleanType)
-                || pair.Value.Length < 2
-                || pair.Value.Any(definition => definition is not
+            if (!IsReplaceableFinalBooleanCarrier(local.Type, booleanType))
+                continue;
+
+            var immediateValues = new HashSet<long>();
+            var hasAuthoritativeBooleanSource = false;
+            var definitionsAreClosed = true;
+            var incomingValueCount = 0;
+            foreach (var definition in pair.Value)
+            {
+                IEnumerable<IOperand> incomingValues = definition switch
+                {
+                    { OpCode: OpCode.Move, Operands.Count: 2 } => definition.Operands.Skip(1),
+                    { OpCode: OpCode.ConditionalSelect, Operands.Count: 4 } => definition.Operands.Skip(2),
+                    _ => [],
+                };
+                var materializedValues = incomingValues.ToArray();
+                if (materializedValues.Length == 0)
+                {
+                    definitionsAreClosed = false;
+                    break;
+                }
+
+                incomingValueCount += materializedValues.Length;
+                foreach (var incomingValue in materializedValues)
+                {
+                    if (incomingValue is Immediate { Value: 0 or 1 } immediate)
                     {
-                        OpCode: OpCode.Move,
-                        Operands: [LocalVariable, Immediate { Value: 0 or 1 }],
-                    })
-                || pair.Value
-                    .Select(definition => ((Immediate)definition.Operands[1]).Value)
-                    .Distinct()
-                    .Count() != 2)
+                        immediateValues.Add(immediate.Value);
+                        continue;
+                    }
+
+                    if (incomingValue is LocalVariable source
+                        && !ReferenceEquals(source, local)
+                        && IsAuthoritativeBooleanSource(source, definitions, booleanType))
+                    {
+                        hasAuthoritativeBooleanSource = true;
+                        continue;
+                    }
+
+                    definitionsAreClosed = false;
+                    break;
+                }
+
+                if (!definitionsAreClosed)
+                    break;
+            }
+
+            // 单侧 0/1 边复制只有在存在权威 Boolean 来源时才构成闭合证据；纯字面量仍要求 0、1 两侧齐全。
+            if (!definitionsAreClosed
+                || incomingValueCount < 2
+                || (!hasAuthoritativeBooleanSource && immediateValues.Count != 2))
                 continue;
 
             var uses = instructions
@@ -1779,9 +1948,7 @@ public static class LocalVariables
                     .Any(operand => ReferenceEquals(operand, local)))
                 .ToArray();
             if (uses.Length == 0
-                || uses.Any(use => use.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
-                    || use.Operands.Count != 3
-                    || !use.Operands.Skip(1).OfType<Immediate>().Any(value => value.Value is 0 or 1)))
+                || uses.Any(use => !IsClosedBooleanBranchUse(use, local)))
                 continue;
 
             local.Type = booleanType;
@@ -1789,6 +1956,37 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    private static bool IsAuthoritativeBooleanSource(
+        LocalVariable source,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
+        TypeAnalysisContext booleanType)
+    {
+        if (GenericCallRebinder.TypesEquivalent(source.Type, booleanType))
+            return true;
+
+        // 比较目标的托管结果恒为 Boolean；其局部类型可能要到 IL 生成时才被最终物化。
+        return IsReplaceableFinalBooleanCarrier(source.Type, booleanType)
+            && definitions.TryGetValue(source, out var sourceDefinitions)
+            && sourceDefinitions.Length > 0
+            && sourceDefinitions.All(definition =>
+                definition.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned);
+    }
+
+    private static bool IsClosedBooleanBranchUse(Instruction instruction, LocalVariable local)
+    {
+        if (instruction.OpCode == OpCode.ConditionalJump)
+            return instruction.Operands.Count == 2
+                && ReferenceEquals(instruction.Operands[1], local);
+
+        if (instruction.OpCode == OpCode.ConditionalSelect)
+            return instruction.Operands.Count == 4
+                && ReferenceEquals(instruction.Operands[1], local);
+
+        return instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned
+            && instruction.Operands.Count == 3
+            && instruction.Operands.Skip(1).OfType<Immediate>().Any(value => value.Value is 0 or 1);
     }
 
     internal static bool BindFinalBooleanBitwiseComponentTypes(
@@ -2008,11 +2206,12 @@ public static class LocalVariables
             return false;
 
         var nativeAddressType = NativeAddressArithmeticType(instruction, appContext);
+        var exactOperandType = ExactIntegerOperationTypeFromOperands(instruction, appContext);
         var targetType = nativeAddressType ?? instruction.IntegerWidthBits switch
         {
             32 => appContext.SystemTypes.SystemInt32Type,
             64 => appContext.SystemTypes.SystemInt64Type,
-            _ => ExactIntegerDestinationType(instruction, destination, appContext),
+            _ => exactOperandType ?? ExactIntegerDestinationType(instruction, destination, appContext),
         };
         if (targetType == null)
             return false;
@@ -2020,17 +2219,86 @@ public static class LocalVariables
         if (locals.Any(local => !IsReplaceableFinalIntegerCarrier(local.Type, targetType, appContext)))
             return false;
 
-        var hasExactIntegerEvidence = nativeAddressType != null || locals.Any(local =>
-            GenericCallRebinder.TypesEquivalent(local.Type, targetType));
+        var hasExactIntegerEvidence = nativeAddressType != null
+            || exactOperandType != null
+            || locals.Any(local => GenericCallRebinder.TypesEquivalent(local.Type, targetType));
         var hasNonBooleanMask = instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
             && instruction.Operands.OfType<Immediate>().Any(immediate => immediate.Value is < 0 or > 1);
         if (!hasExactIntegerEvidence && !hasNonBooleanMask)
             return false;
 
+        var promotesBooleanArithmetic = exactOperandType != null
+            && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+            && !locals.Any(local => GenericCallRebinder.TypesEquivalent(local.Type, targetType))
+            && locals.Any(local => GenericCallRebinder.TypesEquivalent(
+                local.Type,
+                appContext.SystemTypes.SystemBooleanType));
         var changed = false;
         foreach (var local in locals)
+        {
+            // 中文注释：Boolean 调用结果在 CIL 栈上本来就是 I4，只需把算术结果定型为 Int32；
+            // 保留源局部的 Boolean 声明，ILSpy 才能生成零/一投影而不是非法的 bool→int 赋值。
+            if (promotesBooleanArithmetic
+                && !ReferenceEquals(local, destination)
+                && GenericCallRebinder.TypesEquivalent(
+                    local.Type,
+                    appContext.SystemTypes.SystemBooleanType))
+                continue;
             changed |= SetExactType(local, targetType);
+        }
         return changed;
+    }
+
+    /// <summary>
+    /// CFG 重写可能丢失 ARM64 W/X 位宽，但已经精确定型的 Int32/Int64 输入仍能裁决普通整数
+    /// 算术的结果类型。Boolean 输入参与加减乘除时按原生零/一 ABI 提升为 Int32；没有精确输入、
+    /// 同时出现 Int32/Int64、越界字面量或引用输入时保持开放。移位只由被移位值裁决结果，
+    /// Int32 的移位计数不参与结果宽度共识。
+    /// </summary>
+    private static TypeAnalysisContext? ExactIntegerOperationTypeFromOperands(
+        Instruction instruction,
+        ApplicationAnalysisContext appContext)
+    {
+        if (instruction.OpCode is not (
+                OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned))
+            return null;
+
+        var valueOperands = instruction.OpCode is
+            OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
+            ? instruction.Operands.Skip(1).Take(1).ToArray()
+            : instruction.Operands.Skip(1).ToArray();
+        var localValues = valueOperands.OfType<LocalVariable>().ToArray();
+        if (localValues.Length == 0
+            || localValues.Any(local => local.Type?.FullName is not (
+                null or "System.Object" or "System.Boolean" or "System.Int32" or "System.Int64")))
+            return null;
+
+        var exactTypes = localValues
+            .Select(local => local.Type)
+            .Where(type => type?.FullName is "System.Int32" or "System.Int64")
+            .Cast<TypeAnalysisContext>()
+            .GroupBy(type => type.FullName, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+        if (exactTypes.Length > 1)
+            return null;
+
+        var targetType = exactTypes.Length == 1
+            ? exactTypes[0]
+            : localValues.Any(local => GenericCallRebinder.TypesEquivalent(
+                local.Type,
+                appContext.SystemTypes.SystemBooleanType))
+                ? appContext.SystemTypes.SystemInt32Type
+                : null;
+        if (targetType == null)
+            return null;
+
+        return valueOperands
+            .OfType<Immediate>()
+            .All(immediate => IsCompatibleFinalCallScalarLiteral(immediate, targetType))
+            ? targetType
+            : null;
     }
 
     /// <summary>
