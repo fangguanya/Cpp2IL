@@ -555,6 +555,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 托管生产值恢复 List<T> 与 IEnumerator<T> 的跨调用保存身份，并同步泛型签名。
         CalleeSavedManagedReceiverRecovery.Run(this);
 
+        // 中文注释：共享接收者 Phi 到此才获得最终具体引用类型。只用现成的接收者、
+        // methodPtr 与 MethodInfo 双半槽恢复早期未闭合的普通虚调用，不重跑 SSA 前驱分析。
+        LateVirtualCallRecovery.Run(this);
+
         // 中文注释：集合快慢边比较前先删除终态已证明跨值域的 Phi 复制；否则布尔返回槽
         // 会分别承载元素与集合引用，阻断原本完全等价的 List<T>.Add 容量菱形。
         CopyCoalescer.PruneIncompatiblePhiCopies(ControlFlowGraph);
