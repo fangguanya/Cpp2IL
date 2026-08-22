@@ -1050,6 +1050,17 @@ public static class IlGenerator
             return;
         }
 
+        // ARM64 的 W 寄存器写入会把低 32 位零扩展到宿主 long。比如源码中的 -1 会以
+        // 0x00000000FFFFFFFF（4294967295）进入 ISIL；若按 long 直接发射 ldc.i8，随后调用
+        // Int32/UInt32/短整数/布尔/字符形参时就会形成 I8 -> I4 的非法求值栈。托管签名已经
+        // 给出目标栈类型，因此只在值可由同一 32 位位模式精确表达时收窄为 ldc.i4。
+        if (operand is Immediate integerImmediate
+            && TryGetI4Immediate(integerImmediate, expectedType, out var i4Value))
+        {
+            instructions.Add(CilOpCodes.Ldc_I4, i4Value);
+            return;
+        }
+
         switch (operand)
         {
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
@@ -1551,6 +1562,40 @@ public static class IlGenerator
                or "System.Int64" or "System.UInt64"
                or "System.Single" or "System.Double"
                or "System.IntPtr" or "System.UIntPtr");
+
+    internal static bool TryGetI4Immediate(
+        Immediate immediate,
+        TypeAnalysisContext? expectedType,
+        out int value)
+    {
+        value = default;
+        if (expectedType == null)
+            return false;
+
+        var storageType = expectedType.IsEnumType
+            ? expectedType.EnumUnderlyingType
+            : expectedType;
+        if (storageType?.FullName is not (
+                "System.Boolean" or "System.Char"
+                or "System.SByte" or "System.Byte"
+                or "System.Int16" or "System.UInt16"
+                or "System.Int32" or "System.UInt32"))
+            return false;
+
+        if (immediate.Value is >= int.MinValue and <= int.MaxValue)
+        {
+            value = (int)immediate.Value;
+            return true;
+        }
+
+        if (immediate.Value is >= 0 and <= uint.MaxValue)
+        {
+            value = unchecked((int)(uint)immediate.Value);
+            return true;
+        }
+
+        return false;
+    }
 
     private static void EmitInitializedValueType(TypeAnalysisContext type, MethodDefinition method)
     {

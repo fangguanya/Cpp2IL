@@ -46,8 +46,10 @@ public static class DirectRuntimeHelperRecovery
     /// </summary>
     internal static int Run(MethodAnalysisContext method, Func<ulong, HelperKind> classify)
     {
-        ArgumentNullException.ThrowIfNull(method);
-        ArgumentNullException.ThrowIfNull(classify);
+        if (method == null)
+            throw new ArgumentNullException(nameof(method));
+        if (classify == null)
+            throw new ArgumentNullException(nameof(classify));
 
         var rewritten = 0;
         var classificationByAddress = new Dictionary<ulong, HelperKind>();
@@ -393,8 +395,10 @@ public static class DirectRuntimeHelperRecovery
         ulong objectIsInstAddress,
         Func<ulong, string?> resolveThrownException)
     {
-        ArgumentNullException.ThrowIfNull(body);
-        ArgumentNullException.ThrowIfNull(resolveThrownException);
+        if (body == null)
+            throw new ArgumentNullException(nameof(body));
+        if (resolveThrownException == null)
+            throw new ArgumentNullException(nameof(resolveThrownException));
 
         if (IsDirectInterfaceInvokeBody(body))
             return HelperKind.DirectInterfaceInvoke;

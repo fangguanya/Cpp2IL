@@ -1830,6 +1830,50 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Int32形参把W寄存器全一位模式恢复为负一()
+    {
+        var result = IlGenerator.TryGetI4Immediate(
+            new Immediate(uint.MaxValue),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type,
+            out var value);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result, Is.True);
+            Assert.That(value, Is.EqualTo(-1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void UInt32形参保持最高位位模式而不提升到I8()
+    {
+        var result = IlGenerator.TryGetI4Immediate(
+            new Immediate(0x80000000L),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemUInt32Type,
+            out var value);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result, Is.True);
+            Assert.That(value, Is.EqualTo(int.MinValue));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Int64形参禁止把同一立即数错误收窄为I4()
+    {
+        var result = IlGenerator.TryGetI4Immediate(
+            new Immediate(uint.MaxValue),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt64Type,
+            out _);
+
+        Assert.That(result, Is.False);
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 未定型Object局部量非零立即数保持数值指令()
     {
