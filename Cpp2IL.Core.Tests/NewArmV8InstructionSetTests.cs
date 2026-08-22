@@ -1144,6 +1144,72 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 三十二位MoveKeep展开后两条位操作均保留W寄存器位宽()
+    {
+        var destination = new Register(null, "W8");
+
+        var recovered = NewArmV8InstructionSet.TryCreateMoveKeepInstructions(
+            0x72A00028u,
+            destination,
+            out var instructions);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(recovered, Is.True);
+            Assert.That(instructions, Has.Length.EqualTo(2));
+            Assert.That(instructions.Select(instruction => instruction.OpCode),
+                Is.EqualTo(new[] { OpCode.And, OpCode.Or }));
+            Assert.That(instructions.Select(instruction => instruction.IntegerWidthBits),
+                Is.All.EqualTo(32));
+            Assert.That(((Immediate)instructions[0].Operands[2]).UnsignedValue,
+                Is.EqualTo(0x0000FFFFul));
+            Assert.That(((Immediate)instructions[1].Operands[2]).UnsignedValue,
+                Is.EqualTo(0x00010000ul));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 六十四位MoveKeep最高半字展开后保持X寄存器位宽与完整掩码()
+    {
+        var destination = new Register(null, "X0");
+
+        var recovered = NewArmV8InstructionSet.TryCreateMoveKeepInstructions(
+            0xF2F579A0u,
+            destination,
+            out var instructions);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(recovered, Is.True);
+            Assert.That(instructions, Has.Length.EqualTo(2));
+            Assert.That(instructions.Select(instruction => instruction.IntegerWidthBits),
+                Is.All.EqualTo(64));
+            Assert.That(((Immediate)instructions[0].Operands[2]).UnsignedValue,
+                Is.EqualTo(0x0000FFFFFFFFFFFFul));
+            Assert.That(((Immediate)instructions[1].Operands[2]).UnsignedValue,
+                Is.EqualTo(0xABCD000000000000ul));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非MoveKeep编码不生成任何带伪位宽的位操作()
+    {
+        var recovered = NewArmV8InstructionSet.TryCreateMoveKeepInstructions(
+            0x528A3008u,
+            new Register(null, "W8"),
+            out var instructions);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(recovered, Is.False);
+            Assert.That(instructions, Is.Empty);
+        }
+    }
+
     [TestCase(0x1E749000u, 64, -10.0d, TestName = "恢复JWT刷新窗口的双精度负十分钟")]
     [TestCase(0x1E349000u, 32, -10.0d, TestName = "单精度编码保持同一精确数值")]
     [Category("基本功能")]

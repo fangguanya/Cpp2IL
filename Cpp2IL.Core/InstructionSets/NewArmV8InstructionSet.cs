@@ -433,6 +433,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    /// <summary>
+    /// 将 MOVK 精确展开成同一位宽的清半字与写半字操作。位宽必须在原生指令入口写入两条
+    /// ISIL 指令；若延迟到退 SSA 后再从 0xFFFF 掩码猜测，W/X 寄存器会产生同形歧义。
+    /// </summary>
+    internal static bool TryCreateMoveKeepInstructions(
+        uint machineCode,
+        IOperand destination,
+        out Instruction[] instructions)
+    {
+        if (!TryDecodeMoveKeepImmediate(
+                machineCode,
+                out var registerWidth,
+                out _,
+                out var clearMask,
+                out var shiftedImmediate))
+        {
+            instructions = [];
+            return false;
+        }
+
+        instructions =
+        [
+            new Instruction(-1, OpCode.And, destination, destination, Imm(clearMask))
+            {
+                IntegerWidthBits = registerWidth,
+            },
+            new Instruction(-1, OpCode.Or, destination, destination, Imm(shiftedImmediate))
+            {
+                IntegerWidthBits = registerWidth,
+            },
+        ];
+        return true;
+    }
+
     internal static bool TryGetFloatingPointPrecisionBits(Arm64Register register, out int bits)
     {
         if (register is >= Arm64Register.S0 and <= Arm64Register.S31)
@@ -2856,12 +2890,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     // MOVK 保留目标寄存器其他半字；必须读原始编码的 hw 字段，不能从已移位的显示立即数反推。
                     var machineCode = ReadMachineCodeAtAddress(context, address);
-                    if (!TryDecodeMoveKeepImmediate(
-                            machineCode,
-                            out _,
-                            out _,
-                            out var clearMask,
-                            out var shiftedImmediate))
+                    var destination = ConvertOperand(instruction, 0);
+                    if (!TryCreateMoveKeepInstructions(machineCode, destination, out var recovered))
                     {
                         throw new InvalidOperationException(
                             $"MOVK原始编码无效：0x{machineCode:X8} @ 0x{address:X}");
@@ -2870,9 +2900,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (instruction.Op0Kind == Arm64OperandKind.Register)
                         adrpOffsets.Remove(instruction.Op0Reg);
 
-                    var destination = ConvertOperand(instruction, 0);
-                    Add(address, OpCode.And, destination, destination, Imm(clearMask));
-                    Add(address, OpCode.Or, destination, destination, Imm(shiftedImmediate));
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(
+                            address,
+                            recoveredInstruction.OpCode,
+                            recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
                     break;
                 }
             case Arm64Mnemonic.MOVN:
