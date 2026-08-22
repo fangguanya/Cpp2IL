@@ -322,13 +322,14 @@ public static class ListAddRecovery
         foreach (var slowEntry in slowBlock.Predecessors.ToList())
         {
             if (!TryMatchSharedSlowValueEntry(
+                    graph,
                     slowEntry,
                     slowBlock,
                     sharedSlowValue,
                     out var branchSlowValue))
             {
                 Logger.VerboseNewline(
-                    $"ListAdd共享慢尾拒绝：慢入口 b{slowEntry.ID} 未形成对共享参数 {sharedSlowValue} 的唯一载入。");
+                    $"ListAdd共享慢尾拒绝：慢入口 b{slowEntry.ID} 既没有形成对共享参数 {sharedSlowValue} 的唯一载入，也没有由唯一支配定义提供该参数。");
                 continue;
             }
 
@@ -417,6 +418,7 @@ public static class ListAddRecovery
     }
 
     private static bool TryMatchSharedSlowValueEntry(
+        ISILControlFlowGraph graph,
         Block entry,
         Block slowBlock,
         IOperand sharedSlowValue,
@@ -435,17 +437,58 @@ public static class ListAddRecovery
             instructions = instructions.Take(instructions.Count - 1).ToList();
         }
 
-        if (instructions is not
+        if (instructions is
             [
                 {
                     OpCode: OpCode.Move,
                     Operands: [var destination, var source],
                 }
             ]
-            || !ReferenceEquals(destination, sharedSlowValue))
+            && ReferenceEquals(destination, sharedSlowValue))
+        {
+            branchValue = source;
+            return true;
+        }
+
+        // ARM64 会把两条容量边都使用的对象分配提升到菱形之前，慢边因此只剩一条 Jump。
+        // 此时只能在共享参数具有唯一赋值，且该赋值块严格支配容量头时复用原局部；
+        // 多定义、条件定义以及慢入口夹带其他语义都必须保持原图。
+        if (instructions.Count != 0
+            || entry.Predecessors is not [var capacityHead]
+            || !TryResolveUniqueDominatingSharedValue(
+                graph,
+                capacityHead,
+                sharedSlowValue,
+                out branchValue))
             return false;
 
-        branchValue = source;
+        return true;
+    }
+
+    /// <summary>
+    /// 证明共享慢参数来自容量头之前唯一且必经的定义。
+    /// </summary>
+    private static bool TryResolveUniqueDominatingSharedValue(
+        ISILControlFlowGraph graph,
+        Block capacityHead,
+        IOperand sharedSlowValue,
+        out IOperand branchValue)
+    {
+        branchValue = null!;
+        var definitions = graph.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (Block: block, Instruction: instruction)))
+            .Where(candidate => ReferenceEquals(candidate.Instruction.Destination, sharedSlowValue))
+            .ToList();
+        if (definitions is not [{ Block: var definitionBlock }]
+            || ReferenceEquals(definitionBlock, capacityHead))
+            return false;
+
+        // 每次按当前图重新计算支配关系，避免前一项 List.Add 改写后沿用过期的 SSA 支配信息。
+        var dominance = new DominatorInfo(graph);
+        if (!dominance.Dominates(definitionBlock, capacityHead))
+            return false;
+
+        branchValue = sharedSlowValue;
         return true;
     }
 

@@ -1478,6 +1478,65 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 唯一支配元素经纯跳转慢边中继时恢复公开Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var relay = ConfigureDominatingSharedSlowValueRelay(fixture);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(relay));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 唯一元素定义隔两个线性块支配容量头时仍恢复公开Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        ConfigureDominatingSharedSlowValueRelay(fixture, definitionBridgeCount: 2);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 纯跳转慢边元素具有两个定义时保持原图()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        ConfigureDominatingSharedSlowValueRelay(fixture, duplicateDefinition: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 集合状态更新前夹有业务赋值时保留赋值并闭合Add()
     {
         var fixture = CreateInterleavedHeadFixture(touchesReceiver: false);
@@ -2261,6 +2320,79 @@ public class ListAddRecoveryTests
                 new Instruction(-1, OpCode.Move, runtimeClass, elementType));
         }
         return new Fixture(method, graph, receiver, value, carrier, fastBlock, slowBlock);
+    }
+
+    /// <summary>
+    /// 把普通容量菱形改造成“元素在容量头之前唯一分配，慢边仅经纯 Jump 中继”的形态。
+    /// </summary>
+    private static Block ConfigureDominatingSharedSlowValueRelay(
+        Fixture fixture,
+        int definitionBridgeCount = 0,
+        bool duplicateDefinition = false)
+    {
+        if (definitionBridgeCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(definitionBridgeCount));
+
+        var graph = fixture.Graph;
+        var capacityHead = graph.Blocks.Single(block =>
+            block.Successors.Contains(fixture.FastBlock)
+            && block.Successors.Contains(fixture.SlowBlock));
+        var entry = graph.EntryBlock;
+        if (entry.Successors is not [var originalHead] || !ReferenceEquals(originalHead, capacityHead))
+            throw new InvalidOperationException("测试夹具的入口必须直接进入容量头。");
+
+        var nextId = graph.Blocks.Max(block => block.ID) + 1;
+        var definition = new Block { ID = nextId++ };
+        definition.Instructions.Add(new Instruction(-1, OpCode.Newobj, fixture.Value, fixture.Value.Type!));
+        if (duplicateDefinition)
+            definition.Instructions.Add(new Instruction(-1, OpCode.Move, fixture.Value, fixture.Carrier));
+
+        var definitionPath = new List<Block> { definition };
+        for (var index = 0; index < definitionBridgeCount; index++)
+        {
+            definitionPath.Add(new Block
+            {
+                ID = nextId++,
+            });
+        }
+
+        // 中文注释：显式维护指令目标与前驱/后继，确保支配关系由真实 CFG 证明而非列表顺序推断。
+        entry.Successors[0] = definition;
+        definition.Predecessors.Add(entry);
+        for (var index = 0; index < definitionPath.Count; index++)
+        {
+            var current = definitionPath[index];
+            var next = index + 1 < definitionPath.Count ? definitionPath[index + 1] : capacityHead;
+            current.Instructions.Add(new Instruction(-1, OpCode.Jump, next));
+            current.Successors.Add(next);
+            if (index + 1 < definitionPath.Count)
+                next.Predecessors.Add(current);
+        }
+        var entryPredecessorIndex = capacityHead.Predecessors.FindIndex(block => ReferenceEquals(block, entry));
+        if (entryPredecessorIndex < 0)
+            throw new InvalidOperationException("测试夹具的容量头缺少入口前驱。");
+        capacityHead.Predecessors[entryPredecessorIndex] = definitionPath[^1];
+
+        var relay = new Block { ID = nextId++ };
+        relay.Instructions.Add(new Instruction(-1, OpCode.Jump, fixture.SlowBlock));
+        relay.Predecessors.Add(capacityHead);
+        relay.Successors.Add(fixture.SlowBlock);
+        var slowSuccessorIndex = capacityHead.Successors.FindIndex(block => ReferenceEquals(block, fixture.SlowBlock));
+        var headPredecessorIndex = fixture.SlowBlock.Predecessors.FindIndex(block => ReferenceEquals(block, capacityHead));
+        if (slowSuccessorIndex < 0 || headPredecessorIndex < 0)
+            throw new InvalidOperationException("测试夹具的容量慢边拓扑不完整。");
+        capacityHead.Successors[slowSuccessorIndex] = relay;
+        fixture.SlowBlock.Predecessors[headPredecessorIndex] = relay;
+        var capacityBranch = capacityHead.Instructions.Single(instruction =>
+            instruction is { OpCode: OpCode.ConditionalJump, Operands: [Block target, _] }
+            && ReferenceEquals(target, fixture.SlowBlock));
+        capacityBranch.SetOperand(0, relay);
+
+        graph.Blocks.AddRange(definitionPath);
+        graph.Blocks.Add(relay);
+        foreach (var block in definitionPath.Append(relay))
+            block.CalculateBlockType();
+        return relay;
     }
 
     private static Fixture CreateCarriedStateFixture(
