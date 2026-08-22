@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Utils;
 using Disarm;
 using Disarm.InternalDisassembly;
 
@@ -714,6 +715,45 @@ public class NewArmV8InstructionSetTests
         Assert.That(
             NewArmV8InstructionSet.ShouldInvertZeroFlag(conditionCode),
             Is.EqualTo(expectedInversion));
+    }
+
+    [TestCase(Arm64Register.W31, TestName = "基本_CSINC的WZR值操作数规范化为零")]
+    [TestCase(Arm64Register.X31, TestName = "边界_CSEL的XZR值操作数规范化为零")]
+    [Category("基本功能")]
+    public void ConditionalZeroRegisterValueBecomesImmediateZero(Arm64Register register)
+    {
+        var normalized = NewArmV8InstructionSet.NormalizeZeroRegisterValueOperand(
+            Arm64OperandKind.Register,
+            register,
+            new Register(null, Arm64RegisterHelper.CanonicalName(register)));
+
+        Assert.That(normalized, Is.EqualTo(new Immediate(0)));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void NonRegisterOperandCannotBeReinterpretedAsZeroRegister()
+    {
+        var original = new Immediate(31);
+        var normalized = NewArmV8InstructionSet.NormalizeZeroRegisterValueOperand(
+            Arm64OperandKind.Immediate,
+            Arm64Register.W31,
+            original);
+
+        Assert.That(normalized, Is.EqualTo(original));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void OrdinaryConditionalRegisterKeepsItsIdentity()
+    {
+        var original = new Register(null, "W8");
+        var normalized = NewArmV8InstructionSet.NormalizeZeroRegisterValueOperand(
+            Arm64OperandKind.Register,
+            Arm64Register.W8,
+            original);
+
+        Assert.That(normalized, Is.EqualTo(original));
     }
 
     [TestCase(Arm64ConditionCode.MI, false, TestName = "MI直接读取整数减法的负标志")]

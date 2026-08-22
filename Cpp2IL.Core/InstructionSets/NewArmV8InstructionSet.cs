@@ -115,6 +115,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private static Immediate Imm(long value) => new(value);
     private static Immediate Imm(ulong value) => new(unchecked((long)value));
 
+    /// <summary>
+    /// 把只能表示值的 ARM64 31 号通用寄存器规范化为常量零。
+    /// 该帮助器只用于 CSEL/CSINC 等明确按 WZR/XZR 解释的值操作数，
+    /// 栈指针语境仍由帧地址恢复规则独立处理。
+    /// </summary>
+    internal static IOperand NormalizeZeroRegisterValueOperand(
+        Arm64OperandKind kind,
+        Arm64Register register,
+        IOperand converted)
+        => kind == Arm64OperandKind.Register
+           && Arm64RegisterHelper.IsZeroRegister(register)
+            ? Imm(0)
+            : converted;
+
     internal static bool TryDecodeStackPointerAdjustment(
         Arm64Mnemonic mnemonic,
         Arm64OperandKind destinationKind,
@@ -2601,8 +2615,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var destination = ConvertOperand(instruction, 0);
             var preservedTrue = new Register(null, registerPrefix + "_TRUE");
             var preservedFalse = new Register(null, registerPrefix + "_FALSE");
-            Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
-            Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+            Add(
+                address,
+                OpCode.Move,
+                preservedTrue,
+                NormalizeZeroRegisterValueOperand(
+                    instruction.Op1Kind,
+                    instruction.Op1Reg,
+                    ConvertOperand(instruction, 1)));
+            Add(
+                address,
+                OpCode.Move,
+                preservedFalse,
+                NormalizeZeroRegisterValueOperand(
+                    instruction.Op2Kind,
+                    instruction.Op2Reg,
+                    ConvertOperand(instruction, 2)));
             // 条件选择是单条值指令，不是原生控制流。把它提升成跨地址跳转会制造伪基本块，
             // 特别是在同一地址连续生成多条 ISIL 时形成自环；保留为原子值选择供 CIL 内部展开。
             Add(address, OpCode.ConditionalSelect, destination, condition, preservedTrue, preservedFalse);
@@ -3356,12 +3384,32 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var preservedTrue = new Register(null, "CSINC_TRUE");
                     var preservedFalse = new Register(null, "CSINC_FALSE");
                     var incrementedFalse = new Register(null, "CSINC_FALSE_INCREMENTED");
-                    Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
-                    Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
-                    Add(address, OpCode.Add, incrementedFalse, preservedFalse, Imm(1));
-                    Add(address, OpCode.Move, destination, preservedTrue);
-                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
-                    Add(address, OpCode.Move, destination, incrementedFalse);
+                    Add(
+                        address,
+                        OpCode.Move,
+                        preservedTrue,
+                        NormalizeZeroRegisterValueOperand(
+                            instruction.Op1Kind,
+                            instruction.Op1Reg,
+                            ConvertOperand(instruction, 1)));
+                    Add(
+                        address,
+                        OpCode.Move,
+                        preservedFalse,
+                        NormalizeZeroRegisterValueOperand(
+                            instruction.Op2Kind,
+                            instruction.Op2Reg,
+                            ConvertOperand(instruction, 2)));
+                    AddInteger(address, OpCode.Add, incrementedFalse, preservedFalse, Imm(1));
+                    // CSINC 是单条值指令：条件为真选 Rn，否则选 Rm+1。
+                    // 伪跳转展开会制造多余基本块并切断目标标量类型，因此保留原子条件选择。
+                    Add(
+                        address,
+                        OpCode.ConditionalSelect,
+                        destination,
+                        condition,
+                        preservedTrue,
+                        incrementedFalse);
                     break;
                 }
 
@@ -3381,8 +3429,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var preservedTrue = new Register(null, instruction.Mnemonic + "_TRUE");
                     var preservedFalse = new Register(null, instruction.Mnemonic + "_FALSE");
                     var transformedFalse = new Register(null, instruction.Mnemonic + "_FALSE_TRANSFORMED");
-                    Add(address, OpCode.Move, preservedTrue, ConvertOperand(instruction, 1));
-                    Add(address, OpCode.Move, preservedFalse, ConvertOperand(instruction, 2));
+                    Add(
+                        address,
+                        OpCode.Move,
+                        preservedTrue,
+                        NormalizeZeroRegisterValueOperand(
+                            instruction.Op1Kind,
+                            instruction.Op1Reg,
+                            ConvertOperand(instruction, 1)));
+                    Add(
+                        address,
+                        OpCode.Move,
+                        preservedFalse,
+                        NormalizeZeroRegisterValueOperand(
+                            instruction.Op2Kind,
+                            instruction.Op2Reg,
+                            ConvertOperand(instruction, 2)));
                     var falseTransform = GetConditionalFalseTransformOpCode(instruction.Mnemonic)
                         ?? throw new InvalidOperationException($"条件变换指令未映射：{instruction.Mnemonic}");
                     Add(
@@ -3408,11 +3470,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var destination = ConvertOperand(instruction, 0);
                     var preservedSource = new Register(null, "CINC_SOURCE");
                     var incrementedSource = new Register(null, "CINC_INCREMENTED");
-                    Add(address, OpCode.Move, preservedSource, ConvertOperand(instruction, 1));
+                    Add(
+                        address,
+                        OpCode.Move,
+                        preservedSource,
+                        NormalizeZeroRegisterValueOperand(
+                            instruction.Op1Kind,
+                            instruction.Op1Reg,
+                            ConvertOperand(instruction, 1)));
                     AddInteger(address, OpCode.Add, incrementedSource, preservedSource, Imm(1));
-                    Add(address, OpCode.Move, destination, incrementedSource);
-                    Add(address, OpCode.ConditionalJump, Imm(address + 4), condition);
-                    Add(address, OpCode.Move, destination, preservedSource);
+                    // CINC 条件为真时选 Rn+1，否则保留 Rn；与 CSEL 使用同一原子值语义。
+                    Add(
+                        address,
+                        OpCode.ConditionalSelect,
+                        destination,
+                        condition,
+                        incrementedSource,
+                        preservedSource);
                     break;
                 }
 
@@ -3658,9 +3732,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.SUBS:
             case Arm64Mnemonic.ANDS:
                 {
-                    var dest = ConvertOperand(instruction, 0);
-                    var src1 = ConvertOperand(instruction, 1);
-                    var src2 = ConvertOperand(instruction, 2);
+                    var writesZeroRegister = instruction.Op0Kind == Arm64OperandKind.Register
+                                             && Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg);
+                    // TST/ANDS WZR|XZR 只写 NZCV，不得定义后续指令可读的 W31/X31 值。
+                    // 使用独立旗标结果既保留零比较，又阻断零寄存器污染跨指令传播。
+                    var dest = writesZeroRegister
+                        ? new Register(null, "FLAG_LOGICAL_RESULT")
+                        : ConvertOperand(instruction, 0);
+                    var src1 = NormalizeZeroRegisterValueOperand(
+                        instruction.Op1Kind,
+                        instruction.Op1Reg,
+                        ConvertOperand(instruction, 1));
+                    var src2 = NormalizeZeroRegisterValueOperand(
+                        instruction.Op2Kind,
+                        instruction.Op2Reg,
+                        ConvertOperand(instruction, 2));
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ADDS
                         && TryDecodeCmnSignedThreshold(
@@ -3705,7 +3791,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                     else
                     {
-                        AddInteger(address, opCode, dest, src1, src2);
+                        var logicalResult = AddInteger(address, opCode, dest, src1, src2);
+                        if (writesZeroRegister)
+                            logicalResult.IntegerWidthBits = instruction.Op0Reg == Arm64Register.W31 ? 32 : 64;
                         flagState = Arm64FlagState.ZeroOnly;
                     }
 
