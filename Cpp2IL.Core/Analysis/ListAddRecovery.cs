@@ -471,9 +471,9 @@ public static class ListAddRecovery
                 out var slowCarrierTail))
             return false;
         if (slowBlock.Predecessors is not [var capacityHead])
-            return false;
+            return RejectSharedFastTail(slowBlock, "慢边不是单一容量头前驱");
         if (!TryGetMergeBlock(graph, slowBlock, out var merge))
-            return false;
+            return RejectSharedFastTail(slowBlock, "慢边汇合块未闭合");
         if (!TryGetSharedFastBlocks(
                 capacityHead,
                 slowBlock,
@@ -481,18 +481,18 @@ public static class ListAddRecovery
                 originalSharedFastTails,
                 out var stagingBlock,
                 out var sharedFastTail))
-            return false;
+            return RejectSharedFastTail(slowBlock, "快边暂存块或共享快尾拓扑未闭合");
         if (!TryMatchSharedFastTail(
                 sharedFastTail,
                 merge,
                 out var sharedPattern))
-            return false;
+            return RejectSharedFastTail(slowBlock, "共享快尾原生写入形态未闭合");
         if (!TryMatchSharedCapacityHead(
                 capacityHead,
                 slowBlock,
                 publicReceiver,
                 sharedPattern))
-            return false;
+            return RejectSharedFastTail(slowBlock, "容量头接收者、Count 或数组长度未闭合");
         if (!TryMatchSharedStatePrefix(
                 capacityHead,
                 publicReceiver,
@@ -500,7 +500,7 @@ public static class ListAddRecovery
                 out var rewriteHead,
                 out var headPath,
                 out var rewriteStart))
-            return false;
+            return RejectSharedFastTail(slowBlock, "getter/别名与 items/version 状态前缀未闭合");
         if (!TryMatchSharedStagingPath(
                 graph,
                 stagingBlock,
@@ -513,9 +513,9 @@ public static class ListAddRecovery
                 addWithResize.TypeGenericParameters.Single(),
                 out var publicValue,
                 out var preservedCarrierTail))
-            return false;
+            return RejectSharedFastTail(slowBlock, "快慢元素值或暂存载体未闭合");
         if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
-            return false;
+            return RejectSharedFastTail(slowBlock, "公开 Add 目标构造失败");
 
         RewriteSharedFastTail(
             graph,
@@ -532,6 +532,15 @@ public static class ListAddRecovery
             publicReceiver,
             publicValue);
         return true;
+    }
+
+    /// <summary>
+    /// 统一记录共享快尾候选的精确拒绝门，避免各分支重复拼装诊断文本。
+    /// </summary>
+    private static bool RejectSharedFastTail(Block slowBlock, string reason)
+    {
+        Logger.VerboseNewline($"ListAdd共享快尾拒绝：慢边 b{slowBlock.ID}，{reason}。");
+        return false;
     }
 
     private static bool TryMatchSharedSlowPath(
@@ -611,7 +620,7 @@ public static class ListAddRecovery
     {
         pattern = null!;
         var instructions = PatternInstructions(block);
-        if (instructions.Count != 9
+        if (instructions.Count < 7
             || instructions[0] is not
             {
                 OpCode: OpCode.And,
@@ -627,45 +636,159 @@ public static class ListAddRecovery
                 OpCode: OpCode.Subtract,
                 Operands: [LocalVariable normalized, var biasedSource, Immediate { Value: 0x80000000L }],
             }
-            || instructions[3] is not
-            {
-                OpCode: OpCode.ShiftLeft,
-                Operands: [LocalVariable elementOffset, var normalizedSource, Immediate scale],
-            }
-            || instructions[4] is not
-            {
-                OpCode: OpCode.Add,
-                Operands: [LocalVariable elementAddress, var addressLeft, var addressRight],
-            }
-            || instructions[5] is not
-            {
-                OpCode: OpCode.Add,
-                Operands: [LocalVariable newSize, var sizeAddSource, Immediate { Value: 1 }],
-            }
-            || instructions[6] is not
-            {
-                OpCode: OpCode.Move,
-                Operands: [MemoryOperand sizeMemory, var sizeWriteSource],
-            }
-            || instructions[7] is not
-            {
-                OpCode: OpCode.Move,
-                Operands: [MemoryOperand elementMemory, LocalVariable stagedValue],
-            }
-            || instructions[8] is not { OpCode: OpCode.Jump, Operands: [Block target] }
             || !ReferenceEquals(maskSource, masked)
-            || !ReferenceEquals(biasedSource, biased)
-            || !ReferenceEquals(normalizedSource, normalized)
-            || scale.Value is not (1 or 2 or 3 or 4)
-            || !ReferenceEquals(sizeAddSource, sizeState)
-            || !ReferenceEquals(sizeWriteSource, newSize)
-            || sizeMemory is not { Base: LocalVariable sizeAddress, Index: null, Addend: 0 }
-            || elementMemory is not { Base: var storedElementAddress, Index: null, Addend: 0x20 }
-            || !ReferenceEquals(storedElementAddress, elementAddress)
-            || !ReferenceEquals(target, merge))
+            || !ReferenceEquals(biasedSource, biased))
             return false;
 
-        LocalVariable items;
+        // 中文注释：ArrayRecovery 尚未折叠时，共享尾保留缩放、地址合成与原生内存写入。
+        if (instructions is
+            [
+                _,
+                _,
+                _,
+                {
+                    OpCode: OpCode.ShiftLeft,
+                    Operands: [LocalVariable elementOffset, var normalizedSource, Immediate scale],
+                },
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable elementAddress, var addressLeft, var addressRight],
+                },
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable newSize, var sizeAddSource, Immediate { Value: 1 }],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [MemoryOperand sizeMemory, var sizeWriteSource],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [MemoryOperand elementMemory, LocalVariable stagedValue],
+                },
+                { OpCode: OpCode.Jump, Operands: [Block target] },
+            ]
+            && ReferenceEquals(normalizedSource, normalized)
+            && scale.Value is (1 or 2 or 3 or 4)
+            && ReferenceEquals(sizeAddSource, sizeState)
+            && ReferenceEquals(sizeWriteSource, newSize)
+            && sizeMemory is { Base: LocalVariable sizeAddress, Index: null, Addend: 0 }
+            && elementMemory is { Base: var storedElementAddress, Index: null, Addend: 0x20 }
+            && ReferenceEquals(storedElementAddress, elementAddress)
+            && ReferenceEquals(target, merge))
+        {
+            if (TryGetSharedItems(addressLeft, addressRight, elementOffset, out var items))
+            {
+                pattern = new SharedFastTailPattern(items, sizeState, sizeAddress, sizeMemory, stagedValue);
+                return true;
+            }
+        }
+
+        // 中文注释：IL 恢复流水线可能已把最终写入折叠为 ArrayAccess，但为 UInt32
+        // 索引保留了缩放和地址合成证据；此混合形态要求两套证据指向同一 items 与索引。
+        if (instructions is
+            [
+                _,
+                _,
+                _,
+                {
+                    OpCode: OpCode.ShiftLeft,
+                    Operands: [LocalVariable hybridElementOffset, var hybridNormalizedSource, Immediate hybridScale],
+                },
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable, var hybridAddressLeft, var hybridAddressRight],
+                },
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable hybridNewSize, var hybridSizeAddSource, Immediate { Value: 1 }],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [MemoryOperand hybridSizeMemory, var hybridSizeWriteSource],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [ArrayAccess hybridAccess, LocalVariable hybridStagedValue],
+                },
+                { OpCode: OpCode.Jump, Operands: [Block hybridTarget] },
+            ]
+            && ReferenceEquals(hybridNormalizedSource, normalized)
+            && hybridScale.Value is (1 or 2 or 3 or 4)
+            && ReferenceEquals(hybridSizeAddSource, sizeState)
+            && ReferenceEquals(hybridSizeWriteSource, hybridNewSize)
+            && hybridSizeMemory is { Base: LocalVariable hybridSizeAddress, Index: null, Addend: 0 }
+            && ReferenceEquals(hybridAccess.Index, normalized)
+            && ReferenceEquals(hybridTarget, merge)
+            && TryGetSharedItems(
+                hybridAddressLeft,
+                hybridAddressRight,
+                hybridElementOffset,
+                out var hybridItems)
+            && ReferenceEquals(hybridAccess.Array, hybridItems))
+        {
+            pattern = new SharedFastTailPattern(
+                hybridItems,
+                sizeState,
+                hybridSizeAddress,
+                hybridSizeMemory,
+                hybridStagedValue);
+            return true;
+        }
+
+        // 中文注释：ArrayRecovery 已完成时，缩放和元素地址合成被精确折叠为
+        // items[uint32(size)]；仍要求完整三步 UInt32 归一化、原生 _size 写回与唯一汇合。
+        if (instructions is
+            [
+                _,
+                _,
+                _,
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable compactNewSize, var compactSizeAddSource, Immediate { Value: 1 }],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [MemoryOperand compactSizeMemory, var compactSizeWriteSource],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [ArrayAccess compactAccess, LocalVariable compactStagedValue],
+                },
+                { OpCode: OpCode.Jump, Operands: [Block compactTarget] },
+            ]
+            && ReferenceEquals(compactSizeAddSource, sizeState)
+            && ReferenceEquals(compactSizeWriteSource, compactNewSize)
+            && compactSizeMemory is { Base: LocalVariable compactSizeAddress, Index: null, Addend: 0 }
+            && ReferenceEquals(compactAccess.Index, normalized)
+            && ReferenceEquals(compactTarget, merge))
+        {
+            pattern = new SharedFastTailPattern(
+                compactAccess.Array,
+                sizeState,
+                compactSizeAddress,
+                compactSizeMemory,
+                compactStagedValue);
+            return true;
+        }
+
+        Logger.VerboseNewline(
+            $"ListAdd共享快尾形态：b{block.ID}，语义指令数={instructions.Count}，" +
+            string.Join(" | ", instructions.Select(instruction =>
+                $"{instruction.OpCode}({string.Join(",", instruction.Operands.Select(operand => operand.GetType().Name))})")));
+        return false;
+    }
+
+    /// <summary>
+    /// 从共享尾的元素地址加法中读取唯一数组载体，并接受左右操作数交换。
+    /// </summary>
+    private static bool TryGetSharedItems(
+        IOperand addressLeft,
+        IOperand addressRight,
+        LocalVariable elementOffset,
+        out LocalVariable items)
+    {
+        items = null!;
         if (ReferenceEquals(addressLeft, elementOffset) && addressRight is LocalVariable rightItems)
             items = rightItems;
         else if (ReferenceEquals(addressRight, elementOffset) && addressLeft is LocalVariable leftItems)
@@ -673,7 +796,6 @@ public static class ListAddRecovery
         else
             return false;
 
-        pattern = new SharedFastTailPattern(items, sizeState, sizeAddress, sizeMemory, stagedValue);
         return true;
     }
 
@@ -730,7 +852,9 @@ public static class ListAddRecovery
            && AreSameMemoryOperand(memory, sizeMemory)
            || publicReceiver is LocalVariable localReceiver
            && operand is FieldReference field
-           && IsField(field, localReceiver, "_size");
+           && IsField(field, localReceiver, "_size")
+           || publicReceiver is LocalVariable publicCountReceiver
+           && IsPublicListSize(operand, publicCountReceiver, "_size");
 
     private static bool TryMatchSharedStatePrefix(
         Block capacityHead,
@@ -762,12 +886,10 @@ public static class ListAddRecovery
         // 中文注释：字段解析与空分支常量裁剪完成后，原生的两级空检查会收敛为
         // “精确 List<T> 别名 -> items/version 状态 -> 容量头”。别名定义必须保留，
         // 因此从 items 块开始改写；三项状态和两段单后继拓扑缺一不可。
-        if (compactAliasInstructions is
-            [
-                { OpCode: OpCode.Move, Operands: [LocalVariable compactReceiver, var compactSource] },
-            ]
-            && ReferenceEquals(compactReceiver, publicReceiver)
-            && HaveSameConcreteListType(compactReceiver, compactSource)
+        if (TryMatchConcreteListDefinition(
+                compactAliasInstructions,
+                publicReceiver,
+                out var compactReceiver)
             && compactItemsInstructions is
             [
                 { OpCode: OpCode.Move, Operands: [var compactItems, FieldReference compactItemsField] } compactRewriteStart,
@@ -779,8 +901,8 @@ public static class ListAddRecovery
             && IsField(compactVersionSource, compactReceiver, "_version")
             && IsField(compactVersionDestination, compactReceiver, "_version")
             && ReferenceEquals(compactVersion, compactWrittenVersion)
-            && aliasBlock.Successors is [var compactItemsSuccessor]
-            && ReferenceEquals(compactItemsSuccessor, itemsBlock)
+            && aliasBlock.Successors.Count is (1 or 2)
+            && aliasBlock.Successors.Contains(itemsBlock)
             && itemsBlock.Successors is [var compactCapacitySuccessor]
             && ReferenceEquals(compactCapacitySuccessor, capacityHead))
         {
@@ -827,6 +949,55 @@ public static class ListAddRecovery
         rewriteHead = aliasBlock;
         headPath = [aliasBlock, itemsBlock, capacityHead];
         rewriteStart = aliasMove;
+        return true;
+    }
+
+    /// <summary>
+    /// 证明共享快尾使用的具体 <c>List&lt;T&gt;</c> 接收者来自唯一稳定定义。字段解析前通常是
+    /// 别名 Move；属性恢复后则会变成无参数实例 getter。两种形态都只保留定义块，从
+    /// items/version 块开始替换容量实现，避免重复执行 getter 或丢失业务接收者求值。
+    /// </summary>
+    private static bool TryMatchConcreteListDefinition(
+        IReadOnlyList<Instruction> instructions,
+        IOperand publicReceiver,
+        out LocalVariable concreteReceiver)
+    {
+        concreteReceiver = null!;
+        if (publicReceiver is not LocalVariable receiver
+            || receiver.Type is not GenericInstanceTypeAnalysisContext
+            {
+                GenericType.FullName: "System.Collections.Generic.List`1",
+            })
+            return false;
+
+        var definitions = instructions.Where(instruction =>
+            ReferenceEquals(instruction.Destination, receiver)).ToList();
+        if (definitions is
+            [
+                { OpCode: OpCode.Move, Operands: [LocalVariable destination, var source] },
+            ]
+            && HaveSameConcreteListType(destination, source))
+        {
+            concreteReceiver = receiver;
+            return true;
+        }
+
+        if (definitions is not
+            [
+                {
+                    OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext getter, LocalVariable result, var getterReceiver],
+                },
+            ]
+            || !ReferenceEquals(result, receiver)
+            || getter.IsStatic
+            || getter.Parameters.Count != 0
+            || !getter.Name.StartsWith("get_", StringComparison.Ordinal)
+            || getterReceiver is not (LocalVariable or FieldReference)
+            || !GenericCallRebinder.TypesEquivalent(getter.ReturnType, receiver.Type))
+            return false;
+
+        concreteReceiver = receiver;
         return true;
     }
 

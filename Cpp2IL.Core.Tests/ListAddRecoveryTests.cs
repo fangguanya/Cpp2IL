@@ -1317,6 +1317,89 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 属性getter接收者与公开Count共享快尾恢复公开Add()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [6, 7],
+            useResolvedCompactPrefix: true,
+            useGetterPrefix: true,
+            usePublicCount: true,
+            useArrayAccessTail: true,
+            includeGetterBranchContext: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var calls = fixture.Graph.Blocks.SelectMany(block => block.Instructions)
+            .Where(instruction => instruction.IsCall)
+            .ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "get_TargetList" }), Is.EqualTo(2));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 属性getter与公开Count的三个共享追加保留整数边界值()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [int.MinValue, 0, int.MaxValue],
+            useResolvedCompactPrefix: true,
+            useGetterPrefix: true,
+            usePublicCount: true,
+            useArrayAccessTail: true,
+            includeGetterBranchContext: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var values = fixture.Graph.Blocks.SelectMany(block => block.Instructions).Where(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" })
+            .Select(instruction => ((Immediate)instruction.Operands[2]).Value)
+            .ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(3));
+            Assert.That(values, Is.EquivalentTo(new long[] { int.MinValue, 0, int.MaxValue }));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 属性getter返回错误List元素类型时保留原图()
+    {
+        var fixture = CreateSharedFastTailFixture(
+            [6, 7],
+            useResolvedCompactPrefix: true,
+            useGetterPrefix: true,
+            usePublicCount: true,
+            useArrayAccessTail: true,
+            includeGetterBranchContext: true,
+            mismatchGetterReturnType: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.SharedFastTail));
+            Assert.That(fixture.Graph.Blocks.SelectMany(block => block.Instructions).Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.EqualTo(2));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 共享快速尾某项快慢值不同时仅保留该项原容量控制流()
     {
@@ -2559,7 +2642,12 @@ public class ListAddRecoveryTests
         int mismatchFastValueAt = -1,
         int omitExplicitStagingJumpAt = -1,
         bool useResolvedCompactPrefix = false,
-        bool mismatchResolvedAliasType = false)
+        bool mismatchResolvedAliasType = false,
+        bool useGetterPrefix = false,
+        bool usePublicCount = false,
+        bool useArrayAccessTail = false,
+        bool includeGetterBranchContext = false,
+        bool mismatchGetterReturnType = false)
     {
         if (values.Count < 2)
             throw new ArgumentOutOfRangeException(nameof(values));
@@ -2569,6 +2657,7 @@ public class ListAddRecoveryTests
             .GetTypeByFullName("System.Collections.Generic.List`1")!;
         var elementType = app.SystemTypes.SystemInt32Type;
         var listType = listDefinition.MakeGenericInstanceType([elementType]);
+        var wrongListType = listDefinition.MakeGenericInstanceType([app.SystemTypes.SystemStringType]);
         var genericElement = listDefinition.GenericParameters.Single();
         var addWithResize = new InjectedMethodAnalysisContext(
             listDefinition,
@@ -2600,6 +2689,12 @@ public class ListAddRecoveryTests
             listType,
             System.Reflection.FieldAttributes.Private,
             listDefinition);
+        var targetListGetter = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "get_TargetList",
+            mismatchGetterReturnType ? wrongListType : listType,
+            System.Reflection.MethodAttributes.Public,
+            []);
 
         var owner = Local("owner", listType);
         var wrongAliasSource = Local("wrongAliasSource", app.SystemTypes.SystemObjectType);
@@ -2615,6 +2710,7 @@ public class ListAddRecoveryTests
         var elementAddress = Local("elementAddress", app.SystemTypes.SystemIntPtrType);
         var newSize = Local("newSize", app.SystemTypes.SystemInt32Type);
         var instructions = new List<Instruction>();
+        var getterContextBranches = new List<Instruction?>();
         var targets = new List<(
             Instruction? ReceiverNullBranch,
             Instruction? ItemsNullBranch,
@@ -2632,12 +2728,41 @@ public class ListAddRecoveryTests
             var itemsNull = Local($"itemsNull{index}", app.SystemTypes.SystemBooleanType);
             var capacity = Local($"capacity{index}", app.SystemTypes.SystemBooleanType);
 
-            var aliasSource = useResolvedCompactPrefix && mismatchResolvedAliasType
-                ? wrongAliasSource
-                : (IOperand)PublicReceiver();
-            instructions.Add(new Instruction(instructions.Count, OpCode.Move, stateReceiver, aliasSource));
+            if (useGetterPrefix)
+            {
+                instructions.Add(new Instruction(
+                    instructions.Count,
+                    OpCode.Call,
+                    targetListGetter,
+                    stateReceiver,
+                    owner));
+            }
+            else
+            {
+                var aliasSource = useResolvedCompactPrefix && mismatchResolvedAliasType
+                    ? wrongAliasSource
+                    : (IOperand)PublicReceiver();
+                instructions.Add(new Instruction(instructions.Count, OpCode.Move, stateReceiver, aliasSource));
+            }
             Instruction? compactAliasJump = null;
-            if (useResolvedCompactPrefix)
+            Instruction? getterContextBranch = null;
+            if (useGetterPrefix && includeGetterBranchContext)
+            {
+                var getterContextCondition = Local($"getterContextCondition{index}", app.SystemTypes.SystemBooleanType);
+                instructions.Add(new Instruction(
+                    instructions.Count,
+                    OpCode.CheckEqual,
+                    getterContextCondition,
+                    owner,
+                    new Immediate(0)));
+                getterContextBranch = new Instruction(
+                    instructions.Count,
+                    OpCode.ConditionalJump,
+                    new Immediate(-1),
+                    getterContextCondition);
+                instructions.Add(getterContextBranch);
+            }
+            else if (useResolvedCompactPrefix)
             {
                 compactAliasJump = new Instruction(
                     instructions.Count,
@@ -2645,6 +2770,7 @@ public class ListAddRecoveryTests
                     new Immediate(-1));
                 instructions.Add(compactAliasJump);
             }
+            getterContextBranches.Add(getterContextBranch);
             Instruction? receiverNullBranch = null;
             if (!useResolvedCompactPrefix)
             {
@@ -2713,20 +2839,21 @@ public class ListAddRecoveryTests
                 new Immediate(24));
             instructions.Add(capacityStart);
             compactItemsJump?.SetOperand(0, capacityStart);
+            IOperand SharedSize() => usePublicCount
+                ? new ListCount(stateReceiver, listType)
+                : useResolvedCompactPrefix
+                    ? new FieldReference(sizeField, stateReceiver, 0)
+                    : new MemoryOperand(sizeAddress);
             instructions.Add(new Instruction(
                 instructions.Count,
                 OpCode.Move,
                 sizeState,
-                useResolvedCompactPrefix
-                    ? new FieldReference(sizeField, stateReceiver, 0)
-                    : new MemoryOperand(sizeAddress)));
+                SharedSize()));
             instructions.Add(new Instruction(
                 instructions.Count,
                 OpCode.CheckGreaterOrEqualUnsigned,
                 capacity,
-                useResolvedCompactPrefix
-                    ? new FieldReference(sizeField, stateReceiver, 0)
-                    : new MemoryOperand(sizeAddress),
+                SharedSize(),
                 new ArrayLength(items)));
             var capacityBranch = new Instruction(
                 instructions.Count,
@@ -2795,7 +2922,9 @@ public class ListAddRecoveryTests
         instructions.Add(new Instruction(
             instructions.Count,
             OpCode.Move,
-            new MemoryOperand(elementAddress, null, 0x20),
+            useArrayAccessTail
+                ? new ArrayAccess(items, normalized)
+                : new MemoryOperand(elementAddress, null, 0x20),
             stagedValue));
         var sharedTailJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
         instructions.Add(sharedTailJump);
@@ -2815,6 +2944,7 @@ public class ListAddRecoveryTests
 
         for (var index = 0; index < targets.Count; index++)
         {
+            getterContextBranches[index]?.SetOperand(0, nullThrows[index]);
             targets[index].ReceiverNullBranch?.SetOperand(0, nullThrows[index]);
             targets[index].ItemsNullBranch?.SetOperand(0, nullThrows[index]);
             targets[index].CapacityBranch.SetOperand(0, targets[index].SlowCall);
