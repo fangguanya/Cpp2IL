@@ -2359,11 +2359,23 @@ public static class ListAddRecovery
         publicValue = null!;
         preservedSlowTail = [];
         var instructions = fastPrefix.Concat(PatternInstructions(block)).ToList();
-        if (instructions.Count < 4
-            || instructions[^1] is not { OpCode: OpCode.Jump, Operands: [Block target] }
-            || !ReferenceEquals(target, merge))
+        var explicitMergeJump = instructions.LastOrDefault() is
         {
-            Logger.VerboseNewline("ListAdd恢复拒绝：快路径未以指向汇合块的唯一跳转结束。");
+            OpCode: OpCode.Jump,
+            Operands: [Block explicitTarget],
+        }
+            && ReferenceEquals(explicitTarget, merge)
+                ? instructions[^1]
+                : null;
+        // ARM64 的快路尾跳转在 CFG 化或死码清理后可能变成自然落入；此时块边是
+        // 唯一剩余的控制流证据。只接受唯一指向同一汇合块的边，拒绝隐式多出口。
+        var implicitMergeEdge = explicitMergeJump == null
+                                && block.Successors is [var implicitTarget]
+                                && ReferenceEquals(implicitTarget, merge);
+        if (instructions.Count < (explicitMergeJump == null ? 3 : 4)
+            || explicitMergeJump == null && !implicitMergeEdge)
+        {
+            Logger.VerboseNewline("ListAdd恢复拒绝：快路径既无指向汇合块的显式跳转，也无唯一自然落入边。");
             return false;
         }
 
@@ -2412,8 +2424,9 @@ public static class ListAddRecovery
             stores[0],
             sizeAdds[0],
             sizeWrites[0],
-            instructions[^1],
         };
+        if (explicitMergeJump != null)
+            allowed.Add(explicitMergeJump);
         allowed.AddRange(valueConstruction);
 
         if (arrayAccess != null)

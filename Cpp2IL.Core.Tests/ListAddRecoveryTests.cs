@@ -185,6 +185,71 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 快路径唯一自然落入汇合块时恢复公开Add调用()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            fastPathFallsThroughToMerge: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 紧凑数组快路径自然落入时由末次恢复公开Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            useDirectArrayAccess: true,
+            fastPathFallsThroughToMerge: true);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 无显式跳转且快路径存在两个出口时保留容量菱形()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            fastPathFallsThroughToMerge: true,
+            addAmbiguousFastSuccessor: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void Count公开读取参与容量菱形时恢复为公开Add调用()
     {
         var fixture = CreateFixture(
@@ -2138,7 +2203,9 @@ public class ListAddRecoveryTests
         bool useNormalizedDirectArrayIndex = false,
         bool normalizedDirectArrayWrongMask = false,
         bool normalizedDirectArrayWrongSource = false,
-        bool normalizedDirectArrayDuplicateDefinition = false)
+        bool normalizedDirectArrayDuplicateDefinition = false,
+        bool fastPathFallsThroughToMerge = false,
+        bool addAmbiguousFastSuccessor = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var listDefinition = app.GetAssemblyByName("mscorlib")!
@@ -2347,6 +2414,19 @@ public class ListAddRecoveryTests
         }
         var slowBlock = graph.FindBlockByInstruction(instructions[slowCallIndex])!;
         var fastBlock = graph.FindBlockByInstruction(instructions[5])!;
+        if (fastPathFallsThroughToMerge)
+        {
+            // 中文注释：模拟 CFG 化或死码清理删除快路尾跳转、但保留唯一汇合边的生产末态。
+            fastBlock.Instructions.Remove(fastJump);
+            fastBlock.CalculateBlockType();
+        }
+        if (addAmbiguousFastSuccessor)
+        {
+            // 中文注释：第二出口使自然落入语义不再唯一，恢复器必须保留原容量菱形。
+            var ambiguous = graph.ExitBlock;
+            fastBlock.Successors.Add(ambiguous);
+            ambiguous.Predecessors.Add(fastBlock);
+        }
         if (readMistypedRuntimeMethodCarrierFromMerge)
         {
             var mergeBlock = graph.FindBlockByInstruction(instructions[mergeIndex])!;
