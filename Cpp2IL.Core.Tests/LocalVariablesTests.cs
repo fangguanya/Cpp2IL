@@ -2775,6 +2775,108 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 闭合调用Int32形参恢复多定义立即数载体()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var state = new LocalVariable("state", new Register(null, "X8", 1));
+        var consume = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType,
+            "ConsumeInt32",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemInt32Type]);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RecoverCallParameterCarrier",
+            [
+                new Instruction(0, OpCode.Move, state, new Immediate(1)),
+                new Instruction(1, OpCode.Move, state, new Immediate(5)),
+                new Instruction(2, OpCode.CallVoid, consume, state),
+            ],
+            [state]);
+
+        var changed = LocalVariables.ResolveFinalScalarCopyCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(state.Type, Is.SameAs(appContext.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 闭合调用Byte形参接受完整字面量边界()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "W8", 1),
+            appContext.SystemTypes.SystemObjectType);
+        var consume = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType,
+            "ConsumeByte",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemByteType]);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RecoverByteBoundaryCarrier",
+            [
+                new Instruction(0, OpCode.Move, value, new Immediate(byte.MinValue)),
+                new Instruction(1, OpCode.Move, value, new Immediate(byte.MaxValue)),
+                new Instruction(2, OpCode.CallVoid, consume, value),
+            ],
+            [value]);
+
+        var changed = LocalVariables.ResolveFinalScalarCopyCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(value.Type, Is.SameAs(appContext.SystemTypes.SystemByteType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 同一载体被冲突调用形参消费时拒绝定型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var state = new LocalVariable("state", new Register(null, "X8", 1));
+        var consumeInt32 = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType,
+            "ConsumeInt32",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemInt32Type]);
+        var consumeInt64 = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType,
+            "ConsumeInt64",
+            appContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemInt64Type]);
+        var method = CreateConstructorFixture(
+            appContext.SystemTypes.SystemObjectType,
+            "RejectConflictingCallParameterCarrier",
+            [
+                new Instruction(0, OpCode.Move, state, new Immediate(1)),
+                new Instruction(1, OpCode.CallVoid, consumeInt32, state),
+                new Instruction(2, OpCode.CallVoid, consumeInt64, state),
+            ],
+            [state]);
+
+        var changed = LocalVariables.ResolveFinalScalarCopyCarrierTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(state.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 丢失位宽的非布尔掩码从精确整型目标反向恢复源类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

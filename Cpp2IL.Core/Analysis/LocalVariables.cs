@@ -794,7 +794,7 @@ public static class LocalVariables
                 && calledMethod.DeclaringType is { IsValueType: true } declaringType)
                 SetTypeIfUnknown(receiver, declaringType);
 
-            var paramOffset = firstArg + (calledMethod.IsStatic ? 0 : 1);
+            var paramOffset = CallArgumentTrimmer.FirstParameterOperandIndex(instruction, calledMethod);
 
             for (var i = paramOffset; i < instruction.Operands.Count; i++)
             {
@@ -1536,13 +1536,15 @@ public static class LocalVariables
 
     /// <summary>
     /// 退 SSA、集合长度与属性恢复全部完成后，以局部到局部的 Move 为无向等价边，一次性计算
-    /// 连通分量中的唯一标量类型。只有分量恰有一个 Int/UInt/Float 精确类型，且其余节点均为
-    /// 未定型、Object 或 Boolean ABI 占位时才传播；引用类型或两个不同数值域会否决整个分量。
+    /// 连通分量中的唯一标量类型。闭合托管调用的形参也是权威类型种子，但仅靠调用种子定型时，
+    /// 分量中的每一项定义都必须是同类型复制或范围相容的字面量。引用定义、开放泛型形参或两个
+    /// 不同数值域会否决整个分量，避免把共享物理寄存器的另一段生命期误写成标量。
     /// </summary>
     public static bool ResolveFinalScalarCopyCarrierTypes(MethodAnalysisContext method)
     {
         var adjacency = new Dictionary<LocalVariable, HashSet<LocalVariable>>();
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var instructions = method.ControlFlowGraph!.Instructions;
+        foreach (var instruction in instructions)
         {
             if (instruction is not
                 {
@@ -1558,6 +1560,16 @@ public static class LocalVariables
             destinationEdges.Add(source);
             sourceEdges.Add(destination);
         }
+
+        var callConstraints = CollectFinalManagedCallScalarConstraints(instructions);
+        foreach (var constrained in callConstraints.Keys)
+            if (!adjacency.ContainsKey(constrained))
+                adjacency[constrained] = [];
+
+        var definitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.ToArray());
 
         var visited = new HashSet<LocalVariable>();
         var changed = false;
@@ -1582,6 +1594,9 @@ public static class LocalVariables
                 .Select(local => local.Type)
                 .Where(IsFinalScalarType)
                 .Cast<TypeAnalysisContext>()
+                .Concat(component
+                    .Where(callConstraints.ContainsKey)
+                    .SelectMany(local => callConstraints[local]))
                 .GroupBy(type => type.FullName, StringComparer.Ordinal)
                 .Select(group => group.First())
                 .ToArray();
@@ -1590,6 +1605,16 @@ public static class LocalVariables
 
             var consensusType = scalarTypes[0];
             if (component.Any(local => !IsReplaceableFinalCopyCarrier(local.Type, consensusType)))
+                continue;
+
+            // 中文注释：既有精确局部类型已经由字段、长度或原生位宽证明；调用形参只负责给
+            // 完全未定型的多定义分量补种子，后者必须先逐项证明所有写入与形参存储类型一致。
+            var hasExistingScalarSeed = component.Any(local => IsFinalScalarType(local.Type));
+            if (!hasExistingScalarSeed
+                && !HasOnlyCompatibleFinalCallScalarDefinitions(
+                    component,
+                    definitions,
+                    consensusType))
                 continue;
 
             foreach (var local in component)
@@ -1601,6 +1626,108 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    private static Dictionary<LocalVariable, HashSet<TypeAnalysisContext>>
+        CollectFinalManagedCallScalarConstraints(IReadOnlyList<Instruction> instructions)
+    {
+        var constraints = new Dictionary<LocalVariable, HashSet<TypeAnalysisContext>>();
+        foreach (var instruction in instructions)
+        {
+            if (!instruction.IsCall
+                || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
+                continue;
+
+            var firstParameter = CallArgumentTrimmer.FirstParameterOperandIndex(instruction, calledMethod);
+            var availableParameters = Math.Min(
+                calledMethod.Parameters.Count,
+                instruction.Operands.Count - firstParameter);
+            for (var parameterIndex = 0; parameterIndex < availableParameters; parameterIndex++)
+            {
+                if (instruction.Operands[firstParameter + parameterIndex] is not LocalVariable local)
+                    continue;
+
+                var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
+                if (!IsFinalManagedCallScalarType(parameterType)
+                    || ContainsUninstantiatedGenericParameter(parameterType))
+                    continue;
+
+                if (!constraints.TryGetValue(local, out var localConstraints))
+                    constraints[local] = localConstraints = [];
+                localConstraints.Add(parameterType);
+            }
+        }
+
+        return constraints;
+    }
+
+    private static bool HasOnlyCompatibleFinalCallScalarDefinitions(
+        IReadOnlyCollection<LocalVariable> component,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
+        TypeAnalysisContext consensusType)
+    {
+        var componentSet = new HashSet<LocalVariable>(component);
+        foreach (var local in component)
+        {
+            if (!definitions.TryGetValue(local, out var localDefinitions)
+                || localDefinitions.Length == 0)
+                return false;
+
+            foreach (var definition in localDefinitions)
+            {
+                if (definition is not { OpCode: OpCode.Move, Operands.Count: 2 })
+                    return false;
+
+                var source = definition.Operands[1];
+                if (source is LocalVariable sourceLocal)
+                {
+                    if (!componentSet.Contains(sourceLocal)
+                        && !GenericCallRebinder.TypesEquivalent(sourceLocal.Type, consensusType))
+                        return false;
+                    continue;
+                }
+
+                if (!IsCompatibleFinalCallScalarLiteral(source, consensusType))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsFinalManagedCallScalarType(TypeAnalysisContext? type) =>
+        IsFinalScalarType(type)
+        || type?.FullName is "System.Boolean" or "System.Char" or "System.IntPtr" or "System.UIntPtr"
+        || type?.IsEnumType == true;
+
+    private static bool IsCompatibleFinalCallScalarLiteral(IOperand operand, TypeAnalysisContext targetType)
+    {
+        var storageType = targetType.IsEnumType
+            ? targetType.EnumUnderlyingType
+            : targetType;
+        if (storageType == null)
+            return false;
+
+        if (operand is FloatLiteral)
+            return storageType.FullName == "System.Single";
+        if (operand is DoubleLiteral)
+            return storageType.FullName == "System.Double";
+        if (operand is not Immediate { Value: var value })
+            return false;
+
+        return storageType.FullName switch
+        {
+            "System.Boolean" => value is 0 or 1,
+            "System.Char" or "System.UInt16" => value is >= ushort.MinValue and <= ushort.MaxValue,
+            "System.SByte" => value is >= sbyte.MinValue and <= sbyte.MaxValue,
+            "System.Byte" => value is >= byte.MinValue and <= byte.MaxValue,
+            "System.Int16" => value is >= short.MinValue and <= short.MaxValue,
+            "System.Int32" => value is >= int.MinValue and <= int.MaxValue,
+            "System.UInt32" => value is >= uint.MinValue and <= uint.MaxValue,
+            "System.Int64" or "System.IntPtr" => true,
+            "System.UInt64" or "System.UIntPtr" => value >= 0,
+            _ => false,
+        };
     }
 
     /// <summary>
@@ -2335,9 +2462,7 @@ public static class LocalVariables
             }
 
             // Remaining arguments map positionally onto the callee's declared parameters.
-            var paramOffset = calledMethod.IsStatic ? 1 : 2;
-            if (instruction.OpCode == OpCode.Call) // Skip the return value operand
-                paramOffset += 1;
+            var paramOffset = CallArgumentTrimmer.FirstParameterOperandIndex(instruction, calledMethod);
 
             for (var i = paramOffset; i < instruction.Operands.Count; i++)
             {

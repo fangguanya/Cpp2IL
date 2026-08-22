@@ -6,11 +6,13 @@ namespace Cpp2IL.Core.Analysis;
 // Drop any operands beyond the known arguments to a method, e.g. if it was unresolved at ISIL gen time and we guessed 4 operands but it's only actually 2.
 public static class CallArgumentTrimmer
 {
-    internal static int ExpectedOperandCount(Instruction instruction, MethodAnalysisContext called)
+    internal static int FirstParameterOperandIndex(Instruction instruction, MethodAnalysisContext called)
         => 1
            + (instruction.OpCode == OpCode.Call ? 1 : 0)
-           + (called.IsStatic ? 0 : 1)
-           + called.Parameters.Count;
+           + (called.IsStatic ? 0 : 1);
+
+    internal static int ExpectedOperandCount(Instruction instruction, MethodAnalysisContext called)
+        => FirstParameterOperandIndex(instruction, called) + called.Parameters.Count;
 
     public static void Run(MethodAnalysisContext method)
     {
