@@ -48,7 +48,27 @@ public static class IndirectTransferCallRewriter
         CallingConventionResolver.RemapRawArguments(transfer, resolved);
 
         if (!resolved.IsVoid && transfer.Operands.Count > 1 && transfer.Operands[1] is LocalVariable result)
-            result.Type = resolved.ReturnType;
+        {
+            // 中文注释：ARM64 的 X0 同时是首个实参寄存器与返回寄存器。退 SSA 的复制合并
+            // 可能让调用前接收者和调用后结果引用同一逻辑局部，也可能让返回槽仍携带上一段
+            // ArrayList 等具体生命期类型；直接覆盖都会把整段旧生命期污染为 Int32。只有未知、
+            // Object 或原生指针 ABI 占位可以原地精确定型，其余冲突一律分裂托管返回槽。
+            if (RequiresDistinctResultSlot(transfer, result, resolved.ReturnType))
+            {
+                result = new LocalVariable(
+                    $"{result.Name}_managedCallResult_{transfer.Index}",
+                    result.Register,
+                    resolved.ReturnType)
+                {
+                    IsReturn = result.IsReturn,
+                };
+                transfer.SetOperand(1, result);
+            }
+            else
+            {
+                result.Type = resolved.ReturnType;
+            }
+        }
 
         if (!isTailCall)
             return;
@@ -59,5 +79,31 @@ public static class IndirectTransferCallRewriter
 
         block.AddInstruction(new Instruction(-1, OpCode.Return, returnOperands));
         block.CalculateBlockType();
+    }
+
+    /// <summary>
+    /// 判断两个操作数是否表示复制合并后的同一逻辑局部。
+    /// </summary>
+    private static bool SameLogicalLocal(IOperand operand, LocalVariable expected)
+        => operand is LocalVariable local
+           && (ReferenceEquals(local, expected)
+               || local.Name == expected.Name && local.Register == expected.Register);
+
+    /// <summary>
+    /// 判断原始返回槽是否属于调用前仍有效的另一段类型生命期。
+    /// </summary>
+    private static bool RequiresDistinctResultSlot(
+        Instruction transfer,
+        LocalVariable result,
+        TypeAnalysisContext returnType)
+    {
+        if (transfer.Operands.Skip(2).Any(operand => SameLogicalLocal(operand, result)))
+            return true;
+
+        if (result.Type == null || GenericCallRebinder.TypesEquivalent(result.Type, returnType))
+            return false;
+
+        return result.Type.FullName is not (
+            "System.Object" or "System.IntPtr" or "System.UIntPtr");
     }
 }

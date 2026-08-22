@@ -116,6 +116,30 @@ public class LateVirtualCallRecoveryTests
 
     [Test]
     [Category("异常输入")]
+    public void 返回槽与接收者合并时恢复调用但隔离返回值类型()
+    {
+        var fixture = CreateFixture(
+            useInterfaceKlass: false,
+            includeMethodInfo: true,
+            aliasResultWithReceiver: true);
+        var receiverType = fixture.Receiver.Type;
+
+        var recovered = LateVirtualCallRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Transfer.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Transfer.Operands[1], Is.Not.SameAs(fixture.Receiver));
+            Assert.That(((LocalVariable)fixture.Transfer.Operands[1]).Type,
+                Is.SameAs(fixture.App.SystemTypes.SystemInt32Type));
+            Assert.That(fixture.Transfer.Operands[2], Is.SameAs(fixture.Receiver));
+            Assert.That(fixture.Receiver.Type, Is.SameAs(receiverType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
     public void 缺少MethodInfo半槽时保持间接调用()
     {
         var fixture = CreateFixture(useInterfaceKlass: false, includeMethodInfo: false);
@@ -197,7 +221,8 @@ public class LateVirtualCallRecoveryTests
     private static Fixture CreateFixture(
         bool useInterfaceKlass,
         bool includeMethodInfo,
-        bool foldLoads = true)
+        bool foldLoads = true,
+        bool aliasResultWithReceiver = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var assembly = app.GetAssemblyByName("mscorlib")!;
@@ -216,7 +241,9 @@ public class LateVirtualCallRecoveryTests
             app.SystemTypes.SystemVoidType,
             ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
         var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), arrayList);
-        var result = new LocalVariable("result", new Register(null, "X0", 2));
+        var result = aliasResultWithReceiver
+            ? receiver
+            : new LocalVariable("result", new Register(null, "X0", 2));
         var argument = new LocalVariable("argument", new Register(null, "X1"), app.SystemTypes.SystemStringType);
         var klassType = useInterfaceKlass ? collection : arrayList;
         var klass = new LocalVariable(
