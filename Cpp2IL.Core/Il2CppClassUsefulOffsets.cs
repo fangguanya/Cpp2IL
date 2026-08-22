@@ -66,6 +66,27 @@ public static class Il2CppClassUsefulOffsets
         return offset >= GetVtableOffset(metadataVersion, is32Bit);
     }
 
+    /// <summary>
+    /// 返回当前虚调用解析器采用的 <c>Il2CppClass::vtable</c> 起始偏移。
+    /// 该值同时供目标方法半槽与 MethodInfo 半槽识别，禁止两条恢复路径各自维护常量。
+    /// </summary>
+    public static int GetVirtualInvokeDataVtableOffset(bool is32Bit) => is32Bit ? 0xC0 : 0x138;
+
+    /// <summary>
+    /// 判断类元数据内的偏移是否精确落在 <c>VirtualInvokeData.method</c> 指针半槽。
+    /// 每个虚表项由方法地址和 MethodInfo 指针组成；只有第二个指针才是托管调用
+    /// 完成绑定后可删除的原生隐参证据，方法地址半槽必须继续保留给间接调用解析。
+    /// </summary>
+    public static bool IsVirtualInvokeMethodInfoOffset(long offset, bool is32Bit)
+    {
+        var vtableOffset = GetVirtualInvokeDataVtableOffset(is32Bit);
+        var pointerSize = is32Bit ? 4 : 8;
+        var relativeOffset = offset - vtableOffset;
+
+        return relativeOffset >= pointerSize
+               && relativeOffset % (pointerSize * 2L) == pointerSize;
+    }
+
     public static string? GetOffsetName(uint offset, bool is32Bit) =>
         UsefulOffsets.FirstOrDefault(o => o.is32Bit == is32Bit && o.offset == offset)?.name;
 

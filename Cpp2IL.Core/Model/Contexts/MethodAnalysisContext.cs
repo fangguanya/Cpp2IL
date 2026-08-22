@@ -598,6 +598,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
+        // 中文注释：公开托管调用已完成目标和参数绑定后，删除紧邻调用的原生虚表
+        // MethodInfo 半槽装载；随后统一活跃性分析会级联删除失去用途的类指针装载。
+        ResolvedManagedCallScaffoldingRecovery.Run(this);
+
         // 中文注释：此处已经退出 SSA，同一物理局部可有多个定义；按跨块活跃性删除后期重写
         // 留下的具体死写，禁止再用 SSA 全局定义标记保守保留最后一次读取之后的元数据槽。
         PostSsaDeadStoreEliminator.Run(ControlFlowGraph);
