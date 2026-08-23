@@ -43,7 +43,7 @@ public static class ArrayRecovery
     internal static void RecoverPointerDerivedAccesses(ISILControlFlowGraph cfg, int pointerSize)
         => RecoverPointerDerivedAccesses(cfg, pointerSize, null);
 
-    private static void RecoverPointerDerivedAccesses(
+    internal static void RecoverPointerDerivedAccesses(
         ISILControlFlowGraph cfg,
         int pointerSize,
         SystemTypesContext? systemTypes)
@@ -64,28 +64,14 @@ public static class ArrayRecovery
 
                     if (LoopReferenceArrayIndex(memory, block, pointerSize, loopCursors) is { } loopAccess)
                     {
-                        var index = loopAccess.Index;
-                        if (loopAccess.IndexDelta > 0)
-                        {
-                            var computedIndex = new LocalVariable(
-                                $"arrayIndex{temporaryIndex}",
-                                new Register(null, $"ARRAY_INDEX_{temporaryIndex}"),
-                                index.Type);
-                            temporaryIndex++;
-                            block.Instructions.Insert(
-                                instructionIndex,
-                                new Instruction(
-                                    instruction.Index,
-                                    OpCode.Add,
-                                    computedIndex,
-                                    index,
-                                    new Immediate(loopAccess.IndexDelta))
-                                {
-                                    IntegerWidthBits = 32,
-                                });
-                            instructionIndex++;
-                            index = computedIndex;
-                        }
+                        var index = MaterializeArrayIndex(
+                            block,
+                            instruction,
+                            ref instructionIndex,
+                            loopAccess.Index,
+                            loopAccess.IndexDelta,
+                            32,
+                            ref temporaryIndex);
 
                         instruction.SetOperand(operandIndex, new ArrayAccess(loopAccess.Array, index));
                         continue;
@@ -94,7 +80,15 @@ public static class ArrayRecovery
                     if (ReferenceArrayIndex(memory, pointerSize, definitions) is { } access)
                     {
                         BindArrayIndexType(access.Index, memory.IndexExtension, systemTypes);
-                        instruction.SetOperand(operandIndex, access);
+                        var index = MaterializeArrayIndex(
+                            block,
+                            instruction,
+                            ref instructionIndex,
+                            access.Index,
+                            access.IndexDelta,
+                            ArrayIndexWidthBits(memory.IndexExtension, pointerSize),
+                            ref temporaryIndex);
+                        instruction.SetOperand(operandIndex, new ArrayAccess(access.Array, index));
                     }
                 }
             }
@@ -384,6 +378,55 @@ public static class ArrayRecovery
 
     private sealed record LoopArrayAccess(LocalVariable Array, LocalVariable Index, long IndexDelta);
 
+    private sealed record ReferenceArrayAccess(LocalVariable Array, IOperand Index, long IndexDelta);
+
+    /// <summary>
+    /// 把数组基址携带的正向元素偏移统一物化为索引加法。循环游标和直接动态寻址共用
+    /// 同一条生成路径，避免两套索引增量计算发生语义漂移。
+    /// </summary>
+    private static IOperand MaterializeArrayIndex(
+        Block block,
+        Instruction consumer,
+        ref int consumerInstructionIndex,
+        IOperand index,
+        long indexDelta,
+        int integerWidthBits,
+        ref int temporaryIndex)
+    {
+        if (indexDelta == 0)
+            return index;
+
+        var computedIndex = new LocalVariable(
+            $"arrayIndex{temporaryIndex}",
+            new Register(null, $"ARRAY_INDEX_{temporaryIndex}"),
+            index is LocalVariable localIndex ? localIndex.Type : null);
+        temporaryIndex++;
+        block.Instructions.Insert(
+            consumerInstructionIndex,
+            new Instruction(
+                consumer.Index,
+                OpCode.Add,
+                computedIndex,
+                index,
+                new Immediate(indexDelta))
+            {
+                IntegerWidthBits = integerWidthBits,
+            });
+        consumerInstructionIndex++;
+        return computedIndex;
+    }
+
+    /// <summary>
+    /// ARM64 寻址扩展决定索引加法的整数宽度；无扩展时寄存器使用原生宽度。
+    /// </summary>
+    private static int ArrayIndexWidthBits(MemoryIndexExtension extension, int pointerSize) => extension switch
+    {
+        MemoryIndexExtension.ZeroExtend32 or MemoryIndexExtension.SignExtend32 => 32,
+        MemoryIndexExtension.None => pointerSize * 8,
+        MemoryIndexExtension.ZeroExtend64 or MemoryIndexExtension.SignExtend64 => 64,
+        _ => throw new ArgumentOutOfRangeException(nameof(extension), extension, null),
+    };
+
     /// <summary>
     /// 数组索引的 ARM64 扩展方式是整数宽度的直接证据；只为尚未定型的局部量绑定类型。
     /// </summary>
@@ -405,7 +448,7 @@ public static class ArrayRecovery
         };
     }
 
-    private static ArrayAccess? ReferenceArrayIndex(
+    private static ReferenceArrayAccess? ReferenceArrayIndex(
         MemoryOperand memory,
         int pointerSize,
         Dictionary<LocalVariable, Instruction?> definitions)
@@ -414,7 +457,7 @@ public static class ArrayRecovery
             return null;
 
         if (FoldedReferenceArrayIndex(memory, baseLocal, pointerSize, definitions) is { } foldedAccess)
-            return foldedAccess;
+            return new ReferenceArrayAccess(foldedAccess.Array, foldedAccess.Index, 0);
 
         var evaluated = Evaluate(baseLocal, definitions, 0);
         if (evaluated is not
@@ -447,11 +490,11 @@ public static class ArrayRecovery
 
         if (memory.Index == null)
             return memory.Scale == 0
-                ? new ArrayAccess(array, new Immediate(offset / elementSize))
+                ? new ReferenceArrayAccess(array, new Immediate(offset / elementSize), 0)
                 : null;
 
-        return offset == 0 && memory.Scale == elementSize
-            ? new ArrayAccess(array, memory.Index)
+        return memory.Scale == elementSize
+            ? new ReferenceArrayAccess(array, memory.Index, offset / elementSize)
             : null;
     }
 

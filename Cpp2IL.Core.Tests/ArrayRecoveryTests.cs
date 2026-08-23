@@ -54,6 +54,93 @@ public class ArrayRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 带一个元素偏移的数据区基址恢复为原生宽度索引加一()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0"),
+            app.SystemTypes.SystemStringType.MakeSzArrayType());
+        var index = new LocalVariable("index", new Register(null, "X1"));
+        var data = new LocalVariable("data", new Register(null, "X2"), app.SystemTypes.SystemIntPtrType);
+        var value = new LocalVariable("value", new Register(null, "X3"), app.SystemTypes.SystemStringType);
+        var read = new Instruction(1, OpCode.Move, value, new MemoryOperand(data, index, 0, 8));
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Add, data, array, new Immediate(40)),
+            read,
+            new Instruction(2, OpCode.Return, value),
+        ]);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(graph, 8, app.SystemTypes);
+
+        Assert.That(read.Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)read.Operands[1];
+        Assert.That(access.Index, Is.InstanceOf<LocalVariable>());
+        var computedIndex = (LocalVariable)access.Index;
+        var definition = graph.Instructions.Single(instruction =>
+            ReferenceEquals(instruction.Destination, computedIndex));
+        Assert.Multiple(() =>
+        {
+            Assert.That(access.Array, Is.SameAs(array));
+            Assert.That(index.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+            Assert.That(computedIndex.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+            Assert.That(definition.OpCode, Is.EqualTo(OpCode.Add));
+            Assert.That(definition.Operands[1], Is.SameAs(index));
+            Assert.That(definition.Operands[2],
+                Is.InstanceOf<Immediate>().And.Property("Value").EqualTo(1));
+            Assert.That(definition.IntegerWidthBits, Is.EqualTo(64));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 数据区首元素动态访问直接复用原索引且不插入加法()
+    {
+        var fixture = CreateFixture(indexed: true);
+        var instructionCount = fixture.Graph.Instructions.Count();
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        Assert.That(fixture.Read.Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)fixture.Read.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(access.Index, Is.SameAs(fixture.Index));
+            Assert.That(fixture.Graph.Instructions.Count(), Is.EqualTo(instructionCount));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 带元素偏移但动态索引步长错误时保留内存访问()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0"),
+            app.SystemTypes.SystemStringType.MakeSzArrayType());
+        var index = new LocalVariable("index", new Register(null, "X1"));
+        var data = new LocalVariable("data", new Register(null, "X2"), app.SystemTypes.SystemIntPtrType);
+        var value = new LocalVariable("value", new Register(null, "X3"), app.SystemTypes.SystemStringType);
+        var read = new Instruction(1, OpCode.Move, value, new MemoryOperand(data, index, 0, 4));
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Add, data, array, new Immediate(40)),
+            read,
+            new Instruction(2, OpCode.Return, value),
+        ]);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(graph, 8, app.SystemTypes);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(read.Operands[1], Is.InstanceOf<MemoryOperand>());
+            Assert.That(index.Type, Is.Null);
+            Assert.That(graph.Instructions.Count(), Is.EqualTo(3));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 同源重复数据区基址复制恢复为索引元素访问()
     {
         var fixture = CreateRepeatedDataBaseFixture(conflictingSource: false, copyAfterRead: false);
