@@ -627,6 +627,81 @@ public class ListAddRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 慢路径在扩容调用后重读同一属性结果时恢复公开Add并保留读取()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var getter = AddSlowGetterCarrierRefresh(fixture);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var getterCalls = fixture.Graph.Instructions.Where(instruction =>
+            instruction is { OpCode: OpCode.Call, Operands: [var target, ..] }
+            && ReferenceEquals(target, getter.Getter)).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(getterCalls, Has.Count.EqualTo(2));
+            Assert.That(getterCalls.All(instruction =>
+                ReferenceEquals(instruction.Destination, getter.Destination)), Is.True);
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一属性对另一结果局部的观察位于扩容前时仍闭合调用破坏刷新()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var getter = AddSlowGetterCarrierRefresh(
+            fixture,
+            includeSameGetterObservation: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction is { OpCode: OpCode.Call, Operands: [var target, ..] }
+                && ReferenceEquals(target, getter.Getter)), Is.EqualTo(3));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.False);
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [TestCase("getter")]
+    [TestCase("receiver")]
+    [TestCase("intervening-call")]
+    [Category("异常输入")]
+    public void 属性调用破坏刷新的身份或中间调用不闭合时保持原容量控制流(string mismatch)
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        AddSlowGetterCarrierRefresh(
+            fixture,
+            mismatchGetter: mismatch == "getter",
+            mismatchReceiver: mismatch == "receiver",
+            includeOtherInterveningCall: mismatch == "intervening-call");
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
     [TestCase("字段")]
     [TestCase("接收者")]
     [TestCase("偏移")]
@@ -4064,6 +4139,78 @@ public class ListAddRecoveryTests
         return carrier;
     }
 
+    /// <summary>
+    /// 构造真实循环中的属性返回寄存器刷新：容量头之前读取一次属性，私有扩容调用后把
+    /// 同一属性重新写入同一局部，汇合块继续消费该局部。可选分支分别制造同属性的额外
+    /// 观察、getter 身份漂移、接收者漂移和不相关中间调用。
+    /// </summary>
+    private static GetterRefreshFixture AddSlowGetterCarrierRefresh(
+        Fixture fixture,
+        bool mismatchGetter = false,
+        bool mismatchReceiver = false,
+        bool includeSameGetterObservation = false,
+        bool includeOtherInterveningCall = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var elementType = fixture.Value.Type!;
+        var getter = new InjectedMethodAnalysisContext(
+            elementType,
+            "get_CommonnessScore",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.MethodAttributes.Public
+            | System.Reflection.MethodAttributes.HideBySig
+            | System.Reflection.MethodAttributes.SpecialName,
+            []);
+        var otherGetter = new InjectedMethodAnalysisContext(
+            elementType,
+            "get_OtherScore",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.MethodAttributes.Public
+            | System.Reflection.MethodAttributes.HideBySig
+            | System.Reflection.MethodAttributes.SpecialName,
+            []);
+        var destination = Local("commonnessScore", app.SystemTypes.SystemInt32Type, "X8");
+        var observation = Local("propertyObservation", app.SystemTypes.SystemInt32Type);
+        var consumed = Local("consumedScore", app.SystemTypes.SystemInt32Type);
+        var otherReceiver = Local("otherElement", elementType);
+        var slowCall = fixture.Graph.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var head = fixture.Graph.Blocks.Single(block => block.Instructions.Any(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] }));
+        var itemsLoadIndex = head.Instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] });
+
+        head.Instructions.Insert(
+            itemsLoadIndex++,
+            new Instruction(-1, OpCode.Call, getter, destination, fixture.Value));
+        if (includeSameGetterObservation)
+        {
+            head.Instructions.Insert(
+                itemsLoadIndex++,
+                new Instruction(-1, OpCode.Call, getter, observation, fixture.Value));
+        }
+        if (includeOtherInterveningCall)
+        {
+            head.Instructions.Insert(
+                itemsLoadIndex,
+                new Instruction(-1, OpCode.Call, otherGetter, observation, fixture.Value));
+        }
+
+        var slowBlock = fixture.Graph.FindBlockByInstruction(slowCall)!;
+        slowBlock.Instructions.Add(new Instruction(
+            -1,
+            OpCode.Call,
+            mismatchGetter ? otherGetter : getter,
+            destination,
+            mismatchReceiver ? otherReceiver : fixture.Value));
+        var merge = slowBlock.Successors.Single();
+        merge.Instructions.Insert(
+            0,
+            new Instruction(-1, OpCode.Move, consumed, destination));
+        return new GetterRefreshFixture(getter, destination);
+    }
+
     private static void SetImmediateValues(Fixture fixture, long fastValue, long slowValue)
     {
         var fastStore = fixture.Graph.Instructions.Single(instruction =>
@@ -4252,6 +4399,10 @@ public class ListAddRecoveryTests
         LocalVariable Carrier,
         Block FastBlock,
         Block SlowBlock);
+
+    private sealed record GetterRefreshFixture(
+        MethodAnalysisContext Getter,
+        LocalVariable Destination);
 
     private sealed record ChainedFixture(
         MethodAnalysisContext Method,

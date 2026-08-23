@@ -227,6 +227,7 @@ public static class ListAddRecovery
             }
 
             if (!TryMatchSlowPath(
+                    graph,
                     slowBlock,
                     out var slowCall,
                     out var addWithResize,
@@ -411,6 +412,7 @@ public static class ListAddRecovery
         bool compactArrayAccessOnly)
     {
         if (!TryMatchSlowPath(
+                graph,
                 slowBlock,
                 out var slowCall,
                 out var addWithResize,
@@ -613,6 +615,7 @@ public static class ListAddRecovery
         bool compactArrayAccessOnly)
     {
         if (!TryMatchSlowPath(
+                graph,
                 slowBlock,
                 out var slowCall,
                 out var addWithResize,
@@ -1799,6 +1802,7 @@ public static class ListAddRecovery
     }
 
     private static bool TryMatchSlowPath(
+        ISILControlFlowGraph graph,
         Block block,
         out Instruction call,
         out ConcreteGenericMethodAnalysisContext target,
@@ -1835,7 +1839,7 @@ public static class ListAddRecovery
             || !IsValidSlowValuePrefix(
                 instructions.Take(callIndex).ToList(),
                 candidate.Operands[2])
-            || !IsValidSlowTail(block, trailingInstructions))
+            || !IsValidSlowTail(graph, block, trailingInstructions))
             return false;
 
         call = candidate;
@@ -1940,13 +1944,20 @@ public static class ListAddRecovery
     /// <summary>
     /// 验证扩容调用后的载体尾部；显式跳转必须精确指向慢块唯一图后继。
     /// </summary>
-    private static bool IsValidSlowTail(Block block, IReadOnlyList<Instruction> instructions)
+    private static bool IsValidSlowTail(
+        ISILControlFlowGraph graph,
+        Block block,
+        IReadOnlyList<Instruction> instructions)
     {
-        if (instructions.All(IsPotentialSlowTailInstruction))
+        bool IsAllowed(Instruction instruction)
+            => IsPotentialSlowTailInstruction(instruction)
+               || IsRedundantCallClobberRefresh(graph, instruction);
+
+        if (instructions.All(IsAllowed))
             return true;
 
         if (instructions.Count == 0
-            || !instructions.Take(instructions.Count - 1).All(IsPotentialSlowTailInstruction))
+            || !instructions.Take(instructions.Count - 1).All(IsAllowed))
             return false;
 
         return instructions[^1] is { OpCode: OpCode.Return, Operands.Count: 0 }
@@ -1956,7 +1967,8 @@ public static class ListAddRecovery
     }
 
     /// <summary>
-    /// 慢边预筛选只额外放行下一项版本递增的固定加法；接收者、字段回写和快边等价性稍后统一验证。
+    /// 慢边预筛选只额外放行下一项版本递增的固定加法；接收者、字段回写、调用破坏刷新
+    /// 和快边等价性稍后统一验证。
     /// </summary>
     private static bool IsPotentialSlowTailInstruction(Instruction instruction)
         => instruction.OpCode == OpCode.Move
@@ -3065,6 +3077,9 @@ public static class ListAddRecovery
         ISILControlFlowGraph graph,
         Instruction refresh)
     {
+        if (IsRedundantGetterCallClobberRefresh(graph, refresh))
+            return true;
+
         if (refresh is not
             {
                 Index: >= 0,
@@ -3105,6 +3120,181 @@ public static class ListAddRecovery
 
         return false;
     }
+
+    /// <summary>
+    /// 识别扩容慢边对同一无参实例 getter 返回寄存器的重新装载。
+    /// </summary>
+    /// <remarks>
+    /// ARM64 会让快速路径继续复用调用前的 getter 结果，但私有 AddWithResize 会破坏调用者
+    /// 保存寄存器，因此慢边会再次读取同一 getter。恢复为公开 List.Add 后仍保留这次读取，
+    /// 只把它从快慢载体等价比较中排除。候选必须支配刷新块；从候选到刷新且不重入候选块的
+    /// 所有相关路径只允许同一 getter 观察和唯一 AddWithResize，业务调用、接收者写入或结果
+    /// 局部重定义任一出现都保持原容量控制流。
+    /// </remarks>
+    private static bool IsRedundantGetterCallClobberRefresh(
+        ISILControlFlowGraph graph,
+        Instruction refresh)
+    {
+        if (!TryGetInstanceGetterRead(
+                refresh,
+                out var getter,
+                out var destination,
+                out var receiver)
+            || graph.FindBlockByInstruction(refresh) is not { } refreshBlock)
+            return false;
+
+        var refreshPosition = refreshBlock.Instructions.IndexOf(refresh);
+        if (refreshPosition < 0)
+            return false;
+
+        var addCallsBeforeRefresh = refreshBlock.Instructions
+            .Take(refreshPosition)
+            .Where(IsAddWithResizeCall)
+            .ToList();
+        if (addCallsBeforeRefresh is not [var addCall])
+            return false;
+
+        var dominance = new DominatorInfo(graph);
+        foreach (var candidate in graph.Instructions)
+        {
+            if (ReferenceEquals(candidate, refresh)
+                || !TryGetInstanceGetterRead(
+                    candidate,
+                    out var priorGetter,
+                    out var priorDestination,
+                    out var priorReceiver)
+                || !ReferenceEquals(priorGetter, getter)
+                || !ReferenceEquals(priorDestination, destination)
+                || !AreEquivalentValue(priorReceiver, receiver)
+                || graph.FindBlockByInstruction(candidate) is not { } candidateBlock
+                || !dominance.Dominates(candidateBlock, refreshBlock))
+                continue;
+
+            var routeBlocks = CollectForwardRouteBlocksBeforeReentry(candidateBlock, refreshBlock);
+            if (!routeBlocks.Contains(refreshBlock))
+                continue;
+
+            var routeInstructions = new List<Instruction>();
+            foreach (var block in routeBlocks)
+            {
+                var start = ReferenceEquals(block, candidateBlock)
+                    ? block.Instructions.IndexOf(candidate) + 1
+                    : 0;
+                var end = ReferenceEquals(block, refreshBlock)
+                    ? block.Instructions.IndexOf(refresh)
+                    : block.Instructions.Count;
+                if (start < 0 || end < start)
+                {
+                    routeInstructions.Clear();
+                    break;
+                }
+
+                routeInstructions.AddRange(block.Instructions
+                    .Skip(start)
+                    .Take(end - start)
+                    .Where(instruction => instruction.OpCode != OpCode.Nop
+                                          && !IsIgnorableRuntimeMetadataMove(instruction)));
+            }
+
+            if (routeInstructions.Count == 0
+                || routeInstructions.Count(IsAddWithResizeCall) != 1
+                || !routeInstructions.Contains(addCall)
+                || routeInstructions.Any(instruction =>
+                    instruction.IsCall
+                    && !ReferenceEquals(instruction, addCall)
+                    && !IsSameGetterObservation(instruction, getter, receiver))
+                || routeInstructions.Any(instruction =>
+                    ReferenceEquals(instruction.Destination, destination)
+                    || instruction.Destination is { } written
+                    && ReferencesLocal(written, receiver)))
+                continue;
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 收集从候选块出发、到达刷新块且途中不再次进入候选块的精确路由块。
+    /// 循环另一分支只有在回到候选块后才能进入慢边时会被排除，避免把其他迭代的调用
+    /// 错算为本次 AddWithResize 前的调用。
+    /// </summary>
+    private static HashSet<Block> CollectForwardRouteBlocksBeforeReentry(Block start, Block target)
+    {
+        var reachable = new HashSet<Block> { start };
+        var pending = new Stack<Block>(start.Successors.Where(block => !ReferenceEquals(block, start)));
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (ReferenceEquals(block, start) || !reachable.Add(block))
+                continue;
+            if (ReferenceEquals(block, target))
+                continue;
+            foreach (var successor in block.Successors)
+            {
+                if (!ReferenceEquals(successor, start))
+                    pending.Push(successor);
+            }
+        }
+
+        reachable.RemoveWhere(block =>
+            !ReferenceEquals(block, start)
+            && !CanReachBefore(block, target, start));
+        return reachable;
+    }
+
+    /// <summary>
+    /// 读取可作为稳定属性观察的无参实例 getter；接收者限定为具体局部，避免跨字段别名
+    /// 猜测对象身份。
+    /// </summary>
+    private static bool TryGetInstanceGetterRead(
+        Instruction instruction,
+        out MethodAnalysisContext getter,
+        out LocalVariable destination,
+        out LocalVariable receiver)
+    {
+        getter = null!;
+        destination = null!;
+        receiver = null!;
+        if (instruction is not
+            {
+                OpCode: OpCode.Call,
+                Operands:
+                [
+                    MethodAnalysisContext candidateGetter,
+                    LocalVariable candidateDestination,
+                    LocalVariable candidateReceiver,
+                ],
+            }
+            || candidateGetter.IsStatic
+            || candidateGetter.Parameters.Count != 0
+            || !candidateGetter.Name.StartsWith("get_", StringComparison.Ordinal)
+            || !GenericCallRebinder.TypesEquivalent(
+                candidateGetter.ReturnType,
+                candidateDestination.Type))
+            return false;
+
+        getter = candidateGetter;
+        destination = candidateDestination;
+        receiver = candidateReceiver;
+        return true;
+    }
+
+    private static bool IsSameGetterObservation(
+        Instruction instruction,
+        MethodAnalysisContext getter,
+        LocalVariable receiver)
+        => TryGetInstanceGetterRead(instruction, out var candidate, out _, out var candidateReceiver)
+           && ReferenceEquals(candidate, getter)
+           && ReferenceEquals(candidateReceiver, receiver);
+
+    private static bool IsAddWithResizeCall(Instruction instruction)
+        => instruction is
+        {
+            OpCode: OpCode.CallVoid,
+            Operands: [MethodAnalysisContext { Name: "AddWithResize" }, ..],
+        };
 
     /// <summary>
     /// 限定可跨调用重载的稳定源。局部量和立即数不代表可重读存储，保持失败关闭。
