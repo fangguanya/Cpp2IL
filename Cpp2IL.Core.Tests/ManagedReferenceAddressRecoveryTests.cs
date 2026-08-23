@@ -41,6 +41,40 @@ public class ManagedReferenceAddressRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 互斥退出边重复取同一接口槽地址时全部折叠()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumeratorType = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.IEnumerator")!;
+        var disposableType = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.IDisposable")!;
+        var slot = Local("enumerator", "X0", enumeratorType);
+        var carrier = Local("address", "X1", enumeratorType.MakeByReferenceType());
+        var result = Local("disposable", "X2", disposableType);
+        var firstExit = new Instruction(0, OpCode.Move, carrier, new AddressOf(slot));
+        var secondExit = new Instruction(1, OpCode.Move, carrier, new AddressOf(slot));
+        var typeTest = new Instruction(2, OpCode.IsInst, result, new MemoryOperand(carrier), disposableType);
+        var instructions = new List<Instruction>
+        {
+            firstExit,
+            secondExit,
+            typeTest,
+            new(3, OpCode.Return),
+        };
+
+        var rewritten = ManagedReferenceAddressRecovery.Run(instructions);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(firstExit.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(secondExit.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(typeTest.Operands[1], Is.SameAs(slot));
+        }
+    }
+
+    [Test]
     [Category("边界值")]
     public void 未定型槽由唯一引用写入反推并折叠全部零偏移访问()
     {
@@ -106,6 +140,37 @@ public class ManagedReferenceAddressRecoveryTests
         {
             Assert.That(rewritten, Is.EqualTo(0));
             Assert.That(addressMove.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(read.Operands[1], Is.InstanceOf<MemoryOperand>());
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 同一载体在不同退出边指向不同引用槽时保持不动()
+    {
+        var objectType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType;
+        var firstSlot = Local("first", "X0", objectType);
+        var secondSlot = Local("second", "X2", objectType);
+        var carrier = Local("address", "X1", objectType.MakeByReferenceType());
+        var loaded = Local("loaded", "X3", objectType);
+        var firstExit = new Instruction(0, OpCode.Move, carrier, new AddressOf(firstSlot));
+        var secondExit = new Instruction(1, OpCode.Move, carrier, new AddressOf(secondSlot));
+        var read = new Instruction(2, OpCode.Move, loaded, new MemoryOperand(carrier));
+        var instructions = new List<Instruction>
+        {
+            firstExit,
+            secondExit,
+            read,
+            new(3, OpCode.Return),
+        };
+
+        var rewritten = ManagedReferenceAddressRecovery.Run(instructions);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewritten, Is.EqualTo(0));
+            Assert.That(firstExit.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(secondExit.OpCode, Is.EqualTo(OpCode.Move));
             Assert.That(read.Operands[1], Is.InstanceOf<MemoryOperand>());
         }
     }

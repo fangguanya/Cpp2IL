@@ -10,8 +10,9 @@ namespace Cpp2IL.Core.Analysis;
 ///
 /// IL2CPP会在异常清理路径中先把接口或对象局部量的地址写入临时寄存器，再从该地址
 /// 读取同一个引用并执行isinst。若保留这层原生地址，IL生成器会发出ldloca，最终形成
-/// IEnumerator*到object之类的非法转换。只有唯一取址定义、引用类型槽位且载体的全部
-/// 读取都是零偏移解引用时才折叠；ref/out调用、值类型地址和带偏移内存访问均保持原样。
+/// IEnumerator*到object之类的非法转换。退SSA后的两个互斥退出边可能各自写入同一个
+/// 地址载体；只要该载体的全部定义都取同一个引用槽地址，且全部读取都是零偏移解引用，
+/// 就可以统一折叠。ref/out调用、值类型地址、不同槽定义和带偏移内存访问均保持原样。
 /// </summary>
 public static class ManagedReferenceAddressRecovery
 {
@@ -19,25 +20,20 @@ public static class ManagedReferenceAddressRecovery
 
     internal static int Run(IReadOnlyList<Instruction> instructions)
     {
-        var definitions = CollectDefinitionCounts(instructions);
+        var definitions = CollectDefinitions(instructions);
         var rewritten = 0;
 
-        foreach (var addressMove in instructions)
+        foreach (var definitionGroup in definitions)
         {
-            if (addressMove is not
-                {
-                    OpCode: OpCode.Move,
-                    Operands:
-                    [
-                        LocalVariable carrier,
-                        AddressOf { Target: LocalVariable slot }
-                    ]
-                }
-                || !definitions.TryGetValue(carrier, out var definitionCount)
-                || definitionCount != 1)
+            var carrier = definitionGroup.Key;
+            var carrierDefinitions = definitionGroup.Value;
+            if (!TryGetCommonAddressedSlot(carrierDefinitions, carrier, out var slot))
                 continue;
 
-            var dereferences = CollectExclusiveZeroOffsetDereferences(instructions, addressMove, carrier);
+            var dereferences = CollectExclusiveZeroOffsetDereferences(
+                instructions,
+                carrierDefinitions,
+                carrier);
             if (dereferences == null || dereferences.Count == 0)
                 continue;
 
@@ -53,39 +49,85 @@ public static class ManagedReferenceAddressRecovery
                 rewritten++;
             }
 
-            addressMove.OpCode = OpCode.Nop;
-            addressMove.SetOperands();
+            foreach (var addressMove in carrierDefinitions)
+            {
+                addressMove.OpCode = OpCode.Nop;
+                addressMove.SetOperands();
+            }
         }
 
         return rewritten;
     }
 
-    private static Dictionary<LocalVariable, int> CollectDefinitionCounts(IReadOnlyList<Instruction> instructions)
+    private static Dictionary<LocalVariable, List<Instruction>> CollectDefinitions(
+        IReadOnlyList<Instruction> instructions)
     {
-        var counts = new Dictionary<LocalVariable, int>();
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var instruction in instructions)
         {
             if (instruction.Destination is not LocalVariable destination)
                 continue;
 
-            counts.TryGetValue(destination, out var count);
-            counts[destination] = count + 1;
+            if (!definitions.TryGetValue(destination, out var items))
+            {
+                items = [];
+                definitions[destination] = items;
+            }
+
+            items.Add(instruction);
         }
 
-        return counts;
+        return definitions;
+    }
+
+    /// <summary>
+    /// 验证同一退SSA载体的全部定义都取同一个局部槽地址，并返回该唯一槽。
+    /// </summary>
+    private static bool TryGetCommonAddressedSlot(
+        IReadOnlyList<Instruction> definitions,
+        LocalVariable carrier,
+        out LocalVariable slot)
+    {
+        slot = null!;
+        foreach (var definition in definitions)
+        {
+            if (definition is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable destination,
+                        AddressOf { Target: LocalVariable addressed }
+                    ]
+                }
+                || !ReferenceEquals(destination, carrier))
+                return false;
+
+            if (slot == null)
+            {
+                slot = addressed;
+                continue;
+            }
+
+            if (!ReferenceEquals(slot, addressed))
+                return false;
+        }
+
+        return slot != null;
     }
 
     private static List<DereferenceUse>? CollectExclusiveZeroOffsetDereferences(
         IReadOnlyList<Instruction> instructions,
-        Instruction addressMove,
+        IReadOnlyList<Instruction> addressMoves,
         LocalVariable carrier)
     {
+        var addressMoveSet = new HashSet<Instruction>(addressMoves);
         var dereferences = new List<DereferenceUse>();
         foreach (var instruction in instructions)
         {
             for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
             {
-                if (ReferenceEquals(instruction, addressMove) && operandIndex == 0)
+                if (addressMoveSet.Contains(instruction) && operandIndex == 0)
                     continue;
 
                 var operand = instruction.Operands[operandIndex];
