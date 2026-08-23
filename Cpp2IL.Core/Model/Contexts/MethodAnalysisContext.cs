@@ -599,6 +599,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 托管调用结果接回 Return，避免正确 ToArray 结果被无定义返回局部替换成 default。
         ManagedReturnValueRecovery.Run(this);
 
+        // 中文注释：直接返回已闭合后，再处理 foreach 搜索命中边。原生被调用方保存寄存器、
+        // 默认构造值和 CFG 的命中/耗尽双出口必须同时唯一，才把命中对象写回最终返回局部。
+        ManagedReturnPhiRecovery.Run(this);
+
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
