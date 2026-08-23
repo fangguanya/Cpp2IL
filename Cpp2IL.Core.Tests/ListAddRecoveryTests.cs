@@ -2147,6 +2147,75 @@ public class ListAddRecoveryTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 慢扩容边经共享Count刷新汇合时恢复公开Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true);
+        var sharedRefresh = ConfigureSharedPostAddSizeRefresh(fixture);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(sharedRefresh));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 紧凑数组追加经多前驱共享Count刷新时仍恢复公开Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true,
+            useDirectArrayAccess: true);
+        ConfigureSharedPostAddSizeRefresh(fixture, additionalPredecessorCount: 3);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 共享Count刷新块含额外业务计算时保持原容量控制流()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true);
+        ConfigureSharedPostAddSizeRefresh(fixture, includeAdditionalBusiness: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
     [TestCase(true, false)]
     [TestCase(false, true)]
     [Category("异常输入")]
@@ -2460,6 +2529,69 @@ public class ListAddRecoveryTests
                 new Instruction(-1, OpCode.Move, runtimeClass, elementType));
         }
         return new Fixture(method, graph, receiver, value, carrier, fastBlock, slowBlock);
+    }
+
+    /// <summary>
+    /// 把标准容量菱形改造成慢边经过多前驱共享大小刷新、快边直接进入后继汇合块的形态。
+    /// </summary>
+    private static Block ConfigureSharedPostAddSizeRefresh(
+        Fixture fixture,
+        int additionalPredecessorCount = 1,
+        bool includeAdditionalBusiness = false)
+    {
+        if (additionalPredecessorCount < 1)
+            throw new ArgumentOutOfRangeException(nameof(additionalPredecessorCount));
+
+        var graph = fixture.Graph;
+        if (fixture.FastBlock.Successors is not [var merge]
+            || fixture.SlowBlock.Successors is not [var slowMerge]
+            || !ReferenceEquals(merge, slowMerge))
+            throw new InvalidOperationException("标准夹具的快慢边必须进入同一汇合块。");
+
+        var sizeAdvance = fixture.FastBlock.Instructions.Single(instruction =>
+            instruction is
+            {
+                OpCode: OpCode.Add,
+                Operands: [LocalVariable, _, Immediate { Value: 1 }],
+            });
+        var destination = (LocalVariable)sizeAdvance.Operands[0];
+        var source = sizeAdvance.Operands[1];
+        // 中文注释：真实 DataHub 汇合块会在后续循环条件中读取刷新后的 Count；夹具显式保留该数据依赖。
+        merge.Instructions.Insert(0, new Instruction(-1, OpCode.Move, fixture.Carrier, destination));
+        var nextId = graph.Blocks.Max(block => block.ID) + 1;
+        var sharedRefresh = new Block { ID = nextId++ };
+        if (includeAdditionalBusiness)
+        {
+            sharedRefresh.Instructions.Add(
+                new Instruction(-1, OpCode.Move, fixture.Carrier, fixture.Value));
+        }
+        sharedRefresh.Instructions.Add(new Instruction(-1, OpCode.Move, destination, source));
+        sharedRefresh.Instructions.Add(new Instruction(-1, OpCode.Jump, merge));
+        sharedRefresh.Successors.Add(merge);
+        sharedRefresh.Predecessors.Add(fixture.SlowBlock);
+
+        var slowPredecessorIndex = merge.Predecessors.FindIndex(block =>
+            ReferenceEquals(block, fixture.SlowBlock));
+        if (slowPredecessorIndex < 0)
+            throw new InvalidOperationException("标准夹具的汇合块缺少慢边前驱。");
+        merge.Predecessors[slowPredecessorIndex] = sharedRefresh;
+        fixture.SlowBlock.Successors[0] = sharedRefresh;
+        var slowJump = fixture.SlowBlock.Instructions.LastOrDefault(instruction =>
+            instruction is { OpCode: OpCode.Jump });
+        slowJump?.SetOperand(0, sharedRefresh);
+
+        graph.Blocks.Add(sharedRefresh);
+        for (var index = 0; index < additionalPredecessorCount; index++)
+        {
+            var predecessor = new Block { ID = nextId++ };
+            predecessor.Instructions.Add(new Instruction(-1, OpCode.Jump, sharedRefresh));
+            predecessor.Successors.Add(sharedRefresh);
+            sharedRefresh.Predecessors.Add(predecessor);
+            graph.Blocks.Add(predecessor);
+            predecessor.CalculateBlockType();
+        }
+        sharedRefresh.CalculateBlockType();
+        return sharedRefresh;
     }
 
     /// <summary>

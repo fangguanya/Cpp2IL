@@ -237,8 +237,23 @@ public static class ListAddRecovery
 
             if (slowBlock.Predecessors is not [var head])
                 continue;
-            if (!TryGetMergeBlock(graph, slowBlock, out var merge))
+            Block merge;
+            IReadOnlyList<Instruction> effectiveSlowTail = slowTail;
+            Instruction? validatedPublicSizeRefresh = null;
+            if (TryGetSharedPostAddSizeRefresh(
+                    slowBlock,
+                    receiver,
+                    out var postRefreshMerge,
+                    out var sharedRefreshTail))
+            {
+                merge = postRefreshMerge;
+                effectiveSlowTail = slowTail.Concat(sharedRefreshTail).ToList();
+                validatedPublicSizeRefresh = sharedRefreshTail.Single();
+            }
+            else if (!TryGetMergeBlock(graph, slowBlock, out merge))
+            {
                 continue;
+            }
             if (!TryMatchHead(
                     head,
                     slowBlock,
@@ -272,7 +287,8 @@ public static class ListAddRecovery
                     versionResult,
                     versionSource,
                     value,
-                    slowTail,
+                    effectiveSlowTail,
+                    validatedPublicSizeRefresh,
                     addWithResize.AppContext,
                     addWithResize.TypeGenericParameters.Single(),
                     compactArrayAccessOnly,
@@ -301,6 +317,52 @@ public static class ListAddRecovery
         }
 
         return recovered;
+    }
+
+    /// <summary>
+    /// 识别慢扩容边先进入共享 Count/_size 刷新块、快速边直接进入后继汇合块的形态。
+    /// </summary>
+    /// <remarks>
+    /// 该刷新块还服务于未追加元素的业务路径，因此不得从 CFG 删除。恢复器只复制唯一的
+    /// 大小读取到公开 Add 之后，并要求目标局部在真正汇合点可达使用；额外计算、多个刷新
+    /// 或不同集合接收者都会保持原图。
+    /// </remarks>
+    private static bool TryGetSharedPostAddSizeRefresh(
+        Block slowBlock,
+        LocalVariable receiver,
+        out Block merge,
+        out IReadOnlyList<Instruction> refreshTail)
+    {
+        merge = null!;
+        refreshTail = [];
+        if (slowBlock.Successors is not [var sharedRefresh]
+            || sharedRefresh.Predecessors.Count < 2
+            || sharedRefresh.Successors is not [var candidateMerge])
+            return false;
+
+        var instructions = PatternInstructions(sharedRefresh);
+        if (instructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block explicitTarget] })
+        {
+            if (!ReferenceEquals(explicitTarget, candidateMerge))
+                return false;
+            instructions = instructions.Take(instructions.Count - 1).ToList();
+        }
+
+        if (instructions is not
+            [
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [LocalVariable destination, var source],
+                } refresh,
+            ]
+            || !IsDirectStateOperand(source, receiver, "_size")
+            || !IsReferencedFromMerge(candidateMerge, destination))
+            return false;
+
+        merge = candidateMerge;
+        refreshTail = [CloneInstruction(refresh)];
+        return true;
     }
 
     /// <summary>
@@ -395,6 +457,7 @@ public static class ListAddRecovery
                     versionSource,
                     branchSlowValue,
                     slowTail,
+                    null,
                     addWithResize.AppContext,
                     addWithResize.TypeGenericParameters.Single(),
                     compactArrayAccessOnly,
@@ -564,6 +627,7 @@ public static class ListAddRecovery
                 versionSource,
                 value,
                 slowTail,
+                null,
                 addWithResize.AppContext,
                 addWithResize.TypeGenericParameters.Single(),
                 compactArrayAccessOnly,
@@ -2350,6 +2414,7 @@ public static class ListAddRecovery
         IOperand versionSource,
         IOperand value,
         IReadOnlyList<Instruction> slowTail,
+        Instruction? validatedPublicSizeRefresh,
         ApplicationAnalysisContext appContext,
         TypeAnalysisContext elementType,
         bool compactArrayAccessOnly,
@@ -2547,7 +2612,8 @@ public static class ListAddRecovery
 
         var slowStateRefreshes = slowTail.Where(instruction =>
             IsStateRefresh(instruction, receiver, "_size", newSize)
-            || IsStateRefresh(instruction, receiver, "_version", versionResult)).ToList();
+            || IsStateRefresh(instruction, receiver, "_version", versionResult)
+            || ReferenceEquals(instruction, validatedPublicSizeRefresh)).ToList();
         if (slowTail.Any(instruction =>
                 instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference field] }
                 && IsField(field, receiver, "_size")
