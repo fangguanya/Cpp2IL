@@ -2430,17 +2430,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return;
             }
 
-            var calledMethod = methodsAtAddress.Count == 1 ? methodsAtAddress[0] : null;
+            // 共享地址原有的保守规则以当前调用者返回 ABI 维持调用后 X0/V0 的生命期；
+            // void 调用者中的 Enum.TryParse 是唯一需要由候选族补回 Boolean X0 的例外。
+            var calledMethod = methodsAtAddress.Count == 1 ? methodsAtAddress[0] : context;
             // 某些 Unity 6 构建会让接口慢查表助手与 List<T>.AddWithResize 共用原生地址。
             // 前者真实返回 VirtualInvokeData*，后者为 void；在 CFG/SSA 消费关系建立前不能丢掉 X0。
             // 仅对该已知共享身份保留原始返回槽，MetadataResolver 会删除普通 void 的伪返回值，
             // InterfaceDispatchRecovery 则以 Phi、零偏移 methodPtr 和 vtable 链完成最终裁决。
-            var preservePotentialInterfaceLookupResult = calledMethod == null
+            var preservePotentialInterfaceLookupResult = calledMethod.IsVoid
                 && methodsAtAddress.Any(InterfaceDispatchRecovery.IsSharedAddWithResizeCandidate)
                 && HasRecentSmallImmediateArgument(instructions, "X2", ushort.MaxValue);
-            Register? returnRegister = calledMethod is { IsVoid: false }
+            Register? returnRegister = !calledMethod.IsVoid
                 ? Arm64CallingConventionResolver.ReturnRegister(calledMethod)
-                : calledMethod == null
+                : methodsAtAddress.Count > 1
                   && Arm64CallingConventionResolver.TryGetSharedEnumTryParseReturnRegister(
                       methodsAtAddress,
                       out var sharedReturnRegister)
@@ -2465,7 +2467,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 // HFA调用在托管CIL中返回一个完整值类型，在AAPCS64中则会改写连续V寄存器。
                 // 逆序字段投影让SSA同时看到V0..Vn的新定义，并保证所有字段都从尚未覆盖的V0
                 // 聚合体载体读取；后续字段偏移解析会把这些内存形态精确绑定到值类型字段。
-                foreach (var projection in Arm64CallingConventionResolver.ReturnProjections(calledMethod!))
+                foreach (var projection in Arm64CallingConventionResolver.ReturnProjections(calledMethod))
                     Add(address, OpCode.Move, projection.Destination, projection.Source);
 
             }
@@ -2473,7 +2475,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             // 普通小结构体会把一至两个完整托管引用槽分别返回在X0/X1。唯一目标直接使用
             // 其签名；共享泛型体只在全部封闭候选具有同一引用槽布局时使用该布局原型。
             var referenceReturnPrototype = methodsAtAddress.Count == 1
-                ? calledMethod!
+                ? calledMethod
                 : Arm64CallingConventionResolver.TryGetReferenceRegisterAggregateReturnPrototype(
                     methodsAtAddress,
                     out var sharedPrototype)
