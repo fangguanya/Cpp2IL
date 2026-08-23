@@ -220,6 +220,16 @@ public static class ListAddRecovery
             }
 
             if (!compactArrayAccessOnly
+                && TryRecoverSharedSizeAddressCarrierTail(
+                    graph,
+                    slowBlock,
+                    originalSharedFastTails))
+            {
+                recovered++;
+                continue;
+            }
+
+            if (!compactArrayAccessOnly
                 && TryRecoverSharedFastTail(graph, slowBlock, originalSharedFastTails))
             {
                 recovered++;
@@ -961,6 +971,282 @@ public static class ListAddRecovery
             publicReceiver,
             publicValue);
         return true;
+    }
+
+    /// <summary>
+    /// 恢复多接收者把各自 <c>receiver + 24</c> 地址写入同一载体、再共享大小回写与
+    /// 元素写入快尾的 ARM64 形态。
+    /// </summary>
+    /// <remarks>
+    /// 该形态与普通共享快尾的关键差异是：快边暂存的是 <c>_size</c> 写回地址，元素值
+    /// 本身已在所有路径上稳定；容量头也已被字段和 Count 恢复拆成“items/version 状态块”
+    /// 与“Count/容量判断块”。只有地址定义唯一支配当前容量头、接收者与慢调用完全一致，
+    /// 且共享快尾仍保留完整 UInt32 索引归一化时才闭合为公开 <c>Add</c>。
+    /// </remarks>
+    private static bool TryRecoverSharedSizeAddressCarrierTail(
+        ISILControlFlowGraph graph,
+        Block slowBlock,
+        HashSet<Block> originalSharedFastTails)
+    {
+        if (!TryMatchSlowPath(
+                graph,
+                slowBlock,
+                out var slowCall,
+                out var addWithResize,
+                out var receiver,
+                out var slowValue,
+                out var slowTail))
+            return false;
+        if (slowBlock.Predecessors is not [var capacityHead])
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "慢边不是单一容量头前驱");
+        if (!TryGetMergeBlock(graph, slowBlock, out var merge))
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "慢边汇合块未闭合");
+        if (!TryGetSharedFastBlocks(
+                capacityHead,
+                slowBlock,
+                merge,
+                originalSharedFastTails,
+                out var stagingBlock,
+                out var sharedFastTail))
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "快边地址暂存块或共享快尾拓扑未闭合");
+        if (!TryMatchSharedFastTail(
+                sharedFastTail,
+                merge,
+                out var sharedPattern))
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "共享快尾大小回写与数组写入未闭合");
+        if (!TryMatchSharedSizeAddressCarrierHead(
+                capacityHead,
+                slowBlock,
+                stagingBlock,
+                receiver,
+                sharedPattern,
+                out var rewriteHead,
+                out var headPath,
+                out var rewriteStart))
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "items/version 状态块或 Count 容量块未闭合");
+        if (!TryMatchSharedSizeAddressCarrierStaging(
+                graph,
+                capacityHead,
+                stagingBlock,
+                sharedFastTail,
+                receiver,
+                slowValue,
+                slowTail,
+                sharedPattern,
+                addWithResize.AppContext,
+                addWithResize.TypeGenericParameters.Single(),
+                out var publicValue))
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "接收者大小地址或共享元素值未闭合");
+        if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
+            return RejectSharedSizeAddressCarrierTail(slowBlock, "公开 Add 目标构造失败");
+
+        RewriteSharedFastTail(
+            graph,
+            rewriteHead,
+            headPath,
+            stagingBlock,
+            slowBlock,
+            sharedFastTail,
+            merge,
+            rewriteStart,
+            slowCall,
+            slowTail,
+            addTarget,
+            receiver,
+            publicValue);
+        return true;
+    }
+
+    /// <summary>
+    /// 统一记录共享大小地址载体候选的精确拒绝门。
+    /// </summary>
+    private static bool RejectSharedSizeAddressCarrierTail(Block slowBlock, string reason)
+    {
+        Logger.VerboseNewline($"ListAdd共享大小地址拒绝：慢边 b{slowBlock.ID}，{reason}。");
+        return false;
+    }
+
+    /// <summary>
+    /// 验证字段恢复后的两块状态前缀以及正向或反向的无符号容量分支。
+    /// </summary>
+    private static bool TryMatchSharedSizeAddressCarrierHead(
+        Block capacityHead,
+        Block slowBlock,
+        Block stagingBlock,
+        LocalVariable receiver,
+        SharedFastTailPattern pattern,
+        out Block rewriteHead,
+        out List<Block> headPath,
+        out Instruction rewriteStart)
+    {
+        rewriteHead = null!;
+        headPath = [];
+        rewriteStart = null!;
+        if (capacityHead.Predecessors is not [var stateBlock]
+            || stateBlock.Successors is not [var stateSuccessor]
+            || !ReferenceEquals(stateSuccessor, capacityHead)
+            || capacityHead.Successors.Count != 2
+            || !capacityHead.Successors.Contains(slowBlock)
+            || !capacityHead.Successors.Contains(stagingBlock))
+        {
+            Logger.VerboseNewline(
+                $"ListAdd共享大小地址头拒绝：容量块 b{capacityHead.ID} 的前驱或快慢后继拓扑不闭合。");
+            return false;
+        }
+
+        var stateInstructions = PatternInstructions(stateBlock);
+        if (stateInstructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block stateTarget] })
+        {
+            if (!ReferenceEquals(stateTarget, capacityHead))
+                return false;
+            stateInstructions = stateInstructions.Take(stateInstructions.Count - 1).ToList();
+        }
+
+        if (stateInstructions is not
+            [
+                { OpCode: OpCode.Move, Operands: [LocalVariable items, FieldReference itemsField] } firstState,
+                {
+                    OpCode: OpCode.Add,
+                    Operands: [LocalVariable versionResult, FieldReference versionSource, Immediate { Value: 1 }],
+                },
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [FieldReference versionDestination, var writtenVersion],
+                },
+            ]
+            || !ReferenceEquals(items, pattern.Items)
+            || !IsField(itemsField, receiver, "_items")
+            || !IsField(versionSource, receiver, "_version")
+            || !IsField(versionDestination, receiver, "_version")
+            || !ReferenceEquals(versionResult, writtenVersion))
+        {
+            Logger.VerboseNewline(
+                $"ListAdd共享大小地址头拒绝：状态块 b{stateBlock.ID} 指令={DescribePattern(stateInstructions)}。");
+            return false;
+        }
+
+        var capacityInstructions = PatternInstructions(capacityHead);
+        if (capacityInstructions is not
+            [
+                { OpCode: OpCode.Move, Operands: [var sizeState, var sizeSource] },
+                {
+                    OpCode: OpCode.CheckLessUnsigned or OpCode.CheckGreaterOrEqualUnsigned,
+                    Operands: [LocalVariable condition, var checkedSize, ArrayLength length],
+                } comparison,
+                {
+                    OpCode: OpCode.ConditionalJump,
+                    Operands: [Block branchTarget, var branchCondition],
+                },
+            ]
+            || !ReferenceEquals(sizeState, pattern.SizeState)
+            || !IsDirectStateOperand(sizeSource, receiver, "_size")
+            || !IsDirectStateOperand(checkedSize, receiver, "_size")
+            || !ReferenceEquals(length.Array, pattern.Items)
+            || !ReferenceEquals(condition, branchCondition)
+            || comparison.OpCode == OpCode.CheckLessUnsigned
+                && !ReferenceEquals(branchTarget, stagingBlock)
+            || comparison.OpCode == OpCode.CheckGreaterOrEqualUnsigned
+                && !ReferenceEquals(branchTarget, slowBlock))
+        {
+            Logger.VerboseNewline(
+                $"ListAdd共享大小地址头拒绝：容量块 b{capacityHead.ID} 指令={DescribePattern(capacityInstructions)}，" +
+                $"接收者={receiver}，共享大小={pattern.SizeState}，共享items={pattern.Items}。");
+            return false;
+        }
+
+        rewriteHead = stateBlock;
+        headPath = [stateBlock, capacityHead];
+        rewriteStart = firstState;
+        return true;
+    }
+
+    private static string DescribePattern(IReadOnlyList<Instruction> instructions)
+        => string.Join(" | ", instructions.Select(instruction =>
+            $"{instruction.OpCode}({string.Join(",", instruction.Operands.Select(operand => operand.ToString()))})"));
+
+    /// <summary>
+    /// 验证快边只暂存当前接收者的大小字段地址，并证明共享元素值与慢调用实参等价。
+    /// </summary>
+    private static bool TryMatchSharedSizeAddressCarrierStaging(
+        ISILControlFlowGraph graph,
+        Block capacityHead,
+        Block stagingBlock,
+        Block sharedFastTail,
+        LocalVariable receiver,
+        IOperand slowValue,
+        IReadOnlyList<Instruction> slowTail,
+        SharedFastTailPattern pattern,
+        ApplicationAnalysisContext appContext,
+        TypeAnalysisContext elementType,
+        out IOperand publicValue)
+    {
+        publicValue = null!;
+        var instructions = PatternInstructions(stagingBlock);
+        var hasExplicitJump = instructions.LastOrDefault() is
+            { OpCode: OpCode.Jump, Operands: [Block target] }
+            && ReferenceEquals(target, sharedFastTail);
+        var stagingMoves = hasExplicitJump
+            ? instructions.Take(instructions.Count - 1).ToList()
+            : instructions;
+        if (stagingMoves is not
+            [
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [var addressCarrier, LocalVariable branchAddress],
+                },
+            ]
+            || !ReferenceEquals(addressCarrier, pattern.SizeAddress)
+            || slowTail.Count != 0
+            || !TryResolveDominatingListSizeAddress(
+                graph,
+                capacityHead,
+                receiver,
+                branchAddress)
+            || !TryReconcileElementValue(
+                graph,
+                pattern.StagedValue,
+                slowValue,
+                appContext,
+                elementType,
+                PatternInstructions(sharedFastTail),
+                out publicValue,
+                out var valueConstruction)
+            || valueConstruction.Count != 0)
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// 证明分支地址载体仅由当前接收者加 List 大小字段偏移 24 得到，且该定义支配容量头。
+    /// </summary>
+    private static bool TryResolveDominatingListSizeAddress(
+        ISILControlFlowGraph graph,
+        Block capacityHead,
+        LocalVariable receiver,
+        LocalVariable branchAddress)
+    {
+        var definitions = graph.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (Block: block, Instruction: instruction)))
+            .Where(candidate => ReferenceEquals(candidate.Instruction.Destination, branchAddress))
+            .ToList();
+        if (definitions is not
+            [
+                {
+                    Block: var definitionBlock,
+                    Instruction:
+                    {
+                        OpCode: OpCode.Add,
+                        Operands: [var destination, var addressBase, Immediate { Value: 24 }],
+                    },
+                },
+            ]
+            || !ReferenceEquals(destination, branchAddress)
+            || !AreEquivalentValue(addressBase, receiver))
+            return false;
+
+        return new DominatorInfo(graph).Dominates(definitionBlock, capacityHead);
     }
 
     /// <summary>

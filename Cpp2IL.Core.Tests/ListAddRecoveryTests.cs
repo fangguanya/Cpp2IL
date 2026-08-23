@@ -1618,6 +1618,65 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 多接收者共享大小地址载体时逐项恢复公开Add()
+    {
+        var fixture = CreateSharedSizeAddressCarrierTailFixture();
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var calls = fixture.Graph.Instructions.Where(instruction => instruction.IsCall).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 反向容量分支的慢边自然落入汇合点时仍恢复共享地址载体()
+    {
+        var fixture = CreateSharedSizeAddressCarrierTailFixture(
+            omitSecondSlowJump: true,
+            useResolvedSizeField: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(2));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(2));
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.SharedFastTail));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 大小地址来源与慢调用接收者不一致时保留该分支原图()
+    {
+        var fixture = CreateSharedSizeAddressCarrierTailFixture(mismatchSecondAddressReceiver: true);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var calls = fixture.Graph.Instructions.Where(instruction => instruction.IsCall).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.EqualTo(1));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.SharedFastTail));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 唯一支配元素经纯跳转慢边中继时恢复公开Add()
     {
         var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
@@ -3616,6 +3675,274 @@ public class ListAddRecoveryTests
             var stagingJump = targets[omitExplicitStagingJumpAt].StagingJump;
             graph.FindBlockByInstruction(stagingJump)!.Instructions.Remove(stagingJump);
         }
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new SharedFastTailFixture(
+            method,
+            graph,
+            graph.FindBlockByInstruction(sharedTailStart)!);
+    }
+
+    /// <summary>
+    /// 构造两个具体 List 接收者预先计算各自大小字段地址、快边把地址写入同一载体，
+    /// 再共享 UInt32 索引归一化、大小回写与数组写入的真实 ARM64 形态。
+    /// </summary>
+    private static SharedFastTailFixture CreateSharedSizeAddressCarrierTailFixture(
+        bool omitSecondSlowJump = false,
+        bool mismatchSecondAddressReceiver = false,
+        bool useResolvedSizeField = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var elementType = app.SystemTypes.SystemStringType;
+        var listType = listDefinition.MakeGenericInstanceType([elementType]);
+        var genericElement = listDefinition.GenericParameters.Single();
+        var addWithResize = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "AddWithResize",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Private,
+            [genericElement]);
+        var addWithResizeTarget = new ConcreteGenericMethodAnalysisContext(
+            addWithResize,
+            [elementType],
+            []);
+        var itemsField = new InjectedFieldAnalysisContext(
+            "_items",
+            genericElement.MakeSzArrayType(),
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var versionField = new InjectedFieldAnalysisContext(
+            "_version",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+        var sizeField = new InjectedFieldAnalysisContext(
+            "_size",
+            app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private,
+            listDefinition);
+
+        var firstReceiver = Local("addressCarrierFirstList", listType);
+        var secondReceiver = Local("addressCarrierSecondList", listType);
+        var value = Local("addressCarrierValue", elementType);
+        var items = Local("addressCarrierItems", elementType.MakeSzArrayType());
+        var sizeState = Local("addressCarrierSize", app.SystemTypes.SystemInt32Type);
+        var firstAddress = Local("addressCarrierFirstAddress", app.SystemTypes.SystemIntPtrType);
+        var secondAddress = Local("addressCarrierSecondAddress", app.SystemTypes.SystemIntPtrType);
+        var sharedAddress = Local("addressCarrierSharedAddress", app.SystemTypes.SystemIntPtrType);
+        var firstVersion = Local("addressCarrierFirstVersion", app.SystemTypes.SystemInt32Type);
+        var secondVersion = Local("addressCarrierSecondVersion", app.SystemTypes.SystemInt32Type);
+        var firstCondition = Local("addressCarrierFirstCondition", app.SystemTypes.SystemBooleanType);
+        var secondCondition = Local("addressCarrierSecondCondition", app.SystemTypes.SystemBooleanType);
+        var dispatchCondition = Local("addressCarrierDispatch", app.SystemTypes.SystemBooleanType);
+        var masked = Local("addressCarrierMasked", app.SystemTypes.SystemIntPtrType);
+        var biased = Local("addressCarrierBiased", app.SystemTypes.SystemIntPtrType);
+        var normalized = Local("addressCarrierNormalized", app.SystemTypes.SystemIntPtrType);
+        var newSize = Local("addressCarrierNewSize", app.SystemTypes.SystemInt32Type);
+        var instructions = new List<Instruction>();
+
+        FieldReference Field(FieldAnalysisContext field, LocalVariable receiver)
+            => new(field, receiver, 0);
+        IOperand Count(LocalVariable receiver)
+            => useResolvedSizeField
+                ? Field(sizeField, receiver)
+                : new ListCount(receiver, listType);
+
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Add,
+            firstAddress,
+            firstReceiver,
+            new Immediate(24)));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Add,
+            secondAddress,
+            mismatchSecondAddressReceiver ? firstReceiver : secondReceiver,
+            new Immediate(24)));
+        var dispatch = new Instruction(
+            instructions.Count,
+            OpCode.ConditionalJump,
+            new Immediate(-1),
+            dispatchCondition);
+        instructions.Add(dispatch);
+
+        var firstStateStart = new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            items,
+            Field(itemsField, firstReceiver));
+        instructions.Add(firstStateStart);
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Add,
+            firstVersion,
+            Field(versionField, firstReceiver),
+            new Immediate(1)));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            Field(versionField, firstReceiver),
+            firstVersion));
+        var firstStateJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(firstStateJump);
+
+        var firstCapacityStart = new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            sizeState,
+            Count(firstReceiver));
+        instructions.Add(firstCapacityStart);
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.CheckLessUnsigned,
+            firstCondition,
+            Count(firstReceiver),
+            new ArrayLength(items)));
+        var firstCapacityBranch = new Instruction(
+            instructions.Count,
+            OpCode.ConditionalJump,
+            new Immediate(-1),
+            firstCondition);
+        instructions.Add(firstCapacityBranch);
+
+        var firstSlowStart = new Instruction(
+            instructions.Count,
+            OpCode.CallVoid,
+            addWithResizeTarget,
+            firstReceiver,
+            value);
+        instructions.Add(firstSlowStart);
+        var firstSlowJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(firstSlowJump);
+
+        var firstFastStart = new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            sharedAddress,
+            firstAddress);
+        instructions.Add(firstFastStart);
+        var firstFastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(firstFastJump);
+
+        var secondStateStart = new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            items,
+            Field(itemsField, secondReceiver));
+        instructions.Add(secondStateStart);
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Add,
+            secondVersion,
+            Field(versionField, secondReceiver),
+            new Immediate(1)));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            Field(versionField, secondReceiver),
+            secondVersion));
+        var secondStateJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(secondStateJump);
+
+        var secondCapacityStart = new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            sizeState,
+            Count(secondReceiver));
+        instructions.Add(secondCapacityStart);
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.CheckGreaterOrEqualUnsigned,
+            secondCondition,
+            Count(secondReceiver),
+            new ArrayLength(items)));
+        var secondCapacityBranch = new Instruction(
+            instructions.Count,
+            OpCode.ConditionalJump,
+            new Immediate(-1),
+            secondCondition);
+        instructions.Add(secondCapacityBranch);
+
+        var secondFastStart = new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            sharedAddress,
+            secondAddress);
+        instructions.Add(secondFastStart);
+        var secondFastJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(secondFastJump);
+
+        var sharedTailStart = new Instruction(
+            instructions.Count,
+            OpCode.And,
+            masked,
+            sizeState,
+            new Immediate(0xFFFFFFFFL));
+        instructions.Add(sharedTailStart);
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Xor,
+            biased,
+            masked,
+            new Immediate(0x80000000L)));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Subtract,
+            normalized,
+            biased,
+            new Immediate(0x80000000L)));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Add,
+            newSize,
+            sizeState,
+            new Immediate(1)));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            new MemoryOperand(sharedAddress),
+            newSize));
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Move,
+            new ArrayAccess(items, normalized),
+            value));
+        var sharedTailJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+        instructions.Add(sharedTailJump);
+
+        var secondSlowStart = new Instruction(
+            instructions.Count,
+            OpCode.CallVoid,
+            addWithResizeTarget,
+            secondReceiver,
+            value);
+        instructions.Add(secondSlowStart);
+        Instruction? secondSlowJump = null;
+        if (!omitSecondSlowJump)
+        {
+            secondSlowJump = new Instruction(instructions.Count, OpCode.Jump, new Immediate(-1));
+            instructions.Add(secondSlowJump);
+        }
+
+        var merge = new Instruction(instructions.Count, OpCode.Return, firstReceiver);
+        instructions.Add(merge);
+
+        dispatch.SetOperand(0, secondStateStart);
+        firstStateJump.SetOperand(0, firstCapacityStart);
+        firstCapacityBranch.SetOperand(0, firstFastStart);
+        firstSlowJump.SetOperand(0, merge);
+        firstFastJump.SetOperand(0, sharedTailStart);
+        secondStateJump.SetOperand(0, secondCapacityStart);
+        secondCapacityBranch.SetOperand(0, secondSlowStart);
+        secondFastJump.SetOperand(0, sharedTailStart);
+        sharedTailJump.SetOperand(0, merge);
+        secondSlowJump?.SetOperand(0, merge);
+
+        var graph = new ISILControlFlowGraph(instructions);
+        graph.MergeCallBlocks();
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
         method.ControlFlowGraph = graph;
         return new SharedFastTailFixture(
