@@ -3711,9 +3711,10 @@ public class LocalVariablesTests
             update,
         };
 
-        var changed = LocalVariables.BindFinalInt32InductionCarrierTypes(
+        var changed = LocalVariables.BindFinalIntegerInductionCarrierTypes(
             instructions,
             app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType,
             app.SystemTypes.SystemBooleanType);
 
         Assert.Multiple(() =>
@@ -3744,9 +3745,10 @@ public class LocalVariablesTests
             update,
         };
 
-        var changed = LocalVariables.BindFinalInt32InductionCarrierTypes(
+        var changed = LocalVariables.BindFinalIntegerInductionCarrierTypes(
             instructions,
             app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType,
             app.SystemTypes.SystemBooleanType);
 
         Assert.Multiple(() =>
@@ -3757,12 +3759,83 @@ public class LocalVariablesTests
     }
 
     [Test]
-    [Category("异常输入")]
-    public void 六十四位或额外调用消费者保持归纳载体原类型()
+    [Category("基本功能")]
+    public void 六十四位自增与立即数比较恢复原生整数归纳计数器()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
-        var wideCounter = new LocalVariable(
-            "wideCounter",
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X27", 1),
+            app.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            app.SystemTypes.SystemBooleanType);
+        var update = new Instruction(2, OpCode.Add, counter, counter, new Immediate(1))
+        {
+            IntegerWidthBits = 64,
+        };
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, counter, new Immediate(0)),
+            update,
+            new(3, OpCode.CheckEqual, condition, counter, new Immediate(4)),
+        };
+
+        var changed = LocalVariables.BindFinalIntegerInductionCarrierTypes(
+            instructions,
+            app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 六十四位反向归纳接受Int64完整边界()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var counter = new LocalVariable("counter", new Register(null, "X28", 1));
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            app.SystemTypes.SystemBooleanType);
+        var update = new Instruction(2, OpCode.Subtract, counter, counter, new Immediate(1))
+        {
+            IntegerWidthBits = 64,
+        };
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, counter, new Immediate(long.MaxValue)),
+            new(1, OpCode.CheckGreaterOrEqual, condition, counter, new Immediate(long.MinValue)),
+            update,
+        };
+
+        var changed = LocalVariables.BindFinalIntegerInductionCarrierTypes(
+            instructions,
+            app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(app.SystemTypes.SystemIntPtrType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 混合位宽或额外调用消费者保持归纳载体原类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mixedCounter = new LocalVariable(
+            "mixedCounter",
             new Register(null, "X25", 1),
             app.SystemTypes.SystemObjectType);
         var observedCounter = new LocalVariable(
@@ -3773,9 +3846,13 @@ public class LocalVariablesTests
             "condition",
             new Register(null, "Z", 1),
             app.SystemTypes.SystemBooleanType);
-        var wideUpdate = new Instruction(2, OpCode.Add, wideCounter, wideCounter, new Immediate(1))
+        var wideUpdate = new Instruction(2, OpCode.Add, mixedCounter, mixedCounter, new Immediate(1))
         {
             IntegerWidthBits = 64,
+        };
+        var narrowUpdate = new Instruction(3, OpCode.Add, mixedCounter, mixedCounter, new Immediate(1))
+        {
+            IntegerWidthBits = 32,
         };
         var observedUpdate = new Instruction(
             5,
@@ -3788,24 +3865,26 @@ public class LocalVariablesTests
         };
         var instructions = new Instruction[]
         {
-            new(-1, OpCode.Move, wideCounter, new Immediate(0)),
-            new(1, OpCode.CheckLess, condition, wideCounter, new Immediate(4)),
+            new(-1, OpCode.Move, mixedCounter, new Immediate(0)),
+            new(1, OpCode.CheckLess, condition, mixedCounter, new Immediate(4)),
             wideUpdate,
+            narrowUpdate,
             new(-1, OpCode.Move, observedCounter, new Immediate(0)),
             new(4, OpCode.CheckLess, condition, observedCounter, new Immediate(4)),
             observedUpdate,
             new(6, OpCode.CallVoid, new StringLiteral("Observe"), observedCounter),
         };
 
-        var changed = LocalVariables.BindFinalInt32InductionCarrierTypes(
+        var changed = LocalVariables.BindFinalIntegerInductionCarrierTypes(
             instructions,
             app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType,
             app.SystemTypes.SystemBooleanType);
 
         Assert.Multiple(() =>
         {
             Assert.That(changed, Is.False);
-            Assert.That(wideCounter.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+            Assert.That(mixedCounter.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
             Assert.That(observedCounter.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
         });
     }

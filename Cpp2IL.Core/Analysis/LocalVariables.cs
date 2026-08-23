@@ -1764,19 +1764,22 @@ public static class LocalVariables
             method.AppContext.SystemTypes.SystemBooleanType);
 
     /// <summary>
-    /// 退 SSA 与集合重写全部完成后，32 位循环计数器可能只剩“Int32 范围初始化、同局部自更新、
-    /// 与 Int32 立即数比较”三类证据。只有定义和读取完整闭合且自更新仍携带 ARM64 W 位宽时，
-    /// 才把 Object/Boolean ABI 占位恢复为 Int32；64 位更新、调用、字段和引用消费者保持原类型。
+    /// 退 SSA 与集合重写全部完成后，循环计数器可能只剩“整数范围初始化、同局部自更新、
+    /// 与整数立即数比较”三类证据。只有定义和读取完整闭合且全部自更新保留相同 ARM64 位宽时，
+    /// 才把 Object/Boolean ABI 占位按 W32 恢复为 Int32、按 X64 恢复为 IntPtr；混合位宽、调用、
+    /// 字段和引用消费者保持原类型。
     /// </summary>
-    public static bool ResolveFinalInt32InductionCarrierTypes(MethodAnalysisContext method) =>
-        BindFinalInt32InductionCarrierTypes(
+    public static bool ResolveFinalIntegerInductionCarrierTypes(MethodAnalysisContext method) =>
+        BindFinalIntegerInductionCarrierTypes(
             method.ControlFlowGraph!.Instructions,
             method.AppContext.SystemTypes.SystemInt32Type,
+            method.AppContext.SystemTypes.SystemIntPtrType,
             method.AppContext.SystemTypes.SystemBooleanType);
 
-    internal static bool BindFinalInt32InductionCarrierTypes(
+    internal static bool BindFinalIntegerInductionCarrierTypes(
         IReadOnlyList<Instruction> instructions,
         TypeAnalysisContext int32Type,
+        TypeAnalysisContext intPtrType,
         TypeAnalysisContext booleanType)
     {
         var definitions = instructions
@@ -1788,17 +1791,35 @@ public static class LocalVariables
         foreach (var pair in definitions)
         {
             var local = pair.Key;
-            if (!IsReplaceableFinalIntegerCarrier(local.Type, int32Type, booleanType))
+            var updates = pair.Value
+                .Where(definition => TryGetClosedIntegerInductionUpdateWidth(definition, local, out _))
+                .ToArray();
+            var updateWidths = updates
+                .Select(update => update.IntegerWidthBits)
+                .Distinct()
+                .ToArray();
+            if (updates.Length == 0 || updateWidths.Length != 1)
+                continue;
+
+            var targetType = updateWidths[0] switch
+            {
+                32 => int32Type,
+                64 => intPtrType,
+                _ => null,
+            };
+            if (targetType == null
+                || !IsReplaceableFinalInductionCarrier(local.Type, targetType, booleanType))
                 continue;
 
             var initializations = pair.Value
-                .Where(definition => IsClosedInt32InductionInitialization(definition, local))
+                .Where(definition => IsClosedIntegerInductionInitialization(
+                    definition,
+                    local,
+                    updateWidths[0]))
                 .ToArray();
-            var updates = new HashSet<Instruction>(pair.Value
-                .Where(definition => IsClosedInt32InductionUpdate(definition, local)));
+            var updateSet = new HashSet<Instruction>(updates);
             if (initializations.Length == 0
-                || updates.Count == 0
-                || initializations.Length + updates.Count != pair.Value.Length)
+                || initializations.Length + updateSet.Count != pair.Value.Length)
                 continue;
 
             var uses = instructions
@@ -1807,61 +1828,59 @@ public static class LocalVariables
                     .Any(operand => ReferenceEquals(operand, local)))
                 .ToArray();
             if (uses.Length == 0
-                || uses.Any(use => !updates.Contains(use)
-                    && !IsClosedInt32InductionComparison(use, local)))
+                || uses.Any(use => !updateSet.Contains(use)
+                    && !IsClosedIntegerInductionComparison(use, local, updateWidths[0])))
                 continue;
 
-            local.Type = int32Type;
+            local.Type = targetType;
             changed = true;
         }
 
         return changed;
     }
 
-    private static bool IsClosedInt32InductionInitialization(
+    private static bool IsClosedIntegerInductionInitialization(
         Instruction instruction,
-        LocalVariable local) =>
-        instruction is
-        {
-            OpCode: OpCode.Move,
-            Operands: [LocalVariable destination, Immediate { Value: >= int.MinValue and <= int.MaxValue }]
-        }
-        && ReferenceEquals(destination, local);
+        LocalVariable local,
+        int width) =>
+        instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, Immediate immediate] }
+        && ReferenceEquals(destination, local)
+        && IsImmediateInIntegerInductionRange(immediate, width);
 
-    private static bool IsClosedInt32InductionUpdate(
+    private static bool TryGetClosedIntegerInductionUpdateWidth(
         Instruction instruction,
-        LocalVariable local)
+        LocalVariable local,
+        out int width)
     {
-        if (instruction.IntegerWidthBits != 32
+        width = instruction.IntegerWidthBits;
+        if (width is not (32 or 64)
             || instruction.Operands.Count != 3
             || !ReferenceEquals(instruction.Operands[0], local))
             return false;
 
         if (instruction.OpCode == OpCode.Subtract)
             return ReferenceEquals(instruction.Operands[1], local)
-                && instruction.Operands[2] is Immediate
-                {
-                    Value: >= int.MinValue and <= int.MaxValue and not 0
-                };
+                && instruction.Operands[2] is Immediate immediate
+                && immediate.Value != 0
+                && IsImmediateInIntegerInductionRange(immediate, width);
 
         if (instruction.OpCode != OpCode.Add)
             return false;
 
         return ReferenceEquals(instruction.Operands[1], local)
-                && instruction.Operands[2] is Immediate
-                {
-                    Value: >= int.MinValue and <= int.MaxValue and not 0
-                }
+                && instruction.Operands[2] is Immediate rightImmediate
+                && rightImmediate.Value != 0
+                && IsImmediateInIntegerInductionRange(rightImmediate, width)
             || ReferenceEquals(instruction.Operands[2], local)
-                && instruction.Operands[1] is Immediate
-                {
-                    Value: >= int.MinValue and <= int.MaxValue and not 0
-                };
+                && instruction.Operands[1] is Immediate leftImmediate
+                && leftImmediate.Value != 0
+                && IsImmediateInIntegerInductionRange(leftImmediate, width);
     }
 
-    private static bool IsClosedInt32InductionComparison(
+    private static bool IsClosedIntegerInductionComparison(
         Instruction instruction,
-        LocalVariable local)
+        LocalVariable local,
+        int width)
     {
         if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
             || instruction.Operands.Count != 3)
@@ -1872,11 +1891,21 @@ public static class LocalVariables
             .Where(operand => !ReferenceEquals(operand, local))
             .ToArray();
         return comparedValues.Length == 1
-            && comparedValues[0] is Immediate
-            {
-                Value: >= int.MinValue and <= int.MaxValue
-            };
+            && comparedValues[0] is Immediate immediate
+            && IsImmediateInIntegerInductionRange(immediate, width);
     }
+
+    private static bool IsImmediateInIntegerInductionRange(Immediate immediate, int width) =>
+        width == 64 || immediate.Value is >= int.MinValue and <= int.MaxValue;
+
+    private static bool IsReplaceableFinalInductionCarrier(
+        TypeAnalysisContext? type,
+        TypeAnalysisContext targetType,
+        TypeAnalysisContext booleanType) =>
+        type == null
+        || GenericCallRebinder.TypesEquivalent(type, targetType)
+        || GenericCallRebinder.TypesEquivalent(type, booleanType)
+        || type.FullName == "System.Object";
 
     internal static bool BindFinalIntegerControlStateCarrierTypes(
         IReadOnlyList<Instruction> instructions,
