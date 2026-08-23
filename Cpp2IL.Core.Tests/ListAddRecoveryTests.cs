@@ -2173,6 +2173,30 @@ public class ListAddRecoveryTests
 
     [Test]
     [Category("边界值")]
+    public void 快慢边共同经过共享Count刷新时沿公共汇合恢复()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true);
+        var sharedRefresh = ConfigureSharedPostAddSizeRefresh(fixture);
+        RouteFastPathThroughSharedRefresh(fixture, sharedRefresh);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Graph.Blocks, Does.Contain(sharedRefresh));
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(sharedRefresh.Instructions.Count(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, ListCount] }), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
     public void 紧凑数组追加经多前驱共享Count刷新时仍恢复公开Add()
     {
         var fixture = CreateFixture(
@@ -2592,6 +2616,27 @@ public class ListAddRecoveryTests
         }
         sharedRefresh.CalculateBlockType();
         return sharedRefresh;
+    }
+
+    /// <summary>
+    /// 把快边也改为先经过共享刷新块，用于证明普通公共汇合形态不会进入慢边专用规则。
+    /// </summary>
+    private static void RouteFastPathThroughSharedRefresh(Fixture fixture, Block sharedRefresh)
+    {
+        if (sharedRefresh.Successors is not [var merge]
+            || fixture.FastBlock.Successors is not [var fastMerge]
+            || !ReferenceEquals(merge, fastMerge))
+            throw new InvalidOperationException("快边与共享刷新块必须先指向同一真实汇合点。");
+
+        merge.Predecessors.Remove(fixture.FastBlock);
+        fixture.FastBlock.Successors[0] = sharedRefresh;
+        if (!sharedRefresh.Predecessors.Contains(fixture.FastBlock))
+            sharedRefresh.Predecessors.Add(fixture.FastBlock);
+        var fastJump = fixture.FastBlock.Instructions.LastOrDefault(instruction =>
+            instruction is { OpCode: OpCode.Jump });
+        fastJump?.SetOperand(0, sharedRefresh);
+        fixture.FastBlock.CalculateBlockType();
+        sharedRefresh.CalculateBlockType();
     }
 
     /// <summary>

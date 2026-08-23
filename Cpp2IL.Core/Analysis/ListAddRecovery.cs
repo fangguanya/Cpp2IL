@@ -241,6 +241,7 @@ public static class ListAddRecovery
             IReadOnlyList<Instruction> effectiveSlowTail = slowTail;
             Instruction? validatedPublicSizeRefresh = null;
             if (TryGetSharedPostAddSizeRefresh(
+                    head,
                     slowBlock,
                     receiver,
                     out var postRefreshMerge,
@@ -328,6 +329,7 @@ public static class ListAddRecovery
     /// 或不同集合接收者都会保持原图。
     /// </remarks>
     private static bool TryGetSharedPostAddSizeRefresh(
+        Block head,
         Block slowBlock,
         LocalVariable receiver,
         out Block merge,
@@ -338,6 +340,13 @@ public static class ListAddRecovery
         if (slowBlock.Successors is not [var sharedRefresh]
             || sharedRefresh.Predecessors.Count < 2
             || sharedRefresh.Successors is not [var candidateMerge])
+            return false;
+
+        var fastEntries = head.Successors
+            .Where(successor => !ReferenceEquals(successor, slowBlock))
+            .ToList();
+        if (fastEntries is not [var fastEntry]
+            || !CanReachBefore(fastEntry, candidateMerge, sharedRefresh))
             return false;
 
         var instructions = PatternInstructions(sharedRefresh);
@@ -363,6 +372,28 @@ public static class ListAddRecovery
         merge = candidateMerge;
         refreshTail = [CloneInstruction(refresh)];
         return true;
+    }
+
+    /// <summary>
+    /// 证明快速入口能够在经过禁止块之前到达真实汇合点。
+    /// </summary>
+    private static bool CanReachBefore(Block start, Block target, Block forbidden)
+    {
+        var pending = new Stack<Block>();
+        var visited = new HashSet<Block>();
+        pending.Push(start);
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (ReferenceEquals(block, forbidden) || !visited.Add(block))
+                continue;
+            if (ReferenceEquals(block, target))
+                return true;
+            foreach (var successor in block.Successors)
+                pending.Push(successor);
+        }
+
+        return false;
     }
 
     /// <summary>
