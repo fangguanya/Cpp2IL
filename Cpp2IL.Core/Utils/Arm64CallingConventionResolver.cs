@@ -42,6 +42,38 @@ public static class Arm64CallingConventionResolver
             : "X0");
 
     /// <summary>
+    /// 从共享原生地址的候选方法中恢复唯一的直接返回寄存器。
+    /// void候选不产生返回值，因此不参与寄存器一致性判定；只要其余候选都使用同一物理
+    /// 寄存器，就必须在SSA建立前保留该定义，后续精确方法绑定会裁掉最终绑定为void的伪槽。
+    /// </summary>
+    internal static bool TryGetSharedDirectCallReturnRegister(
+        IReadOnlyList<MethodAnalysisContext> candidates,
+        out Register returnRegister)
+    {
+        returnRegister = default;
+        string? expectedRegisterName = null;
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.IsVoid)
+                continue;
+
+            var candidateRegisterName = ReturnRegister(candidate).Name;
+            if (expectedRegisterName != null
+                && !string.Equals(expectedRegisterName, candidateRegisterName, StringComparison.Ordinal))
+                return false;
+
+            expectedRegisterName = candidateRegisterName;
+        }
+
+        if (expectedRegisterName == null)
+            return false;
+
+        returnRegister = new Register(null, expectedRegisterName);
+        return true;
+    }
+
+    /// <summary>
     /// 返回方法在 AAPCS64 下承载直接返回值的全部寄存器。
     /// 同质浮点聚合体的每个成员分别占用一个连续的 V 寄存器，不能退化成 X0 中的对象引用。
     /// </summary>

@@ -31,6 +31,59 @@ public class Arm64CallingConventionResolverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 共享泛型布尔返回候选统一保留X0定义()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var first = CreateStaticMethod("TryParseFirst", app.SystemTypes.SystemBooleanType);
+        var second = CreateStaticMethod("TryParseSecond", app.SystemTypes.SystemBooleanType);
+
+        var resolved = Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
+            [first, second],
+            out var returnRegister);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(returnRegister.Name, Is.EqualTo("X0"));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 共享地址混合布尔与Void候选仍保留X0定义()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var returnsBoolean = CreateStaticMethod("TryParse", app.SystemTypes.SystemBooleanType);
+        var returnsVoid = CreateStaticMethod("AddWithResize", app.SystemTypes.SystemVoidType);
+
+        var resolved = Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
+            [returnsBoolean, returnsVoid],
+            out var returnRegister);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(returnRegister.Name, Is.EqualTo("X0"));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 共享地址整数与浮点返回候选冲突时拒绝猜测寄存器()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var returnsBoolean = CreateStaticMethod("ReturnBoolean", app.SystemTypes.SystemBooleanType);
+        var returnsSingle = CreateStaticMethod("ReturnSingle", app.SystemTypes.SystemSingleType);
+
+        Assert.That(
+            Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
+                [returnsBoolean, returnsSingle],
+                out _),
+            Is.False);
+    }
+
+    [Test]
     [Category("边界值")]
     public void IndirectCallAcceptsExactRawRegisterLayout()
     {
@@ -914,6 +967,16 @@ public class Arm64CallingConventionResolverTests
 
         return aggregate;
     }
+
+    private static InjectedMethodAnalysisContext CreateStaticMethod(
+        string name,
+        TypeAnalysisContext returnType)
+        => new(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType,
+            name,
+            returnType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
 
     private static void SetSequentialFieldOffsets(
         InjectedTypeAnalysisContext aggregate,
