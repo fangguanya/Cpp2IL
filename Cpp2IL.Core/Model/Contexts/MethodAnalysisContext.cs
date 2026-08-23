@@ -622,6 +622,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 目标、但接收者已具体化的调用，修正晚期 Enumerator<T>.MoveNext/Dispose，不重放泛型推断。
         GenericCallRebinder.RunLateSharedReceiverTargets(this);
 
+        // 中文注释：这是布局、集合、调用和末次死码之后的唯一归纳变量门；只消费仍保留 W32
+        // 自更新的闭合初始化/比较分量，避免把零初始化在 CIL 中投影成引用 null。
+        LocalVariables.ResolveFinalInt32InductionCarrierTypes(this);
+
         LocalVariables.RemoveUnused(this);
     }
 

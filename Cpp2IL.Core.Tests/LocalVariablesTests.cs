@@ -3687,6 +3687,129 @@ public class LocalVariablesTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void 三十二位自增与立即数比较恢复闭合归纳计数器()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var counter = new LocalVariable(
+            "counter",
+            new Register(null, "X29", 1),
+            app.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            app.SystemTypes.SystemBooleanType);
+        var update = new Instruction(2, OpCode.Add, counter, counter, new Immediate(1))
+        {
+            IntegerWidthBits = 32,
+        };
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, counter, new Immediate(0)),
+            new(1, OpCode.CheckLessOrEqual, condition, counter, new Immediate(1)),
+            update,
+        };
+
+        var changed = LocalVariables.BindFinalInt32InductionCarrierTypes(
+            instructions,
+            app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 三十二位反向归纳接受Int32完整边界()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var counter = new LocalVariable("counter", new Register(null, "X24", 1));
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            app.SystemTypes.SystemBooleanType);
+        var update = new Instruction(2, OpCode.Subtract, counter, counter, new Immediate(1))
+        {
+            IntegerWidthBits = 32,
+        };
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, counter, new Immediate(int.MaxValue)),
+            new(1, OpCode.CheckGreaterOrEqual, condition, counter, new Immediate(int.MinValue)),
+            update,
+        };
+
+        var changed = LocalVariables.BindFinalInt32InductionCarrierTypes(
+            instructions,
+            app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(counter.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 六十四位或额外调用消费者保持归纳载体原类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var wideCounter = new LocalVariable(
+            "wideCounter",
+            new Register(null, "X25", 1),
+            app.SystemTypes.SystemObjectType);
+        var observedCounter = new LocalVariable(
+            "observedCounter",
+            new Register(null, "X26", 1),
+            app.SystemTypes.SystemObjectType);
+        var condition = new LocalVariable(
+            "condition",
+            new Register(null, "Z", 1),
+            app.SystemTypes.SystemBooleanType);
+        var wideUpdate = new Instruction(2, OpCode.Add, wideCounter, wideCounter, new Immediate(1))
+        {
+            IntegerWidthBits = 64,
+        };
+        var observedUpdate = new Instruction(
+            5,
+            OpCode.Add,
+            observedCounter,
+            observedCounter,
+            new Immediate(1))
+        {
+            IntegerWidthBits = 32,
+        };
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, wideCounter, new Immediate(0)),
+            new(1, OpCode.CheckLess, condition, wideCounter, new Immediate(4)),
+            wideUpdate,
+            new(-1, OpCode.Move, observedCounter, new Immediate(0)),
+            new(4, OpCode.CheckLess, condition, observedCounter, new Immediate(4)),
+            observedUpdate,
+            new(6, OpCode.CallVoid, new StringLiteral("Observe"), observedCounter),
+        };
+
+        var changed = LocalVariables.BindFinalInt32InductionCarrierTypes(
+            instructions,
+            app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemBooleanType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(wideCounter.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+            Assert.That(observedCounter.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+        });
+    }
+
     private static InjectedMethodAnalysisContext CreateConstructorFixture(
         TypeAnalysisContext declaringType,
         string name,
