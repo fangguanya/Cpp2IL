@@ -32,13 +32,13 @@ public class Arm64CallingConventionResolverTests
 
     [Test]
     [Category("基本功能")]
-    public void 共享泛型布尔返回候选统一保留X0定义()
+    public void 共享EnumTryParse泛型候选统一保留X0定义()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
-        var first = CreateStaticMethod("TryParseFirst", app.SystemTypes.SystemBooleanType);
-        var second = CreateStaticMethod("TryParseSecond", app.SystemTypes.SystemBooleanType);
+        var first = CreateStaticMethod(app.SystemTypes.EnumType, "TryParse", app.SystemTypes.SystemBooleanType);
+        var second = CreateStaticMethod(app.SystemTypes.EnumType, "TryParse", app.SystemTypes.SystemBooleanType);
 
-        var resolved = Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
+        var resolved = Arm64CallingConventionResolver.TryGetSharedEnumTryParseReturnRegister(
             [first, second],
             out var returnRegister);
 
@@ -51,34 +51,38 @@ public class Arm64CallingConventionResolverTests
 
     [Test]
     [Category("边界值")]
-    public void 共享地址混合布尔与Void候选仍保留X0定义()
+    public void 单个EnumTryParse候选沿唯一目标路线处理而不冒充共享地址()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
-        var returnsBoolean = CreateStaticMethod("TryParse", app.SystemTypes.SystemBooleanType);
-        var returnsVoid = CreateStaticMethod("AddWithResize", app.SystemTypes.SystemVoidType);
+        var tryParse = CreateStaticMethod(
+            app.SystemTypes.EnumType,
+            "TryParse",
+            app.SystemTypes.SystemBooleanType);
 
-        var resolved = Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
-            [returnsBoolean, returnsVoid],
-            out var returnRegister);
-
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(resolved, Is.True);
-            Assert.That(returnRegister.Name, Is.EqualTo("X0"));
-        }
+        Assert.That(
+            Arm64CallingConventionResolver.TryGetSharedEnumTryParseReturnRegister(
+                [tryParse],
+                out _),
+            Is.False);
     }
 
     [Test]
     [Category("异常输入")]
-    public void 共享地址整数与浮点返回候选冲突时拒绝猜测寄存器()
+    public void 共享地址混入非EnumTryParse候选时拒绝猜测寄存器()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
-        var returnsBoolean = CreateStaticMethod("ReturnBoolean", app.SystemTypes.SystemBooleanType);
-        var returnsSingle = CreateStaticMethod("ReturnSingle", app.SystemTypes.SystemSingleType);
+        var tryParse = CreateStaticMethod(
+            app.SystemTypes.EnumType,
+            "TryParse",
+            app.SystemTypes.SystemBooleanType);
+        var unrelated = CreateStaticMethod(
+            app.SystemTypes.SystemObjectType,
+            "TryParse",
+            app.SystemTypes.SystemBooleanType);
 
         Assert.That(
-            Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
-                [returnsBoolean, returnsSingle],
+            Arm64CallingConventionResolver.TryGetSharedEnumTryParseReturnRegister(
+                [tryParse, unrelated],
                 out _),
             Is.False);
     }
@@ -969,10 +973,11 @@ public class Arm64CallingConventionResolverTests
     }
 
     private static InjectedMethodAnalysisContext CreateStaticMethod(
+        TypeAnalysisContext declaringType,
         string name,
         TypeAnalysisContext returnType)
         => new(
-            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType,
+            declaringType,
             name,
             returnType,
             MethodAttributes.Public | MethodAttributes.Static,

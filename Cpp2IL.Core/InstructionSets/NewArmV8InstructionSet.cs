@@ -2441,7 +2441,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Register? returnRegister = calledMethod is { IsVoid: false }
                 ? Arm64CallingConventionResolver.ReturnRegister(calledMethod)
                 : calledMethod == null
-                  && Arm64CallingConventionResolver.TryGetSharedDirectCallReturnRegister(
+                  && Arm64CallingConventionResolver.TryGetSharedEnumTryParseReturnRegister(
                       methodsAtAddress,
                       out var sharedReturnRegister)
                     ? sharedReturnRegister

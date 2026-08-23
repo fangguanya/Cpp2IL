@@ -42,34 +42,23 @@ public static class Arm64CallingConventionResolver
             : "X0");
 
     /// <summary>
-    /// 从共享原生地址的候选方法中恢复唯一的直接返回寄存器。
-    /// void候选不产生返回值，因此不参与寄存器一致性判定；只要其余候选都使用同一物理
-    /// 寄存器，就必须在SSA建立前保留该定义，后续精确方法绑定会裁掉最终绑定为void的伪槽。
+    /// 从共享原生地址的 Enum.TryParse 泛型候选中恢复 Boolean 直接返回寄存器。
+    /// 此族方法的托管身份与返回 ABI 均唯一，但不同枚举实例会共享原生函数体；在 SSA 建立前
+    /// 保留 X0 定义，才能让后续 MethodInfo 绑定同时恢复 Boolean 返回值和 out 枚举写回。
     /// </summary>
-    internal static bool TryGetSharedDirectCallReturnRegister(
+    internal static bool TryGetSharedEnumTryParseReturnRegister(
         IReadOnlyList<MethodAnalysisContext> candidates,
         out Register returnRegister)
     {
         returnRegister = default;
-        string? expectedRegisterName = null;
-
-        foreach (var candidate in candidates)
-        {
-            if (candidate.IsVoid)
-                continue;
-
-            var candidateRegisterName = ReturnRegister(candidate).Name;
-            if (expectedRegisterName != null
-                && !string.Equals(expectedRegisterName, candidateRegisterName, StringComparison.Ordinal))
-                return false;
-
-            expectedRegisterName = candidateRegisterName;
-        }
-
-        if (expectedRegisterName == null)
+        if (candidates.Count < 2
+            || candidates.Any(candidate =>
+                candidate.DeclaringType?.FullName != "System.Enum"
+                || candidate.Name != "TryParse"
+                || candidate.ReturnType.FullName != "System.Boolean"))
             return false;
 
-        returnRegister = new Register(null, expectedRegisterName);
+        returnRegister = new Register(null, IntegerRegisters[0]);
         return true;
     }
 
