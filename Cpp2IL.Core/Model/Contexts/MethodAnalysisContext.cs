@@ -638,6 +638,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Any/ToList/Select 的结果槽与委托签名，不重放字段解析或其它泛型推断。
         GenericCallRebinder.RunLateSharedEnumClosure(this);
 
+        // 中文注释：枚举泛型链闭合后，委托调用形参已获得最终 Func 类型；只在静态缓存
+        // 空值门、唯一构造与唯一写回形成完整菱形时，把退 SSA 丢失的调用载体接回缓存字段。
+        CachedDelegateCarrierRecovery.Run(this);
+
         // 中文注释：这是布局、集合、调用和末次死码之后的唯一归纳变量门；只消费保留一致 W32/X64
         // 自更新的闭合初始化/比较分量，避免把零初始化在 CIL 中投影成引用 null。
         LocalVariables.ResolveFinalIntegerInductionCarrierTypes(this);
