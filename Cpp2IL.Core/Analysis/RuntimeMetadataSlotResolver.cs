@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
@@ -26,6 +27,93 @@ public static class RuntimeMetadataSlotResolver
         var instructions = method.ControlFlowGraph!.Instructions;
         return CollectInitializedSlotAddresses(instructions, BuildDefinitions(instructions));
     }
+
+    /// <summary>
+    /// 使用本方法初始化过的 MethodRef 槽，把共享 object 泛型调用收紧到唯一具体实例。
+    /// 调用提升阶段可能已经丢弃隐藏 MethodInfo 操作数，因此这里只接受同一泛型基方法且
+    /// 全部初始化槽对具体实参达成唯一共识的证据。
+    /// </summary>
+    public static int RecoverInitializedGenericCallTargets(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong> capturedInitializedSlots)
+    {
+        var libContext = method.AppContext.LibCpp2IlContext;
+        var recovered = RecoverInitializedGenericCallTargets(
+            method.ControlFlowGraph!.Instructions,
+            capturedInitializedSlots,
+            address =>
+            {
+                var usage = MetadataResolver.ResolveAbsoluteSlotUsage(
+                    address,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt,
+                    candidate => candidate.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef);
+                return usage == null ? null : method.AppContext.ResolveContextForMethod(usage);
+            });
+
+        if (recovered > 0)
+        {
+            Logger.VerboseNewline(
+                $"初始化泛型方法槽重绑定：method={method.Name}，recovered={recovered}",
+                nameof(RuntimeMetadataSlotResolver));
+        }
+
+        return recovered;
+    }
+
+    internal static int RecoverInitializedGenericCallTargets(
+        IReadOnlyList<Instruction> instructions,
+        IReadOnlyCollection<ulong> capturedInitializedSlots,
+        Func<ulong, MethodAnalysisContext?> slotResolver)
+    {
+        if (capturedInitializedSlots.Count == 0)
+            return 0;
+
+        var exactTargets = capturedInitializedSlots
+            .Select(slotResolver)
+            .OfType<ConcreteGenericMethodAnalysisContext>()
+            .ToArray();
+        if (exactTargets.Length == 0)
+            return 0;
+
+        var recovered = 0;
+        foreach (var call in instructions)
+        {
+            if (!call.IsCall
+                || call.Operands.Count < 2
+                || call.Operands[0] is not ConcreteGenericMethodAnalysisContext current)
+                continue;
+
+            var compatible = exactTargets
+                .Where(exact => GenericCallRebinder.CanAdoptExactTarget(current, exact))
+                .ToArray();
+            if (compatible.Length == 0)
+                continue;
+
+            var exactTarget = compatible[0];
+            if (compatible.Skip(1).Any(candidate => !SameGenericInstantiation(exactTarget, candidate)))
+                continue;
+
+            if (GenericCallRebinder.TryAdoptExactTarget(call, exactTarget))
+                recovered++;
+        }
+
+        return recovered;
+    }
+
+    private static bool SameGenericInstantiation(
+        ConcreteGenericMethodAnalysisContext left,
+        ConcreteGenericMethodAnalysisContext right)
+        => ReferenceEquals(left.BaseMethodContext, right.BaseMethodContext)
+           && SameTypes(left.TypeGenericParameters, right.TypeGenericParameters)
+           && SameTypes(left.MethodGenericParameters, right.MethodGenericParameters);
+
+    private static bool SameTypes(
+        IReadOnlyList<TypeAnalysisContext> left,
+        IReadOnlyList<TypeAnalysisContext> right)
+        => left.Count == right.Count
+           && left.Select((type, index) => GenericCallRebinder.TypesEquivalent(type, right[index]))
+               .All(equal => equal);
 
     public static bool Run(MethodAnalysisContext method)
         => Run(method, CaptureInitializedSlotAddresses(method));

@@ -250,6 +250,83 @@ public static class GenericCallRebinder
             current.BaseMethodContext,
             typeArguments,
             methodArguments);
+        return ApplyExactTarget(call, current, rebound, concreteReceiver);
+    }
+
+    /// <summary>
+    /// 判断运行时 MethodRef 给出的具体泛型实例是否只把当前共享 object/Int32Enum 占位收紧，
+    /// 已经具体化且冲突的实参一律保持红门。
+    /// </summary>
+    internal static bool CanAdoptExactTarget(
+        ConcreteGenericMethodAnalysisContext current,
+        ConcreteGenericMethodAnalysisContext exact)
+    {
+        if (!ReferenceEquals(current.BaseMethodContext, exact.BaseMethodContext)
+            || current.TypeGenericParameters.Count != exact.TypeGenericParameters.Count
+            || current.MethodGenericParameters.Count != exact.MethodGenericParameters.Count)
+            return false;
+
+        var refined = false;
+        for (var index = 0; index < current.TypeGenericParameters.Count; index++)
+        {
+            if (!CanAdoptExactArgument(
+                    current.TypeGenericParameters[index],
+                    exact.TypeGenericParameters[index],
+                    ref refined))
+                return false;
+        }
+
+        for (var index = 0; index < current.MethodGenericParameters.Count; index++)
+        {
+            if (!CanAdoptExactArgument(
+                    current.MethodGenericParameters[index],
+                    exact.MethodGenericParameters[index],
+                    ref refined))
+                return false;
+        }
+
+        return refined;
+    }
+
+    /// <summary>
+    /// 应用已经由运行时元数据唯一证明的具体泛型目标，并同步结果、接收者和参数类型。
+    /// </summary>
+    internal static bool TryAdoptExactTarget(
+        Instruction call,
+        ConcreteGenericMethodAnalysisContext exact)
+    {
+        if (!call.IsCall
+            || call.Operands.Count < 2
+            || call.Operands[0] is not ConcreteGenericMethodAnalysisContext current
+            || !CanAdoptExactTarget(current, exact))
+            return false;
+
+        return ApplyExactTarget(call, current, exact, null);
+    }
+
+    private static bool CanAdoptExactArgument(
+        TypeAnalysisContext current,
+        TypeAnalysisContext exact,
+        ref bool refined)
+    {
+        if (TypesEquivalent(current, exact))
+            return true;
+        if (!IsSharedIl2CppGenericPlaceholder(current, exact)
+            || LocalVariables.ContainsUninstantiatedGenericParameter(exact)
+            || ContainsSharedEnumPlaceholder(exact))
+            return false;
+
+        refined = true;
+        return true;
+    }
+
+    private static bool ApplyExactTarget(
+        Instruction call,
+        ConcreteGenericMethodAnalysisContext current,
+        ConcreteGenericMethodAnalysisContext rebound,
+        GenericInstanceTypeAnalysisContext? concreteReceiver)
+    {
+        var firstArgument = call.OpCode == OpCode.CallVoid ? 1 : 2;
         call.SetOperand(0, rebound);
 
         // 接收者若只带着旧共享体的声明类型，则用定义链确认的具体类型覆盖；

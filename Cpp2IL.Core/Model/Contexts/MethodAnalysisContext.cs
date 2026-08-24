@@ -417,6 +417,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 初始化保护区删除后不再能从CFG枚举其 MethodInfo 槽；因此先冻结槽地址目录，
         // 后续只把该不可变证据用于清理同一方法内的隐藏元数据读取。
         var initializedRuntimeMetadataSlots = RuntimeMetadataSlotResolver.CaptureInitializedSlotAddresses(this);
+        // 中文注释：部分ARM64调用在提升时已丢弃隐藏MethodInfo实参，但初始化目录仍保存具体
+        // MethodRef；只在同一泛型基方法得到唯一具体实例时收紧共享object目标。
+        RuntimeMetadataSlotResolver.RecoverInitializedGenericCallTargets(
+            this,
+            initializedRuntimeMetadataSlots);
         InjectedCheckRemover.Run(this);
         // 中文注释：类初始化分支内部常带编译器注入的空引用检查；必须先删除注入异常边，
         // 再一次性裁除元数据与类初始化保护区，避免对同一 CFG 做重复保护区扫描。
