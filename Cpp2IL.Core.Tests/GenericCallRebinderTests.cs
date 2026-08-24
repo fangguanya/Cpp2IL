@@ -460,7 +460,126 @@ public class GenericCallRebinderTests
         Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
     }
 
-    private static MethodAnalysisContext CreateCaller(Instruction call)
+    [Test]
+    [Category("基本功能")]
+    public void Int32Enum共享链由Contains结果槽反向闭合ToList()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.GetAssemblyByName("mscorlib")!;
+        var enumerable = app.GetAssemblyByName("System.Core")!
+            .GetTypeByFullName("System.Linq.Enumerable")!;
+        var listDefinition = mscorlib.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var enumerableDefinition = mscorlib.GetTypeByFullName("System.Collections.Generic.IEnumerable`1")!;
+        var int32Enum = mscorlib.GetTypeByFullName("System.Int32Enum")!;
+        var concreteEnum = mscorlib.GetTypeByFullName("System.AttributeTargets")!;
+        var toList = enumerable.Methods.Single(method =>
+            method.Name == "ToList"
+            && method.Parameters.Count == 1
+            && method.GenericParameters.Count == 1);
+        var contains = listDefinition.Methods.Single(method =>
+            method.Name == "Contains" && method.Parameters.Count == 1);
+
+        var toListTarget = new ConcreteGenericMethodAnalysisContext(toList, [], [int32Enum]);
+        var containsTarget = new ConcreteGenericMethodAnalysisContext(contains, [int32Enum], []);
+        var selected = new LocalVariable(
+            "selected",
+            new Register(null, "X0"),
+            enumerableDefinition.MakeGenericInstanceType([int32Enum]));
+        var list = new LocalVariable(
+            "list",
+            new Register(null, "X0", 2),
+            listDefinition.MakeGenericInstanceType([int32Enum]));
+        var found = new LocalVariable(
+            "found",
+            new Register(null, "W0"),
+            app.SystemTypes.SystemBooleanType);
+        var enumValue = new LocalVariable("value", new Register(null, "W1"), concreteEnum);
+        var toListCall = new Instruction(0, OpCode.Call, toListTarget, list, selected);
+        var containsCall = new Instruction(1, OpCode.Call, containsTarget, found, list, enumValue);
+        var caller = CreateCaller(toListCall, containsCall);
+
+        var changedPasses = GenericCallRebinder.RunLateSharedEnumClosure(caller);
+
+        var reboundToList = (ConcreteGenericMethodAnalysisContext)toListCall.Operands[0];
+        var reboundContains = (ConcreteGenericMethodAnalysisContext)containsCall.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(changedPasses, Is.GreaterThanOrEqualTo(1));
+            Assert.That(reboundToList.MethodGenericParameters, Is.EqualTo(new[] { concreteEnum }));
+            Assert.That(reboundContains.TypeGenericParameters, Is.EqualTo(new[] { concreteEnum }));
+            Assert.That(selected.Type!.FullName, Does.Contain(concreteEnum.FullName));
+            Assert.That(list.Type!.FullName, Does.Contain(concreteEnum.FullName));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Int32Enum共享接收者不得被普通Int32实参具体化()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.GetAssemblyByName("mscorlib")!;
+        var listDefinition = mscorlib.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var int32Enum = mscorlib.GetTypeByFullName("System.Int32Enum")!;
+        var contains = listDefinition.Methods.Single(method =>
+            method.Name == "Contains" && method.Parameters.Count == 1);
+        var target = new ConcreteGenericMethodAnalysisContext(contains, [int32Enum], []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            listDefinition.MakeGenericInstanceType([int32Enum]));
+        var value = new LocalVariable(
+            "value",
+            new Register(null, "W1"),
+            app.SystemTypes.SystemInt32Type);
+        var result = new LocalVariable(
+            "result",
+            new Register(null, "W0"),
+            app.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, target, result, receiver, value);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
+            Assert.That(call.Operands[0], Is.SameAs(target));
+            Assert.That(receiver.Type!.FullName, Does.Contain("System.Int32Enum"));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Int32Enum共享目标遇到两个不同具体枚举时保持冲突红门()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.GetAssemblyByName("mscorlib")!;
+        var listDefinition = mscorlib.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var int32Enum = mscorlib.GetTypeByFullName("System.Int32Enum")!;
+        var firstEnum = mscorlib.GetTypeByFullName("System.AttributeTargets")!;
+        var secondEnum = mscorlib.GetTypeByFullName("System.DayOfWeek")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var pair = new InjectedMethodAnalysisContext(
+            listDefinition,
+            "Pair",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private,
+            [genericElement, genericElement]);
+        var target = new ConcreteGenericMethodAnalysisContext(pair, [int32Enum], []);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            listDefinition.MakeGenericInstanceType([int32Enum]));
+        var first = new LocalVariable("first", new Register(null, "W1"), firstEnum);
+        var second = new LocalVariable("second", new Register(null, "W2"), secondEnum);
+        var call = new Instruction(0, OpCode.CallVoid, target, receiver, first, second);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
+            Assert.That(call.Operands[0], Is.SameAs(target));
+            Assert.That(receiver.Type!.FullName, Does.Contain("System.Int32Enum"));
+        });
+    }
+
+    private static MethodAnalysisContext CreateCaller(params Instruction[] calls)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var assembly = app.GetAssemblyByName("mscorlib")!;
@@ -475,8 +594,8 @@ public class GenericCallRebinderTests
             app.SystemTypes.SystemVoidType,
             MethodAttributes.Public | MethodAttributes.Static);
         caller.ControlFlowGraph = new ISILControlFlowGraph([
-            call,
-            new Instruction(1, OpCode.Return),
+            .. calls,
+            new Instruction(calls.Length, OpCode.Return),
         ]);
         return caller;
     }

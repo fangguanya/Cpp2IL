@@ -633,6 +633,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 目标、但接收者已具体化的调用，修正晚期 Enumerator<T>.MoveNext/Dispose，不重放泛型推断。
         GenericCallRebinder.RunLateSharedReceiverTargets(this);
 
+        // 中文注释：业务枚举实参在退 SSA、集合和直接辅助调用恢复后才成为最终证据；
+        // 仅对仍含 Int32Enum 的调用链执行单调闭包，使 Contains 的具体枚举向前推进到
+        // Any/ToList/Select 的结果槽与委托签名，不重放字段解析或其它泛型推断。
+        GenericCallRebinder.RunLateSharedEnumClosure(this);
+
         // 中文注释：这是布局、集合、调用和末次死码之后的唯一归纳变量门；只消费保留一致 W32/X64
         // 自更新的闭合初始化/比较分量，避免把零初始化在 CIL 中投影成引用 null。
         LocalVariables.ResolveFinalIntegerInductionCarrierTypes(this);

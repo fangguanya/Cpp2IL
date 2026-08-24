@@ -51,6 +51,108 @@ public static class GenericCallRebinder
     }
 
     /// <summary>
+    /// 在退 SSA 与业务枚举实参全部稳定后，闭合仍含 Int32Enum 的共享泛型调用链。
+    /// 这里只消费调用签名、调用结果槽和当前实参三类最终证据，不再读取已经失去 SSA 唯一性的
+    /// 字段定义链；每次晋级都会永久移除至少一个 Int32Enum 占位，因此循环严格单调收敛。
+    /// </summary>
+    internal static int RunLateSharedEnumClosure(MethodAnalysisContext method)
+    {
+        var calls = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.IsCall)
+            .ToArray();
+        if (calls.Length == 0)
+            return 0;
+
+        var mutationCount = 0;
+        for (var pass = 0; pass <= calls.Length; pass++)
+        {
+            var changed = false;
+            foreach (var call in calls)
+            {
+                if (!CallContainsSharedEnumPlaceholder(call))
+                    continue;
+
+                changed |= SynchronizeSharedOperandsFromConcreteTarget(call);
+                changed |= TryRebind(call);
+            }
+
+            if (!changed)
+                return mutationCount;
+
+            mutationCount++;
+        }
+
+        throw new DecompilerException(
+            $"Late shared enum generic closure not settling after {calls.Length + 1} passes");
+    }
+
+    private static bool CallContainsSharedEnumPlaceholder(Instruction call)
+    {
+        if (call.Operands.Count == 0
+            || call.Operands[0] is not MethodAnalysisContext calledMethod)
+            return false;
+
+        if (calledMethod is ConcreteGenericMethodAnalysisContext concrete
+            && (concrete.TypeGenericParameters.Any(ContainsSharedEnumPlaceholder)
+                || concrete.MethodGenericParameters.Any(ContainsSharedEnumPlaceholder)))
+            return true;
+
+        if (call.Destination is LocalVariable { Type: { } destinationType }
+            && ContainsSharedEnumPlaceholder(destinationType))
+            return true;
+
+        return call.Operands.OfType<LocalVariable>()
+            .Any(local => local.Type != null && ContainsSharedEnumPlaceholder(local.Type));
+    }
+
+    /// <summary>
+    /// 调用目标可能已在较早阶段具体化，而退 SSA 复制又把操作数局部保留成共享占位。
+    /// 此处只允许同形泛型中的 object/Int32Enum 向目标签名的具体类型晋级；具体类型冲突保持红门。
+    /// </summary>
+    private static bool SynchronizeSharedOperandsFromConcreteTarget(Instruction call)
+    {
+        if (call.Operands.Count < 2
+            || call.Operands[0] is not MethodAnalysisContext calledMethod)
+            return false;
+
+        var changed = false;
+        var firstArgument = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (!calledMethod.IsStatic
+            && firstArgument < call.Operands.Count
+            && call.Operands[firstArgument] is LocalVariable receiver
+            && calledMethod.DeclaringType is { } declaringType
+            && IsSharedIl2CppGenericPlaceholder(receiver.Type, declaringType))
+        {
+            receiver.Type = declaringType;
+            changed = true;
+        }
+
+        if (call.Destination is LocalVariable destination
+            && IsSharedIl2CppGenericPlaceholder(destination.Type, calledMethod.ReturnType))
+        {
+            destination.Type = calledMethod.ReturnType;
+            changed = true;
+        }
+
+        var parameterStart = firstArgument + (calledMethod.IsStatic ? 0 : 1);
+        for (var parameterIndex = 0; parameterIndex < calledMethod.Parameters.Count; parameterIndex++)
+        {
+            var operandIndex = parameterStart + parameterIndex;
+            if (operandIndex >= call.Operands.Count
+                || call.Operands[operandIndex] is not LocalVariable parameter
+                || !IsSharedIl2CppGenericPlaceholder(
+                    parameter.Type,
+                    calledMethod.Parameters[parameterIndex].ParameterType))
+                continue;
+
+            parameter.Type = calledMethod.Parameters[parameterIndex].ParameterType;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
     /// 仅当调用目标是共享 object 泛型实例、接收者是同一泛型定义的具体实例时执行末次重绑定。
     /// 已经具体化但互相冲突的目标与接收者保持原样，避免末次扫描覆盖业务侧具体类型。
     /// </summary>
@@ -96,7 +198,8 @@ public static class GenericCallRebinder
             && OperandType(call.Operands[firstArgument], definitions) is GenericInstanceTypeAnalysisContext receiver
             && SameTypeDefinition(receiver.GenericType, current.BaseMethodContext.DeclaringType)
             && receiver.GenericArguments.Count == current.BaseMethodContext.DeclaringType!.GenericParameters.Count
-            && !receiver.GenericArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter))
+            && !receiver.GenericArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter)
+            && !receiver.GenericArguments.Any(ContainsSharedEnumPlaceholder))
         {
             // 封闭接收者是声明类型实参的最高优先级证据。即便它与当前目标一致，也要阻止
             // List<object>.Add(string) 被普通实参错误收窄成 List<string>。
@@ -111,7 +214,9 @@ public static class GenericCallRebinder
 
         if (!receiverDefinesTypeArguments
             && current.BaseMethodContext.DeclaringType is { GenericParameters.Count: > 0 } declaringType
-            && typeArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter)
+            && typeArguments.Any(argument =>
+                LocalVariables.ContainsUninstantiatedGenericParameter(argument)
+                || ContainsSharedEnumPlaceholder(argument))
             && TryInferTypeArguments(
                 call,
                 current.BaseMethodContext,
@@ -119,6 +224,7 @@ public static class GenericCallRebinder
                 firstArgument,
                 definitions,
                 out var inferredTypeArguments)
+            && CanAdoptInferredArguments(typeArguments, inferredTypeArguments)
             && !TypeListsEquivalent(inferredTypeArguments, typeArguments))
         {
             // 共享泛型实例的接收者可能已经被寄存器复用污染；此时由成员参数中的 VAR
@@ -129,6 +235,7 @@ public static class GenericCallRebinder
 
         if (current.BaseMethodContext.GenericParameters.Count > 0
             && TryInferMethodArguments(call, current.BaseMethodContext, firstArgument, definitions, out var inferred)
+            && CanAdoptInferredArguments(methodArguments, inferred)
             && !TypeListsEquivalent(inferred, methodArguments))
         {
             methodArguments = inferred;
@@ -146,14 +253,19 @@ public static class GenericCallRebinder
 
         // 接收者若只带着旧共享体的声明类型，则用定义链确认的具体类型覆盖；
         // 字段加载等更具体的既有类型保持不动。
-        if (concreteReceiver != null
+        if (!current.IsStatic
             && call.Operands[firstArgument] is LocalVariable receiverLocal
-            && (receiverLocal.Type == null || TypesEquivalent(receiverLocal.Type, current.DeclaringType)))
-            receiverLocal.Type = concreteReceiver;
+            && rebound.DeclaringType is { } reboundDeclaringType
+            && (receiverLocal.Type == null
+                || TypesEquivalent(receiverLocal.Type, current.DeclaringType)
+                || IsSharedIl2CppGenericPlaceholder(receiverLocal.Type, reboundDeclaringType)))
+            receiverLocal.Type = concreteReceiver ?? reboundDeclaringType;
 
         // 旧共享体传播出的object/Enumerator<object>不是独立证据；目标重绑定后以新签名覆盖该返回槽。
         if (call.Destination is LocalVariable destination
-            && (destination.Type == null || TypesEquivalent(destination.Type, current.ReturnType)))
+            && (destination.Type == null
+                || TypesEquivalent(destination.Type, current.ReturnType)
+                || IsSharedIl2CppGenericPlaceholder(destination.Type, rebound.ReturnType)))
             destination.Type = rebound.ReturnType;
 
         // 中文注释：共享泛型目标曾传播到实参局部的旧 object 签名属于弱证据；目标重绑定后，
@@ -164,7 +276,10 @@ public static class GenericCallRebinder
             var operandIndex = parameterStart + parameterIndex;
             if (operandIndex < call.Operands.Count
                 && call.Operands[operandIndex] is LocalVariable parameterLocal
-                && TypesEquivalent(parameterLocal.Type, current.Parameters[parameterIndex].ParameterType))
+                && (TypesEquivalent(parameterLocal.Type, current.Parameters[parameterIndex].ParameterType)
+                    || IsSharedIl2CppGenericPlaceholder(
+                        parameterLocal.Type,
+                        rebound.Parameters[parameterIndex].ParameterType)))
                 parameterLocal.Type = rebound.Parameters[parameterIndex].ParameterType;
         }
 
@@ -235,6 +350,19 @@ public static class GenericCallRebinder
                 return false;
         }
 
+        // 中文注释：调用结果槽也是泛型方法返回类型的权威使用点。IL2CPP 共享体常把
+        // Select/ToList 的前向结果登记成 Int32Enum；后续 Contains(具体枚举) 先恢复集合，
+        // 下一轮再由该集合结果反向闭合 ToList 和 Select，形成无猜测的调用链不动点。
+        if (call.Destination is LocalVariable { Type: { } destinationType }
+            && !TryUnifyGenericParameters(
+                baseMethod.ReturnType,
+                destinationType,
+                genericParameterKind,
+                inferred,
+                ref matchedAny,
+                allowObjectFallback))
+            return false;
+
         return matchedAny && inferred.All(argument => argument != null);
     }
 
@@ -257,9 +385,24 @@ public static class GenericCallRebinder
                 return false;
 
             if (inferred[index] != null && !TypesEquivalent(inferred[index], actual))
-                return allowObjectFallback
-                       && actual.FullName == "System.Object"
-                       && inferred[index].FullName != "System.Object";
+            {
+                if (!allowObjectFallback)
+                    return false;
+
+                // 中文注释：Enumerable 共享签名中的 object 与 Int32Enum 都是弱 ABI 证据。
+                // 具体类型可以覆盖弱占位，弱占位也不能推翻已经形成的具体共识；
+                // Int32Enum 仅能被真实枚举覆盖，普通 Int32 不具备该语义资格。
+                if (IsWeakSharedArgument(actual, inferred[index]))
+                    return true;
+                if (IsWeakSharedArgument(inferred[index], actual))
+                {
+                    inferred[index] = actual;
+                    matchedAny = true;
+                    return true;
+                }
+
+                return false;
+            }
 
             inferred[index] = actual;
             matchedAny = true;
@@ -457,6 +600,118 @@ public static class GenericCallRebinder
         }
 
         return replacedObject;
+    }
+
+    /// <summary>
+    /// 判断类型树中是否仍含 IL2CPP 为值类型共享泛型生成的 Int32Enum 占位。
+    /// 该内部运行时类型不是业务枚举，只有来自调用实参或结果槽的真实枚举证据才能替换它。
+    /// </summary>
+    internal static bool ContainsSharedEnumPlaceholder(TypeAnalysisContext type)
+        => type.FullName == "System.Int32Enum"
+           || type is GenericInstanceTypeAnalysisContext generic
+           && generic.GenericArguments.Any(ContainsSharedEnumPlaceholder)
+           || type is SzArrayTypeAnalysisContext array
+           && ContainsSharedEnumPlaceholder(array.ElementType)
+           || type is ByRefTypeAnalysisContext byRef
+           && ContainsSharedEnumPlaceholder(byRef.ElementType);
+
+    /// <summary>
+    /// 判断现有类型是否仅因 object 或 Int32Enum 共享实参而比候选类型更宽。
+    /// 泛型定义和类型树形状必须完全一致；任一具体实参冲突都会关闭晋级通道。
+    /// </summary>
+    internal static bool IsSharedIl2CppGenericPlaceholder(
+        TypeAnalysisContext? existing,
+        TypeAnalysisContext? concrete)
+    {
+        if (existing == null || concrete == null || TypesEquivalent(existing, concrete))
+            return false;
+
+        if (IsWeakSharedArgument(existing, concrete))
+            return true;
+
+        if (existing is GenericInstanceTypeAnalysisContext existingGeneric
+            && concrete is GenericInstanceTypeAnalysisContext concreteGeneric
+            && TypesEquivalent(existingGeneric.GenericType, concreteGeneric.GenericType)
+            && existingGeneric.GenericArguments.Count == concreteGeneric.GenericArguments.Count)
+        {
+            var replacedAny = false;
+            for (var index = 0; index < existingGeneric.GenericArguments.Count; index++)
+            {
+                var existingArgument = existingGeneric.GenericArguments[index];
+                var concreteArgument = concreteGeneric.GenericArguments[index];
+                if (TypesEquivalent(existingArgument, concreteArgument))
+                    continue;
+                if (!IsSharedIl2CppGenericPlaceholder(existingArgument, concreteArgument))
+                    return false;
+                replacedAny = true;
+            }
+
+            return replacedAny;
+        }
+
+        if (existing is SzArrayTypeAnalysisContext existingArray
+            && concrete is SzArrayTypeAnalysisContext concreteArray)
+            return IsSharedIl2CppGenericPlaceholder(existingArray.ElementType, concreteArray.ElementType);
+
+        if (existing is ByRefTypeAnalysisContext existingByRef
+            && concrete is ByRefTypeAnalysisContext concreteByRef)
+            return IsSharedIl2CppGenericPlaceholder(existingByRef.ElementType, concreteByRef.ElementType);
+
+        return false;
+    }
+
+    private static bool IsWeakSharedArgument(
+        TypeAnalysisContext weak,
+        TypeAnalysisContext concrete)
+        => weak.FullName == "System.Object"
+           && concrete.FullName != "System.Object"
+           || weak.FullName == "System.Int32Enum"
+           && concrete.FullName != "System.Int32Enum"
+           && concrete.IsEnumType;
+
+    private static bool CanAdoptInferredArguments(
+        IReadOnlyList<TypeAnalysisContext> current,
+        IReadOnlyList<TypeAnalysisContext> inferred)
+    {
+        if (current.Count != inferred.Count)
+            return false;
+
+        for (var index = 0; index < current.Count; index++)
+        {
+            if (!ContainsSharedEnumPlaceholder(current[index]))
+                continue;
+            if (!CanRefineSharedEnumPlaceholder(current[index], inferred[index]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool CanRefineSharedEnumPlaceholder(
+        TypeAnalysisContext existing,
+        TypeAnalysisContext inferred)
+    {
+        if (existing.FullName == "System.Int32Enum")
+            return inferred.FullName == "System.Int32Enum" || inferred.IsEnumType;
+
+        if (existing is GenericInstanceTypeAnalysisContext existingGeneric
+            && inferred is GenericInstanceTypeAnalysisContext inferredGeneric
+            && TypesEquivalent(existingGeneric.GenericType, inferredGeneric.GenericType)
+            && existingGeneric.GenericArguments.Count == inferredGeneric.GenericArguments.Count)
+            return existingGeneric.GenericArguments.Select((argument, index) =>
+                    !ContainsSharedEnumPlaceholder(argument)
+                    || CanRefineSharedEnumPlaceholder(argument, inferredGeneric.GenericArguments[index]))
+                .All(valid => valid);
+
+        if (existing is SzArrayTypeAnalysisContext existingArray
+            && inferred is SzArrayTypeAnalysisContext inferredArray)
+            return CanRefineSharedEnumPlaceholder(existingArray.ElementType, inferredArray.ElementType);
+
+        if (existing is ByRefTypeAnalysisContext existingByRef
+            && inferred is ByRefTypeAnalysisContext inferredByRef)
+            return CanRefineSharedEnumPlaceholder(existingByRef.ElementType, inferredByRef.ElementType);
+
+        return false;
     }
 
     private static bool TypeListsEquivalent(
