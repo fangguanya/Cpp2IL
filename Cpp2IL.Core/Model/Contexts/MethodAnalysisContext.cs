@@ -441,6 +441,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // post-27类型槽复用本阶段已经建立的SSA唯一定义索引，禁止重复计算整张方法图。
         InlineTypeCheckRecovery.Run(this, initializedRuntimeMetadataSlots);
         AggregateStackCopyRecovery.RewriteResolvedCopies(this);
+        // 中文注释：聚合返回槽已经绑定到最终 Enumerator 栈槽；在 SSA 常量传播把重叠的
+        // current 子槽折成序言零值前，以循环和字段布局证据恢复该子槽的真实字段身份。
+        ListEnumeratorCurrentRecovery.Run(this);
 
         // 接口与委托分派均依赖统一类型不动点；两者直接给重写后的返回局部变量写入精确类型。
         MetadataResolver.ResolveMethodRgctxCalls(this);
