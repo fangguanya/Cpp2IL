@@ -248,6 +248,106 @@ public class ArrayRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 折叠进基址并带固定列偏移的引用数组恢复为索引加五()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0"),
+            app.SystemTypes.SystemStringType.MakeSzArrayType());
+        var index = new LocalVariable("index", new Register(null, "X1"), app.SystemTypes.SystemInt32Type);
+        var scaledIndex = new LocalVariable("scaledIndex", new Register(null, "X2"));
+        var address = new LocalVariable("address", new Register(null, "X3"), app.SystemTypes.SystemIntPtrType);
+        var value = new LocalVariable("value", new Register(null, "X4"), app.SystemTypes.SystemStringType);
+        var read = new Instruction(2, OpCode.Move, value, new MemoryOperand(address, addend: 72));
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.ShiftLeft, scaledIndex, index, new Immediate(3)),
+            new Instruction(1, OpCode.Add, address, array, scaledIndex),
+            read,
+            new Instruction(3, OpCode.Return, value),
+        ]);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(graph, 8, app.SystemTypes);
+
+        Assert.That(read.Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)read.Operands[1];
+        Assert.That(access.Index, Is.InstanceOf<LocalVariable>());
+        var computedIndex = (LocalVariable)access.Index;
+        var definition = graph.Instructions.Single(instruction =>
+            ReferenceEquals(instruction.Destination, computedIndex));
+        Assert.Multiple(() =>
+        {
+            Assert.That(access.Array, Is.SameAs(array));
+            Assert.That(computedIndex.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(definition.OpCode, Is.EqualTo(OpCode.Add));
+            Assert.That(definition.Operands[1], Is.SameAs(index));
+            Assert.That(definition.Operands[2],
+                Is.InstanceOf<Immediate>().And.Property("Value").EqualTo(5));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 折叠进基址且恰为数组头偏移时不生成索引加法()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0"),
+            app.SystemTypes.SystemStringType.MakeSzArrayType());
+        var index = new LocalVariable("index", new Register(null, "X1"), app.SystemTypes.SystemInt32Type);
+        var scaledIndex = new LocalVariable("scaledIndex", new Register(null, "X2"));
+        var address = new LocalVariable("address", new Register(null, "X3"), app.SystemTypes.SystemIntPtrType);
+        var value = new LocalVariable("value", new Register(null, "X4"), app.SystemTypes.SystemStringType);
+        var read = new Instruction(2, OpCode.Move, value, new MemoryOperand(address, addend: 32));
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.ShiftLeft, scaledIndex, index, new Immediate(3)),
+            new Instruction(1, OpCode.Add, address, array, scaledIndex),
+            read,
+            new Instruction(3, OpCode.Return, value),
+        ]);
+        var instructionCount = graph.Instructions.Count();
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(graph, 8, app.SystemTypes);
+
+        Assert.That(read.Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)read.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(access.Array, Is.SameAs(array));
+            Assert.That(access.Index, Is.SameAs(index));
+            Assert.That(graph.Instructions.Count(), Is.EqualTo(instructionCount));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 折叠进基址的固定列偏移未按元素对齐时保留内存访问()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var array = new LocalVariable(
+            "array",
+            new Register(null, "X0"),
+            app.SystemTypes.SystemStringType.MakeSzArrayType());
+        var index = new LocalVariable("index", new Register(null, "X1"), app.SystemTypes.SystemInt32Type);
+        var scaledIndex = new LocalVariable("scaledIndex", new Register(null, "X2"));
+        var address = new LocalVariable("address", new Register(null, "X3"), app.SystemTypes.SystemIntPtrType);
+        var value = new LocalVariable("value", new Register(null, "X4"), app.SystemTypes.SystemStringType);
+        var read = new Instruction(2, OpCode.Move, value, new MemoryOperand(address, addend: 34));
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.ShiftLeft, scaledIndex, index, new Immediate(3)),
+            new Instruction(1, OpCode.Add, address, array, scaledIndex),
+            read,
+            new Instruction(3, OpCode.Return, value),
+        ]);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(graph, 8, app.SystemTypes);
+
+        Assert.That(read.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 循环数组指针游标按配对列索引恢复七个元素读取()
     {
         var fixture = CreateLoopCursorFixture(
@@ -284,6 +384,81 @@ public class ArrayRecoveryTests
                 Assert.That(computedIndex.Type, Is.SameAs(fixture.Index.Type));
             });
         }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 循环数组游标的负列偏移恢复为索引减二与减一()
+    {
+        var fixture = CreateLoopCursorFixture(
+            cursorInitialOffset: 144,
+            cursorStep: 64,
+            indexInitialValue: 9,
+            indexStep: 8,
+            firstMemoryAddend: -56,
+            readCount: 2);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        var expectedDeltas = new[] { -2L, -1L };
+        for (var slot = 0; slot < fixture.Reads.Count; slot++)
+        {
+            Assert.That(fixture.Reads[slot].Operands[1], Is.InstanceOf<ArrayAccess>());
+            var access = (ArrayAccess)fixture.Reads[slot].Operands[1];
+            Assert.That(access.Index, Is.InstanceOf<LocalVariable>());
+            var computedIndex = (LocalVariable)access.Index;
+            var definition = fixture.Graph.Instructions.Single(instruction =>
+                ReferenceEquals(instruction.Destination, computedIndex));
+            Assert.Multiple(() =>
+            {
+                Assert.That(access.Array, Is.SameAs(fixture.Array));
+                Assert.That(definition.OpCode, Is.EqualTo(OpCode.Add));
+                Assert.That(definition.Operands[1], Is.SameAs(fixture.Index));
+                Assert.That(definition.Operands[2],
+                    Is.InstanceOf<Immediate>().And.Property("Value").EqualTo(expectedDeltas[slot]));
+            });
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 循环数组游标的负列偏移首轮恰为零时允许恢复()
+    {
+        var fixture = CreateLoopCursorFixture(
+            cursorInitialOffset: 64,
+            cursorStep: 8,
+            indexInitialValue: 3,
+            indexStep: 1,
+            firstMemoryAddend: -32,
+            readCount: 1);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        Assert.That(fixture.Reads[0].Operands[1], Is.InstanceOf<ArrayAccess>());
+        var access = (ArrayAccess)fixture.Reads[0].Operands[1];
+        Assert.That(access.Index, Is.InstanceOf<LocalVariable>());
+        var computedIndex = (LocalVariable)access.Index;
+        var definition = fixture.Graph.Instructions.Single(instruction =>
+            ReferenceEquals(instruction.Destination, computedIndex));
+        Assert.That(definition.Operands[2],
+            Is.InstanceOf<Immediate>().And.Property("Value").EqualTo(-3));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 循环数组游标的负列偏移使首轮索引下溢时保留内存读取()
+    {
+        var fixture = CreateLoopCursorFixture(
+            cursorInitialOffset: 64,
+            cursorStep: 8,
+            indexInitialValue: 3,
+            indexStep: 1,
+            firstMemoryAddend: -40,
+            readCount: 1);
+
+        ArrayRecovery.RecoverPointerDerivedAccesses(fixture.Graph, 8);
+
+        Assert.That(fixture.Reads[0].Operands[1], Is.InstanceOf<MemoryOperand>());
     }
 
     [Test]

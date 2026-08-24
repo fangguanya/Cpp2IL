@@ -204,9 +204,12 @@ public static class ArrayRecovery
             return null;
 
         var indexDelta = recovered.Bias + memory.Addend / elementSize;
-        if (indexDelta < 0
-            || indexDelta > int.MaxValue
-            || recovered.InitialIndex > int.MaxValue - indexDelta)
+        // 中文注释：游标可位于一组列的末端，而读取使用负 addend 回看同组前置列。
+        // 只要首轮实际索引仍在非负 Int32 范围内，负增量就是精确的托管列偏移。
+        if (indexDelta is < int.MinValue or > int.MaxValue
+            || recovered.InitialIndex > int.MaxValue
+            || indexDelta < -recovered.InitialIndex
+            || indexDelta > int.MaxValue - recovered.InitialIndex)
             return null;
 
         return new LoopArrayAccess(recovered.Array, recovered.Index, indexDelta);
@@ -457,7 +460,7 @@ public static class ArrayRecovery
             return null;
 
         if (FoldedReferenceArrayIndex(memory, baseLocal, pointerSize, definitions) is { } foldedAccess)
-            return new ReferenceArrayAccess(foldedAccess.Array, foldedAccess.Index, 0);
+            return foldedAccess;
 
         var evaluated = Evaluate(baseLocal, definitions, 0);
         if (evaluated is not
@@ -500,10 +503,11 @@ public static class ArrayRecovery
 
     /// <summary>
     /// ARM64 也会先把 <c>array + index * stride</c> 折进同一个地址局部，最后以内存
-    /// addend 携带数组头大小。该形态包含数组根与索引两个独立变量，普通单根仿射式无法表达；
-    /// 这里只接受精确的 Add、元素头偏移以及与元素大小一致的 ShiftLeft/Multiply。
+    /// addend 携带数组头与固定列偏移。该形态包含数组根与索引两个独立变量，普通单根仿射式
+    /// 无法表达；这里只接受精确的 Add、按元素对齐的非负偏移以及与元素大小一致的
+    /// ShiftLeft/Multiply，并把固定列偏移统一交给索引物化路径。
     /// </summary>
-    private static ArrayAccess? FoldedReferenceArrayIndex(
+    private static ReferenceArrayAccess? FoldedReferenceArrayIndex(
         MemoryOperand memory,
         LocalVariable baseLocal,
         int pointerSize,
@@ -511,18 +515,19 @@ public static class ArrayRecovery
     {
         if (memory.Index != null
             || memory.Scale != 0
-            || memory.Addend != ElementsOffset(pointerSize)
+            || memory.Addend < ElementsOffset(pointerSize)
             || !definitions.TryGetValue(baseLocal, out var addressDefinition)
             || addressDefinition is not { OpCode: OpCode.Add, Operands: [_, var left, var right] })
             return null;
 
-        return TryFoldedOperands(left, right, pointerSize, definitions)
-               ?? TryFoldedOperands(right, left, pointerSize, definitions);
+        return TryFoldedOperands(left, right, memory.Addend, pointerSize, definitions)
+               ?? TryFoldedOperands(right, left, memory.Addend, pointerSize, definitions);
     }
 
-    private static ArrayAccess? TryFoldedOperands(
+    private static ReferenceArrayAccess? TryFoldedOperands(
         IOperand arrayOperand,
         IOperand scaledIndexOperand,
+        long memoryAddend,
         int pointerSize,
         Dictionary<LocalVariable, Instruction?> definitions)
     {
@@ -535,14 +540,17 @@ public static class ArrayRecovery
             return null;
 
         var elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        var fixedElementOffset = memoryAddend - ElementsOffset(pointerSize);
         if (elementSize == 0
+            || fixedElementOffset < 0
+            || fixedElementOffset % elementSize != 0
             || scaledIndexOperand is not LocalVariable scaledIndex
             || !definitions.TryGetValue(scaledIndex, out var scaleDefinition)
             || scaleDefinition == null
             || TryScaledIndex(scaleDefinition, elementSize) is not { } index)
             return null;
 
-        return new ArrayAccess(array, index);
+        return new ReferenceArrayAccess(array, index, fixedElementOffset / elementSize);
     }
 
     private static IOperand? TryScaledIndex(Instruction definition, long elementSize)
