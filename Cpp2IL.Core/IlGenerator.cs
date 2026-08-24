@@ -390,6 +390,16 @@ public static class IlGenerator
                 // If we can't, just fall back to an Ldnull.
                 if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
                 {
+                    // 中文注释：IL2CPP 把分配和构造器拆开后，两者之间可能还有为构造实参
+                    // 计算属性值的托管调用。若仍在分配点提前融合，CIL 会先读取尚未赋值的
+                    // 局部量，再把 getter 错排到构造器之后。中间指令不读取新对象时，把
+                    // 真正的 newobj 留在原构造调用位置，严格保留 ISIL 的求值顺序。
+                    if (ShouldDeferConstructorFusion(context, instruction, constructorCall))
+                    {
+                        instructions.Add(CilOpCodes.Nop);
+                        break;
+                    }
+
                     // 构造器融合和普通构造调用必须共用同一套实参装载规则；分别切片会在最后一个
                     // 可选形参落到栈上时少压一个值，最终把生产者错误延迟成 newobj 栈不平衡。
                     LoadCallParameters(
@@ -1012,6 +1022,64 @@ public static class IlGenerator
 
         return null;
     }
+
+    /// <summary>
+    /// 当分配与构造调用之间存在独立求值且新对象尚未被读取时，把 CIL 的原子
+    /// <c>newobj</c> 延后到构造调用位置；没有中间求值时仍沿用紧邻融合。
+    /// </summary>
+    internal static bool ShouldDeferConstructorFusion(
+        MethodAnalysisContext context,
+        Instruction newobj,
+        Instruction constructorCall)
+    {
+        if (newobj.Operands.Count == 0 || newobj.Operands[0] is not LocalVariable newObject)
+            return false;
+
+        foreach (var block in context.ControlFlowGraph!.Blocks)
+        {
+            var allocationIndex = block.Instructions.IndexOf(newobj);
+            var constructorIndex = block.Instructions.IndexOf(constructorCall);
+            if (allocationIndex < 0 || constructorIndex <= allocationIndex)
+                continue;
+
+            var hasMeaningfulIntermediate = false;
+            for (var index = allocationIndex + 1; index < constructorIndex; index++)
+            {
+                var intermediate = block.Instructions[index];
+                if (intermediate.OpCode == OpCode.Nop)
+                    continue;
+
+                hasMeaningfulIntermediate = true;
+                if (intermediate.Operands.Any(operand => OperandReferencesLocal(operand, newObject)))
+                    return false;
+            }
+
+            return hasMeaningfulIntermediate;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 递归检查复合 ISIL 操作数是否读取指定局部，避免把对象首次使用推到构造之前。
+    /// </summary>
+    private static bool OperandReferencesLocal(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable candidate => ReferenceEquals(candidate, local),
+        AddressOf address => OperandReferencesLocal(address.Target, local),
+        FieldReference field => ReferenceEquals(field.Local, local),
+        ArrayAccess access => ReferenceEquals(access.Array, local)
+                              || OperandReferencesLocal(access.Index, local),
+        ArrayLength length => ReferenceEquals(length.Array, local),
+        MemoryOperand memory => memory.Base is not null && OperandReferencesLocal(memory.Base, local)
+                                || memory.Index is not null && OperandReferencesLocal(memory.Index, local),
+        HomogeneousFloatingAggregateArgument aggregate => aggregate.Components.Any(
+            component => OperandReferencesLocal(component, local)),
+        ListCount count => ReferenceEquals(count.Value, local),
+        StringLength length => ReferenceEquals(length.Value, local),
+        MetadataStringTableLookup lookup => OperandReferencesLocal(lookup.Index, local),
+        _ => false,
+    };
 
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, MemberReference writeLine, MemberReference stringCtor,

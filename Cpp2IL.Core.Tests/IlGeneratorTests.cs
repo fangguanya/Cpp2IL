@@ -734,6 +734,140 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
+    public void 紧邻分配与构造调用保持单一Newobj融合()
+    {
+        var result = 生成构造器融合顺序Cil(插入独立实参计算: false, 插入对象读取: false);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Count(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+            Assert.That(result.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 构造实参在分配后计算时Newobj延后到实参定义之后()
+    {
+        var result = 生成构造器融合顺序Cil(插入独立实参计算: true, 插入对象读取: false);
+        var 常量索引 = result.FindIndex(instruction => instruction.OpCode.Code is CilCode.Ldc_I4 or CilCode.Ldc_I4_7);
+        var 首次存储索引 = result.FindIndex(instruction => instruction.OpCode == CilOpCodes.Stloc);
+        var 构造索引 = result.FindIndex(instruction => instruction.OpCode == CilOpCodes.Newobj);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(常量索引, Is.GreaterThanOrEqualTo(0));
+            Assert.That(首次存储索引, Is.GreaterThan(常量索引));
+            Assert.That(构造索引, Is.GreaterThan(首次存储索引));
+            Assert.That(result.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 构造前读取新对象时禁止延后融合()
+    {
+        var result = 生成构造器融合顺序Cil(插入独立实参计算: false, 插入对象读取: true);
+        var 构造索引 = result.FindIndex(instruction => instruction.OpCode == CilOpCodes.Newobj);
+        var 读取索引 = result.FindIndex(instruction => instruction.OpCode == CilOpCodes.Ldloc);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(构造索引, Is.GreaterThanOrEqualTo(0));
+            Assert.That(读取索引, Is.GreaterThan(构造索引));
+            Assert.That(result.Count(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+        });
+    }
+
+    /// <summary>
+    /// 构造一个最小分配/构造序列，分别覆盖紧邻融合、独立实参计算和对象提前读取。
+    /// </summary>
+    private static List<CilInstruction> 生成构造器融合顺序Cil(bool 插入独立实参计算, bool 插入对象读取)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var systemObject = app.SystemTypes.SystemObjectType;
+        var systemInt32 = app.SystemTypes.SystemInt32Type;
+        var systemVoid = app.SystemTypes.SystemVoidType;
+        var constructor = new InjectedMethodAnalysisContext(
+            systemObject,
+            ".ctor",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.SpecialName
+                                              | ReflectionMethodAttributes.RTSpecialName,
+            [systemInt32]);
+        var caller = new InjectedMethodAnalysisContext(
+            systemObject,
+            "Construct",
+            systemVoid,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            插入独立实参计算 ? [] : [systemInt32]);
+        var constructedObject = new LocalVariable(
+            "constructedObject",
+            new Register(null, "X0"),
+            systemObject);
+        var argument = new LocalVariable(
+            "argument",
+            new Register(null, "W1"),
+            systemInt32);
+        var observedObject = new LocalVariable(
+            "observedObject",
+            new Register(null, "X2"),
+            systemObject);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Newobj, constructedObject, systemObject),
+        };
+        if (插入独立实参计算)
+            instructions.Add(new Instruction(1, OpCode.Move, argument, new Immediate(7)));
+        if (插入对象读取)
+            instructions.Add(new Instruction(2, OpCode.Move, observedObject, constructedObject));
+        instructions.Add(new Instruction(3, OpCode.CallVoid, constructor, constructedObject, argument));
+        instructions.Add(new Instruction(4, OpCode.Return));
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = [constructedObject, observedObject];
+        caller.ParameterLocals = 插入独立实参计算 ? [] : [argument];
+        if (插入独立实参计算)
+            caller.Locals.Add(argument);
+        caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "ConstructorFusionOrderTest.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var typeDefinition = new TypeDefinition(
+            "Cpp2IL.Core.Tests",
+            "ConstructorFusionOrderType",
+            TypeAttributes.Class | TypeAttributes.Public);
+        module.TopLevelTypes.Add(typeDefinition);
+        systemObject.PutExtraData("AsmResolverType", typeDefinition);
+        绑定AsmResolver系统类型(
+            module,
+            systemInt32,
+            "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var constructorDefinition = new MethodDefinition(
+            ".ctor",
+            MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        constructorDefinition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        var callerDefinition = new MethodDefinition(
+            "Construct",
+            MethodAttributes.Public | MethodAttributes.Static,
+            插入独立实参计算
+                ? MethodSignature.CreateStatic(module.CorLibTypeFactory.Void)
+                : MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        if (!插入独立实参计算)
+            callerDefinition.ParameterDefinitions.Add(new ParameterDefinition(1, "argument", (ParameterAttributes)0));
+        typeDefinition.Methods.Add(constructorDefinition);
+        typeDefinition.Methods.Add(callerDefinition);
+        constructor.PutExtraData("AsmResolverMethod", constructorDefinition);
+
+        IlGenerator.GenerateIl(caller, callerDefinition);
+        CilStackValidator.Validate(callerDefinition.CilMethodBody!, "ConstructorFusionOrderType::Construct");
+        return callerDefinition.CilMethodBody!.Instructions.ToList();
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void CallVoid调用非Void目标时必须丢弃返回值并保持栈平衡()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
