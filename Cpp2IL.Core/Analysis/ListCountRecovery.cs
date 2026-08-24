@@ -23,11 +23,13 @@ public static class ListCountRecovery
             for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
             {
                 if (IsDestinationWrite(instruction, operandIndex)
-                    || instruction.Operands[operandIndex] is not FieldReference field
-                    || !TryGetExactListType(field, out var listType))
+                    || !TryGetExactListCount(
+                        instruction.Operands[operandIndex],
+                        out var receiver,
+                        out var listType))
                     continue;
 
-                instruction.SetOperand(operandIndex, new ListCount(field.Local, listType));
+                instruction.SetOperand(operandIndex, new ListCount(receiver, listType));
                 recovered++;
             }
         }
@@ -37,6 +39,43 @@ public static class ListCountRecovery
 
     private static bool IsDestinationWrite(Instruction instruction, int operandIndex)
         => operandIndex == 0 && instruction.OpCode == OpCode.Move;
+
+    private static bool TryGetExactListCount(
+        IOperand operand,
+        out LocalVariable receiver,
+        out GenericInstanceTypeAnalysisContext listType)
+    {
+        if (operand is FieldReference field
+            && TryGetExactListType(field, out listType))
+        {
+            receiver = field.Local;
+            return true;
+        }
+
+        // 中文注释：属性 getter 的结果在字段偏移解析之后才可能从 IEnumerable<T>
+        // 收紧为 List<T>。此时原生 [list+0x18] 仍是 MemoryOperand；以具体 List 布局
+        // 唯一查回 _size 字段，避免再次运行整张 MetadataResolver 扫描。
+        if (operand is MemoryOperand
+            {
+                Base: LocalVariable { Type: GenericInstanceTypeAnalysisContext candidate } local,
+                Index: null,
+                Scale: 0,
+                Addend: var offset,
+            }
+            && candidate.GenericType.FullName == ListTypeFullName
+            && candidate.GenericArguments.Count == 1
+            && GenericInstanceFieldLayout.FindConcreteFieldAtOffset(candidate, offset) is { } layoutField
+            && TryValidateSizeField(layoutField))
+        {
+            receiver = local;
+            listType = candidate;
+            return true;
+        }
+
+        receiver = null!;
+        listType = null!;
+        return false;
+    }
 
     private static bool TryGetExactListType(
         FieldReference field,
@@ -51,12 +90,21 @@ public static class ListCountRecovery
                    ?? field.Field.DeclaringType as GenericInstanceTypeAnalysisContext
                    ?? null!;
 
-        return !fieldDefinition.IsStatic
-               && fieldDefinition.Name == "_size"
-               && fieldDefinition.FieldType.FullName == "System.Int32"
+        return TryValidateSizeField(fieldDefinition)
                && fieldDefinition.DeclaringType.FullName == ListTypeFullName
                && listType is not null
                && listType.GenericType.FullName == ListTypeFullName
                && listType.GenericArguments.Count == 1;
+    }
+
+    private static bool TryValidateSizeField(FieldAnalysisContext field)
+    {
+        var definition = field is ConcreteGenericFieldAnalysisContext concrete
+            ? concrete.BaseFieldContext
+            : field;
+        return !definition.IsStatic
+               && definition.Name == "_size"
+               && definition.FieldType.FullName == "System.Int32"
+               && definition.DeclaringType.FullName == ListTypeFullName;
     }
 }

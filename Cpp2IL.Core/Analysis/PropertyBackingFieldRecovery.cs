@@ -46,8 +46,10 @@ public static class PropertyBackingFieldRecovery
                         : [getter, destination, source.Local]);
                     // 中文注释：共享泛型字段可能早期把 Current 结果登记为 object；
                     // 具体 getter 已由 Enumerator<T> 接收者唯一闭合时，同步返回局部类型。
-                    if (destination.Type == null
-                        || GenericCallRebinder.TypesEquivalent(destination.Type, source.Field.FieldType))
+                    if (CanSharpenGetterResultType(
+                            destination.Type,
+                            source.Field.FieldType,
+                            getter.ReturnType))
                         destination.Type = getter.ReturnType;
                     recovered++;
                     continue;
@@ -95,6 +97,26 @@ public static class PropertyBackingFieldRecovery
         }
 
         return recovered;
+    }
+
+    /// <summary>
+    /// 公开 getter 的声明返回类型是直接调用结果的权威类型。字段恢复前，后续 LINQ 参数可能
+    /// 已把同一结果槽先登记成 IEnumerable 等上界；仅当 getter 返回值可赋给该上界时向下收紧，
+    /// 具体类型冲突继续保留为诊断红门。
+    /// </summary>
+    private static bool CanSharpenGetterResultType(
+        TypeAnalysisContext? destinationType,
+        TypeAnalysisContext fieldType,
+        TypeAnalysisContext getterReturnType)
+    {
+        if (destinationType == null
+            || GenericCallRebinder.TypesEquivalent(destinationType, fieldType)
+            || GenericCallRebinder.TypesEquivalent(destinationType, getterReturnType))
+            return true;
+
+        return GenericCallRebinder.IsAssignableToManagedProjection(
+            getterReturnType,
+            destinationType);
     }
 
     /// <summary>

@@ -566,8 +566,14 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 会分别承载元素与集合引用，阻断原本完全等价的 List<T>.Add 容量菱形。
         CopyCoalescer.PruneIncompatiblePhiCopies(ControlFlowGraph);
 
-        // 中文注释：数值和取址槽位均已终态定型后再执行一次布局恢复链；数组元素类型先闭合，
-        // 随后的 List 快速路径才可用同一具体 T 生成公开 Add/Clear/Count 调用。
+        // 中文注释：跨类型私有字段先恢复为公开属性；getter 声明返回类型可把此前被 LINQ
+        // 参数拓宽的结果槽收紧为 List<T>，后续布局恢复才能识别同一实例的 Count。
+        PropertyBackingFieldRecovery.Run(this);
+        // 中文注释：属性恢复可能刚把原生字段读取物化为公开 getter；此处是调用目标完整后的
+        // 唯一结果收紧点，把 IEnumerable 等上界恢复为 List<T>，不重复早期调用传播。
+        ManagedCallResultTypeRecovery.Run(this);
+        // 中文注释：数值和取址槽位均已终态定型后执行布局恢复链；数组元素类型先闭合，
+        // 随后的 List 快速路径可用同一具体 T 生成公开 Add/Clear/Count 调用。
         ArrayRecovery.Run(this);
         ListAddRecovery.Run(this);
         ListClearRecovery.Run(this);
@@ -577,8 +583,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 不重复早期字段比较和原生位宽推导。
         LocalVariables.ResolveRecoveredLengthComparisonCarrierTypes(this);
         EmptyArrayRecovery.Run(this);
-        PropertyBackingFieldRecovery.Run(this);
-        // 中文注释：公开getter在上一行才替换跨类型私有字段；单次消费新getter的标量结果，
+        // 中文注释：公开getter在上方刚替换跨类型私有字段；单次消费新getter的标量结果，
         // 为比较归纳变量和普通整数算术结果补回精确类型，避免重复扫描属性、数组和集合恢复链。
         LocalVariables.ResolveRecoveredPropertyScalarCarrierTypes(this);
         // 中文注释：集合长度与公开属性已提供最后一批精确标量种子；沿退 SSA Move 连通分量

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -453,7 +454,11 @@ public static class GenericCallRebinder
         return TypesEquivalent(pattern, actual);
     }
 
-    private static bool TryProjectToGenericDefinition(
+    /// <summary>
+    /// 把具体类型投影到指定泛型定义；泛型调用重绑定与公开 getter 结果收紧共用同一条
+    /// 基类/接口实例化规则，避免分别维护 List、数组及接口的泛型实参推导。
+    /// </summary>
+    internal static bool TryProjectToGenericDefinition(
         TypeAnalysisContext actual,
         TypeAnalysisContext genericDefinition,
         out GenericInstanceTypeAnalysisContext projected)
@@ -504,6 +509,25 @@ public static class GenericCallRebinder
 
         projected = null!;
         return false;
+    }
+
+    /// <summary>
+    /// 判断具体托管类型能否赋给既有结果上界。普通继承与泛型接口都走同一投影入口，
+    /// 供泛型调用、公开属性和调用结果恢复共享，避免三处实现各自漂移。
+    /// </summary>
+    internal static bool IsAssignableToManagedProjection(
+        TypeAnalysisContext concrete,
+        TypeAnalysisContext upperBound)
+    {
+        if (TypesEquivalent(concrete, upperBound))
+            return true;
+
+        if (upperBound is GenericInstanceTypeAnalysisContext upperGeneric
+            && TryProjectToGenericDefinition(concrete, upperGeneric.GenericType, out var projected))
+            return TypesEquivalent(projected, upperGeneric)
+                   || IsSharedObjectPlaceholder(upperGeneric, projected);
+
+        return concrete.IsAssignableTo(upperBound);
     }
 
     private static IEnumerable<TypeAnalysisContext> DirectParents(GenericInstanceTypeAnalysisContext type)

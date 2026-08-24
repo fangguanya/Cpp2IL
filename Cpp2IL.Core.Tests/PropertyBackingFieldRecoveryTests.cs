@@ -74,6 +74,54 @@ public class PropertyBackingFieldRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 列表Getter把接口结果槽收紧为具体列表()
+    {
+        var fixture = CreateListGetterFixture();
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Value.Type, Is.SameAs(fixture.ListType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 列表Getter保留已经精确的具体列表结果槽()
+    {
+        var fixture = CreateListGetterFixture(useExactDestination: true);
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Value.Type, Is.SameAs(fixture.ListType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 列表Getter不覆盖元素类型冲突的接口结果槽()
+    {
+        var fixture = CreateListGetterFixture(useConflictingDestination: true);
+        var originalType = fixture.Value.Type;
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Value.Type, Is.SameAs(originalType));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 嵌套比较中的共享Enumerator字段物化StringGetter局部()
     {
@@ -384,6 +432,65 @@ public class PropertyBackingFieldRecoveryTests
             access);
     }
 
+    private static ListGetterFixture CreateListGetterFixture(
+        bool useExactDestination = false,
+        bool useConflictingDestination = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var listDefinition = assembly.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var enumerableDefinition = assembly.GetTypeByFullName("System.Collections.Generic.IEnumerable`1")!;
+        var listType = listDefinition.MakeGenericInstanceType([stringType]);
+        var destinationType = useExactDestination
+            ? listType
+            : enumerableDefinition.MakeGenericInstanceType([
+                useConflictingDestination ? app.SystemTypes.SystemInt32Type : stringType,
+            ]);
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "ListOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var getter = owner.InjectMethodContext(
+            "get_Items",
+            listType,
+            MethodAttributes.Public);
+        owner.InjectPropertyContext(
+            "Items",
+            listType,
+            getter,
+            null,
+            PropertyAttributes.None);
+        var field = owner.InjectFieldContext(
+            "<Items>k__BackingField",
+            listType,
+            FieldAttributes.Private);
+        var callerType = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "ListCaller",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var caller = callerType.InjectMethodContext(
+            "Run",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static);
+        var receiver = new LocalVariable("owner", new Register(null, "X0"), owner);
+        var value = new LocalVariable("items", new Register(null, "X19"), destinationType);
+        var access = new Instruction(
+            0,
+            OpCode.Move,
+            value,
+            new FieldReference(field, receiver, 0x10));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            access,
+            new Instruction(1, OpCode.Return),
+        ]);
+        return new ListGetterFixture(caller, listType, value, access);
+    }
+
     private sealed record Fixture(
         MethodAnalysisContext Caller,
         MethodAnalysisContext Getter,
@@ -397,6 +504,12 @@ public class PropertyBackingFieldRecoveryTests
         TypeAnalysisContext EnumeratorDefinition,
         TypeAnalysisContext StringType,
         LocalVariable Receiver,
+        LocalVariable Value,
+        Instruction Access);
+
+    private sealed record ListGetterFixture(
+        MethodAnalysisContext Caller,
+        TypeAnalysisContext ListType,
         LocalVariable Value,
         Instruction Access);
 }

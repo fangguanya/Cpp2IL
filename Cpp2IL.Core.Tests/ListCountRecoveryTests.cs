@@ -89,6 +89,54 @@ public class ListCountRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 公开Getter收紧后的原生列表大小读取恢复为Count()
+    {
+        var fixture = CreateRawLayoutFixture();
+
+        var recovered = ListCountRecovery.Run(fixture.Method);
+        var count = fixture.Compare.Operands[1] as ListCount;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(count, Is.Not.Null);
+            Assert.That(count!.Value, Is.SameAs(fixture.Receiver));
+            Assert.That(count.ListType.FullName, Is.EqualTo("System.Collections.Generic.List`1<System.String>"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 非大小字段偏移保持原生读取()
+    {
+        var fixture = CreateRawLayoutFixture(offset: 0x10);
+
+        var recovered = ListCountRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Compare.Operands[1], Is.InstanceOf<MemoryOperand>());
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 接口接收者的相同偏移不猜测列表布局()
+    {
+        var fixture = CreateRawLayoutFixture(useInterfaceReceiver: true);
+
+        var recovered = ListCountRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Compare.Operands[1], Is.InstanceOf<MemoryOperand>());
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 相似名称业务字段不改写()
     {
@@ -150,9 +198,43 @@ public class ListCountRecoveryTests
         return new Fixture(method, graph, receiver, instruction);
     }
 
+    private static RawLayoutFixture CreateRawLayoutFixture(
+        long offset = 0x18,
+        bool useInterfaceReceiver = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var listDefinition = assembly.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var receiverType = useInterfaceReceiver
+            ? assembly.GetTypeByFullName("System.Collections.Generic.IEnumerable`1")!
+                .MakeGenericInstanceType([stringType])
+            : listDefinition.MakeGenericInstanceType([stringType]);
+        var receiver = new LocalVariable("items", new Register(null, "X19"), receiverType);
+        var result = new LocalVariable("empty", new Register(null, "W8"), app.SystemTypes.SystemBooleanType);
+        var compare = new Instruction(
+            0,
+            OpCode.CheckEqual,
+            result,
+            new MemoryOperand(receiver, addend: offset),
+            new Immediate(0));
+        var graph = new ISILControlFlowGraph([
+            compare,
+            new Instruction(1, OpCode.Return),
+        ]);
+        var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
+        method.ControlFlowGraph = graph;
+        return new RawLayoutFixture(method, receiver, compare);
+    }
+
     private sealed record Fixture(
         MethodAnalysisContext Method,
         ISILControlFlowGraph Graph,
         LocalVariable Receiver,
         Instruction Instruction);
+
+    private sealed record RawLayoutFixture(
+        MethodAnalysisContext Method,
+        LocalVariable Receiver,
+        Instruction Compare);
 }
