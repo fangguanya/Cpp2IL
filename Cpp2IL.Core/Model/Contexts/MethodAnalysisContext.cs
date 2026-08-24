@@ -606,6 +606,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 默认构造值和 CFG 的命中/耗尽双出口必须同时唯一，才把命中对象写回最终返回局部。
         ManagedReturnPhiRecovery.Run(this);
 
+        // 中文注释：搜索/加权选择成功边可能返回“对象 + 字段偏移”，默认边返回静态槽地址；
+        // 两个地址只有在共同尾声才解引用。引用 Phi 与字段类型到此均已稳定，现统一恢复字段值返回。
+        ManagedFieldReturnRecovery.Run(this);
+
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 

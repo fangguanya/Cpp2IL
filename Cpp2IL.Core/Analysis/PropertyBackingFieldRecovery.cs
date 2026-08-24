@@ -14,6 +14,15 @@ namespace Cpp2IL.Core.Analysis;
 public static class PropertyBackingFieldRecovery
 {
     /// <summary>
+    /// 供晚期新建字段读取的恢复器复用同一访问器判定，避免再次扫描整张方法图。
+    /// </summary>
+    internal static bool TryResolveGetter(
+        TypeAnalysisContext callerType,
+        FieldReference reference,
+        out MethodAnalysisContext getter) =>
+        TryResolveAccessor(callerType, reference, read: true, out getter);
+
+    /// <summary>
     /// 恢复当前方法中具有唯一字段/属性身份、精确类型和公开非虚访问器的读写。
     /// </summary>
     public static int Run(MethodAnalysisContext method)
