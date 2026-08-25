@@ -248,7 +248,11 @@ public static class ListAddRecovery
                 continue;
 
             if (slowBlock.Predecessors is not [var head])
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd标准路径拒绝：慢边 b{slowBlock.ID} 的容量头前驱数={slowBlock.Predecessors.Count}。");
                 continue;
+            }
             Block merge;
             IReadOnlyList<Instruction> effectiveSlowTail = slowTail;
             Instruction? validatedPublicSizeRefresh = null;
@@ -265,12 +269,15 @@ public static class ListAddRecovery
             }
             else if (!TryGetMergeBlock(graph, slowBlock, out merge))
             {
+                Logger.VerboseNewline(
+                    $"ListAdd标准路径拒绝：慢边 b{slowBlock.ID} 没有唯一闭合汇合块。");
                 continue;
             }
             if (!TryMatchHead(
                     head,
                     slowBlock,
                     receiver,
+                    value,
                     out var rewriteHead,
                     out var headPath,
                     out var rewriteStart,
@@ -279,7 +286,11 @@ public static class ListAddRecovery
                     out var versionResult,
                     out var versionSource,
                     out var preservedHeadBusiness))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd标准路径拒绝：容量头 b{head.ID} 的 items/size/version 状态后缀未闭合。");
                 continue;
+            }
             if (!TryGetFastRoute(
                     head,
                     slowBlock,
@@ -288,7 +299,11 @@ public static class ListAddRecovery
                     out var fastEntry,
                     out var fastBody,
                     out var fastPrefix))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd标准路径拒绝：容量头 b{head.ID} 的快速路径拓扑未闭合。");
                 continue;
+            }
             if (!TryMatchFastPath(
                     graph,
                     fastBody,
@@ -309,9 +324,17 @@ public static class ListAddRecovery
                     out var publicValue,
                     out var publicValuePreparation,
                     out var preservedSlowTail))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd标准路径拒绝：容量头 b{head.ID} 的快速路径语义或元素值等价性未闭合。");
                 continue;
+            }
             if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
+            {
+                Logger.VerboseNewline(
+                    $"ListAdd标准路径拒绝：慢边 b{slowBlock.ID} 的 AddWithResize 目标无法精确映射公开 Add。");
                 continue;
+            }
 
             Rewrite(
                 graph,
@@ -464,6 +487,7 @@ public static class ListAddRecovery
                     head,
                     slowEntry,
                     receiver,
+                    branchSlowValue,
                     out var rewriteHead,
                     out var headPath,
                     out var rewriteStart,
@@ -2370,6 +2394,7 @@ public static class ListAddRecovery
         Block head,
         Block slowBlock,
         LocalVariable receiver,
+        IOperand pendingValue,
         out Block rewriteHead,
         out List<Block> headPath,
         out Instruction rewriteStart,
@@ -2399,6 +2424,7 @@ public static class ListAddRecovery
                     suffix,
                     slowBlock,
                     receiver,
+                    pendingValue,
                     out _,
                     out var loadedItems,
                     out var candidateSizeState,
@@ -2428,6 +2454,7 @@ public static class ListAddRecovery
         IReadOnlyList<(Block Block, Instruction Instruction)> suffix,
         Block slowBlock,
         LocalVariable receiver,
+        IOperand pendingValue,
         out Instruction itemsLoad,
         out LocalVariable items,
         out IOperand sizeState,
@@ -2522,6 +2549,7 @@ public static class ListAddRecovery
                 || !IsPreservableHeadBusinessInstruction(
                     instruction,
                     receiver,
+                    pendingValue,
                     loadedItems,
                     version,
                     condition)))
@@ -2564,10 +2592,14 @@ public static class ListAddRecovery
     private static bool IsPreservableHeadBusinessInstruction(
         Instruction instruction,
         LocalVariable receiver,
+        IOperand pendingValue,
         LocalVariable items,
         LocalVariable version,
         LocalVariable condition)
     {
+        if (IsPendingElementSetter(instruction, receiver, pendingValue, items, version, condition))
+            return true;
+
         if (instruction.IsCall
             || instruction.OpCode is OpCode.Return
                 or OpCode.Jump
@@ -2578,6 +2610,52 @@ public static class ListAddRecovery
 
         return instruction.Operands.All(operand =>
             !ReferencesLocal(operand, receiver)
+            && !ReferencesLocal(operand, items)
+            && !ReferencesLocal(operand, version)
+                && !ReferencesLocal(operand, condition));
+    }
+
+    /// <summary>
+    /// 证明夹在 <c>_items</c> 读取与容量判断之间的调用只是在初始化本次待追加元素。
+    /// </summary>
+    /// <remarks>
+    /// ARM64 会把最后一个属性 setter 排到 List 状态读取之后。该调用必须是当前元素类型上的
+    /// 单参数实例 setter，接收者必须与慢扩容实参精确等价，并且所有运行时操作数都不得引用
+    /// List 接收者、items、version 或分支条件；其他调用继续保留原容量控制流。
+    /// </remarks>
+    private static bool IsPendingElementSetter(
+        Instruction instruction,
+        LocalVariable listReceiver,
+        IOperand pendingValue,
+        LocalVariable items,
+        LocalVariable version,
+        LocalVariable condition)
+    {
+        if (instruction is not
+            {
+                OpCode: OpCode.CallVoid,
+                Operands: [MethodAnalysisContext setter, var setterReceiver, _],
+            }
+            || setter.IsStatic
+            || setter.Parameters.Count != 1
+            || !setter.Name.StartsWith("set_", StringComparison.Ordinal)
+            || setter.ReturnType.FullName != "System.Void"
+            || !AreEquivalentValue(setterReceiver, pendingValue))
+            return false;
+
+        var pendingType = pendingValue switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            _ => null,
+        };
+        if (pendingType == null
+            || setter.DeclaringType == null
+            || !GenericCallRebinder.TypesEquivalent(setter.DeclaringType, pendingType))
+            return false;
+
+        return instruction.Operands.Skip(1).All(operand =>
+            !ReferencesLocal(operand, listReceiver)
             && !ReferencesLocal(operand, items)
             && !ReferencesLocal(operand, version)
             && !ReferencesLocal(operand, condition));

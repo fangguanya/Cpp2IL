@@ -1889,6 +1889,77 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void Items读取后的当前元素属性Setter保留并闭合公开Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var setter = AddPendingElementSetter(fixture);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Graph.Instructions.ToList();
+        var setterIndex = instructions.FindIndex(instruction =>
+            instruction is { OpCode: OpCode.CallVoid, Operands: [var target, ..] }
+            && ReferenceEquals(target, setter));
+        var publicAddIndex = instructions.FindIndex(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(setterIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(publicAddIndex, Is.GreaterThan(setterIndex));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Version回写后的当前元素属性Setter保留整数最小值并闭合Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var setter = AddPendingElementSetter(
+            fixture,
+            placeAfterVersionWrite: true,
+            argument: new Immediate(int.MinValue));
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        var setterCall = fixture.Graph.Instructions.SingleOrDefault(instruction =>
+            instruction is { OpCode: OpCode.CallVoid, Operands: [var target, _, Immediate { Value: int.MinValue }] }
+            && ReferenceEquals(target, setter));
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(setterCall, Is.Not.Null);
+            Assert.That(fixture.Graph.Instructions.Count(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Items读取后的另一元素属性Setter保持原容量控制流()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        AddPendingElementSetter(fixture, mismatchReceiver: true);
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 夹入指令读取集合接收者时保持原容量控制流()
     {
@@ -4446,6 +4517,51 @@ public class ListAddRecoveryTests
                 fixture.Carrier,
                 touchesReceiver ? fixture.Receiver : fixture.Value));
         return fixture;
+    }
+
+    /// <summary>
+    /// 在 List 状态头中插入当前待追加元素的属性写入，复现数据加载方法的 ARM64 排序。
+    /// </summary>
+    private static MethodAnalysisContext AddPendingElementSetter(
+        Fixture fixture,
+        bool placeAfterVersionWrite = false,
+        bool mismatchReceiver = false,
+        IOperand? argument = null)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var elementType = fixture.Value.Type!;
+        var setter = new InjectedMethodAnalysisContext(
+            elementType,
+            "set_KarmaImpact",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public
+            | System.Reflection.MethodAttributes.HideBySig
+            | System.Reflection.MethodAttributes.SpecialName,
+            [app.SystemTypes.SystemInt32Type]);
+        var otherElement = Local("otherElement", elementType);
+        var head = fixture.Graph.Blocks.Single(block => block.Instructions.Any(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] }));
+        var anchorIndex = placeAfterVersionWrite
+            ? head.Instructions.FindIndex(instruction =>
+                instruction is
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [FieldReference { Field.Name: "_version" }, _],
+                })
+            : head.Instructions.FindIndex(instruction =>
+                instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.Name: "_items" }] });
+        if (anchorIndex < 0)
+            throw new InvalidOperationException("标准夹具缺少属性 Setter 所需的 List 状态锚点。");
+
+        head.Instructions.Insert(
+            anchorIndex + 1,
+            new Instruction(
+                -1,
+                OpCode.CallVoid,
+                setter,
+                mismatchReceiver ? otherElement : fixture.Value,
+                argument ?? new Immediate(37)));
+        return setter;
     }
 
     private static void AddSlowFieldCarrierRefresh(Fixture fixture, bool mismatchOffset)
