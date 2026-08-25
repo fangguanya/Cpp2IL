@@ -543,10 +543,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：退 SSA 的引用 Phi 此时已表现为“零或具体引用”的边复制。先把零恢复为
         // null 并定型目标，再运行字段偏移解析，才能识别上一 Scenario 的链式字段写入。
         CopyCoalescer.ResolveNullReferencePhiCopyTypes(ControlFlowGraph);
-        // 中文注释：数组与集合布局恢复之前，以全部定义的一致托管复制证据覆盖 X19-X29 上的
-        // IntPtr/Object ABI 占位；不同类型或真实指针定义会使该局部保持原样。
-        CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(this);
-        MetadataResolver.ResolveFieldOffsets(this);
+        // 中文注释：数组与集合布局恢复之前，以全部定义的一致托管复制证据覆盖
+        // IntPtr/Object ABI 占位。字段读取与引用 Phi 定型互为前提，在同一单调循环中收敛；
+        // 异型引用、真实指针定义或歧义字段均保持红门。
+        CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypesAndFields(this);
         InlineConstructorRecovery.Run(this);
 
         // 中文注释：终态字段类型已稳定；按 TypeInfo→static_fields→自类型单例→实例字段

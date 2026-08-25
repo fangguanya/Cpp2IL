@@ -19,16 +19,37 @@ namespace Cpp2IL.Core.Analysis;
 public static class CalleeSavedManagedReceiverRecovery
 {
     /// <summary>
-    /// 退 SSA 后恢复被调用方保存寄存器中的托管复制载体类型。
+    /// 退 SSA 后恢复被调用方保存寄存器和引用 Phi 中的托管复制载体类型。
     /// </summary>
     /// <remarks>
-    /// 只有该局部的全部定义均为同一托管引用类型的直接复制或空值时才提交；真实指针算术、
-    /// 不同引用类型和非保存寄存器均保持原类型。该规则用于数组循环等不以实例调用消费载体的路径。
+    /// 只有该局部的全部定义均为同一托管引用类型的直接复制、字段读取或空值时才提交；
+    /// 非保存寄存器还必须具有至少两个定义和一条退 SSA Phi 复制。真实指针算术、异型引用和
+    /// 运行时元数据载体均保持原类型。该规则用于数组循环以及业务数据项的合流字段读取。
     /// </remarks>
     public static int ResolveManagedCopyCarrierTypes(MethodAnalysisContext method)
         => ResolveManagedCopyCarrierTypes(
             method.ControlFlowGraph!.Instructions,
             method.ParameterLocals);
+
+    /// <summary>
+    /// 以单调收敛循环共同恢复托管复制载体与字段偏移。
+    /// </summary>
+    /// <remarks>
+    /// 字段读取会为 Phi 来源提供具体类型，Phi 定型后又会使以其为基址的后续字段可解析；
+    /// 两个变换都只会将未解析状态推进为已解析状态，因此在无新变化时精确结束。
+    /// </remarks>
+    public static int ResolveManagedCopyCarrierTypesAndFields(MethodAnalysisContext method)
+    {
+        var recovered = 0;
+        while (true)
+        {
+            var recoveredThisRound = ResolveManagedCopyCarrierTypes(method);
+            recovered += recoveredThisRound;
+            var resolvedField = MetadataResolver.ResolveFieldOffsets(method);
+            if (recoveredThisRound == 0 && !resolvedField)
+                return recovered;
+        }
+    }
 
     internal static int ResolveManagedCopyCarrierTypes(
         IReadOnlyList<Instruction> instructions,
@@ -43,7 +64,24 @@ public static class CalleeSavedManagedReceiverRecovery
         foreach (var pair in definitions)
         {
             var destination = pair.Key;
-            if (!IsCalleeSavedArm64Register(destination.Register.Name)
+            var isCalleeSavedCarrier = IsCalleeSavedArm64Register(destination.Register.Name);
+            var isReferencePhiCarrier = pair.Value.Length >= 2
+                                        && pair.Value.Any(definition => definition is
+                                        {
+                                            Index: < 0,
+                                            OpCode: OpCode.Move,
+                                        });
+            if (isCalleeSavedCarrier || isReferencePhiCarrier)
+            {
+                Logger.VerboseNewline(
+                    $"托管复制载体定型候选：destination={destination.Register}，" +
+                    $"type={destination.Type?.FullName ?? "<未定型>"}，calleeSaved={isCalleeSavedCarrier}，" +
+                    $"referencePhi={isReferencePhiCarrier}，definitions=" +
+                    string.Join(" | ", pair.Value.Select(DescribeManagedCopyDefinition)),
+                    nameof(CalleeSavedManagedReceiverRecovery));
+            }
+
+            if ((!isCalleeSavedCarrier && !isReferencePhiCarrier)
                 || parameterLocals?.Contains(destination) == true
                 || !IsReplaceableManagedCopyCarrier(destination.Type))
                 continue;
@@ -62,9 +100,9 @@ public static class CalleeSavedManagedReceiverRecovery
                 if (definition is not
                     {
                         OpCode: OpCode.Move,
-                        Operands: [LocalVariable, LocalVariable { Type: { } sourceType }],
+                        Operands: [LocalVariable, var source],
                     }
-                    || !IsConcreteManagedReference(sourceType))
+                    || !TryGetConcreteManagedReferenceSourceType(source, out var sourceType))
                 {
                     valid = false;
                     break;
@@ -73,14 +111,30 @@ public static class CalleeSavedManagedReceiverRecovery
                 sourceTypes.Add(sourceType);
             }
 
-            var consensusTypes = sourceTypes
-                .GroupBy(type => type.FullName, StringComparer.Ordinal)
-                .Select(group => group.First())
-                .ToArray();
-            if (!valid || consensusTypes.Length != 1)
+            if (!valid || sourceTypes.Count == 0)
+            {
+                Logger.VerboseNewline(
+                    $"托管复制载体定型拒绝：destination={destination.Register}，" +
+                    $"valid={valid}，sourceTypes={string.Join(",", sourceTypes.Select(type => type.FullName))}",
+                    nameof(CalleeSavedManagedReceiverRecovery));
                 continue;
+            }
 
-            destination.Type = consensusTypes[0];
+            var consensusType = sourceTypes[0];
+            if (sourceTypes.Skip(1).Any(sourceType =>
+                    !GenericCallRebinder.TypesEquivalent(sourceType, consensusType)))
+            {
+                Logger.VerboseNewline(
+                    $"托管复制载体定型拒绝：destination={destination.Register}，" +
+                    $"异型来源={string.Join(",", sourceTypes.Select(type => type.FullName))}",
+                    nameof(CalleeSavedManagedReceiverRecovery));
+                continue;
+            }
+
+            destination.Type = consensusType;
+            Logger.VerboseNewline(
+                $"托管复制载体定型提交：destination={destination.Register}，type={consensusType.FullName}",
+                nameof(CalleeSavedManagedReceiverRecovery));
             recovered++;
         }
 
@@ -96,6 +150,36 @@ public static class CalleeSavedManagedReceiverRecovery
                or StaticFieldStorageTypeAnalysisContext
                or RuntimeMethodInfoAnalysisContext)
            && type.FullName != "System.Object";
+
+    /// <summary>
+    /// 从直接局部复制或已解析字段读取中提取具体托管引用类型。
+    /// </summary>
+    private static bool TryGetConcreteManagedReferenceSourceType(
+        IOperand source,
+        out TypeAnalysisContext sourceType)
+    {
+        sourceType = source switch
+        {
+            LocalVariable { IsMethodInfo: false, Type: { } localType } => localType,
+            FieldReference { Field.FieldType: { } fieldType } => fieldType,
+            _ => null!,
+        };
+        return sourceType != null && IsConcreteManagedReference(sourceType);
+    }
+
+    private static string DescribeManagedCopyDefinition(Instruction definition)
+    {
+        var source = definition.Operands.Count > 1 ? definition.Operands[1] : null;
+        var sourceType = source switch
+        {
+            LocalVariable local => local.Type?.FullName ?? "<未定型局部>",
+            FieldReference field => field.Field.FieldType.FullName,
+            Immediate { Value: 0 } => "null",
+            null => "<无来源>",
+            _ => source.GetType().Name,
+        };
+        return $"{definition.Index}:{definition.OpCode}:{sourceType}";
+    }
 
     /// <summary>
     /// 在 SSA 局部刚建立时冻结 X19-X29 的直接局部复制身份。

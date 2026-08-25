@@ -114,6 +114,83 @@ public class CopyCoalescerTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 保存到X20的托管分配结果不与后续X0生命期合并()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listType = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!
+            .MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var listOrigin = new LocalVariable(
+            "listOrigin",
+            new Register(0, "X0_v1"),
+            listType);
+        var laterX0 = new LocalVariable(
+            "laterX0",
+            new Register(0, "X0_v2"));
+        var saved = new LocalVariable(
+            "saved",
+            new Register(20, "X20"),
+            listType);
+        var allocation = new Instruction(
+            0,
+            OpCode.Newobj,
+            listOrigin,
+            listType);
+        var phiCopy = new Instruction(-1, OpCode.Move, laterX0, listOrigin);
+        var method = Method(
+            allocation,
+            phiCopy,
+            new Instruction(2, OpCode.Return, laterX0));
+        method.CalleeSavedSsaCopyEvidence.Add((saved, listOrigin, 1));
+
+        CopyCoalescer.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(phiCopy.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(allocation.Operands[0], Is.SameAs(listOrigin));
+            Assert.That(phiCopy.Operands[0], Is.SameAs(laterX0));
+            Assert.That(phiCopy.Operands[1], Is.SameAs(listOrigin));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 没有保存证据的同槽同型副本仍按原规则合并()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var source = new LocalVariable("source", new Register(0, "X0_v1"), stringType);
+        var destination = new LocalVariable("destination", new Register(0, "X0_v2"), stringType);
+        var copy = new Instruction(-1, OpCode.Move, destination, source);
+        var method = Method(copy, new Instruction(1, OpCode.Return, destination));
+
+        CopyCoalescer.Run(method);
+
+        Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非托管生产值的X20复制不得建立保护来源()
+    {
+        var intType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type;
+        var source = new LocalVariable("source", new Register(0, "X0_v1"), intType);
+        var destination = new LocalVariable("destination", new Register(0, "X0_v2"), intType);
+        var saved = new LocalVariable("saved", new Register(20, "X20"), intType);
+        var copy = new Instruction(-1, OpCode.Move, destination, source);
+        var method = Method(
+            new Instruction(0, OpCode.Move, source, new Immediate(7)),
+            copy,
+            new Instruction(2, OpCode.Return, destination));
+        method.CalleeSavedSsaCopyEvidence.Add((saved, source, 1));
+
+        CopyCoalescer.Run(method);
+
+        Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 退SSA生成的Enumerator到单精度伪复制被删除()
     {
@@ -292,6 +369,8 @@ public class CopyCoalescerTests
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
         method.ControlFlowGraph = new ISILControlFlowGraph([.. instructions]);
         method.ParameterLocals = [];
+        // 中文注释：该夹具绕过构造器，必须显式建立生产路径依赖的冻结证据集合。
+        method.CalleeSavedSsaCopyEvidence = [];
         return method;
     }
 }

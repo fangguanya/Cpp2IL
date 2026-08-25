@@ -9,9 +9,14 @@ namespace Cpp2IL.Core.Analysis;
 // Merge the copies left behind by SSA destruction.
 public static class CopyCoalescer
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method)
+        => Run(method.ControlFlowGraph!, CollectCalleeSavedManagedOrigins(method));
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(cfg, []);
+
+    private static void Run(
+        ISILControlFlowGraph cfg,
+        IReadOnlyCollection<LocalVariable> protectedManagedOrigins)
     {
         var copies = FindSameSlotCopies(cfg);
         var escapedSlots = FindEscapedSlotGroups(cfg);
@@ -43,6 +48,8 @@ public static class CopyCoalescer
                 // this 改写成数组局部，并把数组元素存储误解析为状态机字段写入。
                 if (a.IsThis || b.IsThis
                     || a == b
+                    || ContainsProtectedManagedOrigin(groups, a, protectedManagedOrigins)
+                    || ContainsProtectedManagedOrigin(groups, b, protectedManagedOrigins)
                     || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
                     continue;
 
@@ -60,6 +67,13 @@ public static class CopyCoalescer
             if (a.IsThis || b.IsThis)
                 continue;
 
+            // 中文注释：Call/Newobj 结果一旦被原生代码保存到 X19-X29，就拥有跨后续
+            // X0 复用点的独立生命期。即使退 SSA 生成同槽复制且活跃区间表面不相交，
+            // 也不得把数据项、字段读取或下一次调用结果并回该长期对象。
+            if (ContainsProtectedManagedOrigin(groups, a, protectedManagedOrigins)
+                || ContainsProtectedManagedOrigin(groups, b, protectedManagedOrigins))
+                continue;
+
             // 两个独立构造的具体泛型上下文可能不是同一对象，但只要结构化类型一致，
             // 副本合并就不需要任何转换；不同具体泛型仍保持独立。
             if (a.Type != null
@@ -75,6 +89,47 @@ public static class CopyCoalescer
 
         Rewrite(cfg, groups);
     }
+
+    /// <summary>
+    /// 收集由真实托管调用或分配产生、随后直接保存到 ARM64 X19-X29 的 SSA 来源。
+    /// </summary>
+    private static IReadOnlyCollection<LocalVariable> CollectCalleeSavedManagedOrigins(
+        MethodAnalysisContext method)
+    {
+        var producers = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction is
+            {
+                OpCode: OpCode.Call or OpCode.Newobj,
+                Destination: LocalVariable { Type: { IsValueType: false } }
+            })
+            .Select(instruction => (LocalVariable)instruction.Destination!)
+            .Where(local => !method.ParameterLocals.Contains(local))
+            .ToArray();
+        if (producers.Length == 0)
+            return [];
+
+        return method.CalleeSavedSsaCopyEvidence
+            .Where(evidence => evidence.Index >= 0
+                               && CalleeSavedManagedReceiverRecovery.IsCalleeSavedArm64Register(
+                                   evidence.Destination.Register.Name))
+            .SelectMany(evidence => producers.Where(producer =>
+                SameSsaLocal(producer, evidence.Source)))
+            .Distinct()
+            .ToArray();
+    }
+
+    /// <summary>
+    /// 判断当前并查集合是否已经包含跨调用保存的托管来源。
+    /// </summary>
+    private static bool ContainsProtectedManagedOrigin(
+        DisjointSet groups,
+        LocalVariable root,
+        IReadOnlyCollection<LocalVariable> protectedManagedOrigins)
+        => protectedManagedOrigins.Count != 0
+           && groups.Members(root).Any(protectedManagedOrigins.Contains);
+
+    private static bool SameSsaLocal(LocalVariable left, LocalVariable right)
+        => ReferenceEquals(left, right) || left.Register.Equals(right.Register);
 
     /// <summary>
     /// 删除退 SSA 后由晚期聚合/地址恢复最终证明为跨语义类型的 Phi 复制。该门必须位于

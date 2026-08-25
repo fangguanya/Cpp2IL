@@ -109,6 +109,131 @@ public class CalleeSavedManagedReceiverRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 引用Phi的字段与局部入边恢复业务数据类型()
+    {
+        var fixture = CreateReferencePhiCarrierFixture();
+        var fieldReference = new FieldReference(
+            fixture.ItemField,
+            fixture.Closure,
+            fixture.ItemField.Offset);
+        var instructions = new Instruction[]
+        {
+            new(290, OpCode.Move, fixture.Carrier, fieldReference),
+            new(-1, OpCode.Move, fixture.Carrier, fixture.Current),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Carrier.Type, Is.SameAs(fixture.ItemType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 引用Phi含空值与同型字段时仍恢复业务数据类型()
+    {
+        var fixture = CreateReferencePhiCarrierFixture();
+        var fieldReference = new FieldReference(
+            fixture.ItemField,
+            fixture.Closure,
+            fixture.ItemField.Offset);
+        var instructions = new Instruction[]
+        {
+            new(290, OpCode.Move, fixture.Carrier, fieldReference),
+            new(-1, OpCode.Move, fixture.Carrier, new Immediate(0)),
+            new(-1, OpCode.Move, fixture.Carrier, fixture.Current),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Carrier.Type, Is.SameAs(fixture.ItemType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 内存字段与引用Phi互相推进后恢复后续业务字段()
+    {
+        var fixture = CreateReferencePhiCarrierFixture();
+        var result = new LocalVariable(
+            "result",
+            new Register(null, "X8", 8),
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var sourceDefinition = new Instruction(
+            290,
+            OpCode.Move,
+            fixture.Carrier,
+            new MemoryOperand(fixture.Closure, addend: fixture.ItemField.Offset));
+        var phiDefinition = new Instruction(-1, OpCode.Move, fixture.Carrier, fixture.Current);
+        var businessFieldRead = new Instruction(
+            307,
+            OpCode.Move,
+            result,
+            new MemoryOperand(fixture.Carrier, addend: fixture.ItemValueField.Offset));
+        var callerOwner = new InjectedTypeAnalysisContext(
+            Cpp2IlApi.CurrentAppContext.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "ReferencePhiCaller",
+            Cpp2IlApi.CurrentAppContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var caller = new InjectedMethodAnalysisContext(
+            callerOwner,
+            "Read",
+            Cpp2IlApi.CurrentAppContext.SystemTypes.SystemStringType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(
+            [sourceDefinition, phiDefinition, businessFieldRead, new Instruction(308, OpCode.Return, result)]);
+        caller.Locals = [fixture.Closure, fixture.Current, fixture.Carrier, result];
+        caller.ParameterLocals = [];
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypesAndFields(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Carrier.Type, Is.SameAs(fixture.ItemType));
+            Assert.That(sourceDefinition.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)sourceDefinition.Operands[1]).Field, Is.SameAs(fixture.ItemField));
+            Assert.That(businessFieldRead.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)businessFieldRead.Operands[1]).Field, Is.SameAs(fixture.ItemValueField));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 引用Phi的异型托管入边保持Object红门()
+    {
+        var fixture = CreateReferencePhiCarrierFixture();
+        var conflicting = new LocalVariable(
+            "conflicting",
+            new Register(null, "X1", 2),
+            fixture.ItemType.MakeSzArrayType());
+        var instructions = new Instruction[]
+        {
+            new(290, OpCode.Move, fixture.Carrier, fixture.Current),
+            new(-1, OpCode.Move, fixture.Carrier, conflicting),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(
+                fixture.Carrier.Type,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 唯一具体List分配恢复未定义X19接收者并重绑ToArray()
     {
         var fixture = CreateFixture();
@@ -922,6 +1047,48 @@ public class CalleeSavedManagedReceiverRecoveryTests
         return new ConcreteGenericFieldAnalysisContext(baseField, concreteList);
     }
 
+    private static ReferencePhiCarrierFixture CreateReferencePhiCarrierFixture()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var itemType = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "ReferencePhiItem",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var closureType = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Cpp2IL.Core.Tests",
+            "ReferencePhiClosure",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var itemField = new InjectedFieldAnalysisContext(
+            "item",
+            itemType,
+            FieldAttributes.Public,
+            closureType,
+            offset: 0x10);
+        closureType.Fields.Add(itemField);
+        var itemValueField = new InjectedFieldAnalysisContext(
+            "Disguise",
+            app.SystemTypes.SystemStringType,
+            FieldAttributes.Public,
+            itemType,
+            offset: 0x10);
+        itemType.Fields.Add(itemValueField);
+
+        return new ReferencePhiCarrierFixture(
+            itemType,
+            itemField,
+            itemValueField,
+            new LocalVariable("closure", new Register(null, "X8", 1), closureType),
+            new LocalVariable("current", new Register(null, "X0", 1), itemType),
+            new LocalVariable(
+                "carrier",
+                new Register(null, "X0", 70),
+                app.SystemTypes.SystemObjectType));
+    }
+
     private sealed record Fixture(
         MethodAnalysisContext Caller,
         Instruction Call,
@@ -946,4 +1113,12 @@ public class CalleeSavedManagedReceiverRecoveryTests
         Instruction Call,
         LocalVariable Receiver,
         LocalVariable FirstParameter);
+
+    private sealed record ReferencePhiCarrierFixture(
+        TypeAnalysisContext ItemType,
+        FieldAnalysisContext ItemField,
+        FieldAnalysisContext ItemValueField,
+        LocalVariable Closure,
+        LocalVariable Current,
+        LocalVariable Carrier);
 }
