@@ -236,13 +236,14 @@ public static class ListAddRecovery
                 continue;
             }
 
-            if (!TryMatchSlowPath(
+            if (!TryMatchSlowPathWithValuePreparation(
                     graph,
                     slowBlock,
                     out var slowCall,
                     out var addWithResize,
                     out var receiver,
                     out var value,
+                    out var slowValuePreparation,
                     out var slowTail))
                 continue;
 
@@ -299,12 +300,14 @@ public static class ListAddRecovery
                     versionResult,
                     versionSource,
                     value,
+                    slowValuePreparation,
                     effectiveSlowTail,
                     validatedPublicSizeRefresh,
                     addWithResize.AppContext,
                     addWithResize.TypeGenericParameters.Single(),
                     compactArrayAccessOnly,
                     out var publicValue,
+                    out var publicValuePreparation,
                     out var preservedSlowTail))
                 continue;
             if (!TryCreatePublicAddTarget(addWithResize, out var addTarget))
@@ -324,6 +327,7 @@ public static class ListAddRecovery
                 preservedHeadBusiness,
                 addTarget,
                 receiver,
+                publicValuePreparation,
                 publicValue);
             recovered++;
         }
@@ -499,12 +503,14 @@ public static class ListAddRecovery
                     versionResult,
                     versionSource,
                     branchSlowValue,
+                    [],
                     slowTail,
                     null,
                     addWithResize.AppContext,
                     addWithResize.TypeGenericParameters.Single(),
                     compactArrayAccessOnly,
                     out var publicValue,
+                    out _,
                     out var preservedSlowTail))
             {
                 Logger.VerboseNewline(
@@ -670,12 +676,14 @@ public static class ListAddRecovery
                 versionResult,
                 versionSource,
                 value,
+                [],
                 slowTail,
                 null,
                 addWithResize.AppContext,
                 addWithResize.TypeGenericParameters.Single(),
                 compactArrayAccessOnly,
                 out var publicValue,
+                out _,
                 out var preservedSlowTail)
             || !TryCreatePublicAddTarget(addWithResize, out var addTarget))
             return false;
@@ -1210,9 +1218,12 @@ public static class ListAddRecovery
                 appContext,
                 elementType,
                 PatternInstructions(sharedFastTail),
+                [],
                 out publicValue,
-                out var valueConstruction)
-            || valueConstruction.Count != 0)
+                out var valueConstruction,
+                out var publicValuePreparation)
+            || valueConstruction.Count != 0
+            || publicValuePreparation.Count != 0)
             return false;
 
         return true;
@@ -1774,7 +1785,9 @@ public static class ListAddRecovery
                 appContext,
                 elementType,
                 graph.Instructions.ToList(),
+                [],
                 out publicValue,
+                out _,
                 out _))
             return false;
 
@@ -2095,11 +2108,61 @@ public static class ListAddRecovery
         out LocalVariable receiver,
         out IOperand value,
         out List<Instruction> tail)
+        => TryMatchSlowPathCore(
+            graph,
+            block,
+            allowPropertyGetterValue: false,
+            out call,
+            out target,
+            out receiver,
+            out value,
+            out _,
+            out tail);
+
+    /// <summary>
+    /// 识别标准容量菱形慢边，并保留仅用于构造追加元素的零参数属性读取。
+    /// </summary>
+    /// <remarks>
+    /// ARM64 会在快慢两边分别调用同一属性 getter，再把结果写入数组或传给
+    /// <c>AddWithResize</c>。公开 <c>Add</c> 仍需在调用前执行一次 getter，因此这里把
+    /// 慢边的纯 getter 冻结为公开值准备指令；包含参数、额外副作用或结果不相同的前缀继续拒绝。
+    /// </remarks>
+    private static bool TryMatchSlowPathWithValuePreparation(
+        ISILControlFlowGraph graph,
+        Block block,
+        out Instruction call,
+        out ConcreteGenericMethodAnalysisContext target,
+        out LocalVariable receiver,
+        out IOperand value,
+        out IReadOnlyList<Instruction> valuePreparation,
+        out List<Instruction> tail)
+        => TryMatchSlowPathCore(
+            graph,
+            block,
+            allowPropertyGetterValue: true,
+            out call,
+            out target,
+            out receiver,
+            out value,
+            out valuePreparation,
+            out tail);
+
+    private static bool TryMatchSlowPathCore(
+        ISILControlFlowGraph graph,
+        Block block,
+        bool allowPropertyGetterValue,
+        out Instruction call,
+        out ConcreteGenericMethodAnalysisContext target,
+        out LocalVariable receiver,
+        out IOperand value,
+        out IReadOnlyList<Instruction> valuePreparation,
+        out List<Instruction> tail)
     {
         call = null!;
         target = null!;
         receiver = null!;
         value = null!;
+        valuePreparation = [];
         tail = [];
 
         var instructions = SemanticInstructions(block);
@@ -2122,9 +2185,11 @@ public static class ListAddRecovery
             || candidate.Operands[1] is not LocalVariable list
             || method.Name != "AddWithResize"
             || method.BaseMethodContext.DeclaringType?.FullName != "System.Collections.Generic.List`1"
-            || !IsValidSlowValuePrefix(
+            || !TryCollectSlowValuePreparation(
                 instructions.Take(callIndex).ToList(),
-                candidate.Operands[2])
+                candidate.Operands[2],
+                allowPropertyGetterValue,
+                out var candidateValuePreparation)
             || !IsValidSlowTail(graph, block, trailingInstructions))
             return false;
 
@@ -2132,9 +2197,41 @@ public static class ListAddRecovery
         target = method;
         receiver = list;
         value = candidate.Operands[2];
+        valuePreparation = candidateValuePreparation;
         tail = trailingInstructions
             .Where(instruction => instruction.OpCode is not (OpCode.Return or OpCode.Jump))
             .ToList();
+        return true;
+    }
+
+    /// <summary>
+    /// 收集慢边中只为元素实参服务的构造。既有 HFA 常量规则保持原行为；新规则只接受
+    /// 单条零参数实例属性 getter，且该调用必须直接定义 <paramref name="value"/>。
+    /// </summary>
+    private static bool TryCollectSlowValuePreparation(
+        IReadOnlyList<Instruction> prefix,
+        IOperand value,
+        bool allowPropertyGetterValue,
+        out IReadOnlyList<Instruction> preparation)
+    {
+        preparation = [];
+        if (IsValidSlowValuePrefix(prefix, value))
+            return true;
+        if (!allowPropertyGetterValue
+            || prefix is not
+            [
+                {
+                    OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext getter, LocalVariable destination, _],
+                } getterCall,
+            ]
+            || !ReferenceEquals(destination, value)
+            || getter.IsStatic
+            || getter.Parameters.Count != 0
+            || !getter.Name.StartsWith("get_", StringComparison.Ordinal))
+            return false;
+
+        preparation = [getterCall];
         return true;
     }
 
@@ -2742,15 +2839,18 @@ public static class ListAddRecovery
         LocalVariable versionResult,
         IOperand versionSource,
         IOperand value,
+        IReadOnlyList<Instruction> slowValuePreparation,
         IReadOnlyList<Instruction> slowTail,
         Instruction? validatedPublicSizeRefresh,
         ApplicationAnalysisContext appContext,
         TypeAnalysisContext elementType,
         bool compactArrayAccessOnly,
         out IOperand publicValue,
+        out IReadOnlyList<Instruction> publicValuePreparation,
         out List<Instruction> preservedSlowTail)
     {
         publicValue = null!;
+        publicValuePreparation = [];
         preservedSlowTail = [];
         var instructions = fastPrefix.Concat(PatternInstructions(block)).ToList();
         var explicitMergeJump = instructions.LastOrDefault() is
@@ -2796,8 +2896,10 @@ public static class ListAddRecovery
                 appContext,
                 elementType,
                 instructions,
+                slowValuePreparation,
                 out publicValue,
-                out var valueConstruction))
+                out var valueConstruction,
+                out publicValuePreparation))
         {
             Logger.VerboseNewline($"ListAdd恢复拒绝：快慢元素值不等价，元素类型={elementType.FullName}，快值={stores[0].Operands[1]}，慢值={value}。");
             return false;
@@ -3116,11 +3218,25 @@ public static class ListAddRecovery
         ApplicationAnalysisContext appContext,
         TypeAnalysisContext elementType,
         IReadOnlyList<Instruction> valueScope,
+        IReadOnlyList<Instruction> slowValuePreparation,
         out IOperand publicValue,
-        out IReadOnlyList<Instruction> valueConstruction)
+        out IReadOnlyList<Instruction> valueConstruction,
+        out IReadOnlyList<Instruction> publicValuePreparation)
     {
         publicValue = null!;
         valueConstruction = [];
+        publicValuePreparation = [];
+        if (TryReconcilePropertyGetterValue(
+                graph,
+                fastValue,
+                slowValue,
+                elementType,
+                valueScope,
+                slowValuePreparation,
+                out publicValue,
+                out valueConstruction,
+                out publicValuePreparation))
+            return true;
         if (ReferenceEquals(fastValue, slowValue))
         {
             publicValue = slowValue;
@@ -3191,6 +3307,80 @@ public static class ListAddRecovery
         publicValue = decoded;
         return true;
     }
+
+    /// <summary>
+    /// 证明快慢路径各自执行的是同一个零参数实例属性 getter，并把慢边调用克隆到公开
+    /// <c>Add</c> 之前。getter、接收者、返回类型或唯一定义任一漂移时保持原容量状态机。
+    /// </summary>
+    private static bool TryReconcilePropertyGetterValue(
+        ISILControlFlowGraph graph,
+        IOperand fastValue,
+        IOperand slowValue,
+        TypeAnalysisContext elementType,
+        IReadOnlyList<Instruction> fastValueScope,
+        IReadOnlyList<Instruction> slowValuePreparation,
+        out IOperand publicValue,
+        out IReadOnlyList<Instruction> fastValueConstruction,
+        out IReadOnlyList<Instruction> publicValuePreparation)
+    {
+        publicValue = null!;
+        fastValueConstruction = [];
+        publicValuePreparation = [];
+        if (fastValue is not LocalVariable fastLocal
+            || slowValue is not LocalVariable slowLocal
+            || slowValuePreparation is not
+            [
+                {
+                    OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext slowGetter, var slowDestination, var slowReceiver],
+                } slowGetterCall,
+            ]
+            || !ReferenceEquals(slowDestination, slowLocal)
+            || slowGetter.IsStatic
+            || slowGetter.Parameters.Count != 0
+            || !slowGetter.Name.StartsWith("get_", StringComparison.Ordinal)
+            || !GenericCallRebinder.TypesEquivalent(slowGetter.ReturnType, elementType)
+            || !GenericCallRebinder.TypesEquivalent(slowLocal.Type, elementType))
+            return false;
+
+        var fastDefinitions = fastValueScope.Where(instruction =>
+            ReferenceEquals(instruction.Destination, fastLocal)).ToList();
+        if (fastDefinitions is not
+            [
+                {
+                    OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext fastGetter, var fastDestination, var fastReceiver],
+                } fastGetterCall,
+            ]
+            || !ReferenceEquals(fastDestination, fastLocal)
+            || fastGetter.IsStatic
+            || fastGetter.Parameters.Count != 0
+            || !fastGetter.Name.StartsWith("get_", StringComparison.Ordinal)
+            || !AreSameGetterTarget(fastGetter, slowGetter)
+            || !AreEquivalentValue(fastReceiver, slowReceiver)
+            || !GenericCallRebinder.TypesEquivalent(fastGetter.ReturnType, elementType)
+            || !GenericCallRebinder.TypesEquivalent(fastLocal.Type, elementType)
+            || graph.Instructions.Count(instruction =>
+                ReferenceEquals(instruction.Destination, fastLocal)) != 1
+            || graph.Instructions.Count(instruction =>
+                ReferenceEquals(instruction.Destination, slowLocal)) != 1)
+            return false;
+
+        publicValue = slowLocal;
+        fastValueConstruction = [fastGetterCall];
+        publicValuePreparation = [CloneInstruction(slowGetterCall)];
+        return true;
+    }
+
+    private static bool AreSameGetterTarget(
+        MethodAnalysisContext left,
+        MethodAnalysisContext right)
+        => ReferenceEquals(left, right)
+           || string.Equals(left.FullNameWithSignature, right.FullNameWithSignature, StringComparison.Ordinal)
+           && string.Equals(
+               left.DeclaringType?.FullName,
+               right.DeclaringType?.FullName,
+               StringComparison.Ordinal);
 
     /// <summary>
     /// 将快路径唯一 SSA 定义的 32 位常量表达式与慢路径只读地址中的 Single 逐位对齐。
@@ -3923,11 +4113,13 @@ public static class ListAddRecovery
         IReadOnlyList<Instruction> preservedHeadBusiness,
         ConcreteGenericMethodAnalysisContext addTarget,
         LocalVariable receiver,
+        IReadOnlyList<Instruction> valuePreparation,
         IOperand value)
     {
         var firstRemovedIndex = rewriteHead.Instructions.IndexOf(rewriteStart);
         rewriteHead.Instructions.RemoveRange(firstRemovedIndex, rewriteHead.Instructions.Count - firstRemovedIndex);
         rewriteHead.Instructions.AddRange(preservedHeadBusiness);
+        rewriteHead.Instructions.AddRange(valuePreparation.Select(CloneInstruction));
         rewriteHead.Instructions.Add(new Instruction(slowCall.Index, OpCode.CallVoid, addTarget, receiver, value));
         rewriteHead.Instructions.AddRange(slowTail);
 

@@ -457,6 +457,75 @@ public class ListAddRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 快慢路径同一属性元素读取恢复为单次getter加公开Add()
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        var getter = ConfigurePropertyGetterElementValue(fixture);
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+        var calls = fixture.Graph.Instructions.Where(instruction => instruction.IsCall).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(calls.Count(instruction => ReferenceEquals(instruction.Operands[0], getter)), Is.EqualTo(1));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 公开Count与紧凑数组路径保留一次属性求值并恢复Add()
+    {
+        var fixture = CreateFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType,
+            usePublicCount: true,
+            useDirectArrayAccess: true);
+        var getter = ConfigurePropertyGetterElementValue(fixture);
+
+        var earlyRecovered = ListAddRecovery.Run(fixture.Method);
+        var recovered = ListAddRecovery.RunCompactArrayAccess(fixture.Method);
+        var calls = fixture.Graph.Instructions.Where(instruction => instruction.IsCall).ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(earlyRecovered, Is.Zero);
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(calls.Count(instruction => ReferenceEquals(instruction.Operands[0], getter)), Is.EqualTo(1));
+            Assert.That(calls.Count(instruction =>
+                instruction.Operands[0] is MethodAnalysisContext { Name: "Add" }), Is.EqualTo(1));
+            Assert.That(ContainsListImplementationMember(fixture.Graph), Is.False);
+        });
+    }
+
+    [TestCase("getter")]
+    [TestCase("receiver")]
+    [Category("异常输入")]
+    public void 属性元素读取身份漂移时保持原容量状态机(string mismatch)
+    {
+        var fixture = CreateFixture(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType);
+        ConfigurePropertyGetterElementValue(
+            fixture,
+            mismatchGetter: mismatch == "getter",
+            mismatchReceiver: mismatch == "receiver");
+        var originalBlockCount = fixture.Graph.Blocks.Count;
+
+        var recovered = ListAddRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Graph.Blocks, Has.Count.EqualTo(originalBlockCount));
+            Assert.That(fixture.Graph.Instructions.Any(instruction =>
+                instruction.IsCall
+                && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" }), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 慢路径在扩容调用后重载同一字段载体时保留重载并恢复Add()
     {
@@ -4708,6 +4777,60 @@ public class ListAddRecoveryTests
             && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
         fastStore.SetOperand(1, fastValue);
         slowCall.SetOperand(2, slowValue);
+    }
+
+    /// <summary>
+    /// 把容量夹具的快慢元素值改造成同一零参数属性的两次读取，精确复现 IL2CPP 在
+    /// 数组写入边与 <c>AddWithResize</c> 边分别求值的形态。
+    /// </summary>
+    private static MethodAnalysisContext ConfigurePropertyGetterElementValue(
+        Fixture fixture,
+        bool mismatchGetter = false,
+        bool mismatchReceiver = false)
+    {
+        var elementType = fixture.Value.Type!;
+        var attributes = System.Reflection.MethodAttributes.Public
+                         | System.Reflection.MethodAttributes.HideBySig
+                         | System.Reflection.MethodAttributes.SpecialName;
+        var getter = new InjectedMethodAnalysisContext(
+            elementType,
+            "get_Value",
+            elementType,
+            attributes,
+            []);
+        var otherGetter = new InjectedMethodAnalysisContext(
+            elementType,
+            "get_OtherValue",
+            elementType,
+            attributes,
+            []);
+        var getterReceiver = Local("getterReceiver", elementType);
+        var otherReceiver = Local("otherGetterReceiver", elementType);
+        var fastValue = Local("fastPropertyValue", elementType);
+        var slowValue = Local("slowPropertyValue", elementType);
+
+        var fastStore = fixture.FastBlock.Instructions.Single(instruction =>
+            instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand or ArrayAccess, _] });
+        var fastStoreIndex = fixture.FastBlock.Instructions.IndexOf(fastStore);
+        fixture.FastBlock.Instructions.Insert(
+            fastStoreIndex,
+            new Instruction(-1, OpCode.Call, getter, fastValue, getterReceiver));
+        fastStore.SetOperand(1, fastValue);
+
+        var slowCall = fixture.SlowBlock.Instructions.Single(instruction =>
+            instruction.IsCall
+            && instruction.Operands[0] is MethodAnalysisContext { Name: "AddWithResize" });
+        var slowCallIndex = fixture.SlowBlock.Instructions.IndexOf(slowCall);
+        fixture.SlowBlock.Instructions.Insert(
+            slowCallIndex,
+            new Instruction(
+                -1,
+                OpCode.Call,
+                mismatchGetter ? otherGetter : getter,
+                slowValue,
+                mismatchReceiver ? otherReceiver : getterReceiver));
+        slowCall.SetOperand(2, slowValue);
+        return getter;
     }
 
     private static LocalVariable Local(string name, TypeAnalysisContext type, string? registerName = null)
