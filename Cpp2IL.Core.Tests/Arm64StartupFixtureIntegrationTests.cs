@@ -4,7 +4,9 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using AssetRipper.Primitives;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Api;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -92,6 +94,67 @@ public class Arm64StartupFixtureIntegrationTests
             "a16_darkCheckboxUnchecked",
             "a16_darkCheckboxUnchecked-dm",
         }));
+    }
+
+    [Test]
+    [Category("fixture集成")]
+    [Category("基本功能")]
+    public void 周年礼物颜色的早期初始化槽在最终控制流恢复为空字符串()
+    {
+        var context = LoadFixture();
+        var method = context.Assemblies
+            .SelectMany(assembly => assembly.Types)
+            .Single(type => type.Definition?.FullName == "DataHub")
+            .Methods
+            .Single(candidate => candidate.Definition?.Name == "GetRandomAnniversaryGiftColor");
+
+        void CaptureVerboseLog(string message, string source)
+        {
+            if (source == nameof(RuntimeMetadataSlotResolver))
+                TestContext.Out.WriteLine(message.TrimEnd());
+        }
+
+        Logger.VerboseLog += CaptureVerboseLog;
+        try
+        {
+            method.Analyze();
+        }
+        finally
+        {
+            Logger.VerboseLog -= CaptureVerboseLog;
+        }
+        var finalInstructions = method.ControlFlowGraph!.Instructions;
+        var renderedInstructions = finalInstructions
+            .Select(instruction => instruction.ToString())
+            .ToArray();
+        var emptyLiterals = finalInstructions
+            .SelectMany(instruction => instruction.Operands)
+            .OfType<StringLiteral>()
+            .Where(literal => literal.Value.Length == 0)
+            .ToArray();
+        var returnsEmptyLiteral = finalInstructions
+            .Where(instruction => instruction.OpCode == OpCode.Return)
+            .Any(instruction => instruction.Operands.OfType<StringLiteral>()
+                .Any(literal => literal.Value.Length == 0)
+                || instruction.Operands.OfType<LocalVariable>().Any(returnLocal =>
+                    finalInstructions.Any(definition =>
+                        ReferenceEquals(definition.Destination, returnLocal)
+                        && definition.SourcesAndConstants.OfType<StringLiteral>()
+                            .Any(literal => literal.Value.Length == 0))));
+
+        TestContext.Out.WriteLine("最终控制流：");
+        foreach (var instruction in renderedInstructions)
+            TestContext.Out.WriteLine(instruction);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(renderedInstructions, Has.None.Contains("59EEF90"),
+                "已初始化的空字符串槽不得残留为原生绝对内存读取。");
+            Assert.That(emptyLiterals, Is.Not.Empty,
+                "周年礼物颜色的默认返回值必须恢复为元数据中的空字符串字面量。");
+            Assert.That(returnsEmptyLiteral, Is.True,
+                "最终返回数据流必须包含空字符串定义，而不是整数零或原生指针。");
+        }
     }
 
     [Test]

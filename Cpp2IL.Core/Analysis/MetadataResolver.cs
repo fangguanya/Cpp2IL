@@ -14,11 +14,15 @@ namespace Cpp2IL.Core.Analysis;
 
 public static class MetadataResolver
 {
-    public static void ResolveAll(MethodAnalysisContext method)
+    public static HashSet<ulong> ResolveAll(MethodAnalysisContext method)
     {
         ResolveCalls(method);
+        // 中文注释：此刻运行时初始化调用已绑定为名称，而其SSA实参仍保留绝对槽加载；
+        // 下一步元数据用法解析会把该加载替换为强类型操作数，因此必须在两者之间一次性冻结目录。
+        var initializedRuntimeMetadataSlots = RuntimeMetadataSlotResolver.CaptureInitializedSlotAddresses(method);
         ResolveGetter(method);
         ResolveMetadataUsages(method);
+        return initializedRuntimeMetadataSlots;
     }
 
     /// <summary>

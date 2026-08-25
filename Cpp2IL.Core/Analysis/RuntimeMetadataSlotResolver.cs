@@ -25,7 +25,22 @@ public static class RuntimeMetadataSlotResolver
     public static HashSet<ulong> CaptureInitializedSlotAddresses(MethodAnalysisContext method)
     {
         var instructions = method.ControlFlowGraph!.Instructions;
-        return CollectInitializedSlotAddresses(instructions, BuildDefinitions(instructions));
+        var slots = CollectInitializedSlotAddresses(instructions, BuildDefinitions(instructions));
+        var initializerCalls = instructions
+            .Where(instruction => instruction.IsCall
+                && instruction.Operands.FirstOrDefault() is StringLiteral { Value: var name }
+                && name is InitializeRuntimeMetadata or InitializeMethod)
+            .ToArray();
+        if (initializerCalls.Length > 0)
+        {
+            Logger.VerboseNewline(
+                $"运行时元数据初始化槽捕获：method={method.Name}，calls={initializerCalls.Length}，" +
+                $"count={slots.Count}，slots={string.Join(",", slots.OrderBy(address => address).Select(address => $"0x{address:X}"))}，" +
+                $"first={initializerCalls[0]}",
+                nameof(RuntimeMetadataSlotResolver));
+        }
+
+        return slots;
     }
 
     /// <summary>

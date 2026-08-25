@@ -395,7 +395,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：任何元数据操作数改写前冻结全部“绝对槽 - 零偏移二次读取”候选链；
         // 元数据调用解析完成后再用初始化槽目录过滤，兼顾完整证据与精确边界。
         var runtimeClassSlotCandidates = RuntimeClassSlotIdentityRecovery.CaptureCandidates(this);
-
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
@@ -405,7 +404,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
-        MetadataResolver.ResolveAll(this);
+        // 中文注释：调用目标完成绑定后、元数据加载被强类型替换前，解析器同步返回一次性冻结的
+        // 初始化槽目录；后续阶段只消费该目录，不再扫描已经改写的控制流。
+        var initializedRuntimeMetadataSlots = MetadataResolver.ResolveAll(this);
 
         // ARM64大值类型通过X8指向调用方返回缓冲区；目标身份解析后才能把返回值绑定到真实栈局部。
         HiddenReturnBufferRecovery.Run(this);
@@ -414,9 +415,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         KeyFunctionRecovery.RewriteAllocationsAndBarriers(this);
         DeadCodeEliminator.Run(this);
 
-        // 初始化保护区删除后不再能从CFG枚举其 MethodInfo 槽；因此先冻结槽地址目录，
-        // 后续只把该不可变证据用于清理同一方法内的隐藏元数据读取。
-        var initializedRuntimeMetadataSlots = RuntimeMetadataSlotResolver.CaptureInitializedSlotAddresses(this);
         // 中文注释：部分ARM64调用在提升时已丢弃隐藏MethodInfo实参，但初始化目录仍保存具体
         // MethodRef；只在同一泛型基方法得到唯一具体实例时收紧共享object目标。
         RuntimeMetadataSlotResolver.RecoverInitializedGenericCallTargets(
@@ -510,10 +508,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 这里仅执行一次二级TypeInfo静态字段闭合，并从调用形参、定型局部和字段写入读取预期类型；
         // 链上每个局部仍必须只有一个定义。
         LocalVariables.ResolveExpectedSelfTypedStaticFields(this);
-        // 中文注释：必须先完成 RuntimeClass 与字段闭包，再把剩余的零偏移槽读取改写为
-        // 字符串、类型或方法操作数；否则类型元数据会提前吃掉 static_fields 的类载体证据。
-        MetadataResolver.ResolveInitializedInlineMetadataOperands(this, initializedRuntimeMetadataSlots);
-
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 
@@ -657,6 +651,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveFinalIntegerInductionCarrierTypes(this);
 
         LocalVariables.RemoveUnused(this);
+
+        // 中文注释：返回Phi、字段值返回、集合布局及末次死写均已完成，所有“绝对槽载体→
+        // 零偏移读取”的终态形状现在一次性可见；在流水线末端统一恢复字符串、类型或方法
+        // 元数据操作数，避免早期扫描遗漏后续才物化的默认返回分支。
+        MetadataResolver.ResolveInitializedInlineMetadataOperands(this, initializedRuntimeMetadataSlots);
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
