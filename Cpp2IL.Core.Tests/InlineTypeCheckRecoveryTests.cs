@@ -322,6 +322,70 @@ public class InlineTypeCheckRecoveryTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 空引用失败且成功块立即读取目标字段时恢复IsInst()
+    {
+        var fixture = CreateFixture(
+            exceptionFullName: "System.NullReferenceException",
+            dereferenceTargetFieldOnSuccess: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.IsInst), Is.EqualTo(1));
+            Assert.That(instructions.Any(instruction => instruction.Operands.Any(operand =>
+                operand is FieldReference { Local: var local }
+                && ReferenceEquals(local, instructions.Single(item => item.OpCode == OpCode.IsInst).Destination))), Is.True);
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 源参数经Move载体执行检查和目标字段读取时恢复IsInst()
+    {
+        var fixture = CreateFixture(
+            exceptionFullName: "System.NullReferenceException",
+            dereferenceTargetFieldOnSuccess: true,
+            sourceUsesMoveCarrier: true);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        var isInst = instructions.Single(instruction => instruction.OpCode == OpCode.IsInst);
+        Assert.Multiple(() =>
+        {
+            Assert.That(isInst.Operands[1], Is.SameAs(fixture.Source));
+            Assert.That(instructions.Any(instruction => instruction.Operands.Any(operand =>
+                operand is FieldReference { Local: var local }
+                && ReferenceEquals(local, isInst.Destination))), Is.True);
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 空引用失败但成功块字段偏移不属于目标类型时保持原图()
+    {
+        var fixture = CreateFixture(
+            exceptionFullName: "System.NullReferenceException",
+            dereferenceTargetFieldOnSuccess: true,
+            targetFieldOffsetOnSuccess: 0x7FFF_FFF0);
+
+        InlineTypeCheckRecovery.Run(fixture.Method);
+
+        var instructions = fixture.Method.ControlFlowGraph!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.IsInst), Is.False);
+            Assert.That(instructions.Count(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.EqualTo(2));
+            Assert.That(instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.True);
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 空引用失败块仍有真实空值守卫前驱时只移除类型检查分支()
     {
@@ -377,14 +441,20 @@ public class InlineTypeCheckRecoveryTests
         int failureTrampolineDepth = 0,
         bool failureTrampolineHasComputation = false,
         bool dereferenceTargetOnSuccess = false,
+        bool dereferenceTargetFieldOnSuccess = false,
+        long? targetFieldOffsetOnSuccess = null,
         bool sharedNullGuardPredecessor = false,
-        bool secondCheckBranchesToSuccess = false)
+        bool secondCheckBranchesToSuccess = false,
+        bool sourceUsesMoveCarrier = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var mscorlib = app.GetAssemblyByName("mscorlib")!;
         var targetType = app.SystemTypes.SystemStringType;
         var exceptionType = mscorlib.GetTypeByFullName(exceptionFullName)!;
-        var source = Local("source", app.SystemTypes.SystemObjectType);
+        var sourceParameter = Local("source", app.SystemTypes.SystemObjectType);
+        var source = sourceUsesMoveCarrier
+            ? Local("sourceCarrier", app.SystemTypes.SystemObjectType)
+            : sourceParameter;
         var sourceClass = Local(
             "sourceClass",
             new RuntimeClassTypeAnalysisContext(app.SystemTypes.SystemObjectType, mscorlib));
@@ -432,6 +502,10 @@ public class InlineTypeCheckRecoveryTests
             new Immediate(-1),
             secondCheckBranchesToSuccess ? equal : notEqual);
         var secondFailureJump = new Instruction(-1, OpCode.Jump, new Immediate(-1));
+        var targetField = targetType.Fields.First(field =>
+            !field.IsStatic
+            && field.Offset > 0
+            && (field.Attributes & FieldAttributes.Literal) == 0);
         var useSource = dereferenceTargetOnSuccess
             ? new Instruction(
                 9,
@@ -442,6 +516,14 @@ public class InlineTypeCheckRecoveryTests
                     && method.Parameters.Count == 0),
                 returned,
                 source)
+            : dereferenceTargetFieldOnSuccess
+                ? new Instruction(
+                    9,
+                    OpCode.Move,
+                    returned,
+                    new MemoryOperand(
+                        source,
+                        addend: targetFieldOffsetOnSuccess ?? targetField.Offset))
             : new Instruction(9, OpCode.Move, returned, source);
         var successReturn = new Instruction(10, OpCode.Return, returned);
         var failureThrow = new Instruction(11, OpCode.Throw, exceptionType);
@@ -466,6 +548,8 @@ public class InlineTypeCheckRecoveryTests
             invertCheck,
             secondJump,
         };
+        if (sourceUsesMoveCarrier)
+            instructions.Insert(0, new Instruction(-1, OpCode.Move, source, sourceParameter));
         if (secondCheckBranchesToSuccess)
             instructions.Add(secondFailureJump);
         instructions.Add(useSource);

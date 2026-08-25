@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -202,15 +203,17 @@ public static class InlineTypeCheckRecovery
         source = sourceObject;
         source.Type ??= inferredSourceType;
         targetType = representedTarget;
-        recoveryOpCode = failureSemantics switch
-        {
-            FailureSemantics.CastClass => OpCode.CastClass,
-            FailureSemantics.IsInstThenDereference when SuccessStartsWithTargetDereference(
+        var startsWithTargetDereference = failureSemantics == FailureSemantics.IsInstThenDereference
+            && SuccessStartsWithTargetDereference(
                 secondCheckBlock,
                 secondFailureEntry,
                 source,
                 targetType,
-                definitions) => OpCode.IsInst,
+                definitions);
+        recoveryOpCode = failureSemantics switch
+        {
+            FailureSemantics.CastClass => OpCode.CastClass,
+            FailureSemantics.IsInstThenDereference when startsWithTargetDereference => OpCode.IsInst,
             _ => OpCode.Nop,
         };
         if (recoveryOpCode == OpCode.Nop)
@@ -236,21 +239,63 @@ public static class InlineTypeCheckRecovery
         if (successBlocks.Count != 1)
             return false;
 
+        // 中文注释：ARM64 常先把参数复制到被调用方保存寄存器，再用该载体执行类检查和字段读取。
+        // 比较时统一追溯双方的纯 Move 链，但恢复指令仍绑定原载体，以保持后续支配关系和生命期。
+        var resolvedSource = ResolveMoveSource(source, definitions);
         foreach (var instruction in successBlocks[0].Instructions)
         {
             if (instruction.OpCode is OpCode.Nop or OpCode.Phi)
                 continue;
-            if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid)
-                || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
-                || called.IsStatic
-                || !GenericCallRebinder.TypesEquivalent(called.DeclaringType, targetType))
-                return false;
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid
+                && instruction.Operands.FirstOrDefault() is MethodAnalysisContext called
+                && !called.IsStatic
+                && GenericCallRebinder.TypesEquivalent(called.DeclaringType, targetType))
+            {
+                var receiverIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+                return receiverIndex < instruction.Operands.Count
+                    && ReferenceEquals(
+                        ResolveMoveSource(instruction.Operands[receiverIndex], definitions),
+                        resolvedSource);
+            }
 
-            var receiverIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
-            return receiverIndex < instruction.Operands.Count
-                && ReferenceEquals(
-                    ResolveMoveSource(instruction.Operands[receiverIndex], definitions),
-                    source);
+            // 中文注释：IL2CPP 对“as T 后立即读取字段”会先完成同一类深度/继承表检查，
+            // 再直接以原对象基址读取 T 的字段；类型失败和空对象都进入空引用异常闭包。
+            // 只有首个业务操作数是源对象的零索引实例字段，且该偏移在目标类型继承链上
+            // 唯一对应一个真实字段时，才把该形态视为目标类型解引用。
+            foreach (var memory in instruction.Operands.OfType<MemoryOperand>())
+            {
+                var resolvedBase = memory.Base is LocalVariable memoryBase
+                    ? ResolveMoveSource(memoryBase, definitions)
+                    : memory.Base;
+                var sourceMatches = memory is { Index: null, Scale: 0 }
+                    && ReferenceEquals(resolvedBase, resolvedSource);
+                var fieldMatches = sourceMatches
+                    && HasUniqueInstanceFieldAtOffset(targetType, memory.Addend);
+                if (fieldMatches)
+                    return true;
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool HasUniqueInstanceFieldAtOffset(TypeAnalysisContext targetType, long offset)
+    {
+        for (var current = targetType; current != null; current = current.BaseType)
+        {
+            var matches = current.Fields
+                .Where(field =>
+                    !field.IsStatic
+                    && field.Offset == offset
+                    && (field.Attributes & FieldAttributes.Literal) == 0)
+                .Take(2)
+                .Count();
+            if (matches == 1)
+                return true;
+            if (matches > 1)
+                return false;
         }
 
         return false;
