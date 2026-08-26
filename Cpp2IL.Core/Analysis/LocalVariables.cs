@@ -148,7 +148,7 @@ public static class LocalVariables
             if (method.ParameterOperands[operandIndex] is not Register reg)
                 continue;
 
-            var local = method.Locals.FirstOrDefault(l => l.Register.Number == reg.Number && l.Register.Version == -1);
+            var local = FindParameterLocal(method.Locals, reg);
             if (local == null)
                 continue;
 
@@ -181,6 +181,46 @@ public static class LocalVariables
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
         }
+    }
+
+    /// <summary>
+    /// 查找参数在 SSA 局部中的入口身份。ARM64 叶方法可能直接读取参数寄存器，SSA 会把首次读取编号为 v1，
+    /// 因而不能只接受历史上的未编号版本；相同物理寄存器存在多个版本时，最小版本才是入口值。
+    /// </summary>
+    internal static LocalVariable? FindParameterLocal(
+        IEnumerable<LocalVariable> locals,
+        Register parameterRegister)
+    {
+        var parameterPhysicalName = CanonicalParameterRegisterName(parameterRegister.Name);
+        var candidates = locals
+            .Where(local => CanonicalParameterRegisterName(local.Register.Name) == parameterPhysicalName)
+            .ToList();
+        if (candidates.Count == 0)
+            return null;
+
+        // SSA 已建立时，最小正版本是入口活值；未编号占位只在没有 SSA 入口时使用。
+        return candidates
+                   .Where(local => local.Register.Version >= 0)
+                   .OrderBy(local => local.Register.Version)
+                   .FirstOrDefault()
+               ?? candidates.FirstOrDefault(local => local.Register.Version == -1);
+    }
+
+    /// <summary>
+    /// ARM64 调用约定可能以 Wn 描述窄参数，而指令恢复统一以 Xn 保存同一物理寄存器。
+    /// 这里只归一 W0-W30，其他架构与特殊寄存器名称保持原样。
+    /// </summary>
+    internal static string CanonicalParameterRegisterName(string name)
+    {
+        if (name.Length >= 2
+            && name[0] == 'W'
+            && int.TryParse(name.AsSpan(1), out var index)
+            && index is >= 0 and <= 30)
+        {
+            return $"X{index}";
+        }
+
+        return name;
     }
 
     public static void RemoveUnused(MethodAnalysisContext method)

@@ -19,6 +19,40 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
+    public void 未建立SSA时静态字符参数绑定未编号入口寄存器()
+    {
+        var unversioned = new LocalVariable("entry", new Register(null, "X0", -1));
+
+        var actual = LocalVariables.FindParameterLocal([unversioned], new Register(null, "X0"));
+
+        Assert.That(actual, Is.SameAs(unversioned));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 静态字符叶方法绑定同寄存器最小SSA版本()
+    {
+        var entry = new LocalVariable("entry", new Register(null, "X0", 1));
+        var returned = new LocalVariable("returned", new Register(null, "X0", 4));
+
+        var actual = LocalVariables.FindParameterLocal([returned, entry], new Register(null, "W0"));
+
+        Assert.That(actual, Is.SameAs(entry));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 参数寄存器不存在时保持未绑定()
+    {
+        var unrelated = new LocalVariable("unrelated", new Register(null, "X1", 1));
+
+        var actual = LocalVariables.FindParameterLocal([unrelated], new Register(null, "X0"));
+
+        Assert.That(actual, Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 有符号整数转单精度结果覆盖先到的Enumerator占位类型()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
