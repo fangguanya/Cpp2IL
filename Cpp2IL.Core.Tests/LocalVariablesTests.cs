@@ -19,36 +19,89 @@ public class LocalVariablesTests
 
     [Test]
     [Category("基本功能")]
-    public void 未建立SSA时静态字符参数绑定未编号入口寄存器()
+    public void 静态字符参数绑定宽窄别名的唯一入口寄存器()
     {
         var unversioned = new LocalVariable("entry", new Register(null, "X0", -1));
 
-        var actual = LocalVariables.FindParameterLocal([unversioned], new Register(null, "X0"));
+        var actual = LocalVariables.FindParameterLocal([unversioned], new Register(null, "W0"));
 
         Assert.That(actual, Is.SameAs(unversioned));
     }
 
     [Test]
     [Category("边界值")]
-    public void 静态字符叶方法绑定同寄存器最小SSA版本()
+    public void 体内存在多个SSA版本时仍只绑定入口值()
     {
-        var entry = new LocalVariable("entry", new Register(null, "X0", 1));
+        var entry = new LocalVariable("entry", new Register(null, "W0", -1));
+        var firstDefinition = new LocalVariable("firstDefinition", new Register(null, "X0", 1));
         var returned = new LocalVariable("returned", new Register(null, "X0", 4));
 
-        var actual = LocalVariables.FindParameterLocal([returned, entry], new Register(null, "W0"));
+        var actual = LocalVariables.FindParameterLocal(
+            [returned, firstDefinition, entry],
+            new Register(null, "W0"));
 
         Assert.That(actual, Is.SameAs(entry));
     }
 
     [Test]
     [Category("异常输入")]
-    public void 参数寄存器不存在时保持未绑定()
+    public void 只有体内SSA定义时保持未绑定()
     {
-        var unrelated = new LocalVariable("unrelated", new Register(null, "X1", 1));
+        var firstDefinition = new LocalVariable("firstDefinition", new Register(null, "X0", 1));
+        var source = new LocalVariable("source", new Register(null, "X1", -1));
+        var result = new LocalVariable("result", new Register(null, "X8", 1));
+        var graph = new ISILControlFlowGraph(
+        [
+            new Instruction(0, OpCode.Move, firstDefinition, source),
+            new Instruction(1, OpCode.Subtract, result, firstDefinition, new Immediate(97)),
+            new Instruction(2, OpCode.Return, result)
+        ]);
 
-        var actual = LocalVariables.FindParameterLocal([unrelated], new Register(null, "X0"));
+        var actual = LocalVariables.FindParameterLocal(
+            [firstDefinition],
+            new Register(null, "W0"),
+            graph);
 
         Assert.That(actual, Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 返回Phi合并入口参数时恢复该Phi的参数身份()
+    {
+        var entry = new LocalVariable("entry", new Register(null, "X0", -1));
+        var branchResult = new LocalVariable("branchResult", new Register(null, "X0", 2));
+        var mergedReturn = new LocalVariable("mergedReturn", new Register(null, "X0", 1))
+        {
+            IsReturn = true
+        };
+        var graph = new ISILControlFlowGraph(
+        [
+            new Instruction(0, OpCode.Move, branchResult, new Immediate(122)),
+            new Instruction(1, OpCode.Phi, mergedReturn, branchResult, entry),
+            new Instruction(2, OpCode.Return, mergedReturn)
+        ]);
+
+        var actual = LocalVariables.FindParameterLocal(
+            [entry, branchResult, mergedReturn],
+            new Register(null, "W0"),
+            graph);
+
+        Assert.That(actual, Is.SameAs(mergedReturn));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 宽窄别名同时作为入口值时精确寄存器优先()
+    {
+        var wideEntry = new LocalVariable("wideEntry", new Register(null, "X0", -1));
+        var narrowEntry = new LocalVariable("narrowEntry", new Register(null, "W0", -1));
+
+        var actual = LocalVariables.FindParameterLocal(
+            [wideEntry, narrowEntry],
+            new Register(null, "W0"));
+
+        Assert.That(actual, Is.SameAs(narrowEntry));
     }
 
     [Test]

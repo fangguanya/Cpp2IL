@@ -4,6 +4,7 @@ using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
@@ -148,7 +149,10 @@ public static class LocalVariables
             if (method.ParameterOperands[operandIndex] is not Register reg)
                 continue;
 
-            var local = FindParameterLocal(method.Locals, reg);
+            var local = FindParameterLocal(
+                method.Locals,
+                reg,
+                method.ControlFlowGraph);
             if (local == null)
                 continue;
 
@@ -184,26 +188,92 @@ public static class LocalVariables
     }
 
     /// <summary>
-    /// 查找参数在 SSA 局部中的入口身份。ARM64 叶方法可能直接读取参数寄存器，SSA 会把首次读取编号为 v1，
-    /// 因而不能只接受历史上的未编号版本；相同物理寄存器存在多个版本时，最小版本才是入口值。
+    /// 查找参数在 SSA 局部中的入口身份。SSA 明确以 <c>Version=-1</c> 表示方法入口活值，
+    /// 任何非负版本都是方法体内的定义，不得仅因版本号最小就当作参数。
     /// </summary>
     internal static LocalVariable? FindParameterLocal(
         IEnumerable<LocalVariable> locals,
-        Register parameterRegister)
+        Register parameterRegister,
+        ISILControlFlowGraph? graph = null)
     {
-        var parameterPhysicalName = CanonicalParameterRegisterName(parameterRegister.Name);
-        var candidates = locals
-            .Where(local => CanonicalParameterRegisterName(local.Register.Name) == parameterPhysicalName)
+        var entryLocals = locals
+            .Where(local => local.Register.Version == -1)
             .ToList();
-        if (candidates.Count == 0)
-            return null;
 
-        // SSA 已建立时，最小正版本是入口活值；未编号占位只在没有 SSA 入口时使用。
-        return candidates
-                   .Where(local => local.Register.Version >= 0)
-                   .OrderBy(local => local.Register.Version)
-                   .FirstOrDefault()
-               ?? candidates.FirstOrDefault(local => local.Register.Version == -1);
+        // 先保留历史上的精确寄存器身份，避免对其他架构扩大匹配范围。
+        var exact = entryLocals.FirstOrDefault(local =>
+            local.Register.Number == parameterRegister.Number
+            && local.Register.Name == parameterRegister.Name);
+
+        // ARM64 窄参数可由 Wn 传入，而后续 ISIL 以 Xn 读取同一物理寄存器。
+        // 只有唯一的未定义入口别名才构成身份证明；存在歧义时保持未绑定。
+        var parameterPhysicalName = CanonicalParameterRegisterName(parameterRegister.Name);
+        var aliases = entryLocals
+            .Where(local => CanonicalParameterRegisterName(local.Register.Name) == parameterPhysicalName)
+            .Take(2)
+            .ToArray();
+        // ARM64 返回寄存器与首参寄存器重合时，出口 Phi 会合并“原参数”和
+        // “分支返回值”。退 SSA 前必须把该 Phi 作为参数身份保护，否则复制传播会让
+        // 早期参数读取变成 default。只接受唯一的、由 Phi/Move 链确切连回入口局部的正版本。
+        if (graph != null)
+        {
+            var entrySet = new HashSet<LocalVariable>(entryLocals);
+            var definitions = graph.Blocks
+                .SelectMany(block => block.Instructions)
+                .Where(instruction => instruction.Destination is LocalVariable)
+                .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+                .ToDictionary(group => group.Key, group => group.ToArray());
+            var provenEntryPhis = locals
+                .Where(local => local.IsReturn
+                                && local.Register.Version >= 0
+                                && CanonicalParameterRegisterName(local.Register.Name) == parameterPhysicalName
+                                && IsEntryPhiCarrier(local, entrySet, definitions))
+                .Take(2)
+                .ToArray();
+            if (provenEntryPhis.Length == 1)
+                return provenEntryPhis[0];
+        }
+
+        if (exact != null)
+            return exact;
+        return aliases.Length == 1 ? aliases[0] : null;
+    }
+
+    /// <summary>
+    /// 判断候选是否为确切合并入口参数的 Phi。根候选必须由唯一 Phi 定义；
+    /// 内部只沿唯一 Move/Phi 定义回溯，任何算术、调用或多定义都不构成入口身份。
+    /// </summary>
+    internal static bool IsEntryPhiCarrier(
+        LocalVariable candidate,
+        ISet<LocalVariable> entryLocals,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions)
+    {
+        if (!definitions.TryGetValue(candidate, out var rootDefinitions)
+            || rootDefinitions is not [{ OpCode: OpCode.Phi }])
+            return false;
+
+        return ReachesEntry(candidate, entryLocals, definitions, []);
+    }
+
+    private static bool ReachesEntry(
+        LocalVariable current,
+        ISet<LocalVariable> entryLocals,
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions,
+        HashSet<LocalVariable> visited)
+    {
+        if (entryLocals.Contains(current))
+            return true;
+        if (!visited.Add(current)
+            || !definitions.TryGetValue(current, out var currentDefinitions)
+            || currentDefinitions.Length != 1
+            || currentDefinitions[0].OpCode is not (OpCode.Move or OpCode.Phi))
+            return false;
+
+        var reachesEntry = currentDefinitions[0].Sources
+            .OfType<LocalVariable>()
+            .Any(source => ReachesEntry(source, entryLocals, definitions, visited));
+        visited.Remove(current);
+        return reachesEntry;
     }
 
     /// <summary>
