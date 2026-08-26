@@ -6,6 +6,7 @@ using AsmResolver;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
 using AsmResolver.DotNet.Signatures;
+using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.OutputFormats;
 using Cpp2IL.Core.Utils.AsmResolver;
@@ -14,6 +15,67 @@ namespace Cpp2IL.Core.Tests;
 
 public class DllOutputTests
 {
+    [Test]
+    [Category("基本功能")]
+    public void 单索引器属性恢复唯一默认成员名称()
+    {
+        var module = new ModuleDefinition("SingleIndexer.dll");
+        var property = new PropertyDefinition(
+            "Entry",
+            PropertyAttributes.None,
+            PropertySignature.CreateInstance(
+                module.CorLibTypeFactory.String,
+                [module.CorLibTypeFactory.Int32]));
+
+        var restored = AsmResolverAssemblyPopulator.TryGetUnambiguousIndexerName(
+            [property],
+            out var name);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(restored, Is.True);
+            Assert.That(name, Is.EqualTo("Entry"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 普通无参属性不生成默认成员名称()
+    {
+        var module = new ModuleDefinition("OrdinaryProperty.dll");
+        var property = new PropertyDefinition(
+            "Value",
+            PropertyAttributes.None,
+            PropertySignature.CreateInstance(module.CorLibTypeFactory.String));
+
+        Assert.That(
+            AsmResolverAssemblyPopulator.TryGetUnambiguousIndexerName([property], out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 多种索引器属性名称存在歧义时保持关闭()
+    {
+        var module = new ModuleDefinition("AmbiguousIndexer.dll");
+        var first = new PropertyDefinition(
+            "First",
+            PropertyAttributes.None,
+            PropertySignature.CreateInstance(
+                module.CorLibTypeFactory.String,
+                [module.CorLibTypeFactory.Int32]));
+        var second = new PropertyDefinition(
+            "Second",
+            PropertyAttributes.None,
+            PropertySignature.CreateInstance(
+                module.CorLibTypeFactory.String,
+                [module.CorLibTypeFactory.String]));
+
+        Assert.That(
+            AsmResolverAssemblyPopulator.TryGetUnambiguousIndexerName([first, second], out _),
+            Is.False);
+    }
+
     [Test]
     [Category("基本功能")]
     public void IL2CPP模块上下文绑定到唯一CLI全局类型()

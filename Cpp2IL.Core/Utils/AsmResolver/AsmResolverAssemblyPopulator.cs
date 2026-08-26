@@ -460,6 +460,76 @@ public static class AsmResolverAssemblyPopulator
 
             ilTypeDefinition.Properties.Add(managedProperty);
         }
+
+        AddMissingIndexerMetadata(typeContext, ilTypeDefinition);
+    }
+
+    /// <summary>
+    /// C# 编译器依靠 DefaultMemberAttribute 将带参数 PropertyDef 发射为索引器。
+    /// IL2CPP 元数据可能不保留该属性，因此只在所有参数化属性共享唯一名称时补回；
+    /// 多种名称代表无法证明语言层默认成员，必须保持关闭。
+    /// </summary>
+    private static void AddMissingIndexerMetadata(TypeAnalysisContext typeContext, TypeDefinition ilTypeDefinition)
+    {
+        const string attributeName = "System.Reflection.DefaultMemberAttribute";
+        if (!TryGetUnambiguousIndexerName(ilTypeDefinition.Properties, out var indexerName)
+            || ilTypeDefinition.CustomAttributes.Any(attribute =>
+                attribute.Constructor?.DeclaringType?.FullName == attributeName)
+            || typeContext.CustomAttributes?.Any(attribute =>
+                attribute.Constructor.DeclaringType?.FullName == attributeName) == true)
+        {
+            return;
+        }
+
+        // 各程序集会并行填充，不能依赖 mscorlib 的 MethodDefinition 已经建立。
+        // 直接面向当前模块的 CorLibScope 构造标准属性引用，避免跨任务时序依赖。
+        var module = ilTypeDefinition.DeclaringModule!;
+        var attributeType = module.CorLibTypeFactory.CorLibScope.CreateTypeReference(
+            "System.Reflection",
+            "DefaultMemberAttribute");
+        var constructor = new MemberReference(
+            attributeType,
+            ".ctor",
+            MethodSignature.CreateInstance(
+                module.CorLibTypeFactory.Void,
+                [module.CorLibTypeFactory.String]));
+        var signature = new CustomAttributeSignature([
+            new CustomAttributeArgument(module.CorLibTypeFactory.String, indexerName)
+        ]);
+        ilTypeDefinition.CustomAttributes.Add(new CustomAttribute(
+            (ICustomAttributeType)constructor,
+            signature));
+    }
+
+    /// <summary>
+    /// 单次扫描确定参数化属性是否具有唯一名称；普通属性不参与候选。
+    /// </summary>
+    internal static bool TryGetUnambiguousIndexerName(
+        IEnumerable<PropertyDefinition> properties,
+        out string indexerName)
+    {
+        string? candidate = null;
+        foreach (var property in properties)
+        {
+            if (property.Signature?.ParameterTypes.Count is not > 0)
+                continue;
+
+            var current = property.Name?.ToString();
+            if (string.IsNullOrEmpty(current))
+            {
+                indexerName = string.Empty;
+                return false;
+            }
+            if (candidate != null && !string.Equals(candidate, current, StringComparison.Ordinal))
+            {
+                indexerName = string.Empty;
+                return false;
+            }
+            candidate = current;
+        }
+
+        indexerName = candidate ?? string.Empty;
+        return candidate != null;
     }
 
     private static void CopyEventsInType(TypeAnalysisContext cppTypeDefinition, TypeDefinition ilTypeDefinition)
