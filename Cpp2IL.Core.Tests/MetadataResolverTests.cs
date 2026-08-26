@@ -781,6 +781,120 @@ public class MetadataResolverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 强类型字符串直接绝对槽恢复为字面量()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var destination = new LocalVariable("destination", new Register(null, "X0", 1), stringType);
+        var load = new Instruction(
+            0,
+            OpCode.Move,
+            destination,
+            new MemoryOperand(addend: 0x59EEF90));
+
+        var changed = MetadataResolver.ResolveFinalTypedAbsoluteStringLoads(
+            [load],
+            stringType,
+            [0x59EEF90],
+            address => address == 0x59EEF90
+                ? new StringLiteral("relative")
+                : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(load.Operands[1], Is.TypeOf<StringLiteral>());
+            Assert.That(((StringLiteral)load.Operands[1]).Value, Is.EqualTo("relative"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同一最大绝对字符串槽的共享读取只解析一次()
+    {
+        var stringType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType;
+        var firstLoad = new Instruction(
+            0,
+            OpCode.Move,
+            new LocalVariable("first", new Register(null, "X0", 1), stringType),
+            new MemoryOperand(addend: long.MaxValue));
+        var secondLoad = new Instruction(
+            1,
+            OpCode.Move,
+            new LocalVariable("second", new Register(null, "X1", 1), stringType),
+            new MemoryOperand(addend: long.MaxValue));
+        var resolverCalls = 0;
+
+        var changed = MetadataResolver.ResolveFinalTypedAbsoluteStringLoads(
+            [firstLoad, secondLoad],
+            stringType,
+            [(ulong)long.MaxValue],
+            address =>
+            {
+                resolverCalls++;
+                return address == long.MaxValue
+                    ? new StringLiteral("boundary")
+                    : null;
+            });
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(2));
+            Assert.That(resolverCalls, Is.EqualTo(1));
+            Assert.That(((StringLiteral)firstLoad.Operands[1]).Value, Is.EqualTo("boundary"));
+            Assert.That(((StringLiteral)secondLoad.Operands[1]).Value, Is.EqualTo("boundary"));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非字符串负地址索引地址和未解析绝对槽保持原样()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var stringType = appContext.SystemTypes.SystemStringType;
+        var integerMemory = new MemoryOperand(addend: 0x1000);
+        var negativeMemory = new MemoryOperand(addend: -1);
+        var index = new LocalVariable("index", new Register(null, "X2", 1), appContext.SystemTypes.SystemInt32Type);
+        var indexedMemory = new MemoryOperand(indexRegister: index, addend: 0x2000);
+        var unresolvedMemory = new MemoryOperand(addend: 0x3000);
+        var uninitializedMemory = new MemoryOperand(addend: 0x4000);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move,
+                new LocalVariable("integer", new Register(null, "X0", 1), appContext.SystemTypes.SystemInt32Type),
+                integerMemory),
+            new(1, OpCode.Move,
+                new LocalVariable("negative", new Register(null, "X0", 2), stringType),
+                negativeMemory),
+            new(2, OpCode.Move,
+                new LocalVariable("indexed", new Register(null, "X0", 3), stringType),
+                indexedMemory),
+            new(3, OpCode.Move,
+                new LocalVariable("unresolved", new Register(null, "X0", 4), stringType),
+                unresolvedMemory),
+            new(4, OpCode.Move,
+                new LocalVariable("uninitialized", new Register(null, "X0", 5), stringType),
+                uninitializedMemory),
+        };
+
+        var changed = MetadataResolver.ResolveFinalTypedAbsoluteStringLoads(
+            instructions,
+            stringType,
+            [0x1000, 0x2000, 0x3000],
+            address => address == 0x4000 ? new StringLiteral("未初始化槽") : null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.Zero);
+            Assert.That(instructions[0].Operands[1], Is.EqualTo(integerMemory));
+            Assert.That(instructions[1].Operands[1], Is.EqualTo(negativeMemory));
+            Assert.That(instructions[2].Operands[1], Is.EqualTo(indexedMemory));
+            Assert.That(instructions[3].Operands[1], Is.EqualTo(unresolvedMemory));
+            Assert.That(instructions[4].Operands[1], Is.EqualTo(uninitializedMemory));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 四百个不同偏移的强类型字符串二层槽全部恢复()
     {

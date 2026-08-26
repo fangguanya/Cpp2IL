@@ -655,6 +655,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // 中文注释：返回Phi、字段值返回、集合布局及末次死写均已完成，所有“绝对槽载体→
         // 零偏移读取”的终态形状现在一次性可见；在流水线末端统一恢复字符串、类型或方法
         // 元数据操作数，避免早期扫描遗漏后续才物化的默认返回分支。
+        MetadataResolver.ResolveFinalTypedAbsoluteStringLoads(this, initializedRuntimeMetadataSlots);
         MetadataResolver.ResolveInitializedInlineMetadataOperands(this, initializedRuntimeMetadataSlots);
     }
 

@@ -259,6 +259,44 @@ public static class MetadataResolver
     }
 
     /// <summary>
+    /// 在类型、Phi 和返回生命期全部收敛后，恢复退 SSA 最终物化出的强类型字符串绝对槽读取。
+    /// 地址必须同时属于本方法初始化目录并由元数据唯一证明为 StringLiteral。
+    /// </summary>
+    public static int ResolveFinalTypedAbsoluteStringLoads(
+        MethodAnalysisContext method,
+        IReadOnlyCollection<ulong> initializedRuntimeMetadataSlots)
+    {
+        if (initializedRuntimeMetadataSlots.Count == 0)
+            return 0;
+
+        var libContext = method.AppContext.LibCpp2IlContext;
+        var changed = ResolveFinalTypedAbsoluteStringLoads(
+            method.ControlFlowGraph!.Instructions,
+            method.AppContext.SystemTypes.SystemStringType,
+            initializedRuntimeMetadataSlots,
+            address =>
+            {
+                var usage = ResolveAbsoluteSlotUsage(
+                    address,
+                    libContext.GetAnyGlobalByAddress,
+                    libContext.CheckForPost27GlobalTableEntryAt,
+                    candidate => candidate.Type == MetadataUsageType.StringLiteral);
+                return usage?.Type == MetadataUsageType.StringLiteral
+                    ? new StringLiteral(usage.AsLiteral())
+                    : null;
+            });
+
+        if (changed > 0)
+        {
+            Logger.VerboseNewline(
+                $"终态强类型字符串绝对槽：method={method.Name}，recovered={changed}",
+                nameof(MetadataResolver));
+        }
+
+        return changed;
+    }
+
+    /// <summary>
     /// 恢复 ARM64 的“两个字符串元数据槽经 CSEL 选择，再统一解引用”形态。两个输入槽
     /// 必须都由元数据证明为字符串；提交后选择结果直接承载托管字符串，并只删除其零偏移
     /// 读取用途，内存写目标和带偏移访问保持原样。
@@ -452,6 +490,23 @@ public static class MetadataResolver
                 : null);
 
     /// <summary>
+    /// 对可测试指令集只恢复终态的直接绝对字符串槽；间接表读取已由早期强类型规则处理，
+    /// 两种形态共用同一个元数据槽扫描器且各执行一次。
+    /// </summary>
+    internal static int ResolveFinalTypedAbsoluteStringLoads(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext stringType,
+        IReadOnlyCollection<ulong> initializedRuntimeMetadataSlots,
+        Func<ulong, StringLiteral?> absoluteSlotResolver)
+        => ResolvePost27TableLoads(
+            instructions,
+            destination => destination.Type == stringType,
+            (address, _) => absoluteSlotResolver(address),
+            initializedRuntimeMetadataSlots.Contains,
+            includeIndirectTableLoads: false,
+            includeDirectAbsoluteLoads: true);
+
+    /// <summary>
     /// 对可测试指令集恢复post-27二层类型槽。目标局部可以尚未定型；元数据用法本身
     /// 是类型身份的权威证据，调用方会在改写后执行一次类型收敛。
     /// </summary>
@@ -489,7 +544,9 @@ public static class MetadataResolver
         Func<ulong, long, IOperand?> entryResolver,
         Func<ulong, bool>? tableAddressFilter = null,
         Action<LocalVariable, IOperand>? onResolved = null,
-        IReadOnlyDictionary<LocalVariable, Instruction>? knownDefinitions = null)
+        IReadOnlyDictionary<LocalVariable, Instruction>? knownDefinitions = null,
+        bool includeIndirectTableLoads = true,
+        bool includeDirectAbsoluteLoads = false)
     {
         // 中文注释：调用方若已为同一SSA指令快照建立唯一定义索引，必须复用该索引；
         // 这避免内联类型检查和元数据解析对63,397个方法重复执行GroupBy全图计算。
@@ -510,23 +567,49 @@ public static class MetadataResolver
                         LocalVariable destination,
                         MemoryOperand
                         {
-                            Base: LocalVariable tableBase,
                             Index: null,
                             Scale: 0,
                             Addend: >= 0
                         } entryMemory
                     ]
                 }
-                || !destinationFilter(destination)
-                || ResolveAbsoluteSlotAddress(
-                    tableBase,
-                    definitions,
-                    [],
-                    absoluteSlotAddresses) is not { } tableGlobalAddress
-                || tableAddressFilter != null && !tableAddressFilter(tableGlobalAddress))
+                || !destinationFilter(destination))
                 continue;
 
-            var key = (tableGlobalAddress, entryMemory.Addend);
+            ulong tableGlobalAddress;
+            long entryOffset;
+            if (entryMemory.Base is LocalVariable tableBase)
+            {
+                if (!includeIndirectTableLoads)
+                    continue;
+
+                if (ResolveAbsoluteSlotAddress(
+                        tableBase,
+                        definitions,
+                        [],
+                        absoluteSlotAddresses) is not { } resolvedTableGlobalAddress)
+                    continue;
+
+                tableGlobalAddress = resolvedTableGlobalAddress;
+                entryOffset = entryMemory.Addend;
+            }
+            else if (includeDirectAbsoluteLoads && entryMemory.Base == null)
+            {
+                // 中文注释：大型方法在退 SSA 后可能把“绝对槽载体再零偏移读取”折回单条
+                // 绝对内存读取。目标已由类型不动点证明为 System.String，元数据目录又能把
+                // 该地址的零偏移项唯一证明为 StringLiteral 时，直接恢复同一个托管字面量。
+                tableGlobalAddress = (ulong)entryMemory.Addend;
+                entryOffset = 0;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (tableAddressFilter != null && !tableAddressFilter(tableGlobalAddress))
+                continue;
+
+            var key = (tableGlobalAddress, entryOffset);
             if (!resolvedEntries.TryGetValue(key, out var resolved))
             {
                 resolved = entryResolver(key.Item1, key.Item2);
