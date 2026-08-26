@@ -176,11 +176,25 @@ public static class GenericCallRebinder
     }
 
     internal static bool TryRebind(Instruction call)
-        => TryRebind(call, null);
+        => TryRebind(call, null, null);
+
+    /// <summary>
+    /// 使用调用所在方法的泛型作用域重绑定实例目标。Newobj 的运行时类载体可以精确给出
+    /// Dictionary&lt;TKey, TValue&gt; 这类开放但已限定作用域的接收者；仅接受归属当前方法或
+    /// 当前声明类型的泛型参数，避免把其他方法的开放参数当成同一实例证据。
+    /// </summary>
+    internal static bool TryRebind(Instruction call, MethodAnalysisContext containingMethod)
+        => TryRebind(call, null, containingMethod);
 
     internal static bool TryRebind(
         Instruction call,
         IReadOnlyDictionary<LocalVariable, IOperand>? definitions)
+        => TryRebind(call, definitions, null);
+
+    private static bool TryRebind(
+        Instruction call,
+        IReadOnlyDictionary<LocalVariable, IOperand>? definitions,
+        MethodAnalysisContext? containingMethod)
     {
         if (!call.IsCall
             || call.Operands.Count < 2
@@ -199,7 +213,8 @@ public static class GenericCallRebinder
             && OperandType(call.Operands[firstArgument], definitions) is GenericInstanceTypeAnalysisContext receiver
             && SameTypeDefinition(receiver.GenericType, current.BaseMethodContext.DeclaringType)
             && receiver.GenericArguments.Count == current.BaseMethodContext.DeclaringType!.GenericParameters.Count
-            && !receiver.GenericArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter)
+            && receiver.GenericArguments.All(argument =>
+                IsClosedOrOwnedByContainingScope(argument, containingMethod))
             && !receiver.GenericArguments.Any(ContainsSharedEnumPlaceholder))
         {
             // 封闭接收者是声明类型实参的最高优先级证据。即便它与当前目标一致，也要阻止
@@ -251,6 +266,44 @@ public static class GenericCallRebinder
             typeArguments,
             methodArguments);
         return ApplyExactTarget(call, current, rebound, concreteReceiver);
+    }
+
+    /// <summary>
+    /// 封闭实参直接可用；开放实参必须递归只包含调用所在方法或声明类型拥有的泛型参数。
+    /// </summary>
+    private static bool IsClosedOrOwnedByContainingScope(
+        TypeAnalysisContext argument,
+        MethodAnalysisContext? containingMethod)
+    {
+        if (!LocalVariables.ContainsUninstantiatedGenericParameter(argument))
+            return true;
+        if (containingMethod == null)
+            return false;
+
+        return ContainsOnlyOwnedGenericParameters(argument, containingMethod);
+    }
+
+    private static bool ContainsOnlyOwnedGenericParameters(
+        TypeAnalysisContext argument,
+        MethodAnalysisContext containingMethod)
+    {
+        if (argument is GenericParameterTypeAnalysisContext parameter)
+        {
+            if (ReferenceEquals(parameter.Owner, containingMethod)
+                || containingMethod is ConcreteGenericMethodAnalysisContext concrete
+                && ReferenceEquals(parameter.Owner, concrete.BaseMethodContext))
+                return true;
+
+            var declaringType = containingMethod.DeclaringType is GenericInstanceTypeAnalysisContext instance
+                ? instance.GenericType
+                : containingMethod.DeclaringType;
+            return ReferenceEquals(parameter.Owner, declaringType);
+        }
+
+        return argument is GenericInstanceTypeAnalysisContext nested
+               && nested.GenericArguments.Count > 0
+               && nested.GenericArguments.All(type =>
+                   ContainsOnlyOwnedGenericParameters(type, containingMethod));
     }
 
     /// <summary>

@@ -5,6 +5,7 @@ using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -68,6 +69,94 @@ public class GenericCallRebinderTests
         {
             Assert.That(GenericCallRebinder.TryRebind(call), Is.False);
             Assert.That(call.Operands[0], Is.SameAs(target));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 当前方法泛型参数可作为Newobj接收者的精确实参()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var containingMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Convert",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        var fixture = CreateOpenListConstructorCall(
+            containingMethod,
+            Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+            "TValue");
+
+        var changed = GenericCallRebinder.TryRebind(fixture.Call, containingMethod);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            var rebound = (ConcreteGenericMethodAnalysisContext)fixture.Call.Operands[0];
+            Assert.That(rebound.TypeGenericParameters.Single(), Is.SameAs(fixture.Parameter));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 当前声明类型泛型参数可作为Newobj接收者的精确实参()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var containingType = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "GenericOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var containingMethod = new InjectedMethodAnalysisContext(
+            containingType,
+            "Create",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        var fixture = CreateOpenListConstructorCall(
+            containingType,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+            "TItem");
+
+        var changed = GenericCallRebinder.TryRebind(fixture.Call, containingMethod);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            var rebound = (ConcreteGenericMethodAnalysisContext)fixture.Call.Operands[0];
+            Assert.That(rebound.TypeGenericParameters.Single(), Is.SameAs(fixture.Parameter));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 其他方法拥有的开放参数不得重绑定Newobj接收者()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var containingMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Create",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        var unrelatedMethod = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "Other",
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Private | MethodAttributes.Static,
+            []);
+        var fixture = CreateOpenListConstructorCall(
+            unrelatedMethod,
+            Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+            "TOther");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GenericCallRebinder.TryRebind(fixture.Call, containingMethod), Is.False);
+            Assert.That(fixture.Call.Operands[0], Is.SameAs(fixture.OriginalTarget));
         });
     }
 
@@ -598,5 +687,37 @@ public class GenericCallRebinderTests
             new Instruction(calls.Length, OpCode.Return),
         ]);
         return caller;
+    }
+
+    private static (
+        Instruction Call,
+        ConcreteGenericMethodAnalysisContext OriginalTarget,
+        GenericParameterTypeAnalysisContext Parameter) CreateOpenListConstructorCall(
+            HasGenericParameters parameterOwner,
+            Il2CppTypeEnum parameterKind,
+            string parameterName)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var constructor = listDefinition.Methods.Single(method =>
+            method.Name == ".ctor" && method.Parameters.Count == 0);
+        var originalTarget = new ConcreteGenericMethodAnalysisContext(
+            constructor,
+            [app.SystemTypes.SystemObjectType],
+            []);
+        var parameter = new GenericParameterTypeAnalysisContext(
+            parameterName,
+            0,
+            parameterKind,
+            GenericParameterAttributes.None,
+            parameterOwner);
+        parameterOwner.GenericParameters.Add(parameter);
+        var receiver = new LocalVariable(
+            "receiver",
+            new Register(null, "X0"),
+            listDefinition.MakeGenericInstanceType([parameter]));
+        var call = new Instruction(0, OpCode.CallVoid, originalTarget, receiver);
+        return (call, originalTarget, parameter);
     }
 }

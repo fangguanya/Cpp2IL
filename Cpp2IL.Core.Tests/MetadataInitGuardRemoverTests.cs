@@ -73,6 +73,52 @@ public class MetadataInitGuardRemoverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 同源MethodInfo载体允许删除共享地址误绑定的Rgctx初始化调用()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: true,
+            ordinaryRecursiveCall: false,
+            referencedMethod: true,
+            useMisboundCallTarget: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.True);
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+            Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同MethodInfo根的误绑定调用不得删除业务分支()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            referencedMethod: true,
+            useMisboundCallTarget: true,
+            useUnrelatedCallCarrier: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.False);
+            Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 零参泛型初始化调用返回值未消费时仍按守卫身份删除()
     {
@@ -619,7 +665,9 @@ public class MetadataInitGuardRemoverTests
         bool nestedPseudoGuard = false,
         bool referencedMethod = false,
         bool omitCallCarrier = false,
-        bool consumeCallResult = false)
+        bool consumeCallResult = false,
+        bool useMisboundCallTarget = false,
+        bool useUnrelatedCallCarrier = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var objectType = app.SystemTypes.SystemObjectType;
@@ -642,6 +690,12 @@ public class MetadataInitGuardRemoverTests
             representedMethod,
             objectType.DeclaringAssembly);
         var concreteCallTarget = new ConcreteGenericMethodAnalysisContext(representedMethod, [], []);
+        var misboundCallTarget = new InjectedMethodAnalysisContext(
+            objectType,
+            "SharedAddressAlias",
+            booleanType,
+            MethodAttributes.Public,
+            [objectType]);
         var methodInfo = new LocalVariable("methodInfo", new Register(null, "X2"), methodInfoType);
         var savedMethodInfo = new LocalVariable(
             "savedMethodInfo",
@@ -651,6 +705,12 @@ public class MetadataInitGuardRemoverTests
         var callCarrier = useSavedCarrier
             ? new LocalVariable("callMethodInfo", new Register(null, "X0", 2), app.SystemTypes.SystemIntPtrType)
             : carrier;
+        var unrelatedMethodInfo = new LocalVariable(
+            "unrelatedMethodInfo",
+            new Register(null, "X3"),
+            new RuntimeMethodInfoAnalysisContext(
+                misboundCallTarget,
+                objectType.DeclaringAssembly));
         var receiver = new LocalVariable("receiver", new Register(null, "X0"), objectType);
         var ordinaryGuardCarrier = new LocalVariable(
             "ordinaryGuardCarrier",
@@ -694,9 +754,13 @@ public class MetadataInitGuardRemoverTests
                 : new Instruction(
                     4,
                     OpCode.Call,
-                    concreteCallTarget,
+                    useMisboundCallTarget ? misboundCallTarget : concreteCallTarget,
                     callResult,
-                    ordinaryRecursiveCall ? receiver : callCarrier));
+                    ordinaryRecursiveCall
+                        ? receiver
+                        : useUnrelatedCallCarrier
+                            ? unrelatedMethodInfo
+                            : callCarrier));
         if (nestedPseudoGuard)
         {
             var nestedCondition = new LocalVariable(

@@ -669,13 +669,22 @@ public static class LocalVariables
     /// </summary>
     internal static bool RefreshResolvedNewobjTypesAndCalls(MethodAnalysisContext method)
     {
+        var instructions = method.ControlFlowGraph!.Instructions.ToArray();
+        var definitions = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+        var resolvedClassTypes = new Dictionary<LocalVariable, TypeAnalysisContext?>();
         var changedAllocations = new HashSet<LocalVariable>();
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in instructions)
         {
             if (instruction.OpCode != OpCode.Newobj
                 || instruction.Operands.Count < 2
                 || instruction.Operands[0] is not LocalVariable destination
-                || InstantiatedType(instruction.Operands[1]) is not { } instantiatedType
+                || ResolveInstantiatedType(
+                    instruction.Operands[1],
+                    definitions,
+                    resolvedClassTypes,
+                    []) is not { } instantiatedType
                 || GenericCallRebinder.TypesEquivalent(destination.Type, instantiatedType))
                 continue;
 
@@ -687,7 +696,7 @@ public static class LocalVariables
             return false;
 
         var changed = true;
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        foreach (var instruction in instructions)
         {
             if (!instruction.IsCall)
                 continue;
@@ -696,10 +705,64 @@ public static class LocalVariables
             if (receiverIndex < instruction.Operands.Count
                 && instruction.Operands[receiverIndex] is LocalVariable receiver
                 && changedAllocations.Contains(receiver))
-                changed |= GenericCallRebinder.TryRebind(instruction);
+                changed |= GenericCallRebinder.TryRebind(instruction, method);
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// 从 Newobj 的类载体恢复实例类型。活跃 Move/Phi 入边比载体上残留的寄存器复用类型更强；
+    /// Phi 的每条入边必须给出同一 Il2CppClass&lt;T&gt;，任一缺失或冲突均保持未解析。
+    /// </summary>
+    private static TypeAnalysisContext? ResolveInstantiatedType(
+        IOperand classOperand,
+        ILookup<LocalVariable, Instruction> definitions,
+        IDictionary<LocalVariable, TypeAnalysisContext?> memo,
+        HashSet<LocalVariable> visiting)
+    {
+        if (classOperand is not LocalVariable local)
+            return InstantiatedType(classOperand);
+        if (memo.TryGetValue(local, out var cached))
+            return cached;
+        if (!visiting.Add(local))
+            return null;
+
+        var localDefinitions = definitions[local].Take(2).ToArray();
+        TypeAnalysisContext? resolved;
+        if (localDefinitions is [{ OpCode: OpCode.Move, Operands: [LocalVariable _, var source] }])
+        {
+            resolved = ResolveInstantiatedType(source, definitions, memo, visiting);
+            // 原生内存读取本身没有托管类型操作数；此时解析器已经写入目标局部的
+            // RuntimeClassType，允许把它作为该次读取的精确结果。其他未知来源不得借用陈旧类型。
+            if (resolved == null && source is MemoryOperand)
+                resolved = InstantiatedType(local);
+        }
+        else if (localDefinitions is [{ OpCode: OpCode.Phi } phi])
+        {
+            var sources = phi.Operands.Skip(1).ToArray();
+            var sourceTypes = sources
+                .Select(source => ResolveInstantiatedType(source, definitions, memo, visiting))
+                .ToArray();
+            resolved = sourceTypes.Length > 0
+                       && sourceTypes.All(type => type != null)
+                       && sourceTypes.Skip(1).All(type =>
+                           GenericCallRebinder.TypesEquivalent(type, sourceTypes[0]))
+                ? sourceTypes[0]
+                : null;
+        }
+        else if (localDefinitions.Length == 0)
+        {
+            resolved = InstantiatedType(local);
+        }
+        else
+        {
+            resolved = null;
+        }
+
+        visiting.Remove(local);
+        memo[local] = resolved;
+        return resolved;
     }
 
     private static TypeAnalysisContext? InstantiatedType(IOperand classOperand) =>

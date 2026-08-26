@@ -359,10 +359,11 @@ public static class MetadataInitGuardRemover
             })
             return true;
 
-        if (instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called
-            || !SameMethod(called, guardedMethod))
+        if (instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called)
             return false;
 
+        // 共享原生地址可能先被解析成另一个托管方法。精确的 rgctx_data 零值守卫、封闭区域、
+        // 唯一调用以及同源 MethodInfo 首实参已经共同证明初始化语义，目标名不再参与判定。
         if (instruction.Sources.FirstOrDefault() is LocalVariable callCarrier
             && ResolveRuntimeMethodInfo(callCarrier, definitions) is { } represented
             && SameMethod(represented.RepresentedMethod, guardedMethod))
@@ -371,6 +372,9 @@ public static class MetadataInitGuardRemover
                 ResolveUniqueMoveRoot(callCarrier, definitions),
                 ResolveUniqueMoveRoot(guardCarrier, definitions));
         }
+
+        if (!SameMethod(called, guardedMethod))
+            return false;
 
         // 某些共享泛型零参方法把“rgctx初始化入口”误绑定为该方法自身，但调用只携带
         // 被丢弃的返回值，没有可见MethodInfo实参。零显式参数、静态目标、无调用源且

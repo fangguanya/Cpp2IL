@@ -2303,6 +2303,164 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 后置Newobj沿单源Phi覆盖类载体上的陈旧类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listObject = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var baseConstructor = listDefinition.Methods.First(method => method.Name == ".ctor" && method.Parameters.Count == 0);
+        var objectConstructor = new ConcreteGenericMethodAnalysisContext(
+            baseConstructor,
+            [appContext.SystemTypes.SystemObjectType],
+            []);
+        var concreteClass = new LocalVariable(
+            "concreteClass",
+            new Register(null, "X1", 1),
+            new RuntimeClassTypeAnalysisContext(listString, listString.DeclaringAssembly));
+        var mergedClass = new LocalVariable(
+            "mergedClass",
+            new Register(null, "X1", 2),
+            new RuntimeClassTypeAnalysisContext(
+                appContext.SystemTypes.SystemStringType,
+                appContext.SystemTypes.SystemStringType.DeclaringAssembly));
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), listObject);
+        var classLoad = new Instruction(
+            -2,
+            OpCode.Move,
+            concreteClass,
+            new MemoryOperand(addend: 0x1000));
+        var phi = new Instruction(-1, OpCode.Phi, mergedClass, concreteClass);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, mergedClass);
+        var call = new Instruction(1, OpCode.CallVoid, objectConstructor, receiver);
+        var method = CreateConstructorFixture(
+            listDefinition,
+            "RefreshAllocationFromSinglePhiSource",
+            [classLoad, phi, allocation, call],
+            [concreteClass, mergedClass, receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(receiver.Type, Is.SameAs(listString));
+            Assert.That(call.Operands[0], Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+            var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+            Assert.That(rebound.TypeGenericParameters.Single(), Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 后置Newobj接受多入边一致的类载体Phi()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listObject = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var firstClass = new LocalVariable(
+            "firstClass",
+            new Register(null, "X1", 1),
+            new RuntimeClassTypeAnalysisContext(listString, listString.DeclaringAssembly));
+        var secondClass = new LocalVariable(
+            "secondClass",
+            new Register(null, "X2", 1),
+            new RuntimeClassTypeAnalysisContext(listString, listString.DeclaringAssembly));
+        var mergedClass = new LocalVariable("mergedClass", new Register(null, "X1", 2));
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), listObject);
+        var phi = new Instruction(-1, OpCode.Phi, mergedClass, firstClass, secondClass);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, mergedClass);
+        var method = CreateConstructorFixture(
+            listDefinition,
+            "RefreshAllocationFromConsensusPhi",
+            [phi, allocation],
+            [firstClass, secondClass, mergedClass, receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(receiver.Type, Is.SameAs(listString));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 后置Newobj遇到类载体Phi类型冲突时保持红门()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listObject = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var firstClass = new LocalVariable(
+            "firstClass",
+            new Register(null, "X1", 1),
+            new RuntimeClassTypeAnalysisContext(listString, listString.DeclaringAssembly));
+        var secondClass = new LocalVariable(
+            "secondClass",
+            new Register(null, "X2", 1),
+            new RuntimeClassTypeAnalysisContext(listObject, listObject.DeclaringAssembly));
+        var mergedClass = new LocalVariable(
+            "mergedClass",
+            new Register(null, "X1", 2),
+            new RuntimeClassTypeAnalysisContext(listString, listString.DeclaringAssembly));
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), listObject);
+        var phi = new Instruction(-1, OpCode.Phi, mergedClass, firstClass, secondClass);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, mergedClass);
+        var method = CreateConstructorFixture(
+            listDefinition,
+            "RejectConflictingAllocationPhi",
+            [phi, allocation],
+            [firstClass, secondClass, mergedClass, receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(listObject));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 后置Newobj不得借用未知Move来源上的陈旧类类型()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var listObject = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemObjectType]);
+        var listString = listDefinition.MakeGenericInstanceType([appContext.SystemTypes.SystemStringType]);
+        var unknownSource = new LocalVariable("unknownSource", new Register(null, "X2", 1));
+        var staleClass = new LocalVariable(
+            "staleClass",
+            new Register(null, "X1", 1),
+            new RuntimeClassTypeAnalysisContext(listString, listString.DeclaringAssembly));
+        var receiver = new LocalVariable("receiver", new Register(null, "X0", 1), listObject);
+        var move = new Instruction(-1, OpCode.Move, staleClass, unknownSource);
+        var allocation = new Instruction(0, OpCode.Newobj, receiver, staleClass);
+        var method = CreateConstructorFixture(
+            listDefinition,
+            "RejectStaleClassOnUnknownMoveSource",
+            [move, allocation],
+            [unknownSource, staleClass, receiver]);
+
+        var changed = LocalVariables.RefreshResolvedNewobjTypesAndCalls(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(receiver.Type, Is.SameAs(listObject));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 后置Newobj类型已精确时保持不变()
     {
