@@ -148,14 +148,27 @@ public static class DirectRuntimeHelperRecovery
 
     /// <summary>
     /// 快速 castclass ABI：X0 同时承载输入和输出，X1 为目标 Il2CppClass*。
-    /// 寄存器身份必须一致，避免把普通二参数原生函数误认成转换。
+    /// 晚期字段/属性恢复可能已经把X0输入折叠为强类型字段或属性结果，因此这里只要求
+    /// 返回槽仍属于X0且输入具有托管引用证据；最终语义仍必须由辅助函数机器码分类确认。
     /// </summary>
     private static bool IsCastClassShape(Instruction instruction)
         => instruction.Operands is
-           [Immediate, LocalVariable destination, LocalVariable source,
+           [Immediate, LocalVariable destination, { } source,
                TypeAnalysisContext { IsValueType: false }, ..]
            && destination.Register.Name == "X0"
-           && source.Register.Name == "X0";
+           && IsManagedReferenceOperand(source);
+
+    /// <summary>
+    /// 判断晚期折叠后的调用输入是否仍带有确定的托管引用类型。仅接纳局部与实例字段，
+    /// 不把整数、原生内存或无类型表达式提升为对象，避免普通原生二参数调用进入候选集。
+    /// </summary>
+    private static bool IsManagedReferenceOperand(IOperand operand)
+        => operand switch
+        {
+            LocalVariable { Type: { IsValueType: false } } => true,
+            FieldReference { Field.FieldType.IsValueType: false } => true,
+            _ => false,
+        };
 
     /// <summary>
     /// foreach 清理 ABI 的唯一托管实参是 X0 异常状态结构地址；X2 只是调用点残留寄存器，
@@ -205,7 +218,7 @@ public static class DirectRuntimeHelperRecovery
         IReadOnlyDictionary<Instruction, Graphs.Block> homeBlocks)
     {
         if (instruction.Operands is not
-            [Immediate, LocalVariable destination, LocalVariable source,
+            [Immediate, LocalVariable destination, { } source,
                 TypeAnalysisContext { IsValueType: false } targetType, ..])
             return false;
 

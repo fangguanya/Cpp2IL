@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -17,6 +18,166 @@ public class DirectRuntimeHelperRecoveryTests
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 属性结果已脱离X0时仍按机器码恢复CastClass()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("propertyValue", "PROPERTY_VALUE_1", app.SystemTypes.SystemObjectType);
+        var nativeResult = Local("nativeResult", "X0", app.SystemTypes.SystemObjectType);
+        var use = Local("use", "X20", app.SystemTypes.SystemObjectType);
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x1F5559C),
+            nativeResult,
+            source,
+            app.SystemTypes.SystemStringType);
+        var consume = new Instruction(1, OpCode.Move, use, nativeResult);
+        var context = CreateContext(call, consume, new Instruction(2, OpCode.Return));
+        context.Locals = [source, nativeResult, use];
+
+        var rewritten = DirectRuntimeHelperRecovery.Run(
+            context,
+            _ => DirectRuntimeHelperRecovery.HelperKind.CastClass);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.CastClass));
+            Assert.That(call.Operands[1], Is.SameAs(source));
+            Assert.That(call.Operands[2], Is.SameAs(app.SystemTypes.SystemStringType));
+            Assert.That(call.Operands[0], Is.TypeOf<LocalVariable>().And.Not.SameAs(nativeResult));
+            Assert.That(((LocalVariable)call.Operands[0]).Type, Is.SameAs(app.SystemTypes.SystemStringType));
+            Assert.That(consume.Operands[1], Is.SameAs(call.Operands[0]));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 同地址字段输入CastClass逐调用恢复且机器码只分类一次()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Local("owner", "X21", app.SystemTypes.SystemObjectType);
+        var field = new InjectedFieldAnalysisContext(
+            "Occupation",
+            app.SystemTypes.SystemObjectType,
+            FieldAttributes.Public,
+            app.SystemTypes.SystemObjectType);
+        var firstSource = new FieldReference(field, owner, 0x138);
+        var secondSource = new FieldReference(field, owner, 0x138);
+        var firstResult = Local("firstResult", "X0", app.SystemTypes.SystemObjectType);
+        var secondResult = Local("secondResult", "X0", app.SystemTypes.SystemObjectType);
+        var first = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x1F5559C),
+            firstResult,
+            firstSource,
+            app.SystemTypes.SystemStringType);
+        var second = new Instruction(
+            1,
+            OpCode.Call,
+            new Immediate(0x1F5559C),
+            secondResult,
+            secondSource,
+            app.SystemTypes.SystemStringType);
+        var context = CreateContext(first, second, new Instruction(2, OpCode.Return));
+        context.Locals = [owner, firstResult, secondResult];
+        var classifications = 0;
+
+        var rewritten = DirectRuntimeHelperRecovery.Run(
+            context,
+            _ =>
+            {
+                classifications++;
+                return DirectRuntimeHelperRecovery.HelperKind.CastClass;
+            });
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewritten, Is.EqualTo(2));
+            Assert.That(classifications, Is.EqualTo(1));
+            Assert.That(first.OpCode, Is.EqualTo(OpCode.CastClass));
+            Assert.That(first.Operands[1], Is.SameAs(firstSource));
+            Assert.That(second.OpCode, Is.EqualTo(OpCode.CastClass));
+            Assert.That(second.Operands[1], Is.SameAs(secondSource));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 值类型输入或非X0返回槽均不进入CastClass候选()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var valueSource = Local("valueSource", "PROPERTY_VALUE_2", app.SystemTypes.SystemInt32Type);
+        var referenceSource = Local("referenceSource", "PROPERTY_VALUE_3", app.SystemTypes.SystemObjectType);
+        var firstResult = Local("firstResult", "X0", app.SystemTypes.SystemObjectType);
+        var secondResult = Local("secondResult", "X1", app.SystemTypes.SystemObjectType);
+        var first = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x1F5559C),
+            firstResult,
+            valueSource,
+            app.SystemTypes.SystemStringType);
+        var second = new Instruction(
+            1,
+            OpCode.Call,
+            new Immediate(0x1F5559C),
+            secondResult,
+            referenceSource,
+            app.SystemTypes.SystemStringType);
+        var context = CreateContext(first, second, new Instruction(2, OpCode.Return));
+        context.Locals = [valueSource, referenceSource, firstResult, secondResult];
+        var classifications = 0;
+
+        var rewritten = DirectRuntimeHelperRecovery.Run(
+            context,
+            _ =>
+            {
+                classifications++;
+                return DirectRuntimeHelperRecovery.HelperKind.CastClass;
+            });
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(classifications, Is.Zero);
+            Assert.That(first.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(second.OpCode, Is.EqualTo(OpCode.Call));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 调用形状成立但机器码不是CastClass时保持原调用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = Local("source", "PROPERTY_VALUE_4", app.SystemTypes.SystemObjectType);
+        var result = Local("result", "X0", app.SystemTypes.SystemObjectType);
+        var call = new Instruction(
+            0,
+            OpCode.Call,
+            new Immediate(0x1F5559C),
+            result,
+            source,
+            app.SystemTypes.SystemStringType);
+        var context = CreateContext(call, new Instruction(1, OpCode.Return));
+        context.Locals = [source, result];
+
+        var rewritten = DirectRuntimeHelperRecovery.Run(
+            context,
+            _ => DirectRuntimeHelperRecovery.HelperKind.None);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(call.Operands[0], Is.EqualTo(new Immediate(0x1F5559C)));
+        }
     }
 
     [Test]
