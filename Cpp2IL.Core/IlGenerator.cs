@@ -1078,6 +1078,7 @@ public static class IlGenerator
         ListCount count => ReferenceEquals(count.Value, local),
         StringLength length => ReferenceEquals(length.Value, local),
         MetadataStringTableLookup lookup => OperandReferencesLocal(lookup.Index, local),
+        ReadOnlyUInt16TableLookup lookup => OperandReferencesLocal(lookup.Index, local),
         _ => false,
     };
 
@@ -1293,6 +1294,14 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
+                break;
+            case ReadOnlyUInt16TableLookup tableLookup:
+                instructions.Add(CilOpCodes.Ldstr, tableLookup.Values);
+                LoadOperand(tableLookup.Index, method, locals, writeLine, stringCtor,
+                    Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type);
+                var charsGetter = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType.Methods
+                    .Single(candidate => candidate.Name == "get_Chars" && candidate.Parameters.Count == 1);
+                instructions.Add(CilOpCodes.Callvirt, charsGetter.ToMethodDescriptor(module));
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.

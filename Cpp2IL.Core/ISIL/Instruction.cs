@@ -291,6 +291,8 @@ public class Instruction : IOperand
                 => aggregate.Components.SelectMany(ExpandAggregateSource),
             MetadataStringTableLookup lookup
                 => ExpandAggregateSource(lookup.Index),
+            ReadOnlyUInt16TableLookup lookup
+                => ExpandAggregateSource(lookup.Index),
             _ => [operand],
         };
 

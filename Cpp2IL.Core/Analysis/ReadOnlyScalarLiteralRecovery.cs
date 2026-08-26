@@ -1,6 +1,8 @@
 using System;
 using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -20,8 +22,16 @@ public static class ReadOnlyScalarLiteralRecovery
             return;
 
         var binary = method.AppContext.Binary;
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitions = instructions
+            .Where(candidate => candidate.Destination is LocalVariable)
+            .GroupBy(candidate => (LocalVariable)candidate.Destination!)
+            .ToDictionary(group => group.Key, group => (IReadOnlyList<Instruction>)group.ToList());
+        var uniqueDefinitions = RuntimeMetadataStringTableRecovery.BuildUniqueDefinitions(instructions);
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        foreach (var instruction in block.Instructions)
         {
+            ResolveIndexedUInt16Table(instruction, block, method, elf, definitions, uniqueDefinitions);
             for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
             {
                 if (instruction.Operands[operandIndex] is not MemoryOperand
@@ -61,6 +71,168 @@ public static class ReadOnlyScalarLiteralRecovery
                     moveDestination.Type = floatingType;
             }
         }
+    }
+
+    private static void ResolveIndexedUInt16Table(
+        Instruction instruction,
+        Block tableBlock,
+        MethodAnalysisContext method,
+        ElfFile elf,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> definitions,
+        IReadOnlyDictionary<LocalVariable, Instruction> uniqueDefinitions)
+    {
+        if (instruction.OpCode != OpCode.Return
+            || instruction.Operands.Count != 1
+            || instruction.Operands[0] is not MemoryOperand
+            {
+                Index: not null,
+                Scale: 2,
+                Addend: >= 0
+            } memory
+            || method.ReturnType?.FullName != "System.Char")
+            return;
+
+        if (memory.Index is not LocalVariable tableIndex
+            || !TryMatchDominatingUpperBound(
+                method, tableBlock, tableIndex, uniqueDefinitions, out var maximumIndex)
+            || maximumIndex < 0
+            || maximumIndex >= int.MaxValue)
+            return;
+
+        var elementCount = checked((int)maximumIndex + 1);
+        if (elementCount > int.MaxValue / sizeof(ushort))
+            return;
+        var byteCount = elementCount * sizeof(ushort);
+        var baseAddress = memory.Base is null
+            ? 0UL
+            : MetadataResolver.ResolveConvergedAbsoluteSlotAddress(memory.Base, definitions, [], []);
+        if (baseAddress is null)
+            return;
+
+        var addend = (ulong)memory.Addend;
+        if (baseAddress.Value > ulong.MaxValue - addend)
+            return;
+        var address = baseAddress.Value + addend;
+        var binary = method.AppContext.Binary;
+        if (!TryValidateUInt16TableRange(
+                address,
+                byteCount,
+                binary.RawLength,
+                elf.IsReadOnlyFileBackedVirtualRange,
+                binary.TryMapVirtualAddressToRaw,
+                out var rawOffset))
+            return;
+
+        if (rawOffset > int.MaxValue)
+            return;
+        var raw = binary.GetRawBinaryContent().Slice((int)rawOffset, byteCount);
+        if (!TryDecodeUInt16Table(raw, binary.IsBigEndian, elementCount, out var values))
+            return;
+
+        tableIndex.Type = method.AppContext.SystemTypes.SystemInt32Type;
+        instruction.SetOperand(0, new ReadOnlyUInt16TableLookup(values, memory.Index!));
+    }
+
+    private static bool TryMatchDominatingUpperBound(
+        MethodAnalysisContext method,
+        Block tableBlock,
+        LocalVariable tableIndex,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        out long maximumIndex)
+    {
+        maximumIndex = -1;
+        foreach (var guardBlock in method.ControlFlowGraph!.Blocks)
+        {
+            if (!method.DominatorInfo!.Dominates(guardBlock, tableBlock)
+                || guardBlock.Instructions.LastOrDefault() is not
+                {
+                    OpCode: OpCode.ConditionalJump,
+                    Operands: [Block jumpTarget, LocalVariable condition]
+                }
+                || guardBlock.Successors.Count != 2
+                || method.DominatorInfo.Dominates(jumpTarget, tableBlock)
+                || CanReach(jumpTarget, tableBlock)
+                || !definitions.TryGetValue(condition, out var comparison)
+                || comparison is not
+                {
+                    OpCode: OpCode.CheckGreaterUnsigned,
+                    Operands: [LocalVariable, var comparedIndex, Immediate upperBound]
+                }
+                || !RuntimeMetadataStringTableRecovery.OperandsRepresentSameValue(
+                    tableIndex, comparedIndex, definitions))
+                continue;
+
+            maximumIndex = upperBound.Value;
+            return true;
+        }
+
+        return false;
+    }
+
+    internal static bool CanReach(Block start, Block target)
+    {
+        var pending = new Stack<Block>();
+        var visited = new HashSet<Block>();
+        pending.Push(start);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (!visited.Add(current))
+                continue;
+            if (ReferenceEquals(current, target))
+                return true;
+            foreach (var successor in current.Successors)
+                pending.Push(successor);
+        }
+
+        return false;
+    }
+
+    internal static bool TryValidateUInt16TableRange(
+        ulong address,
+        int byteCount,
+        long rawLength,
+        Func<ulong, int, bool> isReadOnly,
+        TryMapVirtualAddress map,
+        out long rawOffset)
+    {
+        rawOffset = -1;
+        return byteCount > 0
+               && (address & 1) == 0
+               && rawLength >= byteCount
+               && isReadOnly(address, byteCount)
+               && map(address, out rawOffset)
+               && rawOffset >= 0
+               && rawOffset <= rawLength - byteCount;
+    }
+
+    internal delegate bool TryMapVirtualAddress(ulong address, out long rawOffset);
+
+    internal static bool TryDecodeUInt16Table(
+        ReadOnlySpan<byte> raw,
+        bool isBigEndian,
+        int elementCount,
+        out string values)
+    {
+        if (elementCount <= 0
+            || elementCount > int.MaxValue / sizeof(ushort)
+            || raw.Length != elementCount * sizeof(ushort))
+        {
+            values = string.Empty;
+            return false;
+        }
+
+        var chars = new char[elementCount];
+        for (var index = 0; index < elementCount; index++)
+        {
+            var element = raw.Slice(index * sizeof(ushort), sizeof(ushort));
+            chars[index] = (char)(isBigEndian
+                ? BinaryPrimitives.ReadUInt16BigEndian(element)
+                : BinaryPrimitives.ReadUInt16LittleEndian(element));
+        }
+
+        values = new string(chars);
+        return true;
     }
 
     internal static bool TryDecodeScalarLiteral(

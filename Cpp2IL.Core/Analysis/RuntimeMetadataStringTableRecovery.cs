@@ -154,7 +154,7 @@ public static class RuntimeMetadataStringTableRecovery
     /// <summary>
     /// 只接受“index &gt; max 时跳往默认块”的原生无符号上界保护。
     /// </summary>
-    private static bool TryMatchUnsignedUpperBound(
+    internal static bool TryMatchUnsignedUpperBound(
         Block tableBlock,
         LocalVariable tableIndex,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
@@ -278,12 +278,35 @@ public static class RuntimeMetadataStringTableRecovery
     /// <summary>
     /// 比较操作数沿唯一 Move 复制链收敛到同一值时才视为同一个索引。
     /// </summary>
-    private static bool OperandsRepresentSameValue(
+    internal static bool OperandsRepresentSameValue(
         IOperand left,
         IOperand right,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions)
-        => ReferenceEquals(ResolveCopiedValue(left, definitions, []),
-            ResolveCopiedValue(right, definitions, []));
+    {
+        left = ResolveCopiedValue(left, definitions, []);
+        right = ResolveCopiedValue(right, definitions, []);
+        if (ReferenceEquals(left, right))
+            return true;
+
+        return left is LocalVariable leftLocal
+               && right is LocalVariable rightLocal
+               && definitions.TryGetValue(leftLocal, out var leftDefinition)
+               && definitions.TryGetValue(rightLocal, out var rightDefinition)
+               && leftDefinition is
+               {
+                   OpCode: OpCode.And,
+                   Operands: [LocalVariable, var leftSource, Immediate leftMask]
+               }
+               && rightDefinition is
+               {
+                   OpCode: OpCode.And,
+                   Operands: [LocalVariable, var rightSource, Immediate rightMask]
+               }
+               && leftMask.Value == rightMask.Value
+               && ReferenceEquals(
+                   ResolveCopiedValue(leftSource, definitions, []),
+                   ResolveCopiedValue(rightSource, definitions, []));
+    }
 
     private static IOperand ResolveCopiedValue(
         IOperand operand,
@@ -335,7 +358,7 @@ public static class RuntimeMetadataStringTableRecovery
         return left.Value + right.Value;
     }
 
-    private static Dictionary<LocalVariable, Instruction> BuildUniqueDefinitions(
+    internal static Dictionary<LocalVariable, Instruction> BuildUniqueDefinitions(
         IReadOnlyList<Instruction> instructions)
         => instructions
             .Where(instruction => instruction.Destination is LocalVariable)

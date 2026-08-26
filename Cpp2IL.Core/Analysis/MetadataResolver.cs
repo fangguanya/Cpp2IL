@@ -733,6 +733,18 @@ public static class MetadataResolver
     {
         if (definition is
             {
+                OpCode: OpCode.Add,
+                Operands: [LocalVariable, Immediate left, Immediate right]
+            }
+            && left.Value >= 0
+            && right.Value >= 0)
+        {
+            // ADRP/ADD 在退 SSA 后可能成为两个非负立即数之和；只接受无局部输入的精确常量地址。
+            return checked((ulong)left.Value + (ulong)right.Value);
+        }
+
+        if (definition is
+            {
                 OpCode: OpCode.Move,
                 Operands:
                 [

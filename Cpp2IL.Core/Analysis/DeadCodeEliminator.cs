@@ -159,6 +159,10 @@ public static class DeadCodeEliminator
                 foreach (var used in EnumerateUsedLocals(lookup.Index))
                     yield return used;
                 break;
+            case ReadOnlyUInt16TableLookup lookup:
+                foreach (var used in EnumerateUsedLocals(lookup.Index))
+                    yield return used;
+                break;
             case HomogeneousFloatingAggregateArgument aggregate:
                 foreach (var component in aggregate.Components)
                 foreach (var used in EnumerateUsedLocals(component))
