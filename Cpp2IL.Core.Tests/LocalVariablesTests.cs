@@ -17,6 +17,41 @@ public class LocalVariablesTests
         TestGameLoader.LoadSimple2019Game();
     }
 
+    [TestCase("W0", "X0")]
+    [TestCase("W7", "X7")]
+    [TestCase("W30", "X30")]
+    [Category("基本功能")]
+    public void 参数寄存器宽窄别名归一为同一物理寄存器(string input, string expected)
+    {
+        Assert.That(LocalVariables.CanonicalParameterRegisterName(input), Is.EqualTo(expected));
+    }
+
+    [TestCase("W00", "X0")]
+    [TestCase("W030", "X30")]
+    [TestCase("W00000000000000000000000000000030", "X30")]
+    [TestCase("W31", "W31")]
+    [TestCase("W", "W")]
+    [TestCase("", "")]
+    [Category("边界值")]
+    public void 参数寄存器归一严格限制在W0到W30(string input, string expected)
+    {
+        Assert.That(LocalVariables.CanonicalParameterRegisterName(input), Is.EqualTo(expected));
+    }
+
+    [TestCase("W+1")]
+    [TestCase("W-1")]
+    [TestCase("W 1")]
+    [TestCase("W1 ")]
+    [TestCase("W1A")]
+    [TestCase("W１")]
+    [TestCase("w1")]
+    [TestCase("X1")]
+    [Category("异常输入")]
+    public void 非法或非目标寄存器名称保持原值(string input)
+    {
+        Assert.That(LocalVariables.CanonicalParameterRegisterName(input), Is.EqualTo(input));
+    }
+
     [Test]
     [Category("基本功能")]
     public void 静态字符参数绑定宽窄别名的唯一入口寄存器()

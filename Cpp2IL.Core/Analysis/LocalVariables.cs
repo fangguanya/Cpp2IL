@@ -282,15 +282,23 @@ public static class LocalVariables
     /// </summary>
     internal static string CanonicalParameterRegisterName(string name)
     {
-        if (name.Length >= 2
-            && name[0] == 'W'
-            && int.TryParse(name.AsSpan(1), out var index)
-            && index is >= 0 and <= 30)
+        if (name.Length < 2 || name[0] != 'W')
+            return name;
+
+        var index = 0;
+        for (var characterIndex = 1; characterIndex < name.Length; characterIndex++)
         {
-            return $"X{index}";
+            // ARM64 寄存器名称只接受十进制数字；符号、空白和其他字符均不是物理寄存器别名。
+            var digit = name[characterIndex] - '0';
+            if ((uint)digit > 9)
+                return name;
+
+            index = index * 10 + digit;
+            if (index > 30)
+                return name;
         }
 
-        return name;
+        return $"X{index}";
     }
 
     public static void RemoveUnused(MethodAnalysisContext method)
