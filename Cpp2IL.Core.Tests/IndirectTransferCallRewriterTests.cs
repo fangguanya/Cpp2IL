@@ -176,6 +176,96 @@ public class IndirectTransferCallRewriterTests
         });
     }
 
+    [Test]
+    [Category("基本功能")]
+    public void Object返回槽分裂后显式转换回具体Ssa结果()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemVoidType);
+        var target = CreateMethod("Current", app.SystemTypes.SystemObjectType);
+        var receiver = new LocalVariable("enumerator", new Register(null, "X1"), app.SystemTypes.SystemObjectType);
+        var concreteResult = new LocalVariable(
+            "currentPerson",
+            new Register(null, "X0", 9),
+            app.SystemTypes.SystemStringType);
+        var transfer = CreateRawTransfer(OpCode.IndirectCall, receiver);
+        transfer.SetOperand(1, concreteResult);
+        var block = CreateBlock(transfer);
+
+        IndirectTransferCallRewriter.Rewrite(owner, transfer, block, target, receiver);
+
+        var managedResult = (LocalVariable)transfer.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(block.Instructions, Has.Count.EqualTo(2));
+            Assert.That(managedResult, Is.Not.SameAs(concreteResult));
+            Assert.That(managedResult.Type, Is.SameAs(app.SystemTypes.SystemObjectType));
+            Assert.That(block.Instructions[1].OpCode, Is.EqualTo(OpCode.CastClass));
+            Assert.That(block.Instructions[1].Operands[0], Is.SameAs(concreteResult));
+            Assert.That(block.Instructions[1].Operands[1], Is.SameAs(managedResult));
+            Assert.That(block.Instructions[1].Operands[2], Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Object尾调用分裂结果但不写回无后继具体槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemObjectType);
+        var target = CreateMethod("Current", app.SystemTypes.SystemObjectType);
+        var receiver = new LocalVariable("enumerator", new Register(null, "X1"), app.SystemTypes.SystemObjectType);
+        var concreteResult = new LocalVariable(
+            "currentPerson",
+            new Register(null, "X0", 9),
+            app.SystemTypes.SystemStringType);
+        var transfer = CreateRawTransfer(OpCode.IndirectJump, receiver);
+        transfer.SetOperand(1, concreteResult);
+        var block = CreateBlock(transfer);
+
+        IndirectTransferCallRewriter.Rewrite(owner, transfer, block, target, receiver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(block.Instructions, Has.Count.EqualTo(2));
+            Assert.That(block.Instructions, Has.None.Matches<Instruction>(instruction =>
+                instruction.OpCode == OpCode.CastClass));
+            Assert.That(block.Instructions[^1].OpCode, Is.EqualTo(OpCode.Return));
+            Assert.That(block.Instructions[^1].Operands.Single(), Is.SameAs(transfer.Operands[1]));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Object返回槽与源操作数逻辑别名时拒绝具体槽回写()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateMethod("Owner", app.SystemTypes.SystemVoidType);
+        var target = CreateMethod("Current", app.SystemTypes.SystemObjectType);
+        var receiver = new LocalVariable(
+            "shared",
+            new Register(null, "X0", 9),
+            app.SystemTypes.SystemStringType);
+        var equivalentResult = new LocalVariable(
+            "shared",
+            new Register(null, "X0", 9),
+            app.SystemTypes.SystemStringType);
+        var transfer = CreateRawTransfer(OpCode.IndirectCall, receiver);
+        transfer.SetOperand(1, equivalentResult);
+        var block = CreateBlock(transfer);
+
+        IndirectTransferCallRewriter.Rewrite(owner, transfer, block, target, receiver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(transfer.Operands[1], Is.Not.SameAs(equivalentResult));
+            Assert.That(block.Instructions, Has.Count.EqualTo(1));
+            Assert.That(block.Instructions, Has.None.Matches<Instruction>(instruction =>
+                instruction.OpCode == OpCode.CastClass));
+            Assert.That(equivalentResult.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
     [TestCase("System.Object")]
     [TestCase("System.IntPtr")]
     [TestCase("System.UIntPtr")]

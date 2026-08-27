@@ -53,8 +53,12 @@ public static class IndirectTransferCallRewriter
             // 可能让调用前接收者和调用后结果引用同一逻辑局部，也可能让返回槽仍携带上一段
             // ArrayList 等具体生命期类型；直接覆盖都会把整段旧生命期污染为 Int32。只有未知、
             // Object 或原生指针 ABI 占位可以原地精确定型，其余冲突一律分裂托管返回槽。
-            if (RequiresDistinctResultSlot(transfer, result, resolved.ReturnType))
+            var aliasesSourceOperand = transfer.Operands
+                .Skip(2)
+                .Any(operand => SameLogicalLocal(operand, result));
+            if (RequiresDistinctResultSlot(result, resolved.ReturnType, aliasesSourceOperand))
             {
+                var originalResult = result;
                 result = new LocalVariable(
                     $"{result.Name}_managedCallResult_{transfer.Index}",
                     result.Register,
@@ -63,6 +67,28 @@ public static class IndirectTransferCallRewriter
                     IsReturn = result.IsReturn,
                 };
                 transfer.SetOperand(1, result);
+
+                // 中文注释：接口 Current 等方法声明返回 Object，而原生内联类型检查已经把
+                // 同一 X0 SSA 结果收紧为具体引用。分裂调用槽后必须立即以显式 castclass
+                // 恢复原 SSA 定义；否则具体局部只剩消费者，CIL 会读取 default/null。
+                // 接收者别名、尾调用、值类型或不相容类型均没有唯一安全回写语义，保持红门。
+                if (!isTailCall
+                    && !aliasesSourceOperand
+                    && CanBridgeManagedResult(originalResult.Type, resolved.ReturnType))
+                {
+                    var transferPosition = block.Instructions.IndexOf(transfer);
+                    if (transferPosition >= 0)
+                    {
+                        block.Instructions.Insert(
+                            transferPosition + 1,
+                            new Instruction(
+                                -1,
+                                OpCode.CastClass,
+                                originalResult,
+                                result,
+                                originalResult.Type!));
+                    }
+                }
             }
             else
             {
@@ -93,11 +119,11 @@ public static class IndirectTransferCallRewriter
     /// 判断原始返回槽是否属于调用前仍有效的另一段类型生命期。
     /// </summary>
     private static bool RequiresDistinctResultSlot(
-        Instruction transfer,
         LocalVariable result,
-        TypeAnalysisContext returnType)
+        TypeAnalysisContext returnType,
+        bool aliasesSourceOperand)
     {
-        if (transfer.Operands.Skip(2).Any(operand => SameLogicalLocal(operand, result)))
+        if (aliasesSourceOperand)
             return true;
 
         if (result.Type == null || GenericCallRebinder.TypesEquivalent(result.Type, returnType))
@@ -106,4 +132,16 @@ public static class IndirectTransferCallRewriter
         return result.Type.FullName is not (
             "System.Object" or "System.IntPtr" or "System.UIntPtr");
     }
+
+    /// <summary>
+    /// 仅当具体引用能赋给方法声明返回上界时，才允许从分裂的托管返回槽向下转换。
+    /// </summary>
+    private static bool CanBridgeManagedResult(
+        TypeAnalysisContext? concreteType,
+        TypeAnalysisContext returnType)
+        => concreteType is { IsValueType: false }
+           && returnType is { IsValueType: false }
+           && concreteType.FullName is not (
+               "System.Object" or "System.IntPtr" or "System.UIntPtr")
+           && GenericCallRebinder.IsAssignableToManagedProjection(concreteType, returnType);
 }
