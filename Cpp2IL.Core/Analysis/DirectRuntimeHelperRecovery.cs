@@ -199,7 +199,7 @@ public static class DirectRuntimeHelperRecovery
         }
         else
         {
-            var splitDestination = SplitResultLiveRange(
+            var splitDestination = LocalLiveRangeHelper.SplitResultLiveRange(
                 method,
                 instruction,
                 destination,
@@ -222,7 +222,7 @@ public static class DirectRuntimeHelperRecovery
                 TypeAnalysisContext { IsValueType: false } targetType, ..])
             return false;
 
-        var splitDestination = SplitResultLiveRange(
+        var splitDestination = LocalLiveRangeHelper.SplitResultLiveRange(
             method,
             instruction,
             destination,
@@ -302,72 +302,6 @@ public static class DirectRuntimeHelperRecovery
         }
 
         return false;
-    }
-
-    /// <summary>
-    /// 退SSA后同一物理 X0 局部可能承载多个不同返回类型。每个已证明的辅助调用必须获得
-    /// 独立托管局部，并只在线性、无汇合、尚未重定义的后继区替换其读取，避免最后一次
-    /// cast 类型反向污染此前所有循环。
-    /// </summary>
-    private static LocalVariable SplitResultLiveRange(
-        MethodAnalysisContext method,
-        Instruction definition,
-        LocalVariable original,
-        TypeAnalysisContext type,
-        IReadOnlyDictionary<Instruction, Graphs.Block> homeBlocks,
-        string role)
-    {
-        var fresh = new LocalVariable(
-            $"runtime_{role}_{definition.Index}",
-            // 保留原生寄存器名称用于同一ABI链的后续辅助调用识别；唯一版本号只负责
-            // 把退SSA后复用的物理槽拆成独立托管局部。
-            original.Register.Copy(definition.Index),
-            type);
-        method.Locals.Add(fresh);
-
-        var home = homeBlocks[definition];
-        var startIndex = home.Instructions.IndexOf(definition) + 1;
-        var visited = new HashSet<Graphs.Block>();
-        var queue = new Queue<(Graphs.Block Block, int Index)>();
-        queue.Enqueue((home, startIndex));
-
-        while (queue.Count > 0)
-        {
-            var (block, index) = queue.Dequeue();
-            if (!visited.Add(block))
-                continue;
-
-            var killed = false;
-            for (var instructionIndex = index; instructionIndex < block.Instructions.Count; instructionIndex++)
-            {
-                var current = block.Instructions[instructionIndex];
-                var destinationIndex = current.OpCode is OpCode.Call or OpCode.IndirectCall
-                    ? 1
-                    : current.Destination == null ? -1 : 0;
-
-                for (var operandIndex = 0; operandIndex < current.Operands.Count; operandIndex++)
-                {
-                    if (operandIndex == destinationIndex)
-                        continue;
-                    if (ReferenceEquals(current.Operands[operandIndex], original))
-                        current.SetOperand(operandIndex, fresh);
-                }
-
-                if (ReferenceEquals(current.Destination, original))
-                {
-                    killed = true;
-                    break;
-                }
-            }
-
-            if (killed)
-                continue;
-            foreach (var successor in block.Successors)
-                if (successor.Predecessors.Count == 1)
-                    queue.Enqueue((successor, 0));
-        }
-
-        return fresh;
     }
 
     private static HelperKind Classify(ApplicationAnalysisContext appContext, ulong address)

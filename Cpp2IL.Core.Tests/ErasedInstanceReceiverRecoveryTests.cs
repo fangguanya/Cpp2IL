@@ -177,6 +177,46 @@ public class ErasedInstanceReceiverRecoveryTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 布尔结果与This搬运共用局部时拆分标量生存区()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var booleanProducer = Method(
+            owner,
+            "Compare",
+            app.SystemTypes.SystemBooleanType,
+            isStatic: true);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var thisLocal = Local("this", owner, 0);
+        thisLocal.IsThis = true;
+        var receiver = Local("mixedX0", owner, 4);
+        var testBit = Local("testBit", app.SystemTypes.SystemBooleanType, 5);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 6);
+        var producerCall = new Instruction(0, OpCode.Call, booleanProducer, receiver);
+        var bitTest = new Instruction(1, OpCode.And, testBit, receiver, new Immediate(1));
+        var thisMove = new Instruction(2, OpCode.Move, receiver, thisLocal);
+        var instanceCall = new Instruction(3, OpCode.Call, target, result, receiver);
+        Prepare(caller, [producerCall, bitTest, thisMove, instanceCall], receiver, testBit, result);
+        caller.Locals.Add(thisLocal);
+        caller.ParameterLocals = [thisLocal];
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(instanceCall.Operands[2], Is.SameAs(thisLocal));
+            Assert.That(receiver.Type, Is.SameAs(owner));
+            Assert.That(producerCall.Destination, Is.Not.SameAs(receiver));
+            Assert.That(producerCall.Destination, Is.SameAs(bitTest.Operands[1]));
+            Assert.That(((LocalVariable)producerCall.Destination!).Type,
+                Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 混合值类型调用结果缺少类型共识时保持原接收者()
     {

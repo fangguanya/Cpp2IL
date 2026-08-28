@@ -57,13 +57,19 @@ public static class ErasedInstanceReceiverRecovery
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
             .ToDictionary(group => group.Key, group => group.ToList());
+        var homeBlocks = method.ControlFlowGraph.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (instruction, block)))
+            .ToDictionary(pair => pair.instruction, pair => pair.block);
         var evidenceByReceiver = new Dictionary<LocalVariable, ScalarReceiverEvidence>();
         var rewrites = new List<ReceiverRewrite>();
         foreach (var candidate in EnumerateCandidates(method))
         {
             if (!evidenceByReceiver.TryGetValue(candidate.Receiver, out var evidence))
             {
-                evidence = ResolveScalarReceiverEvidence(candidate.Receiver, allDefinitions);
+                evidence = ResolveScalarReceiverEvidence(
+                    candidate.Receiver,
+                    allDefinitions,
+                    homeBlocks);
                 evidenceByReceiver.Add(candidate.Receiver, evidence);
             }
 
@@ -78,7 +84,9 @@ public static class ErasedInstanceReceiverRecovery
                 candidate.Instruction,
                 candidate.ReceiverIndex,
                 candidate.Receiver,
-                evidence.RestoredType));
+                evidence.RestoredType,
+                evidence.SplitDefinitions,
+                evidence.SplitType));
         }
 
         return RewriteToThis(method, rewrites);
@@ -123,6 +131,8 @@ public static class ErasedInstanceReceiverRecovery
         if (thisLocal == null)
             return 0;
 
+        SplitScalarCallResults(method, rewrites);
+
         foreach (var rewrite in rewrites)
         {
             rewrite.Instruction.SetOperand(rewrite.ReceiverIndex, thisLocal);
@@ -138,58 +148,133 @@ public static class ErasedInstanceReceiverRecovery
 
     private static ScalarReceiverEvidence ResolveScalarReceiverEvidence(
         LocalVariable receiver,
-        IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions)
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions,
+        IReadOnlyDictionary<Instruction, Graphs.Block> homeBlocks)
     {
         if (!allDefinitions.ContainsKey(receiver))
         {
             // 中文注释：ARM64 实例接收者固定从 X0 传入；若同类型调用的 X0 完全没有
             // 定义，说明优化器删除了未被被调方法观察的 this。其他参数寄存器不作推断。
-            return new(receiver.Register.Name == "X0", null);
+            return new(receiver.Register.Name == "X0", null, null, null);
         }
 
-        if (TryResolveCallResultType(receiver, allDefinitions, out var restoredType))
-            return new(true, restoredType);
+        if (TryResolveScalarCallEvidence(
+                receiver,
+                allDefinitions,
+                homeBlocks,
+                out var restoredType,
+                out var splitDefinitions))
+        {
+            return splitDefinitions.Count == 0
+                ? new(true, restoredType, null, null)
+                : new(true, null, splitDefinitions, restoredType);
+        }
 
-        return new(HasErasedScalarValueGraph(receiver, allDefinitions), null);
+        return new(HasErasedScalarValueGraph(receiver, allDefinitions), null, null, null);
     }
 
-    private static bool TryResolveCallResultType(
+    private static bool TryResolveScalarCallEvidence(
         LocalVariable receiver,
         IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions,
-        out TypeAnalysisContext? restoredType)
+        IReadOnlyDictionary<Instruction, Graphs.Block> homeBlocks,
+        out TypeAnalysisContext? restoredType,
+        out IReadOnlyList<Instruction> splitDefinitions)
     {
         restoredType = null;
+        splitDefinitions = [];
         if (!allDefinitions.TryGetValue(receiver, out var definitions) || definitions.Count == 0)
             return false;
 
+        var scalarDefinitions = new List<Instruction>();
+        var sawThisDefinition = false;
         foreach (var definition in definitions)
         {
             // 中文注释：ARM64会让静态调用的值类型返回值留在X0，并把该X0直接带入
-            // 随后的实例调用。全部定义必须都是同一值类型调用结果，才构成可逆的类型证据。
-            if (!definition.IsCall
-                || definition.Operands.Count < 2
-                || definition.Operands[0] is not MethodAnalysisContext producer
-                || producer.IsVoid
-                || !producer.ReturnType.IsValueType)
+            // 随后的实例调用。全部标量定义必须具有同一值类型，其他定义只能是明确this搬运。
+            if (definition.IsCall
+                && definition.Operands.Count >= 2
+                && definition.Operands[0] is MethodAnalysisContext producer
+                && !producer.IsVoid
+                && producer.ReturnType.IsValueType)
             {
+                scalarDefinitions.Add(definition);
+                if (restoredType == null)
+                {
+                    restoredType = producer.ReturnType;
+                    continue;
+                }
+
+                if (ReferenceEquals(restoredType, producer.ReturnType))
+                    continue;
+
                 restoredType = null;
                 return false;
             }
 
-            if (restoredType == null)
+            if (definition.OpCode == OpCode.Move
+                && definition.Operands.Count >= 2
+                && definition.Operands[1] is LocalVariable { IsThis: true })
             {
-                restoredType = producer.ReturnType;
+                sawThisDefinition = true;
                 continue;
             }
 
-            if (!ReferenceEquals(restoredType, producer.ReturnType))
-            {
-                restoredType = null;
-                return false;
-            }
+            restoredType = null;
+            return false;
         }
 
-        return restoredType != null;
+        if (restoredType == null || scalarDefinitions.Count == 0)
+            return false;
+
+        if (!sawThisDefinition)
+            return true;
+
+        // 中文注释：引用this与标量结果共享退SSA局部时，必须先证明每个标量定义的读取
+        // 都在本基本块内且在下一次重定义前出现，才能精确拆分而不跨控制流汇合猜测。
+        if (scalarDefinitions.Any(definition =>
+                !LocalLiveRangeHelper.HasUseBeforeRedefinition(
+                    definition,
+                    receiver,
+                    homeBlocks)))
+        {
+            restoredType = null;
+            return false;
+        }
+
+        splitDefinitions = scalarDefinitions;
+        return true;
+    }
+
+    private static void SplitScalarCallResults(
+        MethodAnalysisContext method,
+        IReadOnlyList<ReceiverRewrite> rewrites)
+    {
+        var plans = rewrites
+            .Where(rewrite => rewrite is
+                { Receiver: not null, SplitDefinitions: not null, SplitType: not null })
+            .GroupBy(rewrite => rewrite.Receiver!)
+            .Select(group => group.First())
+            .ToList();
+        if (plans.Count == 0)
+            return;
+
+        var homeBlocks = method.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (instruction, block)))
+            .ToDictionary(pair => pair.instruction, pair => pair.block);
+        foreach (var plan in plans)
+        {
+            foreach (var definition in plan.SplitDefinitions!)
+            {
+                var fresh = LocalLiveRangeHelper.SplitResultLiveRange(
+                    method,
+                    definition,
+                    plan.Receiver!,
+                    plan.SplitType!,
+                    homeBlocks,
+                    "scalarCallResult");
+                definition.Destination = fresh;
+            }
+        }
     }
 
     private static bool HasErasedScalarValueGraph(
@@ -279,11 +364,15 @@ public static class ErasedInstanceReceiverRecovery
 
     private readonly record struct ScalarReceiverEvidence(
         bool ShouldRewrite,
-        TypeAnalysisContext? RestoredType);
+        TypeAnalysisContext? RestoredType,
+        IReadOnlyList<Instruction>? SplitDefinitions,
+        TypeAnalysisContext? SplitType);
 
     private readonly record struct ReceiverRewrite(
         Instruction Instruction,
         int ReceiverIndex,
         LocalVariable? Receiver = null,
-        TypeAnalysisContext? RestoredType = null);
+        TypeAnalysisContext? RestoredType = null,
+        IReadOnlyList<Instruction>? SplitDefinitions = null,
+        TypeAnalysisContext? SplitType = null);
 }
