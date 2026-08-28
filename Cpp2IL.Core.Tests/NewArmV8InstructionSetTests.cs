@@ -2003,6 +2003,118 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 跳转表接受边界后的单次索引寄存器复制()
+    {
+        // CMP/B.HI 验证 W0 后，MOV W8,W0 把同一值交给字节表寻址；这是 Clang 常见发射形状。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x68, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54, 0xE8, 0x03, 0x00, 0x2A,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var match = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd).Single();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(match.AdjustedIndexRegister, Is.EqualTo(Arm64Register.X8));
+            Assert.That(match.Bounds.EntryCount, Is.EqualTo(27));
+            Assert.That(match.TableAddress, Is.EqualTo(SyntheticJumpTableImageStart + 0xAB8));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 跳转表保持比较寄存器直接寻址形状()
+    {
+        // W8 同时承担比较和表索引时不需要复制，既有严格形状必须继续成立。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 跳转表拒绝来自未验证寄存器的索引复制()
+    {
+        // MOV W8,W1 的来源不是 CMP W0，不能继承 W0 的边界证明。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x68, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54, 0xE8, 0x03, 0x01, 0x2A,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 跳转表允许目标累加与分派之间保存独立寄存器快照()
+    {
+        // ADD X10 后保存 X24 到 X20，最终 BR 仍只读取未被改写的 X10。
+        var instructions = DecodeInstructions(
+            [
+                0x68, 0xD2, 0x00, 0x51, 0x1F, 0x6D, 0x01, 0x71, 0x08, 0x3D, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xF0, 0x29, 0x01, 0x28, 0x91, 0xF5, 0x03, 0x18, 0xAA,
+                0xAA, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x78, 0x4A, 0x09, 0x0B, 0x8B,
+                0xF4, 0x03, 0x18, 0xAA, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticHalfwordJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 跳转表拒绝快照指令改写最终分派寄存器()
+    {
+        // MOV X10,X24 覆盖了目标 ADD 的结果，BR X10 已不再由表项证明。
+        var instructions = DecodeInstructions(
+            [
+                0x68, 0xD2, 0x00, 0x51, 0x1F, 0x6D, 0x01, 0x71, 0x08, 0x3D, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xF0, 0x29, 0x01, 0x28, 0x91, 0xF5, 0x03, 0x18, 0xAA,
+                0xAA, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x78, 0x4A, 0x09, 0x0B, 0x8B,
+                0xEA, 0x03, 0x18, 0xAA, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticHalfwordJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Is.Empty);
+    }
+
+    [Test]
     [Category("边界值")]
     public void 跳转表边界保留非零下界计数与独立默认目标()
     {

@@ -2289,14 +2289,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     {
         match = null!;
         var branch = nativeInstructions[branchIndex];
-        var targetAdd = nativeInstructions[branchIndex - 1];
-        var tableLoad = nativeInstructions[branchIndex - 2];
-        var branchBaseLoad = nativeInstructions[branchIndex - 3];
         if (branch.Mnemonic != Arm64Mnemonic.BR
-            || targetAdd.Mnemonic != Arm64Mnemonic.ADD
+            || branch.Op0Kind != Arm64OperandKind.Register)
+            return false;
+
+        // 中文注释：Clang 允许在目标 ADD 与最终 BR 之间保存与分派无关的被调用方保存寄存器。
+        // 只跨过寄存器到寄存器的 MOV；一旦遇到控制流、内存或算术就停止，避免向前猜测模式。
+        var targetAddIndex = branchIndex - 1;
+        while (targetAddIndex >= 3
+               && IsIndependentRegisterSnapshotBeforeJump(
+                   nativeInstructions[targetAddIndex],
+                   branch.Op0Reg))
+        {
+            targetAddIndex--;
+        }
+
+        if (targetAddIndex < 3)
+            return false;
+        var targetAdd = nativeInstructions[targetAddIndex];
+        var tableLoadIndex = targetAddIndex - 1;
+        var tableLoad = nativeInstructions[tableLoadIndex];
+        var branchBaseLoad = nativeInstructions[targetAddIndex - 2];
+        if (targetAdd.Mnemonic != Arm64Mnemonic.ADD
             || tableLoad.Mnemonic is not (Arm64Mnemonic.LDRB or Arm64Mnemonic.LDRH)
             || branchBaseLoad.Mnemonic != Arm64Mnemonic.ADR
-            || branch.Op0Kind != Arm64OperandKind.Register
             || tableLoad.Op0Kind != Arm64OperandKind.Register
             || tableLoad.Op1Kind != Arm64OperandKind.Memory
             || tableLoad.MemAddendReg == Arm64Register.INVALID
@@ -2322,7 +2338,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 or MemoryIndexExtension.SignExtend64)
             return false;
 
-        var dispatchStartIndex = branchIndex - 3;
+        var protectedGapRegisters = new HashSet<string>(StringComparer.Ordinal)
+        {
+            Arm64RegisterHelper.CanonicalName(branch.Op0Reg),
+            Arm64RegisterHelper.CanonicalName(branchBaseLoad.Op0Reg),
+            Arm64RegisterHelper.CanonicalName(tableLoad.Op0Reg),
+            Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg),
+        };
+        for (var index = targetAddIndex + 1; index < branchIndex; index++)
+        {
+            var snapshot = nativeInstructions[index];
+            if (!IsIndependentRegisterSnapshotBeforeJump(snapshot, branch.Op0Reg)
+                || protectedGapRegisters.Contains(
+                    Arm64RegisterHelper.CanonicalName(snapshot.Op0Reg)))
+                return false;
+        }
+
+        var dispatchStartIndex = targetAddIndex - 2;
         var boundaryIndex = -1;
         for (var index = dispatchStartIndex - 1; index >= 1; index--)
         {
@@ -2342,16 +2374,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if (comparison.Mnemonic != Arm64Mnemonic.CMP
             || comparison.Op0Kind != Arm64OperandKind.Register
             || comparison.Op1Kind != Arm64OperandKind.Immediate
-            || comparison.Op1Imm < 0
-            || Arm64RegisterHelper.CanonicalName(comparison.Op0Reg) != adjustedIndexName)
+            || comparison.Op1Imm < 0)
             return false;
+        var comparisonIndexName = Arm64RegisterHelper.CanonicalName(comparison.Op0Reg);
 
         var lowerBound = 0L;
         if (boundaryIndex >= 2)
         {
             var normalization = nativeInstructions[boundaryIndex - 2];
             if (normalization.Op0Kind == Arm64OperandKind.Register
-                && Arm64RegisterHelper.CanonicalName(normalization.Op0Reg) == adjustedIndexName)
+                && Arm64RegisterHelper.CanonicalName(normalization.Op0Reg) == comparisonIndexName)
             {
                 if (normalization.Mnemonic is not (Arm64Mnemonic.SUB or Arm64Mnemonic.ADD)
                     || normalization.Op1Kind != Arm64OperandKind.Register
@@ -2364,14 +2396,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
         }
 
-        // 边界检查后索引必须保持不变，否则表项数量不再能证明内存读取安全。
-        for (var index = boundaryIndex + 1; index < branchIndex - 2; index++)
+        // 中文注释：Clang 会在边界检查后用 MOV 把已经验证的 Wn 索引复制到表寻址寄存器。
+        // 两个寄存器不同时只接受一次精确寄存器复制；复制前不得重写比较寄存器，复制后不得
+        // 再写表索引。这样既保留同寄存器旧形状，也不把任意数据搬运误认成已验证索引。
+        var awaitsIndexCopy = comparisonIndexName != adjustedIndexName;
+        for (var index = boundaryIndex + 1; index < tableLoadIndex; index++)
         {
             var candidate = nativeInstructions[index];
-            if (candidate.Op0Kind == Arm64OperandKind.Register
-                && Arm64RegisterHelper.CanonicalName(candidate.Op0Reg) == adjustedIndexName)
+            if (candidate.Op0Kind != Arm64OperandKind.Register)
+                continue;
+
+            var destinationName = Arm64RegisterHelper.CanonicalName(candidate.Op0Reg);
+            if (awaitsIndexCopy && destinationName == comparisonIndexName)
                 return false;
+            if (destinationName != adjustedIndexName)
+                continue;
+            if (!awaitsIndexCopy
+                || candidate.Mnemonic != Arm64Mnemonic.MOV
+                || candidate.Op1Kind != Arm64OperandKind.Register
+                || Arm64RegisterHelper.CanonicalName(candidate.Op1Reg) != comparisonIndexName)
+                return false;
+            awaitsIndexCopy = false;
         }
+
+        if (awaitsIndexCopy)
+            return false;
 
         var boundary = nativeInstructions[boundaryIndex];
         var maximumAdjustedIndex = boundary.MnemonicConditionCode == Arm64ConditionCode.HI
@@ -2391,7 +2440,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var tableAddress = 0UL;
         var hasPage = false;
         var hasTableAddress = false;
-        for (var index = boundaryIndex + 1; index < branchIndex - 2; index++)
+        for (var index = boundaryIndex + 1; index < tableLoadIndex; index++)
         {
             var candidate = nativeInstructions[index];
             if (candidate.Op0Kind != Arm64OperandKind.Register
@@ -2654,6 +2703,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             && targetAdd.FinalOpExtendType is Arm64ExtendType.UXTW or Arm64ExtendType.UXTX;
         return isShiftedRegister || isUnsignedExtendedRegister;
     }
+
+    private static bool IsIndependentRegisterSnapshotBeforeJump(
+        Arm64Instruction instruction,
+        Arm64Register jumpTargetRegister)
+        => instruction.Mnemonic == Arm64Mnemonic.MOV
+           && instruction.Op0Kind == Arm64OperandKind.Register
+           && instruction.Op1Kind == Arm64OperandKind.Register
+           && Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)
+               != Arm64RegisterHelper.CanonicalName(jumpTargetRegister);
 
     private static bool IsNativeControlTransfer(Arm64Mnemonic mnemonic)
         => mnemonic is Arm64Mnemonic.B
