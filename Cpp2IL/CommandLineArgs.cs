@@ -52,7 +52,7 @@ public class CommandLineArgs
     [Option("isil-assembly-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确程序集名；空值表示全部程序集。")]
     public IEnumerable<string> IsilAssemblyFilters { get; set; } = new List<string>();
 
-    [Option("isil-type-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确类型全名；空值表示全部类型。")]
+    [Option("isil-type-filter", Separator = '|', HelpText = "ISIL按以 | 分隔的精确类型全名处理；IL恢复还递归纳入所选根类型的嵌套类型；空值表示全部类型。")]
     public IEnumerable<string> IsilTypeFilters { get; set; } = new List<string>();
 
     [Option("isil-method-filter", Separator = '|', HelpText = "ISIL与IL恢复仅处理以 | 分隔的精确方法签名；必须同时指定类型筛选。")]

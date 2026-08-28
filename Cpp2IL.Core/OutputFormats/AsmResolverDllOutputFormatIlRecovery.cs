@@ -51,13 +51,26 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 assemblyFilters,
                 assembly => assembly.Name,
                 "IL恢复程序集");
-            var types = IsilDumpSelectionHelper.SelectExact(
-                assemblies.SelectMany(assembly => assembly.Types),
+            var typeCandidates = assemblies
+                .SelectMany(assembly => assembly.Types)
+                .ToArray();
+            var selectedTypeRoots = IsilDumpSelectionHelper.SelectExact(
+                typeCandidates,
                 typeFilters,
                 type => type.Definition?.FullName ?? string.Empty,
                 "IL恢复类型");
-            if (typeFilters.Count > 0 && types.Any(type => type is InjectedTypeAnalysisContext || type.Methods.Count == 0))
-                throw new InvalidOperationException("IL恢复类型筛选命中了注入类型或没有方法的类型。");
+            if (typeFilters.Count > 0 && selectedTypeRoots.Any(type => type is InjectedTypeAnalysisContext))
+                throw new InvalidOperationException("IL恢复类型筛选命中了注入类型。");
+
+            // 精确类型是恢复根；编译器生成的状态机、闭包及其更深嵌套类型必须进入同一恢复闭包。
+            var types = IsilDumpSelectionHelper.ExpandDescendantClosure(
+                typeCandidates,
+                selectedTypeRoots,
+                type => type.NestedTypes);
+            if (typeFilters.Count > 0 && !types
+                    .SelectMany(type => type.Methods)
+                    .Any(method => method is not InjectedMethodAnalysisContext))
+                throw new InvalidOperationException("IL恢复类型筛选命中的类型及其嵌套类型都没有可恢复方法。");
 
             var methods = IsilDumpSelectionHelper.SelectExact(
                 types.SelectMany(type => type.Methods)
@@ -70,7 +83,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(methods);
             selectedMethodCount = methods.Count;
             Logger.InfoNewline(
-                $"IL恢复已精确选择 {assemblies.Count} 个程序集、{types.Count} 个类型与 {methods.Count} 个方法；其他成员只保留声明。",
+                $"IL恢复已精确选择 {assemblies.Count} 个程序集、{selectedTypeRoots.Count} 个根类型、" +
+                $"{types.Count} 个含嵌套闭包类型与 {methods.Count} 个方法；其他成员只保留声明。",
                 "DllOutput");
         }
 

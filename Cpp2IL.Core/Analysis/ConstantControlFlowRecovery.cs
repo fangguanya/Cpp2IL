@@ -12,7 +12,7 @@ namespace Cpp2IL.Core.Analysis;
 public sealed class IntegerControlStatePlan
 {
     private readonly Dictionary<LocalVariable, HashSet<long>> _domains;
-    private static readonly IReadOnlySet<long> NoValues = new HashSet<long>();
+    private static readonly IReadOnlyCollection<long> NoValues = Array.Empty<long>();
 
     internal IntegerControlStatePlan(IReadOnlyDictionary<LocalVariable, HashSet<long>> domains)
     {
@@ -29,7 +29,7 @@ public sealed class IntegerControlStatePlan
         _domains.TryGetValue(local, out var domain)
         && values.All(domain.Contains);
 
-    internal bool TryGetDomain(LocalVariable local, out IReadOnlySet<long> domain)
+    internal bool TryGetDomain(LocalVariable local, out IReadOnlyCollection<long> domain)
     {
         if (_domains.TryGetValue(local, out var values))
         {

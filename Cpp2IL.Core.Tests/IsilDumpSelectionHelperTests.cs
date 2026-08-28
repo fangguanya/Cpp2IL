@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Tests;
@@ -93,6 +94,70 @@ public class IsilDumpSelectionHelperTests
             new[] { "GameManager" },
             value => value,
             "ISIL 类型"));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void ExpandDescendantClosureIncludesRecursiveCompilerGeneratedTypes()
+    {
+        var candidates = new[]
+        {
+            "Sibling",
+            "Container",
+            "Container+<Run>d__1",
+            "Container+<Run>d__1+IteratorState"
+        };
+        var children = new Dictionary<string, string[]>
+        {
+            ["Container"] = ["Container+<Run>d__1"],
+            ["Container+<Run>d__1"] = ["Container+<Run>d__1+IteratorState"]
+        };
+
+        var selected = IsilDumpSelectionHelper.ExpandDescendantClosure(
+            candidates,
+            new[] { "Container" },
+            value => children.TryGetValue(value, out var nested)
+                ? nested
+                : Array.Empty<string>());
+
+        Assert.That(selected, Is.EqualTo(new[]
+        {
+            "Container",
+            "Container+<Run>d__1",
+            "Container+<Run>d__1+IteratorState"
+        }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ExpandDescendantClosureKeepsNestedRootBoundaryAndDeduplicatesCycles()
+    {
+        var candidates = new[] { "Container", "Container+Nested", "Container+Sibling" };
+        var children = new Dictionary<string, string[]>
+        {
+            ["Container"] = ["Container+Nested", "Container+Sibling"],
+            ["Container+Nested"] = ["Container+Nested"]
+        };
+
+        var selected = IsilDumpSelectionHelper.ExpandDescendantClosure(
+            candidates,
+            new[] { "Container+Nested", "Container+Nested" },
+            value => children.TryGetValue(value, out var nested)
+                ? nested
+                : Array.Empty<string>());
+
+        Assert.That(selected, Is.EqualTo(new[] { "Container+Nested" }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ExpandDescendantClosureRejectsChildOutsideCandidateUniverse()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            IsilDumpSelectionHelper.ExpandDescendantClosure(
+                new[] { "Container" },
+                new[] { "Container" },
+                _ => new[] { "Container+Missing" }));
     }
 
     [TestCase(" ", "")]

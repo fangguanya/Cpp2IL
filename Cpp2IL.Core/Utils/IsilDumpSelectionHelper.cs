@@ -6,6 +6,49 @@ namespace Cpp2IL.Core.Utils;
 
 public static class IsilDumpSelectionHelper
 {
+    /// <summary>
+    /// 从精确根节点递归扩展全部后代，并按候选集合的原始顺序返回唯一闭包。
+    /// </summary>
+    public static IReadOnlyList<T> ExpandDescendantClosure<T>(
+        IEnumerable<T> candidates,
+        IEnumerable<T> selectedRoots,
+        Func<T, IEnumerable<T>> directChildrenSelector)
+    {
+        if (candidates == null)
+            throw new ArgumentNullException(nameof(candidates));
+        if (selectedRoots == null)
+            throw new ArgumentNullException(nameof(selectedRoots));
+        if (directChildrenSelector == null)
+            throw new ArgumentNullException(nameof(directChildrenSelector));
+
+        var candidateList = candidates.ToList();
+        var candidateSet = new HashSet<T>(candidateList);
+        var rootList = selectedRoots.ToList();
+        if (rootList.Any(root => !candidateSet.Contains(root)))
+            throw new ArgumentException("所选根节点必须属于候选集合。", nameof(selectedRoots));
+
+        var closure = new HashSet<T>();
+        var pending = new Stack<T>(rootList);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (!closure.Add(current))
+                continue;
+
+            var children = directChildrenSelector(current)
+                           ?? throw new InvalidOperationException("子节点选择器返回了空集合引用。");
+            foreach (var child in children)
+            {
+                if (!candidateSet.Contains(child))
+                    throw new InvalidOperationException("子节点选择器返回了候选集合之外的节点。");
+                if (!closure.Contains(child))
+                    pending.Push(child);
+            }
+        }
+
+        return candidateList.Where(closure.Contains).ToList();
+    }
+
     public static IReadOnlyList<string> NormalizeFilters(IEnumerable<string>? filters, string label)
     {
         if (string.IsNullOrWhiteSpace(label))
