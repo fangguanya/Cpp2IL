@@ -491,7 +491,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // 将无副作用的共享Move/Return尾链改写为直接返回，使大型字符串分派反编译为
         // 扁平早返回序列，避免数百层else触发Roslyn表达式复杂度上限。
-        TailReturnRecovery.Run(ControlFlowGraph);
+        TailReturnRecovery.Run(this);
 
         // Now out of SSA: clean up the per-edge copies that phi removal introduced (a local can have
         // several definitions merging at a join here, so this pass propagates conservatively), then
@@ -590,7 +590,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveFinalScalarCopyCarrierTypes(this);
         // 中文注释：条件选择与退 SSA 边复制会用 Boolean 叶和非布尔状态码构造异常/短路控制状态；
         // 仅在定义与比较消费者完全闭合时恢复 Int32，引用和普通业务数值仍保持原类型。
-        LocalVariables.ResolveFinalIntegerControlStateCarrierTypes(this);
+        var finalIntegerControlStatePlan =
+            LocalVariables.ResolveFinalIntegerControlStateCarrierTypes(this);
         // 中文注释：退 SSA 的布尔边复制在此已稳定；只闭合由权威 Boolean 叶、0/1 复制和
         // 小位逻辑组成的分量，引用类型或非布尔掩码会使整个分量失败关闭。
         LocalVariables.ResolveFinalBooleanBitwiseCarrierTypes(this);
@@ -600,7 +601,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // 中文注释：字段、集合和保存接收者全部恢复后，固定异常状态码的比较已经成为纯常量；
         // 此时裁掉其不可达返回/抛出边，避免异常 ABI 状态值进入托管返回类型。
-        ConstantControlFlowRecovery.Run(ControlFlowGraph);
+        ConstantControlFlowRecovery.Run(ControlFlowGraph, finalIntegerControlStatePlan);
 
         // 中文注释：固定异常边裁除后，正常返回路径重新成为唯一链；把同一 X0 上紧邻的
         // 托管调用结果接回 Return，避免正确 ToArray 结果被无定义返回局部替换成 default。

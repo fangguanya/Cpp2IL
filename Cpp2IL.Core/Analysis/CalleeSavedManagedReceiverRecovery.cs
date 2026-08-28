@@ -23,7 +23,8 @@ public static class CalleeSavedManagedReceiverRecovery
     /// </summary>
     /// <remarks>
     /// 只有该局部的全部定义均为同一托管引用类型的直接复制、字段读取或空值时才提交；
-    /// 非保存寄存器还必须具有至少两个定义和一条退 SSA Phi 复制。真实指针算术、异型引用和
+    /// 非保存寄存器必须具有至少一条退 SSA 边复制。单边复制也是完整的值定义，
+    /// 不应因没有第二条入边而保留为 System.Object。真实指针、装箱包装、异型引用和
     /// 运行时元数据载体均保持原类型。该规则用于数组循环以及业务数据项的合流字段读取。
     /// </remarks>
     public static int ResolveManagedCopyCarrierTypes(MethodAnalysisContext method)
@@ -65,23 +66,22 @@ public static class CalleeSavedManagedReceiverRecovery
         {
             var destination = pair.Key;
             var isCalleeSavedCarrier = IsCalleeSavedArm64Register(destination.Register.Name);
-            var isReferencePhiCarrier = pair.Value.Length >= 2
-                                        && pair.Value.Any(definition => definition is
-                                        {
-                                            Index: < 0,
-                                            OpCode: OpCode.Move,
-                                        });
-            if (isCalleeSavedCarrier || isReferencePhiCarrier)
+            var isDeSsaEdgeCopyCarrier = pair.Value.Any(definition => definition is
+            {
+                Index: < 0,
+                OpCode: OpCode.Move,
+            });
+            if (isCalleeSavedCarrier || isDeSsaEdgeCopyCarrier)
             {
                 Logger.VerboseNewline(
                     $"托管复制载体定型候选：destination={destination.Register}，" +
                     $"type={destination.Type?.FullName ?? "<未定型>"}，calleeSaved={isCalleeSavedCarrier}，" +
-                    $"referencePhi={isReferencePhiCarrier}，definitions=" +
+                    $"deSsaEdgeCopy={isDeSsaEdgeCopyCarrier}，definitions=" +
                     string.Join(" | ", pair.Value.Select(DescribeManagedCopyDefinition)),
                     nameof(CalleeSavedManagedReceiverRecovery));
             }
 
-            if ((!isCalleeSavedCarrier && !isReferencePhiCarrier)
+            if ((!isCalleeSavedCarrier && !isDeSsaEdgeCopyCarrier)
                 || parameterLocals?.Contains(destination) == true
                 || !IsReplaceableManagedCopyCarrier(destination.Type))
                 continue;
@@ -145,11 +145,24 @@ public static class CalleeSavedManagedReceiverRecovery
         => type == null || type.FullName is "System.Object" or "System.IntPtr" or "System.UIntPtr";
 
     private static bool IsConcreteManagedReference(TypeAnalysisContext type)
-        => !type.IsValueType
-           && type is not (RuntimeClassTypeAnalysisContext
-               or StaticFieldStorageTypeAnalysisContext
-               or RuntimeMethodInfoAnalysisContext)
-           && type.FullName != "System.Object";
+    {
+        if (type.IsValueType || type.FullName == "System.Object")
+            return false;
+
+        // 数组是真实托管引用；其他包装类型表示指针、ByRef、装箱、Pinned 或修饰类型，
+        // 它们都不能作为普通对象入边来反推载体类型。
+        if (type is WrappedTypeAnalysisContext
+            and not ArrayTypeAnalysisContext
+            and not SzArrayTypeAnalysisContext)
+            return false;
+
+        return type is not (RuntimeClassTypeAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext
+            or RgctxTableTypeAnalysisContext
+            or MethodRgctxTableTypeAnalysisContext
+            or SentinelTypeAnalysisContext);
+    }
 
     /// <summary>
     /// 从直接局部复制或已解析字段读取中提取具体托管引用类型。

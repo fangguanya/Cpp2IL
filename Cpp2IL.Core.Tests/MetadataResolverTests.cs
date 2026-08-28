@@ -1453,6 +1453,192 @@ public class MetadataResolverTests
 
     [Test]
     [Category("基本功能")]
+    public void 唯一布尔字段读取把Object结果槽恢复为精确类型()
+    {
+        var fixture = CreateResolvedFieldLoadTypingFixture();
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Result.Type,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType));
+            Assert.That(fixture.Loads[0].Operands[1], Is.TypeOf<FieldReference>());
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百个同类型字段读取共享结果槽时只形成一个类型共识()
+    {
+        var fixture = CreateResolvedFieldLoadTypingFixture(definitionCount: 400);
+
+        var firstChanged = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+        var secondChanged = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstChanged, Is.True);
+            Assert.That(secondChanged, Is.False);
+            Assert.That(fixture.Result.Type,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType));
+            Assert.That(fixture.Loads.Select(load => load.Operands[1]),
+                Is.All.TypeOf<FieldReference>());
+        });
+    }
+
+    [TestCase(true, false)]
+    [TestCase(false, true)]
+    [Category("异常输入")]
+    public void 字段类型冲突或混合定义时保持Object结果槽(
+        bool mismatchSecondFieldType,
+        bool includeNonFieldDefinition)
+    {
+        var fixture = CreateResolvedFieldLoadTypingFixture(
+            definitionCount: 2,
+            mismatchSecondFieldType: mismatchSecondFieldType,
+            includeNonFieldDefinition: includeNonFieldDefinition);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Result.Type,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType));
+            Assert.That(fixture.Loads.Select(load => load.Operands[1]),
+                Is.All.TypeOf<FieldReference>());
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 不同接收者字段地址Phi恢复为同类型字段值Phi()
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture();
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(fixture.Phi.OpCode, Is.EqualTo(OpCode.Phi));
+            Assert.That(fixture.Phi.Operands.Skip(1), Is.EqualTo(fixture.AddressLocals));
+            Assert.That(fixture.Load.Operands[1], Is.SameAs(fixture.PhiValue));
+            for (var index = 0; index < fixture.AddressDefinitions.Length; index++)
+            {
+                var definition = fixture.AddressDefinitions[index];
+                Assert.That(definition.OpCode, Is.EqualTo(OpCode.Move));
+                Assert.That(definition.Operands[0], Is.SameAs(fixture.AddressLocals[index]));
+                Assert.That(definition.Operands[1], Is.TypeOf<FieldReference>());
+                var reference = (FieldReference)definition.Operands[1];
+                Assert.That(reference.Local, Is.SameAs(fixture.Receivers[index % 2]));
+                Assert.That(reference.Field, Is.SameAs(fixture.Fields[index % 2]));
+            }
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 四百条异址入边含公共附加偏移和反序加法仍只恢复一次()
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture(
+            inputCount: 400,
+            memoryAddend: 5,
+            reverseOddAdds: true);
+
+        var firstChanged = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+        var secondChanged = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstChanged, Is.True);
+            Assert.That(secondChanged, Is.False);
+            Assert.That(fixture.AddressDefinitions, Has.Length.EqualTo(400));
+            Assert.That(fixture.AddressDefinitions.Select(definition => definition.OpCode),
+                Is.All.EqualTo(OpCode.Move));
+            for (var index = 0; index < fixture.AddressDefinitions.Length; index++)
+            {
+                var reference = (FieldReference)fixture.AddressDefinitions[index].Operands[1];
+                Assert.That(reference.Field, Is.SameAs(fixture.Fields[index % 2]));
+                Assert.That(reference.Offset, Is.EqualTo(index % 2 == 0 ? 0x25 : 0x2D));
+            }
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi入边字段类型不一致时整组保持原生地址图()
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture(mismatchSecondFieldType: true);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        AssertPhiBackedFieldCandidateUnchanged(fixture, changed);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    [Category("异常输入")]
+    public void 字段地址或Phi结果存在额外用途时整组保持原生地址图(bool addPhiExtraUse)
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture(
+            addAddressExtraUse: !addPhiExtraUse,
+            addPhiExtraUse: addPhiExtraUse);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        AssertPhiBackedFieldCandidateUnchanged(fixture, changed);
+    }
+
+    [TestCase(true, 0, MemoryIndexExtension.None)]
+    [TestCase(false, 1, MemoryIndexExtension.None)]
+    [TestCase(false, 0, MemoryIndexExtension.ZeroExtend32)]
+    [Category("异常输入")]
+    public void 带索引缩放或扩展的Phi公共读取保持原生地址图(
+        bool includeIndex,
+        int scale,
+        MemoryIndexExtension extension)
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture(
+            includeIndex: includeIndex,
+            memoryScale: scale,
+            indexExtension: extension);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        AssertPhiBackedFieldCandidateUnchanged(fixture, changed);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Phi字段地址与公共附加偏移溢出时整组保持原生地址图()
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture();
+        fixture.AddressDefinitions[0].SetOperand(2, new Immediate(long.MaxValue));
+        fixture.Load.SetOperand(1, new MemoryOperand(fixture.PhiValue, addend: 1));
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        AssertPhiBackedFieldCandidateUnchanged(fixture, changed);
+    }
+
+    [TestCase(PhiReceiverKind.Pointer)]
+    [TestCase(PhiReceiverKind.ByRef)]
+    [TestCase(PhiReceiverKind.RuntimeClass)]
+    [Category("异常输入")]
+    public void 非托管实例接收者不参与Phi字段值恢复(PhiReceiverKind receiverKind)
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture(firstReceiverKind: receiverKind);
+
+        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+
+        AssertPhiBackedFieldCandidateUnchanged(fixture, changed);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 已初始化同址槽的内联读取恢复为强类型元数据操作数()
     {
         var slot = new LocalVariable("slot", new Register(null, "X29"));
@@ -1580,6 +1766,270 @@ public class MetadataResolverTests
             Assert.That(instructions[2].Operands[2], Is.EqualTo(inlineRead));
         });
     }
+
+    /// <summary>
+    /// 构造两种托管实例字段地址交替进入同一 Phi 的通用夹具；字段偏移由地址偏移与
+    /// 公共读取附加偏移唯一合成，测试不得另写一套字段布局计算。
+    /// </summary>
+    private static PhiBackedInstanceFieldFixture CreatePhiBackedInstanceFieldFixture(
+        int inputCount = 2,
+        long memoryAddend = 0,
+        bool reverseOddAdds = false,
+        bool mismatchSecondFieldType = false,
+        bool includeIndex = false,
+        int memoryScale = 0,
+        MemoryIndexExtension indexExtension = MemoryIndexExtension.None,
+        bool addAddressExtraUse = false,
+        bool addPhiExtraUse = false,
+        PhiReceiverKind firstReceiverKind = PhiReceiverKind.Managed)
+    {
+        if (inputCount < 2)
+            throw new ArgumentOutOfRangeException(nameof(inputCount));
+
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owners = new[]
+        {
+            new InjectedTypeAnalysisContext(
+                assembly,
+                "Fixture",
+                "PhiFieldOwnerA",
+                app.SystemTypes.SystemObjectType,
+                System.Reflection.TypeAttributes.Public),
+            new InjectedTypeAnalysisContext(
+                assembly,
+                "Fixture",
+                "PhiFieldOwnerB",
+                app.SystemTypes.SystemObjectType,
+                System.Reflection.TypeAttributes.Public),
+        };
+        var fields = new[]
+        {
+            owners[0].InjectFieldContext(
+                "ValueA",
+                app.SystemTypes.SystemStringType,
+                System.Reflection.FieldAttributes.Private),
+            owners[1].InjectFieldContext(
+                "ValueB",
+                mismatchSecondFieldType
+                    ? app.SystemTypes.SystemInt32Type
+                    : app.SystemTypes.SystemStringType,
+                System.Reflection.FieldAttributes.Private),
+        };
+        fields[0].OverrideOffset = checked((int)(0x20L + memoryAddend));
+        fields[1].OverrideOffset = checked((int)(0x28L + memoryAddend));
+
+        TypeAnalysisContext firstReceiverType = firstReceiverKind switch
+        {
+            PhiReceiverKind.Managed => owners[0],
+            PhiReceiverKind.Pointer => owners[0].MakePointerType(),
+            PhiReceiverKind.ByRef => owners[0].MakeByReferenceType(),
+            PhiReceiverKind.RuntimeClass => new RuntimeClassTypeAnalysisContext(owners[0], assembly),
+            _ => throw new ArgumentOutOfRangeException(nameof(firstReceiverKind)),
+        };
+        var receivers = new[]
+        {
+            new LocalVariable("receiverA", new Register(null, "X0", 1), firstReceiverType),
+            new LocalVariable("receiverB", new Register(null, "X1", 1), owners[1]),
+        };
+        var addressLocals = Enumerable.Range(0, inputCount)
+            .Select(index => new LocalVariable(
+                $"fieldAddress{index}",
+                new Register(null, "X8", index + 1)))
+            .ToArray();
+        var addressDefinitions = addressLocals
+            .Select((address, index) =>
+            {
+                var receiver = receivers[index % 2];
+                var offset = new Immediate(index % 2 == 0 ? 0x20 : 0x28);
+                return reverseOddAdds && index % 2 != 0
+                    ? new Instruction(index, OpCode.Add, address, offset, receiver)
+                    : new Instruction(index, OpCode.Add, address, receiver, offset);
+            })
+            .ToArray();
+
+        var phiValue = new LocalVariable(
+            "mergedFieldAddress",
+            new Register(null, "X8", inputCount + 1));
+        var phiOperands = new List<IOperand> { phiValue };
+        phiOperands.AddRange(addressLocals);
+        var phi = new Instruction(inputCount, OpCode.Phi, phiOperands);
+        var memoryIndex = includeIndex
+            ? new LocalVariable(
+                "memoryIndex",
+                new Register(null, "X9", 1),
+                app.SystemTypes.SystemInt32Type)
+            : null;
+        var result = new LocalVariable("result", new Register(null, "X0", 2));
+        var load = new Instruction(
+            inputCount + 1,
+            OpCode.Move,
+            result,
+            new MemoryOperand(phiValue, memoryIndex, memoryAddend, memoryScale, indexExtension));
+        var instructions = addressDefinitions.Cast<Instruction>()
+            .Append(phi)
+            .Append(load)
+            .ToList();
+        if (addAddressExtraUse)
+        {
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Add,
+                new LocalVariable("extraAddressUse", new Register(null, "X10", 1)),
+                addressLocals[0],
+                new Immediate(1)));
+        }
+        if (addPhiExtraUse)
+        {
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                new LocalVariable("extraPhiUse", new Register(null, "X10", 2)),
+                phiValue));
+        }
+        instructions.Add(new Instruction(instructions.Count, OpCode.Return, result));
+
+        var method = owners[0].InjectMethodContext(
+            "ReadMergedValue",
+            app.SystemTypes.SystemObjectType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        return new PhiBackedInstanceFieldFixture(
+            method,
+            receivers,
+            fields,
+            addressLocals,
+            addressDefinitions,
+            phiValue,
+            phi,
+            load);
+    }
+
+    /// <summary>
+    /// 失败候选必须同时保留全部 Add、地址 Phi 与公共内存读取，任何一条入边都不得先行改写。
+    /// </summary>
+    private static void AssertPhiBackedFieldCandidateUnchanged(
+        PhiBackedInstanceFieldFixture fixture,
+        bool changed)
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.AddressDefinitions.Select(definition => definition.OpCode),
+                Is.All.EqualTo(OpCode.Add));
+            Assert.That(fixture.AddressDefinitions
+                    .SelectMany(definition => definition.Operands)
+                    .OfType<FieldReference>(),
+                Is.Empty);
+            Assert.That(fixture.Phi.OpCode, Is.EqualTo(OpCode.Phi));
+            Assert.That(fixture.Load.Operands[1], Is.TypeOf<MemoryOperand>());
+        });
+    }
+
+    public enum PhiReceiverKind
+    {
+        Managed,
+        Pointer,
+        ByRef,
+        RuntimeClass,
+    }
+
+    private sealed record PhiBackedInstanceFieldFixture(
+        MethodAnalysisContext Method,
+        LocalVariable[] Receivers,
+        InjectedFieldAnalysisContext[] Fields,
+        LocalVariable[] AddressLocals,
+        Instruction[] AddressDefinitions,
+        LocalVariable PhiValue,
+        Instruction Phi,
+        Instruction Load);
+
+    /// <summary>
+    /// 构造多个已知接收者字段读取写入同一弱结果槽的通用夹具。字段解析与结果槽
+    /// 定型共用生产代码的完整定义索引，夹具不复制任何布局或类型裁决逻辑。
+    /// </summary>
+    private static ResolvedFieldLoadTypingFixture CreateResolvedFieldLoadTypingFixture(
+        int definitionCount = 1,
+        bool mismatchSecondFieldType = false,
+        bool includeNonFieldDefinition = false)
+    {
+        if (definitionCount < 1)
+            throw new ArgumentOutOfRangeException(nameof(definitionCount));
+
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var owners = new[]
+        {
+            new InjectedTypeAnalysisContext(
+                assembly,
+                "Fixture",
+                "ResolvedFieldLoadOwnerA",
+                app.SystemTypes.SystemObjectType,
+                System.Reflection.TypeAttributes.Public),
+            new InjectedTypeAnalysisContext(
+                assembly,
+                "Fixture",
+                "ResolvedFieldLoadOwnerB",
+                app.SystemTypes.SystemObjectType,
+                System.Reflection.TypeAttributes.Public),
+        };
+        var fields = new[]
+        {
+            owners[0].InjectFieldContext(
+                "FlagA",
+                app.SystemTypes.SystemBooleanType,
+                System.Reflection.FieldAttributes.Private),
+            owners[1].InjectFieldContext(
+                "FlagB",
+                mismatchSecondFieldType
+                    ? app.SystemTypes.SystemInt32Type
+                    : app.SystemTypes.SystemBooleanType,
+                System.Reflection.FieldAttributes.Private),
+        };
+        fields[0].OverrideOffset = 0x20;
+        fields[1].OverrideOffset = 0x28;
+
+        var receivers = new[]
+        {
+            new LocalVariable("receiverA", new Register(null, "X0", 1), owners[0]),
+            new LocalVariable("receiverB", new Register(null, "X1", 1), owners[1]),
+        };
+        var result = new LocalVariable(
+            "result",
+            new Register(null, "X8", 1),
+            app.SystemTypes.SystemObjectType);
+        var loads = Enumerable.Range(0, definitionCount)
+            .Select(index => new Instruction(
+                index,
+                OpCode.Move,
+                result,
+                new MemoryOperand(
+                    receivers[index % 2],
+                    addend: index % 2 == 0 ? 0x20 : 0x28)))
+            .ToArray();
+        var instructions = loads.Cast<Instruction>().ToList();
+        if (includeNonFieldDefinition)
+        {
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.Move,
+                result,
+                new Immediate(0)));
+        }
+        instructions.Add(new Instruction(instructions.Count, OpCode.Return));
+
+        var method = owners[0].InjectMethodContext(
+            "ReadResolvedFields",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        return new ResolvedFieldLoadTypingFixture(method, result, loads);
+    }
+
+    private sealed record ResolvedFieldLoadTypingFixture(
+        MethodAnalysisContext Method,
+        LocalVariable Result,
+        Instruction[] Loads);
 
     private static IndirectInstanceFieldFixture CreateIndirectInstanceFieldFixture(
         IReadOnlyList<long> addressOffsets,

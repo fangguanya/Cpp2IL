@@ -11,6 +11,12 @@ namespace Cpp2IL.Core.Tests;
 
 public class NewArmV8InstructionSetTests
 {
+    // 合成映像把表页、半字站点、字节站点分开放置，同时让全部默认分支目标落在映像范围内。
+    private const ulong SyntheticJumpTableImageStart = 0x1000;
+    private const ulong SyntheticHalfwordJumpTableSite = 0x2000;
+    private const ulong SyntheticByteJumpTableSite = 0x3000;
+    private const ulong SyntheticJumpTableImageEnd = 0x5000;
+
     /// <summary>
     /// 将四字节夹具解码成唯一 ARM64 指令；测试输入若不是单指令必须立即失败。
     /// </summary>
@@ -25,6 +31,14 @@ public class NewArmV8InstructionSetTests
 
         return decoded.Single();
     }
+
+    /// <summary>按给定虚拟地址解码连续 ARM64 机器码，供生产匹配器的编码字段测试使用。</summary>
+    private static Arm64Instruction[] DecodeInstructions(byte[] machineCode, ulong address)
+        => Disassembler.Disassemble(
+                machineCode,
+                address,
+                new Disassembler.Options(true, true, false))
+            .ToArray();
 
     [TestCase(Arm64Mnemonic.STRB, Arm64Register.W0, 8, TestName = "基本_字节存储保留8位覆盖宽度")]
     [TestCase(Arm64Mnemonic.STURH, Arm64Register.W0, 16, TestName = "边界_无符号半字节存储保留16位覆盖宽度")]
@@ -1919,6 +1933,254 @@ public class NewArmV8InstructionSetTests
                 out var targets),
             Is.False);
         Assert.That(targets, Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 半字跳转表按小端表项恢复全部精确目标()
+    {
+        // 三个半字表项分别表示相对分支基址的 0、2、257 条 ARM64 指令偏移。
+        var resolved = NewArmV8InstructionSet.TryResolveJumpTableTargets(
+            [0x00, 0x00, 0x02, 0x00, 0x01, 0x01],
+            sizeof(ushort),
+            3,
+            0x1000,
+            0x1000,
+            0x2000,
+            out var targets);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.True);
+            Assert.That(targets, Is.EqualTo(new ulong[] { 0x1000, 0x1008, 0x1404 }));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 合成机器码一次扫描恢复字节与半字两个跳转表站点()
+    {
+        // 两段均包含 SUB/CMP/B.HI、ADRP/ADD、ADR、索引加载、ADD/BR；第二段改用同编码族的 LDRB。
+        var halfwordSite = DecodeInstructions(
+            [
+                0x68, 0xD2, 0x00, 0x51, 0x1F, 0x6D, 0x01, 0x71, 0x08, 0x3D, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xF0, 0x29, 0x01, 0x28, 0x91, 0xE0, 0x03, 0x1F, 0x2A,
+                0x8A, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x78, 0x4A, 0x09, 0x0B, 0x8B,
+                0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticHalfwordJumpTableSite);
+        var byteSite = DecodeInstructions(
+            [
+                0x88, 0xD2, 0x00, 0x51, 0x1F, 0x6D, 0x01, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0xF4, 0x03, 0x1F, 0xAA,
+                0x8A, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B,
+                0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            halfwordSite.Concat(byteSite).ToArray(),
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+        var halfword = matches.Single(candidate =>
+            candidate.DispatchAddress == SyntheticHalfwordJumpTableSite + 0x24);
+        var bytes = matches.Single(candidate =>
+            candidate.DispatchAddress == SyntheticByteJumpTableSite + 0x24);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(matches, Has.Count.EqualTo(2));
+            Assert.That(halfword.EntryWidthBytes, Is.EqualTo(sizeof(ushort)));
+            Assert.That(halfword.TableAddress, Is.EqualTo(SyntheticJumpTableImageStart + 0xA00));
+            Assert.That(halfword.BranchBaseAddress, Is.EqualTo(SyntheticHalfwordJumpTableSite + 0x28));
+            Assert.That(halfword.Bounds.LowerBound, Is.EqualTo(52));
+            Assert.That(halfword.Bounds.EntryCount, Is.EqualTo(92));
+            Assert.That(halfword.Bounds.DefaultTarget, Is.EqualTo(SyntheticHalfwordJumpTableSite + 0x7A8));
+            Assert.That(bytes.EntryWidthBytes, Is.EqualTo(sizeof(byte)));
+            Assert.That(bytes.TableAddress, Is.EqualTo(SyntheticJumpTableImageStart + 0xAB8));
+            Assert.That(bytes.Bounds.DefaultTarget, Is.EqualTo(SyntheticByteJumpTableSite + 0xDD0));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 跳转表边界保留非零下界计数与独立默认目标()
+    {
+        var recovered = NewArmV8InstructionSet.TryCreateJumpTableBounds(
+            52,
+            91,
+            0x1800,
+            0x1000,
+            0x2000,
+            out var bounds);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.True);
+            Assert.That(bounds.LowerBound, Is.EqualTo(52));
+            Assert.That(bounds.EntryCount, Is.EqualTo(92));
+            Assert.That(bounds.DefaultTarget, Is.EqualTo(0x1800));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 半字跳转表证据不足或目标未对齐时整体关闭()
+    {
+        var truncated = NewArmV8InstructionSet.TryResolveJumpTableTargets(
+            [0x00, 0x00, 0x01],
+            sizeof(ushort),
+            2,
+            0x1000,
+            0x1000,
+            0x2000,
+            out var truncatedTargets);
+        var unaligned = NewArmV8InstructionSet.TryResolveJumpTableTargets(
+            [0x00, 0x00],
+            sizeof(ushort),
+            1,
+            0x1002,
+            0x1000,
+            0x2000,
+            out var unalignedTargets);
+        // 把同一合成形状的 B.HI 改为 B.LS；默认边证据方向不闭合时匹配器必须拒绝。
+        var invertedBoundary = DecodeInstructions(
+            [
+                0x68, 0xD2, 0x00, 0x51, 0x1F, 0x6D, 0x01, 0x71, 0x09, 0x3D, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xF0, 0x29, 0x01, 0x28, 0x91, 0xE0, 0x03, 0x1F, 0x2A,
+                0x8A, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x78, 0x4A, 0x09, 0x0B, 0x8B,
+                0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticHalfwordJumpTableSite);
+        var invalidMatches = NewArmV8InstructionSet.FindJumpTableMatches(
+            invertedBoundary,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(truncated, Is.False);
+            Assert.That(truncatedTargets, Is.Empty);
+            Assert.That(unaligned, Is.False);
+            Assert.That(unalignedTargets, Is.Empty);
+            Assert.That(invalidMatches, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 跳转表拒绝第二次累加基址并成组关闭单向跨站点入口()
+    {
+        // 在合法 ADRP+ADD 后再次写 X9；旧状态机会错误地仍以 pageAddress 为基准接受第二次 ADD。
+        var doubleAdd = DecodeInstructions(
+            [
+                0x68, 0xD2, 0x00, 0x51, 0x1F, 0x6D, 0x01, 0x71, 0x08, 0x3D, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xF0, 0x29, 0x01, 0x28, 0x91, 0x29, 0x11, 0x00, 0x91,
+                0xE0, 0x03, 0x1F, 0x2A, 0x8A, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x78,
+                0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticHalfwordJumpTableSite);
+        var doubleAddMatches = NewArmV8InstructionSet.FindJumpTableMatches(
+            doubleAdd,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        var dispatches = new Dictionary<int, Arm64JumpTableDispatch>
+        {
+            [10] = new(
+                Arm64Register.W8,
+                0x1100,
+                new Arm64JumpTableBounds(0, 1, 0x1300),
+                [0x1200]),
+            [20] = new(
+                Arm64Register.W9,
+                0x1200,
+                new Arm64JumpTableBounds(0, 1, 0x1500),
+                [0x1400]),
+        };
+        var unsafeDispatches = NewArmV8InstructionSet.FindUnsafeJumpTableDispatches(
+            dispatches,
+            []);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(doubleAddMatches, Is.Empty);
+            Assert.That(unsafeDispatches, Is.EquivalentTo(new[] { 10, 20 }));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 普通直接分支按各自立即数字段关闭跳转表候选入口()
+    {
+        var directBranches = DecodeInstructions(
+            [
+                0x02, 0x00, 0x00, 0x14, // B +8
+                0x40, 0x00, 0x00, 0xB4, // CBZ X0, +8
+                0x40, 0x00, 0x00, 0xB5, // CBNZ X0, +8
+                0x40, 0x00, 0x00, 0x36, // TBZ X0, #0, +8
+                0x40, 0x00, 0x00, 0x37, // TBNZ X0, #0, +8
+            ],
+            0x1100);
+        var dispatches = directBranches
+            .Select((instruction, index) => new KeyValuePair<int, Arm64JumpTableDispatch>(
+                index,
+                new Arm64JumpTableDispatch(
+                    Arm64Register.W8,
+                    instruction.Address + 8,
+                    new Arm64JumpTableBounds(0, 1, 0x2000),
+                    [0x2100])))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
+
+        var unsafeDispatches = NewArmV8InstructionSet.FindUnsafeJumpTableDispatches(
+            dispatches,
+            directBranches);
+
+        Assert.That(unsafeDispatches, Is.EquivalentTo(dispatches.Keys));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 普通直接分支保留后向位移并拒绝地址下溢()
+    {
+        var validBackward = DecodeSingleInstruction(
+            [0xE0, 0xFF, 0xFF, 0xB4],
+            0x1200); // CBZ X0, -4
+        var underflow = DecodeSingleInstruction(
+            [0xE0, 0xFF, 0xFF, 0xB4],
+            0); // 同一位移在零地址会下溢
+
+        var valid = NewArmV8InstructionSet.TryGetNonCallDirectBranchTarget(
+            validBackward,
+            out var validTarget);
+        var invalid = NewArmV8InstructionSet.TryGetNonCallDirectBranchTarget(
+            underflow,
+            out var invalidTarget);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(valid, Is.True);
+            Assert.That(validTarget, Is.EqualTo(0x11FC));
+            Assert.That(invalid, Is.False);
+            Assert.That(invalidTarget, Is.Zero);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非分支指令不产生普通直接分支目标()
+    {
+        var add = DecodeSingleInstruction([0x00, 0x04, 0x00, 0x91], 0x1300);
+
+        var resolved = NewArmV8InstructionSet.TryGetNonCallDirectBranchTarget(
+            add,
+            out var target);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.False);
+            Assert.That(target, Is.Zero);
+        });
     }
 
     [Test]

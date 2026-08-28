@@ -975,9 +975,11 @@ public static class MetadataResolver
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
         var changed = PackedFieldStoreRecovery.Run(method) > 0;
-        var definitions = BuildDefinitionIndex(method.ControlFlowGraph!.Instructions);
+        var instructions = method.ControlFlowGraph!.Instructions;
+        changed |= ResolvePhiBackedManagedFieldLoads(instructions) > 0;
+        var definitions = BuildDefinitionIndex(instructions);
 
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        foreach (var instruction in instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
@@ -993,42 +995,326 @@ public static class MetadataResolver
                 if (!TryResolveFieldBase(memory, definitions, out var local, out var fieldOffset))
                     continue;
 
-                // check if static field access
-                var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type!;
-                // 泛型声明的字段元数据偏移均可能为零；必须先以声明自身的 T 参数构造开放布局实例，
-                // 否则委托字段无法获得 Func<T>/Comparison<T> 等精确类型，后续 BR 尾调用也无法绑定 Invoke。
-                var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
-
-                FieldAnalysisContext? field;
-                if (genericOwner != null && staticOwner == null)
-                {
-                    // 泛型定义的字段元数据偏移不可信，统一按具体或开放实例重新计算布局。
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, fieldOffset);
-                }
-                else
-                {
-                    field = FindUniqueRuntimeFieldAtOffset(
-                        genericOwner?.GenericType ?? owner,
-                        staticOwner != null,
-                        fieldOffset);
-                }
-
-                if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                if (!TryCreateResolvedFieldReference(local, fieldOffset, out var fieldReference))
                     continue;
 
-                // make sure we have a full GIT for field access. open type is bad.
-                if (genericOwner != null
-                    && field is not ConcreteGenericFieldAnalysisContext)
-                    field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
-
-                instruction.SetOperand(i, new FieldReference(field, local, checked((int)fieldOffset)));
+                instruction.SetOperand(i, fieldReference);
                 changed = true;
             }
         }
 
+        // 中文注释：字段操作数已在上面的同一轮原子替换完成；直接复用既有完整定义索引，
+        // 只在一个局部的全部定义都读取同一精确字段类型时回填结果槽，禁止再次扫描方法图。
+        changed |= BindResolvedFieldLoadDestinationTypes(definitions);
         return changed;
     }
+
+    /// <summary>
+    /// 用已解析字段的元数据类型闭合同一局部的 CIL 槽类型。只有 null/object 弱载体、
+    /// 全部定义均为字段读取且字段类型完全一致时才提交；混合定义或类型冲突保持原状。
+    /// </summary>
+    internal static bool BindResolvedFieldLoadDestinationTypes(
+        IReadOnlyDictionary<LocalVariable, Instruction[]> definitions)
+    {
+        var changed = false;
+        foreach (var pair in definitions)
+        {
+            var local = pair.Key;
+            if (local.Type != null && local.Type.FullName != "System.Object")
+                continue;
+
+            TypeAnalysisContext? consensusType = null;
+            var definitionsAreClosed = pair.Value.Length > 0;
+            foreach (var definition in pair.Value)
+            {
+                if (definition is not
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable destination, FieldReference field]
+                    }
+                    || !ReferenceEquals(destination, local))
+                {
+                    definitionsAreClosed = false;
+                    break;
+                }
+
+                var fieldType = field.Field.FieldType;
+                if (consensusType != null
+                    && !GenericCallRebinder.TypesEquivalent(consensusType, fieldType))
+                {
+                    definitionsAreClosed = false;
+                    break;
+                }
+
+                consensusType ??= fieldType;
+            }
+
+            if (!definitionsAreClosed || consensusType == null)
+                continue;
+
+            local.Type = consensusType;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// 把“各分支计算实例字段地址、Phi 汇合地址、汇合后统一读取”恢复为字段值 Phi。
+    /// 解析阶段先冻结全图的唯一用途和字段引用计划；只有候选的全部入边都通过验证，
+    /// 才一次提交该候选的所有 Add 与公共读取，避免失败入边留下半改写图。
+    /// </summary>
+    internal static int ResolvePhiBackedManagedFieldLoads(IReadOnlyList<Instruction> instructions)
+    {
+        var definitions = BuildUniqueDefinitions(instructions);
+        var uses = BuildLocalUseIndex(instructions);
+        var plans = new List<ManagedFieldPhiRewritePlan>();
+
+        foreach (var load in instructions)
+        {
+            if (TryPlanManagedFieldPhiRewrite(load, definitions, uses, out var plan))
+                plans.Add(plan);
+        }
+
+        // 中文注释：所有候选都基于同一份未修改快照完成证明；唯一用途约束保证计划之间互不重叠。
+        foreach (var plan in plans)
+        {
+            foreach (var input in plan.Inputs)
+            {
+                input.AddressDefinition.OpCode = OpCode.Move;
+                input.AddressDefinition.SetOperands(input.AddressLocal, input.FieldReference);
+                input.AddressDefinition.IntegerWidthBits = 0;
+            }
+
+            plan.Load.SetOperand(1, plan.PhiValue);
+            plan.Load.MemoryAccessWidthBits = 0;
+        }
+
+        return plans.Count;
+    }
+
+    /// <summary>
+    /// 为单个公共读取建立完整改写计划。Phi 结果与每条地址入边都必须恰好只有预期的一次用途；
+    /// 输入必须是唯一 Add 定义，且所有实例字段的托管值类型完全一致。
+    /// </summary>
+    private static bool TryPlanManagedFieldPhiRewrite(
+        Instruction load,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> uses,
+        out ManagedFieldPhiRewritePlan plan)
+    {
+        plan = null!;
+        if (load is not
+            {
+                OpCode: OpCode.Move,
+                Operands:
+                [
+                    LocalVariable,
+                    MemoryOperand
+                    {
+                        Base: LocalVariable phiValue,
+                        Index: null,
+                        Scale: 0,
+                        IndexExtension: MemoryIndexExtension.None
+                    } memory
+                ]
+            }
+            || !definitions.TryGetValue(phiValue, out var phi)
+            || phi is not { OpCode: OpCode.Phi, Operands.Count: >= 3 }
+            || !ReferenceEquals(phi.Operands[0], phiValue)
+            || !HasSingleUse(uses, phiValue, load))
+            return false;
+
+        var inputs = new List<ManagedFieldPhiInputRewrite>(phi.Operands.Count - 1);
+        TypeAnalysisContext? consensusType = null;
+        for (var index = 1; index < phi.Operands.Count; index++)
+        {
+            if (phi.Operands[index] is not LocalVariable addressLocal
+                || !definitions.TryGetValue(addressLocal, out var addressDefinition)
+                || !HasSingleUse(uses, addressLocal, phi)
+                || !TryDecodeManagedFieldAddressDefinition(
+                    addressDefinition,
+                    out var receiver,
+                    out var addressOffset))
+                return false;
+
+            long fieldOffset;
+            try
+            {
+                fieldOffset = checked(addressOffset + memory.Addend);
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+
+            if (!TryCreateResolvedFieldReference(receiver, fieldOffset, out var fieldReference))
+                return false;
+
+            var fieldType = fieldReference.Field.FieldType;
+            if (consensusType != null
+                && !GenericCallRebinder.TypesEquivalent(consensusType, fieldType))
+                return false;
+
+            consensusType ??= fieldType;
+            inputs.Add(new ManagedFieldPhiInputRewrite(addressDefinition, addressLocal, fieldReference));
+        }
+
+        if (consensusType == null)
+            return false;
+
+        plan = new ManagedFieldPhiRewritePlan(load, phiValue, inputs);
+        return true;
+    }
+
+    /// <summary>
+    /// 一次扫描建立完整局部量用途索引。这里从原始操作数递归展开地址、字段、数组与聚合包装，
+    /// 不依赖按操作码裁剪后的 Sources，确保任何隐藏在复合操作数中的额外地址用途都会否决改写。
+    /// </summary>
+    private static IReadOnlyDictionary<LocalVariable, List<Instruction>> BuildLocalUseIndex(
+        IReadOnlyList<Instruction> instructions)
+    {
+        var uses = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in instructions)
+        {
+            var destination = instruction.Destination;
+            var destinationIndex = -1;
+            if (destination != null)
+            {
+                for (var index = 0; index < instruction.Operands.Count; index++)
+                {
+                    if (!ReferenceEquals(instruction.Operands[index], destination))
+                        continue;
+
+                    destinationIndex = index;
+                    break;
+                }
+            }
+
+            for (var index = 0; index < instruction.Operands.Count; index++)
+            {
+                if (index == destinationIndex)
+                    continue;
+
+                CollectLocalUses(instruction.Operands[index], instruction, uses);
+            }
+        }
+
+        return uses;
+    }
+
+    private static void CollectLocalUses(
+        IOperand operand,
+        Instruction consumer,
+        Dictionary<LocalVariable, List<Instruction>> uses)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                if (!uses.TryGetValue(local, out var consumers))
+                    uses[local] = consumers = [];
+                consumers.Add(consumer);
+                break;
+            case MemoryOperand memory:
+                if (memory.Base != null)
+                    CollectLocalUses(memory.Base, consumer, uses);
+                if (memory.Index != null)
+                    CollectLocalUses(memory.Index, consumer, uses);
+                break;
+            case AddressOf address:
+                CollectLocalUses(address.Target, consumer, uses);
+                break;
+            case ArrayAccess arrayAccess:
+                CollectLocalUses(arrayAccess.Array, consumer, uses);
+                CollectLocalUses(arrayAccess.Index, consumer, uses);
+                break;
+            case ArrayLength arrayLength:
+                CollectLocalUses(arrayLength.Array, consumer, uses);
+                break;
+            case FieldReference fieldReference:
+                CollectLocalUses(fieldReference.Local, consumer, uses);
+                break;
+            case ListCount listCount:
+                CollectLocalUses(listCount.Value, consumer, uses);
+                break;
+            case StringLength stringLength:
+                CollectLocalUses(stringLength.Value, consumer, uses);
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                    CollectLocalUses(component, consumer, uses);
+                break;
+            case MetadataStringTableLookup metadataLookup:
+                CollectLocalUses(metadataLookup.Index, consumer, uses);
+                break;
+            case ReadOnlyUInt16TableLookup tableLookup:
+                CollectLocalUses(tableLookup.Index, consumer, uses);
+                break;
+        }
+    }
+
+    private static bool HasSingleUse(
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> uses,
+        LocalVariable local,
+        Instruction expectedConsumer)
+        => uses.TryGetValue(local, out var consumers)
+           && consumers.Count == 1
+           && ReferenceEquals(consumers[0], expectedConsumer);
+
+    /// <summary>
+    /// 统一把已经证明的局部量与运行时偏移解析为字段引用。直接内存访问与 Phi 地址恢复
+    /// 共用同一套泛型布局、继承查找、唯一性和整数范围规则，避免两条路径重复计算布局。
+    /// </summary>
+    private static bool TryCreateResolvedFieldReference(
+        LocalVariable local,
+        long fieldOffset,
+        out FieldReference fieldReference)
+    {
+        fieldReference = null!;
+        var localType = local.Type;
+        if (localType == null || fieldOffset is < int.MinValue or > int.MaxValue)
+            return false;
+
+        var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
+        var owner = staticOwner ?? localType;
+        // 中文注释：泛型声明的元数据偏移可能为零，必须先构造具体或开放布局实例，
+        // 才能得到 Func<T>、Comparison<T> 等字段的精确托管类型。
+        var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);
+
+        FieldAnalysisContext? field;
+        if (genericOwner != null && staticOwner == null)
+        {
+            field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, fieldOffset);
+        }
+        else
+        {
+            field = FindUniqueRuntimeFieldAtOffset(
+                genericOwner?.GenericType ?? owner,
+                staticOwner != null,
+                fieldOffset);
+        }
+
+        // 只有唯一直接字段才能在本阶段形成可验证的 FieldReference；组合偏移不得猜测为某个业务字段。
+        if (field == null)
+            return false;
+
+        if (genericOwner != null
+            && field is not ConcreteGenericFieldAnalysisContext)
+            field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+
+        fieldReference = new FieldReference(field, local, (int)fieldOffset);
+        return true;
+    }
+
+    private sealed record ManagedFieldPhiRewritePlan(
+        Instruction Load,
+        LocalVariable PhiValue,
+        IReadOnlyList<ManagedFieldPhiInputRewrite> Inputs);
+
+    private readonly record struct ManagedFieldPhiInputRewrite(
+        Instruction AddressDefinition,
+        LocalVariable AddressLocal,
+        FieldReference FieldReference);
 
     /// <summary>
     /// 一次建立局部量完整定义索引。
@@ -1120,7 +1406,8 @@ public static class MetadataResolver
 
     /// <summary>
     /// 解码单条“托管对象 + 常量”字段地址定义。
-    /// 两种加法操作数顺序共用同一入口，数值、指针、byref 和静态存储根均保持原生地址语义。
+    /// 两种加法操作数顺序共用同一入口，数值、指针、byref、静态存储和运行时元数据根
+    /// 均保持原生地址语义，只有真实托管实例接收者可以进入字段解析。
     /// </summary>
     private static bool TryDecodeManagedFieldAddressDefinition(
         Instruction definition,
@@ -1158,7 +1445,9 @@ public static class MetadataResolver
                && receiver.Type is not (
                    PointerTypeAnalysisContext
                    or ByRefTypeAnalysisContext
-                   or StaticFieldStorageTypeAnalysisContext);
+                   or StaticFieldStorageTypeAnalysisContext
+                   or RuntimeClassTypeAnalysisContext
+                   or RuntimeMethodInfoAnalysisContext);
     }
 
     /// <summary>

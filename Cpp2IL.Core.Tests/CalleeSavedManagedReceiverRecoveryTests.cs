@@ -234,6 +234,112 @@ public class CalleeSavedManagedReceiverRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    public void 退Ssa单边复制将Object载体精化为具体托管引用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable(
+            "source",
+            new Register(null, "X20", 1),
+            app.SystemTypes.SystemStringType);
+        var carrier = new LocalVariable(
+            "edgeCopyCarrier",
+            new Register(null, "stack_-150", 2),
+            app.SystemTypes.SystemObjectType);
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, carrier, source),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(carrier.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 退Ssa同型多边与空边共同收敛为具体托管引用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var arrayType = app.SystemTypes.SystemStringType.MakeSzArrayType();
+        var first = new LocalVariable("first", new Register(null, "X20", 1), arrayType);
+        var second = new LocalVariable("second", new Register(null, "X21", 2), arrayType);
+        var carrier = new LocalVariable(
+            "edgeCopyCarrier",
+            new Register(null, "stack_-158", 3),
+            app.SystemTypes.SystemObjectType);
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, carrier, first),
+            new(-1, OpCode.Move, carrier, new Immediate(0)),
+            new(-1, OpCode.Move, carrier, second),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(carrier.Type, Is.SameAs(arrayType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 退Ssa边复制拒绝异型多来源值类型装箱指针与运行时元数据()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var objectType = app.SystemTypes.SystemObjectType;
+        var stringType = app.SystemTypes.SystemStringType;
+        var integerType = app.SystemTypes.SystemInt32Type;
+        var conflicting = new LocalVariable("conflicting", new Register(null, "stack_-160", 1), objectType);
+        var valueCarrier = new LocalVariable("valueCarrier", new Register(null, "stack_-168", 2), objectType);
+        var boxedCarrier = new LocalVariable("boxedCarrier", new Register(null, "stack_-170", 3), objectType);
+        var pointerCarrier = new LocalVariable("pointerCarrier", new Register(null, "stack_-178", 4), objectType);
+        var metadataCarrier = new LocalVariable("metadataCarrier", new Register(null, "stack_-180", 5), objectType);
+        var stringSource = new LocalVariable("stringSource", new Register(null, "X0", 6), stringType);
+        var arraySource = new LocalVariable("arraySource", new Register(null, "X1", 7), stringType.MakeSzArrayType());
+        var valueSource = new LocalVariable("valueSource", new Register(null, "W2", 8), integerType);
+        var boxedSource = new LocalVariable(
+            "boxedSource",
+            new Register(null, "X3", 9),
+            new BoxedTypeAnalysisContext(integerType));
+        var pointerSource = new LocalVariable(
+            "pointerSource",
+            new Register(null, "X4", 10),
+            integerType.MakePointerType());
+        var metadataSource = new LocalVariable(
+            "metadataSource",
+            new Register(null, "X5", 11),
+            new RuntimeClassTypeAnalysisContext(stringType, stringType.DeclaringAssembly));
+        var instructions = new Instruction[]
+        {
+            new(-1, OpCode.Move, conflicting, stringSource),
+            new(-1, OpCode.Move, conflicting, arraySource),
+            new(-1, OpCode.Move, valueCarrier, valueSource),
+            new(-1, OpCode.Move, boxedCarrier, boxedSource),
+            new(-1, OpCode.Move, pointerCarrier, pointerSource),
+            new(-1, OpCode.Move, metadataCarrier, metadataSource),
+        };
+
+        var recovered = CalleeSavedManagedReceiverRecovery.ResolveManagedCopyCarrierTypes(instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(conflicting.Type, Is.SameAs(objectType));
+            Assert.That(valueCarrier.Type, Is.SameAs(objectType));
+            Assert.That(boxedCarrier.Type, Is.SameAs(objectType));
+            Assert.That(pointerCarrier.Type, Is.SameAs(objectType));
+            Assert.That(metadataCarrier.Type, Is.SameAs(objectType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 唯一具体List分配恢复未定义X19接收者并重绑ToArray()
     {
         var fixture = CreateFixture();

@@ -3891,12 +3891,15 @@ public class LocalVariablesTests
         var changed = LocalVariables.BindFinalIntegerControlStateCarrierTypes(
             instructions,
             app.SystemTypes.SystemInt32Type,
-            app.SystemTypes.SystemBooleanType);
+            app.SystemTypes.SystemBooleanType,
+            out var plan);
 
         Assert.Multiple(() =>
         {
             Assert.That(changed, Is.True);
             Assert.That(state.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(plan.TryGetDomain(state, out var domain), Is.True);
+            Assert.That(domain, Is.EquivalentTo(new long[] { 119 }));
         });
     }
 
@@ -3921,12 +3924,15 @@ public class LocalVariablesTests
         var changed = LocalVariables.BindFinalIntegerControlStateCarrierTypes(
             instructions,
             app.SystemTypes.SystemInt32Type,
-            app.SystemTypes.SystemBooleanType);
+            app.SystemTypes.SystemBooleanType,
+            out var plan);
 
         Assert.Multiple(() =>
         {
             Assert.That(changed, Is.True);
             Assert.That(state.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(plan.TryGetDomain(state, out var domain), Is.True);
+            Assert.That(domain, Is.EquivalentTo(new long[] { int.MinValue, int.MaxValue, 0, 1 }));
         });
     }
 

@@ -1,7 +1,10 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -12,8 +15,9 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class TailReturnRecovery
 {
-    public static int Run(ISILControlFlowGraph graph)
+    public static int Run(MethodAnalysisContext method)
     {
+        var graph = method.ControlFlowGraph!;
         var contracts = BuildReturnContracts(graph.Blocks);
         var changed = 0;
 
@@ -25,7 +29,8 @@ public static class TailReturnRecovery
                 || block.Successors.Count != 1
                 || !ReferenceEquals(block.Successors[0], target)
                 || !contracts.TryGetValue(target, out var returnedOperand)
-                || returnedOperand == null)
+                || returnedOperand == null
+                || !HasProvenReturnValue(method, block, jump, returnedOperand))
                 continue;
 
             jump.OpCode = OpCode.Return;
@@ -46,6 +51,125 @@ public static class TailReturnRecovery
 
         return changed;
     }
+
+    /// <summary>
+    /// 证明把当前边折叠为 Return 后，返回操作数在该点一定已赋值且类型合法。
+    /// 常量和入口参数天然支配当前边；普通局部必须在当前基本块中找到最近的显式定义，
+    /// 不能借用其他前驱对共享返回槽的赋值，否则空桥会生成未赋值的伪早退。
+    /// </summary>
+    private static bool HasProvenReturnValue(
+        MethodAnalysisContext method,
+        Block block,
+        Instruction jump,
+        IOperand returnedOperand)
+    {
+        if (Instruction.IsConstantValue(returnedOperand))
+            return IsOperandCompatible(method, returnedOperand);
+
+        if (returnedOperand is not LocalVariable returnedLocal)
+            return false;
+
+        var jumpIndex = block.Instructions.IndexOf(jump);
+        for (var index = jumpIndex - 1; index >= 0; index--)
+        {
+            var definition = block.Instructions[index];
+            if (!ReferenceEquals(definition.Destination, returnedLocal))
+                continue;
+
+            return IsDefinitionCompatible(method, definition);
+        }
+
+        return method.ParameterLocals.Contains(returnedLocal)
+               && IsOperandCompatible(method, returnedLocal);
+    }
+
+    /// <summary>
+    /// 使用定义指令的真实生产值校验类型，避免仅凭已污染的目标局部类型放行错误返回。
+    /// </summary>
+    private static bool IsDefinitionCompatible(
+        MethodAnalysisContext method,
+        Instruction definition)
+    {
+        if (definition.OpCode == OpCode.Move && definition.Operands is [_, { } source])
+            return IsOperandCompatible(method, source);
+
+        if (definition.OpCode == OpCode.Call
+            && definition.Operands.FirstOrDefault() is MethodAnalysisContext calledMethod)
+            return IsTypeCompatible(calledMethod.ReturnType, method.ReturnType);
+
+        if (definition.OpCode == OpCode.Newobj
+            && definition.Operands is [_, TypeAnalysisContext allocatedType, ..])
+            return IsTypeCompatible(
+                allocatedType is RuntimeClassTypeAnalysisContext runtimeClass
+                    ? runtimeClass.RepresentedType
+                    : allocatedType,
+                method.ReturnType);
+
+        return false;
+    }
+
+    private static bool IsOperandCompatible(MethodAnalysisContext method, IOperand operand)
+    {
+        var systemTypes = method.AppContext.SystemTypes;
+        return operand switch
+        {
+            LocalVariable { Type: { } type } => IsTypeCompatible(type, method.ReturnType),
+            StringLiteral => IsTypeCompatible(systemTypes.SystemStringType, method.ReturnType),
+            FloatLiteral => IsTypeCompatible(systemTypes.SystemSingleType, method.ReturnType),
+            DoubleLiteral => IsTypeCompatible(systemTypes.SystemDoubleType, method.ReturnType),
+            TypeAnalysisContext => IsTypeCompatible(systemTypes.SystemTypeType, method.ReturnType),
+            Immediate immediate => IsImmediateCompatible(method, immediate),
+            _ => false,
+        };
+    }
+
+    private static bool IsImmediateCompatible(MethodAnalysisContext method, Immediate immediate)
+    {
+        var returnType = method.ReturnType;
+        if (immediate.Value == 0 && IsManagedReferenceType(returnType))
+            return true;
+
+        var systemTypes = method.AppContext.SystemTypes;
+        return returnType.IsEnumType
+               || systemTypes.TryGetIl2CppTypeEnum(returnType, out var primitiveType)
+               && primitiveType is
+                   Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN
+                   or Il2CppTypeEnum.IL2CPP_TYPE_CHAR
+                   or Il2CppTypeEnum.IL2CPP_TYPE_I1
+                   or Il2CppTypeEnum.IL2CPP_TYPE_U1
+                   or Il2CppTypeEnum.IL2CPP_TYPE_I2
+                   or Il2CppTypeEnum.IL2CPP_TYPE_U2
+                   or Il2CppTypeEnum.IL2CPP_TYPE_I4
+                   or Il2CppTypeEnum.IL2CPP_TYPE_U4
+                   or Il2CppTypeEnum.IL2CPP_TYPE_I8
+                   or Il2CppTypeEnum.IL2CPP_TYPE_U8
+                   or Il2CppTypeEnum.IL2CPP_TYPE_I
+                   or Il2CppTypeEnum.IL2CPP_TYPE_U;
+    }
+
+    private static bool IsTypeCompatible(TypeAnalysisContext producedType, TypeAnalysisContext returnType)
+        => GenericCallRebinder.TypesEquivalent(producedType, returnType)
+           || IsManagedReferenceType(producedType)
+           && IsManagedReferenceType(returnType)
+           && GenericCallRebinder.IsAssignableToManagedProjection(producedType, returnType);
+
+    /// <summary>
+    /// 与托管引用恢复器使用同一边界：排除原生地址、运行时元数据和静态存储包装；
+    /// 泛型参数仅在元数据明确声明引用类型约束时视为托管引用。
+    /// </summary>
+    private static bool IsManagedReferenceType(TypeAnalysisContext type)
+        => !type.IsValueType
+           && type is not (ByRefTypeAnalysisContext
+               or PointerTypeAnalysisContext
+               or RuntimeClassTypeAnalysisContext
+               or RuntimeMethodInfoAnalysisContext
+               or RuntimeFieldInfoAnalysisContext
+               or StaticFieldStorageTypeAnalysisContext
+               or RgctxTableTypeAnalysisContext
+               or MethodRgctxTableTypeAnalysisContext
+               or SentinelTypeAnalysisContext)
+           && (type is not GenericParameterTypeAnalysisContext genericParameter
+               || genericParameter.Attributes.HasFlag(GenericParameterAttributes.ReferenceTypeConstraint));
 
     /// <summary>
     /// 为每个透明尾块计算“从该块进入最终会返回哪个当前可用操作数”。

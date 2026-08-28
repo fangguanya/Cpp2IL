@@ -1938,11 +1938,15 @@ public static class LocalVariables
     /// 全部读取都只是与这些状态码或零比较时，才把最终载体恢复成 Int32。引用、算术、调用、
     /// 越界字面量和其它消费者会否决该局部，避免覆盖同一寄存器的独立托管生命期。
     /// </summary>
-    public static bool ResolveFinalIntegerControlStateCarrierTypes(MethodAnalysisContext method) =>
+    public static IntegerControlStatePlan ResolveFinalIntegerControlStateCarrierTypes(MethodAnalysisContext method)
+    {
         BindFinalIntegerControlStateCarrierTypes(
             method.ControlFlowGraph!.Instructions,
             method.AppContext.SystemTypes.SystemInt32Type,
-            method.AppContext.SystemTypes.SystemBooleanType);
+            method.AppContext.SystemTypes.SystemBooleanType,
+            out var plan);
+        return plan;
+    }
 
     /// <summary>
     /// 退 SSA 与集合重写全部完成后，循环计数器可能只剩“整数范围初始化、同局部自更新、
@@ -2091,12 +2095,49 @@ public static class LocalVariables
     internal static bool BindFinalIntegerControlStateCarrierTypes(
         IReadOnlyList<Instruction> instructions,
         TypeAnalysisContext int32Type,
-        TypeAnalysisContext booleanType)
+        TypeAnalysisContext booleanType) =>
+        BindFinalIntegerControlStateCarrierTypes(
+            instructions,
+            int32Type,
+            booleanType,
+            out _);
+
+    /// <summary>
+    /// 一次建立整数控制状态的定义、读取与闭合值域目录，并把同一份结果交给后续控制流恢复。
+    /// 测试入口仍可只读取布尔变化结果；生产流水线通过输出计划避免再次扫描整张方法图。
+    /// </summary>
+    internal static bool BindFinalIntegerControlStateCarrierTypes(
+        IReadOnlyList<Instruction> instructions,
+        TypeAnalysisContext int32Type,
+        TypeAnalysisContext booleanType,
+        out IntegerControlStatePlan plan)
     {
-        var definitions = instructions
-            .Where(instruction => instruction.Destination is LocalVariable)
-            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
-            .ToDictionary(group => group.Key, group => group.ToArray());
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        var uses = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is LocalVariable destination)
+            {
+                if (!definitions.TryGetValue(destination, out var localDefinitions))
+                    definitions[destination] = localDefinitions = [];
+                localDefinitions.Add(instruction);
+            }
+
+            // 中文注释：同一指令多次读取同一局部只登记一次，既保留完整消费者集合，
+            // 又避免后续闭合检查为重复操作数支付重复成本。
+            var instructionUses = instruction.Operands
+                .Skip(instruction.Destination is LocalVariable ? 1 : 0)
+                .OfType<LocalVariable>()
+                .Distinct();
+            foreach (var source in instructionUses)
+            {
+                if (!uses.TryGetValue(source, out var localUses))
+                    uses[source] = localUses = [];
+                localUses.Add(instruction);
+            }
+        }
+
+        var domains = new Dictionary<LocalVariable, HashSet<long>>();
         var changed = false;
 
         foreach (var pair in definitions)
@@ -2110,22 +2151,20 @@ public static class LocalVariables
                 || !stateValues.Any(value => value is < 0 or > 1))
                 continue;
 
-            var uses = instructions
-                .Where(instruction => instruction.Operands
-                    .Skip(instruction.Destination is LocalVariable ? 1 : 0)
-                    .Any(operand => ReferenceEquals(operand, local)))
-                .ToArray();
-            if (uses.Length == 0
-                || uses.Any(use => !IsClosedInt32ControlStateComparison(
+            if (!uses.TryGetValue(local, out var localUses)
+                || localUses.Count == 0
+                || localUses.Any(use => !IsClosedInt32ControlStateComparison(
                     use,
                     local,
                     stateValues)))
                 continue;
 
             local.Type = int32Type;
+            domains[local] = stateValues;
             changed = true;
         }
 
+        plan = new IntegerControlStatePlan(domains);
         return changed;
     }
 
@@ -2170,8 +2209,15 @@ public static class LocalVariables
             return true;
         }
 
-        return value is LocalVariable source
-            && GenericCallRebinder.TypesEquivalent(source.Type, booleanType);
+        if (value is not LocalVariable source
+            || !GenericCallRebinder.TypesEquivalent(source.Type, booleanType))
+            return false;
+
+        // 中文注释：Boolean 来源的完整托管值域就是 0/1；把它写入计划后，控制流分析
+        // 无需重新检查来源类型，也不会把未知布尔值误当成某一个固定分支。
+        stateValues.Add(0);
+        stateValues.Add(1);
+        return true;
     }
 
     private static bool IsClosedInt32ControlStateComparison(

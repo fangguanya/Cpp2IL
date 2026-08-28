@@ -103,8 +103,34 @@ internal readonly struct Arm64PackedHalfwordPredicatePattern
     internal int ReverseLaneMask { get; }
 }
 
+/// <summary>只保存由原生边界分支证明的跳转表范围，不从表内容猜测数量或默认分支。</summary>
+internal readonly record struct Arm64JumpTableBounds(
+    long LowerBound,
+    int EntryCount,
+    ulong DefaultTarget);
+
+/// <summary>单个证据闭合的 ARM64 跳转表站点。</summary>
+internal sealed record Arm64JumpTableMatch(
+    int BranchIndex,
+    Arm64Register AdjustedIndexRegister,
+    int EntryWidthBytes,
+    ulong BoundaryAddress,
+    ulong DispatchAddress,
+    ulong TableAddress,
+    ulong BranchBaseAddress,
+    Arm64JumpTableBounds Bounds);
+
+/// <summary>已读取并验证全部表项的 ARM64 跳转表站点。</summary>
+internal sealed record Arm64JumpTableDispatch(
+    Arm64Register AdjustedIndexRegister,
+    ulong DispatchAddress,
+    Arm64JumpTableBounds Bounds,
+    ulong[] CaseTargets);
+
 public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 {
+    private const int MaximumJumpTableEntryCount = 65_536;
+
     private static readonly Arm64CallingConventionAdapter CallingConventions = new();
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
@@ -1475,28 +1501,121 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         };
     }
 
+    /// <summary>
+    /// 由显式 CMP 上界和条件分支创建跳转表边界。case 数量只取自控制流，默认目标只取自边界分支。
+    /// </summary>
+    internal static bool TryCreateJumpTableBounds(
+        long lowerBound,
+        long maximumAdjustedIndex,
+        ulong defaultTarget,
+        ulong methodStart,
+        ulong methodEnd,
+        out Arm64JumpTableBounds bounds)
+    {
+        bounds = default;
+        if (methodStart >= methodEnd
+            || maximumAdjustedIndex < 0
+            || maximumAdjustedIndex >= MaximumJumpTableEntryCount
+            || defaultTarget < methodStart
+            || defaultTarget >= methodEnd
+            || (defaultTarget - methodStart) % sizeof(uint) != 0)
+            return false;
+
+        try
+        {
+            // 同时验证 case 标签上界，防止 lower + count 在命名或后续 CIL 恢复时溢出。
+            _ = checked(lowerBound + maximumAdjustedIndex);
+            bounds = new Arm64JumpTableBounds(
+                lowerBound,
+                checked((int)maximumAdjustedIndex + 1),
+                defaultTarget);
+            return true;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 按一字节或小端两字节表项解析分支目标。读取长度、目标范围与四字节对齐任一不闭合时整体失败。
+    /// </summary>
+    internal static bool TryResolveJumpTableTargets(
+        ReadOnlySpan<byte> table,
+        int entryWidthBytes,
+        int entryCount,
+        ulong branchBaseAddress,
+        ulong methodStart,
+        ulong methodEnd,
+        out ulong[] targets)
+    {
+        targets = [];
+        if (entryWidthBytes is not (sizeof(byte) or sizeof(ushort))
+            || entryCount <= 0
+            || entryCount > MaximumJumpTableEntryCount
+            || methodStart >= methodEnd)
+            return false;
+
+        int requiredByteCount;
+        try
+        {
+            requiredByteCount = checked(entryWidthBytes * entryCount);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
+        if (table.Length < requiredByteCount)
+            return false;
+
+        var resolved = new ulong[entryCount];
+        for (var index = 0; index < entryCount; index++)
+        {
+            ulong encodedOffset = entryWidthBytes == sizeof(byte)
+                ? table[index]
+                : BinaryPrimitives.ReadUInt16LittleEndian(
+                    table.Slice(index * sizeof(ushort), sizeof(ushort)));
+
+            ulong target;
+            try
+            {
+                target = checked(branchBaseAddress + checked(encodedOffset * sizeof(uint)));
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+
+            if (target < methodStart
+                || target >= methodEnd
+                || (target - methodStart) % sizeof(uint) != 0)
+                return false;
+
+            resolved[index] = target;
+        }
+
+        targets = resolved;
+        return true;
+    }
+
+    /// <summary>
+    /// 保留既有字节表测试入口；真实恢复统一走带显式宽度和显式数量的解析器。
+    /// </summary>
     internal static bool TryResolveByteJumpTableTargets(
         ReadOnlySpan<byte> table,
         ulong branchBaseAddress,
         ulong methodStart,
         ulong methodEnd,
         out ulong[] targets)
-    {
-        targets = new ulong[table.Length];
-        for (var index = 0; index < table.Length; index++)
-        {
-            var target = checked(branchBaseAddress + (ulong)table[index] * sizeof(uint));
-            if (target < methodStart || target >= methodEnd || (target - methodStart) % sizeof(uint) != 0)
-            {
-                targets = [];
-                return false;
-            }
-
-            targets[index] = target;
-        }
-
-        return targets.Length > 0;
-    }
+        => TryResolveJumpTableTargets(
+            table,
+            sizeof(byte),
+            table.Length,
+            branchBaseAddress,
+            methodStart,
+            methodEnd,
+            out targets);
 
     internal static bool CanEmitCarryZeroCondition(
         Arm64ConditionCode conditionCode,
@@ -1568,9 +1687,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
 
-        if (TryRecoverByteJumpTableMethod(insns, context, out var jumpTableInstructions))
-            return jumpTableInstructions;
-
         if (adrpOffsets == null!) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
         else
@@ -1580,10 +1696,47 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var addresses = new List<ulong>();
         var flagState = Arm64FlagState.None;
         var conditionalComparisonFallbackNzcv = 0L;
+        var jumpTableDispatches = RecoverJumpTableDispatches(insns, context);
+        var jumpTableTargets = new HashSet<ulong>(jumpTableDispatches.Values
+            .SelectMany(dispatch => dispatch.CaseTargets.Append(dispatch.Bounds.DefaultTarget)));
 
         for (var index = 0; index < insns.Count; index++)
         {
-            if (TryEmitPackedHalfwordPredicatePattern(
+            var instruction = insns[index];
+            var address = ResolveInstructionAddress(
+                context.UnderlyingPointer,
+                index,
+                instruction.Mnemonic,
+                instruction.Address);
+
+            // 跳转表目标可能落在普通转换不产出 ISIL 的原生指令上；显式锚点保证地址修复不漂移。
+            if (jumpTableTargets.Contains(address))
+            {
+                instructions.Add(new Instruction(instructions.Count, OpCode.Nop));
+                addresses.Add(address);
+            }
+
+            if (jumpTableDispatches.TryGetValue(index, out var jumpTableDispatch))
+            {
+                AppendJumpTableDispatch(
+                    jumpTableDispatch,
+                    instructions,
+                    addresses);
+                // 只替换最终 BR；ADR/LDR/ADD 继续走原转换器，保留 scratch 寄存器副作用。
+                continue;
+            }
+
+            // 若向量组合窗口内部存在分支目标，则保留逐指令地址，禁止一次合并吞掉目标锚点。
+            var packedPatternContainsJumpTarget = jumpTableTargets.Count > 0
+                && Enumerable.Range(index, Math.Min(13, insns.Count - index))
+                    .Select(candidateIndex => ResolveInstructionAddress(
+                        context.UnderlyingPointer,
+                        candidateIndex,
+                        insns[candidateIndex].Mnemonic,
+                        insns[candidateIndex].Address))
+                    .Any(jumpTableTargets.Contains);
+            if (!packedPatternContainsJumpTarget
+                && TryEmitPackedHalfwordPredicatePattern(
                     insns,
                     index,
                     context,
@@ -1595,12 +1748,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 continue;
             }
 
-            var instruction = insns[index];
-            var address = ResolveInstructionAddress(
-                context.UnderlyingPointer,
-                index,
-                instruction.Mnemonic,
-                instruction.Address);
             ConvertInstructionStatement(
                 instruction,
                 address,
@@ -2104,188 +2251,457 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
     }
 
-    private bool TryRecoverByteJumpTableMethod(
+    /// <summary>
+    /// 单次扫描全部 BR；一个候选失败不会阻断后续站点。
+    /// </summary>
+    internal static IReadOnlyList<Arm64JumpTableMatch> FindJumpTableMatches(
         IReadOnlyList<Arm64Instruction> nativeInstructions,
-        MethodAnalysisContext context,
-        out List<Instruction> instructions)
+        ulong methodStart,
+        ulong methodEnd)
     {
-        instructions = [];
-        for (var branchIndex = 4; branchIndex < nativeInstructions.Count; branchIndex++)
+        var result = new List<Arm64JumpTableMatch>();
+        if (methodStart >= methodEnd)
+            return result;
+
+        for (var branchIndex = 3; branchIndex < nativeInstructions.Count; branchIndex++)
         {
-            var branch = nativeInstructions[branchIndex];
-            if (branch.Mnemonic != Arm64Mnemonic.BR
-                || nativeInstructions[branchIndex - 1].Mnemonic != Arm64Mnemonic.ADD
-                || nativeInstructions[branchIndex - 2].Mnemonic != Arm64Mnemonic.LDRB
-                || nativeInstructions[branchIndex - 3].Mnemonic != Arm64Mnemonic.ADR)
+            if (TryMatchJumpTableDispatch(
+                    nativeInstructions,
+                    branchIndex,
+                    methodStart,
+                    methodEnd,
+                    out var match))
+                result.Add(match);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 只匹配由 SUB/ADD、CMP、B.HI/B.CS 支配的 ADR、LDRB/LDRH、ADD、BR 形状。
+    /// </summary>
+    private static bool TryMatchJumpTableDispatch(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        int branchIndex,
+        ulong methodStart,
+        ulong methodEnd,
+        out Arm64JumpTableMatch match)
+    {
+        match = null!;
+        var branch = nativeInstructions[branchIndex];
+        var targetAdd = nativeInstructions[branchIndex - 1];
+        var tableLoad = nativeInstructions[branchIndex - 2];
+        var branchBaseLoad = nativeInstructions[branchIndex - 3];
+        if (branch.Mnemonic != Arm64Mnemonic.BR
+            || targetAdd.Mnemonic != Arm64Mnemonic.ADD
+            || tableLoad.Mnemonic is not (Arm64Mnemonic.LDRB or Arm64Mnemonic.LDRH)
+            || branchBaseLoad.Mnemonic != Arm64Mnemonic.ADR
+            || branch.Op0Kind != Arm64OperandKind.Register
+            || tableLoad.Op0Kind != Arm64OperandKind.Register
+            || tableLoad.Op1Kind != Arm64OperandKind.Memory
+            || tableLoad.MemAddendReg == Arm64Register.INVALID
+            || tableLoad.MemOffset != 0
+            || tableLoad.MemIndexMode != Arm64MemoryIndexMode.Offset
+            || branchBaseLoad.Op0Kind != Arm64OperandKind.Register
+            || branchBaseLoad.Op1Kind is not (
+                Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative)
+            || !IsScaledJumpTargetAdd(targetAdd, branchBaseLoad, tableLoad, branch))
+            return false;
+
+        var entryWidthBytes = tableLoad.Mnemonic == Arm64Mnemonic.LDRB
+            ? sizeof(byte)
+            : sizeof(ushort);
+        if (!TryDecodeMemoryIndex(
+                tableLoad.MemShiftType,
+                tableLoad.MemExtendType,
+                tableLoad.MemExtendOrShiftAmount,
+                out var tableIndexScale,
+                out var tableIndexExtension)
+            || tableIndexScale != entryWidthBytes
+            || tableIndexExtension is MemoryIndexExtension.SignExtend32
+                or MemoryIndexExtension.SignExtend64)
+            return false;
+
+        var dispatchStartIndex = branchIndex - 3;
+        var boundaryIndex = -1;
+        for (var index = dispatchStartIndex - 1; index >= 1; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (candidate.Mnemonic == Arm64Mnemonic.B
+                && candidate.MnemonicConditionCode is Arm64ConditionCode.HI or Arm64ConditionCode.CS)
+                boundaryIndex = index;
+            if (boundaryIndex >= 0 || IsNativeControlTransfer(candidate.Mnemonic))
+                break;
+        }
+
+        if (boundaryIndex < 1)
+            return false;
+
+        var comparison = nativeInstructions[boundaryIndex - 1];
+        var adjustedIndexName = Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg);
+        if (comparison.Mnemonic != Arm64Mnemonic.CMP
+            || comparison.Op0Kind != Arm64OperandKind.Register
+            || comparison.Op1Kind != Arm64OperandKind.Immediate
+            || comparison.Op1Imm < 0
+            || Arm64RegisterHelper.CanonicalName(comparison.Op0Reg) != adjustedIndexName)
+            return false;
+
+        var lowerBound = 0L;
+        if (boundaryIndex >= 2)
+        {
+            var normalization = nativeInstructions[boundaryIndex - 2];
+            if (normalization.Op0Kind == Arm64OperandKind.Register
+                && Arm64RegisterHelper.CanonicalName(normalization.Op0Reg) == adjustedIndexName)
+            {
+                if (normalization.Mnemonic is not (Arm64Mnemonic.SUB or Arm64Mnemonic.ADD)
+                    || normalization.Op1Kind != Arm64OperandKind.Register
+                    || normalization.Op2Kind != Arm64OperandKind.Immediate
+                    || normalization.Op2Imm < 0)
+                    return false;
+                lowerBound = normalization.Mnemonic == Arm64Mnemonic.SUB
+                    ? normalization.Op2Imm
+                    : -normalization.Op2Imm;
+            }
+        }
+
+        // 边界检查后索引必须保持不变，否则表项数量不再能证明内存读取安全。
+        for (var index = boundaryIndex + 1; index < branchIndex - 2; index++)
+        {
+            var candidate = nativeInstructions[index];
+            if (candidate.Op0Kind == Arm64OperandKind.Register
+                && Arm64RegisterHelper.CanonicalName(candidate.Op0Reg) == adjustedIndexName)
+                return false;
+        }
+
+        var boundary = nativeInstructions[boundaryIndex];
+        var maximumAdjustedIndex = boundary.MnemonicConditionCode == Arm64ConditionCode.HI
+            ? comparison.Op1Imm
+            : comparison.Op1Imm - 1;
+        if (!TryCreateJumpTableBounds(
+                lowerBound,
+                maximumAdjustedIndex,
+                boundary.BranchTarget,
+                methodStart,
+                methodEnd,
+                out var bounds))
+            return false;
+
+        var tableBaseName = Arm64RegisterHelper.CanonicalName(tableLoad.MemBase);
+        var pageAddress = 0UL;
+        var tableAddress = 0UL;
+        var hasPage = false;
+        var hasTableAddress = false;
+        for (var index = boundaryIndex + 1; index < branchIndex - 2; index++)
+        {
+            var candidate = nativeInstructions[index];
+            if (candidate.Op0Kind != Arm64OperandKind.Register
+                || Arm64RegisterHelper.CanonicalName(candidate.Op0Reg) != tableBaseName)
                 continue;
 
-            var tableLoad = nativeInstructions[branchIndex - 2];
-            var branchBaseLoad = nativeInstructions[branchIndex - 3];
-            if (branch.Op0Reg != nativeInstructions[branchIndex - 1].Op0Reg
-                || nativeInstructions[branchIndex - 1].Op1Reg != branchBaseLoad.Op0Reg
-                || tableLoad.Op0Kind != Arm64OperandKind.Register
-                || tableLoad.Op1Kind != Arm64OperandKind.Memory
-                || tableLoad.MemAddendReg == Arm64Register.INVALID
-                || branchBaseLoad.Op1Kind is not (
-                    Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative))
-                continue;
+            var candidateAddress = ResolveInstructionAddress(
+                methodStart,
+                index,
+                candidate.Mnemonic,
+                candidate.Address);
+            if (candidate.Mnemonic == Arm64Mnemonic.ADRP
+                && candidate.Op1Kind is Arm64OperandKind.Immediate
+                    or Arm64OperandKind.ImmediatePcRelative)
+            {
+                // 表基址只接受一个 ADRP 和紧随其后的一个 ADD；重复写入无法证明最终地址来源。
+                if (hasPage || hasTableAddress)
+                    return false;
+                pageAddress = ResolveAdrpPageAddress(candidateAddress, candidate.Op1Imm);
+                hasPage = true;
+            }
+            else if (candidate.Mnemonic == Arm64Mnemonic.ADD
+                     && hasPage
+                     && candidate.Op1Kind == Arm64OperandKind.Register
+                     && Arm64RegisterHelper.CanonicalName(candidate.Op1Reg) == tableBaseName
+                     && candidate.Op2Kind == Arm64OperandKind.Immediate
+                     && candidate.Op2Imm >= 0)
+            {
+                try
+                {
+                    tableAddress = checked(pageAddress + (ulong)candidate.Op2Imm);
+                    hasPage = false;
+                    hasTableAddress = true;
+                }
+                catch (OverflowException)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+        }
 
-            var tableBaseAdd = nativeInstructions
-                .Take(branchIndex - 2)
-                .LastOrDefault(candidate =>
-                    candidate.Mnemonic == Arm64Mnemonic.ADD
-                    && candidate.Op0Reg == tableLoad.MemBase
-                    && candidate.Op1Reg == tableLoad.MemBase
-                    && candidate.Op2Kind == Arm64OperandKind.Immediate);
-            if (tableBaseAdd.Mnemonic != Arm64Mnemonic.ADD)
-                continue;
+        if (!hasTableAddress || tableAddress % (ulong)entryWidthBytes != 0)
+            return false;
 
-            var tablePageLoad = nativeInstructions
-                .TakeWhile(candidate => candidate.Address < tableBaseAdd.Address)
-                .LastOrDefault(candidate =>
-                    candidate.Mnemonic == Arm64Mnemonic.ADRP
-                    && candidate.Op0Reg == tableLoad.MemBase);
-            if (tablePageLoad.Mnemonic != Arm64Mnemonic.ADRP)
-                continue;
+        var boundaryAddress = ResolveInstructionAddress(
+            methodStart,
+            boundaryIndex,
+            boundary.Mnemonic,
+            boundary.Address);
+        var dispatchAddress = ResolveInstructionAddress(
+            methodStart,
+            branchIndex,
+            branch.Mnemonic,
+            branch.Address);
+        if (dispatchAddress < methodStart
+            || dispatchAddress >= methodEnd
+            || dispatchAddress % sizeof(uint) != 0
+            || (bounds.DefaultTarget >= boundaryAddress
+                && bounds.DefaultTarget <= dispatchAddress))
+            return false;
 
-            var indexAdjust = nativeInstructions
-                .Take(branchIndex - 3)
-                .LastOrDefault(candidate =>
-                    candidate.Mnemonic == Arm64Mnemonic.ADD
-                    && Arm64RegisterHelper.CanonicalName(candidate.Op0Reg)
-                        == Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg)
-                    && Arm64RegisterHelper.CanonicalName(candidate.Op1Reg)
-                        == Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg)
-                    && candidate.Op2Kind == Arm64OperandKind.Immediate);
-            if (indexAdjust.Mnemonic != Arm64Mnemonic.ADD)
-                continue;
+        var branchBaseAddress = ResolveAdrAddress(
+            ResolveInstructionAddress(
+                methodStart,
+                dispatchStartIndex,
+                branchBaseLoad.Mnemonic,
+                branchBaseLoad.Address),
+            branchBaseLoad.Op1Imm);
+        match = new Arm64JumpTableMatch(
+            branchIndex,
+            tableLoad.MemAddendReg,
+            entryWidthBytes,
+            boundaryAddress,
+            dispatchAddress,
+            tableAddress,
+            branchBaseAddress,
+            bounds);
+        return true;
+    }
 
-            var tableAddress = checked(
-                ResolveAdrpPageAddress(tablePageLoad.Address, tablePageLoad.Op1Imm)
-                + (ulong)tableBaseAdd.Op2Imm);
-            var branchBaseAddress = ResolveAdrAddress(branchBaseLoad.Address, branchBaseLoad.Op1Imm);
-            var methodEnd = checked(context.UnderlyingPointer + (ulong)context.RawBytes.Length);
-            var maximumEntryCount = checked((int)Math.Min(
-                256UL,
-                methodEnd > branchBaseAddress ? (methodEnd - branchBaseAddress) / sizeof(uint) : 0));
-            if (maximumEntryCount == 0)
-                continue;
+    private Dictionary<int, Arm64JumpTableDispatch> RecoverJumpTableDispatches(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        MethodAnalysisContext context)
+    {
+        var result = new Dictionary<int, Arm64JumpTableDispatch>();
+        var methodStart = context.UnderlyingPointer;
+        ulong methodEnd;
+        try
+        {
+            methodEnd = checked(methodStart + (ulong)context.RawBytes.Length);
+        }
+        catch (OverflowException)
+        {
+            return result;
+        }
 
+        foreach (var match in FindJumpTableMatches(nativeInstructions, methodStart, methodEnd))
+        {
             byte[] table;
             try
             {
-                var rawTableAddress = context.AppContext.Binary.MapVirtualAddressToRaw(tableAddress);
+                var tableByteCount = checked(match.Bounds.EntryCount * match.EntryWidthBytes);
+                var rawTableAddress = context.AppContext.Binary.MapVirtualAddressToRaw(match.TableAddress);
                 table = context.AppContext.Binary.Reader.ReadByteArrayAtRawAddress(
                     rawTableAddress,
-                    maximumEntryCount);
+                    tableByteCount);
+                if (table.Length != tableByteCount)
+                    continue;
             }
             catch
             {
                 continue;
             }
 
-            var targetAddresses = new List<ulong>();
-            foreach (var entry in table)
-            {
-                var target = checked(branchBaseAddress + (ulong)entry * sizeof(uint));
-                if (target < context.UnderlyingPointer
-                    || target >= methodEnd
-                    || (target - context.UnderlyingPointer) % sizeof(uint) != 0)
-                    break;
-                targetAddresses.Add(target);
-            }
-
-            if (targetAddresses.Count < 2
-                || !TryResolveByteJumpTableTargets(
-                    table.AsSpan(0, targetAddresses.Count),
-                    branchBaseAddress,
-                    context.UnderlyingPointer,
+            if (!TryResolveJumpTableTargets(
+                    table,
+                    match.EntryWidthBytes,
+                    match.Bounds.EntryCount,
+                    match.BranchBaseAddress,
+                    methodStart,
                     methodEnd,
-                    out var validatedTargets))
+                    out var caseTargets)
+                || caseTargets.Any(target =>
+                    target >= match.BoundaryAddress
+                    && target <= match.DispatchAddress))
                 continue;
 
-            var convertedPrefix = new List<Instruction>();
-            var convertedAddresses = new List<ulong>();
-            var prefixFlagState = Arm64FlagState.None;
-            var prefixFallbackNzcv = 0L;
-            for (var index = 0; index <= branchIndex - 4; index++)
+            result[match.BranchIndex] = new Arm64JumpTableDispatch(
+                match.AdjustedIndexRegister,
+                match.DispatchAddress,
+                match.Bounds,
+                caseTargets);
+        }
+
+        foreach (var invalidBranchIndex in FindUnsafeJumpTableDispatches(result, nativeInstructions))
+            result.Remove(invalidBranchIndex);
+
+        return result;
+    }
+
+    /// <summary>
+    /// 一次建立候选地址索引并关闭所有跨候选边的两端；普通直接分支命中的候选也保持原始 BR。
+    /// </summary>
+    internal static HashSet<int> FindUnsafeJumpTableDispatches(
+        IReadOnlyDictionary<int, Arm64JumpTableDispatch> dispatches,
+        IReadOnlyList<Arm64Instruction> nativeInstructions)
+    {
+        var dispatchIndicesByAddress = new Dictionary<ulong, List<int>>();
+        foreach (var pair in dispatches)
+        {
+            if (!dispatchIndicesByAddress.TryGetValue(pair.Value.DispatchAddress, out var indices))
+                dispatchIndicesByAddress[pair.Value.DispatchAddress] = indices = [];
+            indices.Add(pair.Key);
+        }
+
+        var unsafeIndices = new HashSet<int>();
+        void MarkTarget(ulong target, int? sourceIndex)
+        {
+            if (!dispatchIndicesByAddress.TryGetValue(target, out var destinationIndices))
+                return;
+            if (sourceIndex.HasValue)
+                unsafeIndices.Add(sourceIndex.Value);
+            foreach (var destinationIndex in destinationIndices)
+                unsafeIndices.Add(destinationIndex);
+        }
+
+        // 每条候选边只访问一次；A→B 会同时关闭 A、B，链式关系自然覆盖整个相关连通分量。
+        foreach (var pair in dispatches)
+        foreach (var target in pair.Value.CaseTargets.Append(pair.Value.Bounds.DefaultTarget))
+            MarkTarget(target, pair.Key);
+
+        foreach (var instruction in nativeInstructions)
+        {
+            if (TryGetNonCallDirectBranchTarget(instruction, out var target))
+                MarkTarget(target, null);
+        }
+
+        return unsafeIndices;
+    }
+
+    /// <summary>
+    /// 按指令族读取非调用直接分支目标。Disarm 的 BranchTarget 只适用于 B/BL，
+    /// 比较分支和位测试分支必须使用各自的 PC 相对立即数字段。
+    /// </summary>
+    internal static bool TryGetNonCallDirectBranchTarget(
+        Arm64Instruction instruction,
+        out ulong target)
+    {
+        switch (instruction.Mnemonic)
+        {
+            case Arm64Mnemonic.B:
+                target = instruction.BranchTarget;
+                return true;
+            case Arm64Mnemonic.CBZ:
+            case Arm64Mnemonic.CBNZ:
+                return TryAddSignedOffset(instruction.Address, instruction.Op1Imm, out target);
+            case Arm64Mnemonic.TBZ:
+            case Arm64Mnemonic.TBNZ:
+                return TryAddSignedOffset(instruction.Address, instruction.Op2Imm, out target);
+            default:
+                target = 0;
+                return false;
+        }
+    }
+
+    /// <summary>在不发生地址环绕的前提下解析 PC 相对目标。</summary>
+    private static bool TryAddSignedOffset(ulong address, long offset, out ulong target)
+    {
+        if (offset >= 0)
+        {
+            var positiveOffset = (ulong)offset;
+            if (positiveOffset > ulong.MaxValue - address)
             {
-                var native = nativeInstructions[index];
-                ConvertInstructionStatement(
-                    native,
-                    native.Address,
-                    convertedPrefix,
-                    convertedAddresses,
-                    context,
-                    ref prefixFlagState,
-                    ref prefixFallbackNzcv);
+                target = 0;
+                return false;
             }
 
-            var targetAnchors = validatedTargets
-                .Distinct()
-                .ToDictionary(target => target, _ => new Instruction(0, OpCode.Nop));
-            var result = new List<Instruction>(convertedPrefix);
-            var resultAddresses = new List<ulong>(convertedAddresses);
-            var indexOperand = new Register(null, Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg));
-            for (var tableIndex = 0; tableIndex < validatedTargets.Length; tableIndex++)
-            {
-                var condition = new Register(null, $"JUMP_TABLE_CASE_{tableIndex}");
-                result.Add(new Instruction(result.Count, OpCode.CheckEqual, condition, indexOperand, Imm(tableIndex)));
-                resultAddresses.Add(branch.Address);
-                result.Add(new Instruction(
-                    result.Count,
-                    OpCode.ConditionalJump,
-                    targetAnchors[validatedTargets[tableIndex]],
-                    condition));
-                resultAddresses.Add(branch.Address);
-            }
-
-            result.Add(new Instruction(result.Count, OpCode.Jump, targetAnchors[validatedTargets[^1]]));
-            resultAddresses.Add(branch.Address);
-            var suffixFlagState = prefixFlagState;
-            var suffixFallbackNzcv = prefixFallbackNzcv;
-            for (var index = branchIndex + 1; index < nativeInstructions.Count; index++)
-            {
-                var native = nativeInstructions[index];
-                if (targetAnchors.TryGetValue(native.Address, out var anchor))
-                {
-                    anchor.Index = result.Count;
-                    result.Add(anchor);
-                    resultAddresses.Add(native.Address);
-                }
-
-                ConvertInstructionStatement(
-                    native,
-                    native.Address,
-                    result,
-                    resultAddresses,
-                    context,
-                    ref suffixFlagState,
-                    ref suffixFallbackNzcv);
-            }
-
-            for (var index = 0; index < result.Count; index++)
-            {
-                result[index].Index = index;
-                if (result[index].OpCode is not (OpCode.Jump or OpCode.ConditionalJump)
-                    || result[index].Operands[0] is not Immediate immediate)
-                    continue;
-
-                var targetIndex = resultAddresses.FindIndex(candidate => candidate == immediate.UnsignedValue);
-                if (targetIndex < 0)
-                {
-                    instructions = [];
-                    return false;
-                }
-
-                result[index].SetOperand(0, result[targetIndex]);
-            }
-            PruneUnconsumedReturnProjections(result, context);
-            instructions = result;
+            target = address + positiveOffset;
             return true;
         }
 
-        return false;
+        // 避免对 long.MinValue 直接取反；先平移一位再恢复其绝对值。
+        var negativeMagnitude = (ulong)(-(offset + 1)) + 1;
+        if (negativeMagnitude > address)
+        {
+            target = 0;
+            return false;
+        }
+
+        target = address - negativeMagnitude;
+        return true;
+    }
+
+    private static bool IsScaledJumpTargetAdd(
+        Arm64Instruction targetAdd,
+        Arm64Instruction branchBaseLoad,
+        Arm64Instruction tableLoad,
+        Arm64Instruction branch)
+    {
+        if (targetAdd.Op0Kind != Arm64OperandKind.Register
+            || targetAdd.Op1Kind != Arm64OperandKind.Register
+            || targetAdd.Op2Kind != Arm64OperandKind.Register
+            || targetAdd.Op3Kind != Arm64OperandKind.Immediate
+            || targetAdd.Op3Imm != 2
+            || Arm64RegisterHelper.CanonicalName(branch.Op0Reg)
+                != Arm64RegisterHelper.CanonicalName(targetAdd.Op0Reg)
+            || Arm64RegisterHelper.CanonicalName(targetAdd.Op1Reg)
+                != Arm64RegisterHelper.CanonicalName(branchBaseLoad.Op0Reg)
+            || Arm64RegisterHelper.CanonicalName(targetAdd.Op2Reg)
+                != Arm64RegisterHelper.CanonicalName(tableLoad.Op0Reg))
+            return false;
+
+        var isShiftedRegister = targetAdd.FinalOpExtendType == Arm64ExtendType.NONE
+            && targetAdd.FinalOpShiftType == Arm64ShiftType.LSL;
+        var isUnsignedExtendedRegister = targetAdd.FinalOpShiftType == Arm64ShiftType.NONE
+            && targetAdd.FinalOpExtendType is Arm64ExtendType.UXTW or Arm64ExtendType.UXTX;
+        return isShiftedRegister || isUnsignedExtendedRegister;
+    }
+
+    private static bool IsNativeControlTransfer(Arm64Mnemonic mnemonic)
+        => mnemonic is Arm64Mnemonic.B
+            or Arm64Mnemonic.BL
+            or Arm64Mnemonic.BR
+            or Arm64Mnemonic.BLR
+            or Arm64Mnemonic.RET
+            or Arm64Mnemonic.CBZ
+            or Arm64Mnemonic.CBNZ
+            or Arm64Mnemonic.TBZ
+            or Arm64Mnemonic.TBNZ;
+
+    private static void AppendJumpTableDispatch(
+        Arm64JumpTableDispatch dispatch,
+        List<Instruction> instructions,
+        List<ulong> addresses)
+    {
+        // 保留调整后的索引做逐项比较；边界分支已保证它只会落入合法表项范围。
+        var indexOperand = new Register(
+            null,
+            Arm64RegisterHelper.CanonicalName(dispatch.AdjustedIndexRegister));
+        for (var tableIndex = 0; tableIndex < dispatch.CaseTargets.Length; tableIndex++)
+        {
+            var caseValue = checked(dispatch.Bounds.LowerBound + tableIndex);
+            var condition = new Register(
+                null,
+                $"JUMP_TABLE_{dispatch.DispatchAddress:X}_CASE_{caseValue}");
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.CheckEqual,
+                condition,
+                indexOperand,
+                Imm(tableIndex)));
+            addresses.Add(dispatch.DispatchAddress);
+            instructions.Add(new Instruction(
+                instructions.Count,
+                OpCode.ConditionalJump,
+                Imm(dispatch.CaseTargets[tableIndex]),
+                condition));
+            addresses.Add(dispatch.DispatchAddress);
+        }
+
+        // default 是边界分支自己的目标，不能把最后一个 case 偷换成 default。
+        instructions.Add(new Instruction(
+            instructions.Count,
+            OpCode.Jump,
+            Imm(dispatch.Bounds.DefaultTarget)));
+        addresses.Add(dispatch.DispatchAddress);
     }
 
     private bool TryEmitPackedHalfwordPredicatePattern(

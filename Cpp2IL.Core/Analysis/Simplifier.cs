@@ -92,8 +92,11 @@ public static class Simplifier
                 {
                     var instruction = block.Instructions[i];
 
-                    // If it's move and it moves something to local, replace and remove it
-                    if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
+                    // 中文注释：晚期传播只能重复使用无副作用的字面量。字段、内存、数组、取址和
+                    // 其他复合操作数都表示“在此处求值一次”的快照，把它们搬到使用点会重新读取。
+                    if (instruction.OpCode == OpCode.Move
+                        && instruction.Operands[0] is LocalVariable local
+                        && IsRepeatableLiteral(instruction.Operands[1]))
                     {
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
@@ -132,6 +135,10 @@ public static class Simplifier
             return changed;
         }
 
+        // 中文注释：采用显式白名单，新增的复合操作数默认保留定义点快照，避免未来类型被误当常量。
+        private static bool IsRepeatableLiteral(IOperand operand) =>
+            operand is Immediate or FloatLiteral or DoubleLiteral or StringLiteral;
+
         private void InlineLocals()
         {
             var definitionCounts = CountDefinitions();
@@ -157,9 +164,15 @@ public static class Simplifier
                     // If it's move and it moves local to local, replace and remove it
                     if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
                     {
-                        // A local with several definitions is not in SSA form, so its value at a join
-                        // depends on the path taken; don't carry this definition across that join.
-                        var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;
+                        // 中文注释：目标多定义时不能跨汇合；源局部若在复制后可能出现另一版本，
+                        // 也必须保守停在汇合点，避免从“源未重定义”的兄弟路径绕过失效路径。
+                        var localHasMultipleDefinitions =
+                            definitionCounts.TryGetValue(local, out var localDefinitions) && localDefinitions > 1;
+                        var sourceCanBeRedefined =
+                            definitionCounts.TryGetValue(source, out var sourceDefinitions)
+                            && (sourceDefinitions > 1
+                                || _method.ParameterLocals.Contains(source) && sourceDefinitions > 0);
+                        var stopAtJoins = localHasMultipleDefinitions || sourceCanBeRedefined;
 
                         // Replace local with source
                         ReplaceLocalsUntilReassignment(block, i + 1, local, source, stopAtJoins);
@@ -219,15 +232,22 @@ public static class Simplifier
             while (remaining.Count > 0)
             {
                 var (currentBlock, index) = remaining.Pop();
+                var reassignedOnCurrentBranch = false;
 
                 // Process instructions starting at the given index
                 for (var i = index; i < currentBlock.Instructions.Count; i++)
                 {
                     var instruction = currentBlock.Instructions[i];
 
-                    // Stop on this branch when reassigned
-                    if (instruction.Destination is LocalVariable destLocal && destLocal == local)
-                        return;
+                    // 中文注释：目标别名重定义后不再使用旧复制；源局部重定义后，继续把别名替换为
+                    // 源局部会观察新值。两种情况都只截断当前路径，工作栈中的兄弟路径继续处理。
+                    if (instruction.Destination is LocalVariable destLocal
+                        && (destLocal == local
+                            || replacement is LocalVariable replacementLocal && destLocal == replacementLocal))
+                    {
+                        reassignedOnCurrentBranch = true;
+                        break;
+                    }
 
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
@@ -264,6 +284,9 @@ public static class Simplifier
                     }
                 }
 
+                if (reassignedOnCurrentBranch)
+                    continue;
+
                 // Process successors
                 foreach (var successor in currentBlock.Successors)
                 {
@@ -295,6 +318,7 @@ public static class Simplifier
             while (remaining.Count > 0)
             {
                 var (currentBlock, index) = remaining.Pop();
+                var reassignedOnCurrentBranch = false;
 
                 var blockSources = _sourceCache[currentBlock];
 
@@ -302,6 +326,7 @@ public static class Simplifier
                 for (var i = index; i < currentBlock.Instructions.Count; i++)
                 {
                     var instruction = currentBlock.Instructions[i];
+
                     var sources = blockSources[instruction];
 
                     // Direct usage check
@@ -369,7 +394,18 @@ public static class Simplifier
                             }
                         }
                     }
+
+                    // 中文注释：先检查“读取旧值并写回同一局部”的指令，再在纯重定义处截断。
+                    // 重定义之后的读取属于新值；当前分支停止，工作栈中的兄弟分支仍继续检查。
+                    if (instruction.Destination is LocalVariable destination && destination == local)
+                    {
+                        reassignedOnCurrentBranch = true;
+                        break;
+                    }
                 }
+
+                if (reassignedOnCurrentBranch)
+                    continue;
 
                 // Process successors
                 foreach (var successor in currentBlock.Successors)

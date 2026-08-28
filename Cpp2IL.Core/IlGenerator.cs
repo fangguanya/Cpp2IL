@@ -48,6 +48,9 @@ public static class IlGenerator
 
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
+        var controlFlowGraph = context.ControlFlowGraph
+                               ?? throw new DecompilerException($"方法 {context.Name} 缺少控制流图，CIL 生成终止。");
+        var emissionBlocks = GetReachableBlockEmissionOrder(controlFlowGraph);
         var assembly = context.DeclaringType!.DeclaringAssembly;
         var module = definition.DeclaringModule!;
         var importer = module.DefaultImporter;
@@ -64,7 +67,7 @@ public static class IlGenerator
             .ImportWith(importer);
 
         // Change branch targets to instructions
-        foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
+        foreach (var instruction in emissionBlocks.SelectMany(block => block.Instructions))
         {
             if (instruction.Operands.Count > 0 && instruction.Operands[0] is Block target)
             {
@@ -82,7 +85,7 @@ public static class IlGenerator
         definition.CilMethodBody = body;
 
         // Make sure context.Locals actually has all locals (idk why it doesn't sometimes)
-        foreach (var operand in context.ControlFlowGraph.Instructions.SelectMany(i => i.Operands))
+        foreach (var operand in emissionBlocks.SelectMany(block => block.Instructions).SelectMany(i => i.Operands))
         {
             LocalVariable? local = null;
 
@@ -158,9 +161,9 @@ public static class IlGenerator
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
 
-        foreach (var block in context.ControlFlowGraph!.Blocks)
+        foreach (var block in emissionBlocks)
         {
-            if (block == context.ControlFlowGraph.EntryBlock || block == context.ControlFlowGraph.ExitBlock)
+            if (block == controlFlowGraph.EntryBlock || block == controlFlowGraph.ExitBlock)
                 continue;
 
             if (block.Instructions.Count == 0)
@@ -179,8 +182,8 @@ public static class IlGenerator
             
             if (lastInstruction.OpCode == OpCode.ConditionalJump)
             {
-                var trueTarget = TryResolveJumpTargetBlock(lastInstruction, context.ControlFlowGraph);
-                var falseSuccessor = block.Successors.FirstOrDefault(s => s != trueTarget && s != context.ControlFlowGraph.ExitBlock);
+                var trueTarget = TryResolveJumpTargetBlock(lastInstruction, controlFlowGraph);
+                var falseSuccessor = block.Successors.FirstOrDefault(s => s != trueTarget && s != controlFlowGraph.ExitBlock);
                 if (falseSuccessor == null) continue;
                 var bridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
                 definition.CilMethodBody!.Instructions.Add(bridge);
@@ -273,6 +276,54 @@ public static class IlGenerator
                && opCode != CilOpCodes.Jmp
                && opCode != CilOpCodes.Endfinally
                && opCode != CilOpCodes.Endfilter;
+    }
+
+    /// <summary>
+    /// 按可达 CFG 的反向后序生成唯一块发射顺序。退 SSA 新建的临界边桥即使追加在
+    /// <see cref="ISILControlFlowGraph.Blocks"/> 尾部，只要它位于一条前向边上，就会先于
+    /// 消费 Phi 结果的后继发射；循环回边则自然留在循环头之后。遍历严格保留后继列表的
+    /// 语义顺序，不使用易受分析阶段插块影响的块编号。
+    /// </summary>
+    internal static IReadOnlyList<Block> GetReachableBlockEmissionOrder(ISILControlFlowGraph graph)
+    {
+        if (graph == null)
+            throw new ArgumentNullException(nameof(graph));
+
+        var registeredBlocks = new HashSet<Block>(graph.Blocks);
+        if (!registeredBlocks.Contains(graph.EntryBlock))
+            throw new DecompilerException("控制流图入口块未登记到块列表中。");
+        if (!registeredBlocks.Contains(graph.ExitBlock))
+            throw new DecompilerException("控制流图退出块未登记到块列表中。");
+
+        // 大型恢复方法可能包含数千个块；使用显式栈避免递归 DFS 耗尽托管调用栈。
+        var visited = new HashSet<Block> { graph.EntryBlock };
+        var postOrder = new List<Block>(registeredBlocks.Count);
+        var remaining = new Stack<(Block Block, int NextSuccessorIndex)>();
+        remaining.Push((graph.EntryBlock, 0));
+
+        while (remaining.Count > 0)
+        {
+            var (block, nextSuccessorIndex) = remaining.Pop();
+            if (nextSuccessorIndex >= block.Successors.Count)
+            {
+                postOrder.Add(block);
+                continue;
+            }
+
+            remaining.Push((block, nextSuccessorIndex + 1));
+            var successor = block.Successors[nextSuccessorIndex];
+            if (successor == null || !registeredBlocks.Contains(successor))
+            {
+                throw new DecompilerException(
+                    $"可达控制流边指向未登记块：from={block.ID}，to={successor?.ID.ToString() ?? "null"}。");
+            }
+
+            if (visited.Add(successor))
+                remaining.Push((successor, 0));
+        }
+
+        postOrder.Reverse();
+        return postOrder;
     }
     
     private static Block? TryResolveJumpTargetBlock(Instruction jumpInstruction, ISILControlFlowGraph cfg)
