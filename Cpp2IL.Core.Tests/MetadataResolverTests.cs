@@ -1457,11 +1457,13 @@ public class MetadataResolverTests
     {
         var fixture = CreateResolvedFieldLoadTypingFixture();
 
-        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+        var firstChanged = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+        var secondChanged = MetadataResolver.ResolveFieldOffsets(fixture.Method);
 
         Assert.Multiple(() =>
         {
-            Assert.That(changed, Is.True);
+            Assert.That(firstChanged, Is.True);
+            Assert.That(secondChanged, Is.False, "精确布尔类型已经闭合后不得重复报告变化");
             Assert.That(fixture.Result.Type,
                 Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType));
             Assert.That(fixture.Loads[0].Operands[1], Is.TypeOf<FieldReference>());
@@ -1498,17 +1500,59 @@ public class MetadataResolverTests
         var fixture = CreateResolvedFieldLoadTypingFixture(
             definitionCount: 2,
             mismatchSecondFieldType: mismatchSecondFieldType,
-            includeNonFieldDefinition: includeNonFieldDefinition);
+            includeNonFieldDefinition: includeNonFieldDefinition,
+            createResolvedFieldReferences: true);
 
-        var changed = MetadataResolver.ResolveFieldOffsets(fixture.Method);
+        var changed = MetadataResolver.BindResolvedFieldLoadDestinationTypes(
+            MetadataResolver.BuildDefinitionIndex(fixture.Method.ControlFlowGraph!.Instructions));
 
         Assert.Multiple(() =>
         {
-            Assert.That(changed, Is.True);
+            Assert.That(changed, Is.False);
             Assert.That(fixture.Result.Type,
                 Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType));
             Assert.That(fixture.Loads.Select(load => load.Operands[1]),
                 Is.All.TypeOf<FieldReference>());
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void Object字段读取不会把Object弱槽误报为类型变化()
+    {
+        var fixture = CreateResolvedFieldLoadTypingFixture(
+            definitionCount: 2,
+            useObjectFieldType: true,
+            createResolvedFieldReferences: true);
+
+        var changed = MetadataResolver.BindResolvedFieldLoadDestinationTypes(
+            MetadataResolver.BuildDefinitionIndex(fixture.Method.ControlFlowGraph!.Instructions));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.Result.Type,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 结果槽已是字段精确类型时不重复报告变化()
+    {
+        var fixture = CreateResolvedFieldLoadTypingFixture(
+            definitionCount: 2,
+            useStrongResultType: true,
+            createResolvedFieldReferences: true);
+
+        var changed = MetadataResolver.BindResolvedFieldLoadDestinationTypes(
+            MetadataResolver.BuildDefinitionIndex(fixture.Method.ControlFlowGraph!.Instructions));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(fixture.Result.Type,
+                Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType));
         });
     }
 
@@ -1951,7 +1995,10 @@ public class MetadataResolverTests
     private static ResolvedFieldLoadTypingFixture CreateResolvedFieldLoadTypingFixture(
         int definitionCount = 1,
         bool mismatchSecondFieldType = false,
-        bool includeNonFieldDefinition = false)
+        bool includeNonFieldDefinition = false,
+        bool useObjectFieldType = false,
+        bool useStrongResultType = false,
+        bool createResolvedFieldReferences = false)
     {
         if (definitionCount < 1)
             throw new ArgumentOutOfRangeException(nameof(definitionCount));
@@ -1973,17 +2020,20 @@ public class MetadataResolverTests
                 app.SystemTypes.SystemObjectType,
                 System.Reflection.TypeAttributes.Public),
         };
+        var primaryFieldType = useObjectFieldType
+            ? app.SystemTypes.SystemObjectType
+            : app.SystemTypes.SystemBooleanType;
         var fields = new[]
         {
             owners[0].InjectFieldContext(
                 "FlagA",
-                app.SystemTypes.SystemBooleanType,
+                primaryFieldType,
                 System.Reflection.FieldAttributes.Private),
             owners[1].InjectFieldContext(
                 "FlagB",
                 mismatchSecondFieldType
                     ? app.SystemTypes.SystemInt32Type
-                    : app.SystemTypes.SystemBooleanType,
+                    : primaryFieldType,
                 System.Reflection.FieldAttributes.Private),
         };
         fields[0].OverrideOffset = 0x20;
@@ -1997,15 +2047,23 @@ public class MetadataResolverTests
         var result = new LocalVariable(
             "result",
             new Register(null, "X8", 1),
-            app.SystemTypes.SystemObjectType);
+            useStrongResultType
+                ? primaryFieldType
+                : app.SystemTypes.SystemObjectType);
         var loads = Enumerable.Range(0, definitionCount)
-            .Select(index => new Instruction(
-                index,
-                OpCode.Move,
-                result,
-                new MemoryOperand(
-                    receivers[index % 2],
-                    addend: index % 2 == 0 ? 0x20 : 0x28)))
+            .Select(index =>
+            {
+                var fieldIndex = index % 2;
+                IOperand source = createResolvedFieldReferences
+                    ? new FieldReference(
+                        fields[fieldIndex],
+                        receivers[fieldIndex],
+                        (int)fields[fieldIndex].Offset)
+                    : new MemoryOperand(
+                        receivers[fieldIndex],
+                        addend: fields[fieldIndex].Offset);
+                return new Instruction(index, OpCode.Move, result, source);
+            })
             .ToArray();
         var instructions = loads.Cast<Instruction>().ToList();
         if (includeNonFieldDefinition)

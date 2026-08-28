@@ -1049,7 +1049,14 @@ public static class MetadataResolver
                 consensusType ??= fieldType;
             }
 
-            if (!definitionsAreClosed || consensusType == null)
+            // 中文注释：System.Object 字段并未比 null/Object 弱载体提供更精确的信息；
+            // 同一精确类型也不构成状态变化。只有获得新的强类型事实时才推进不动点，
+            // 避免 Object→Object 在每一轮都报告 changed 而耗尽迭代上限。
+            if (!definitionsAreClosed
+                || consensusType == null
+                || consensusType.FullName == "System.Object"
+                || (local.Type != null
+                    && GenericCallRebinder.TypesEquivalent(local.Type, consensusType)))
                 continue;
 
             local.Type = consensusType;
