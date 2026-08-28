@@ -518,12 +518,19 @@ public class SsaForm
 
     private void RewriteUses(Instruction instruction)
     {
+        var destination = instruction.Destination;
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
             var operand = instruction.Operands[i];
 
             if (operand is Register register)
             {
+                // 写目标在本条指令随后才获得新版本；若先按旧栈顶改写，W0/X0 这类
+                // 同编号别名会错误继承旧定义的名称与宽度。内存写目标的基址和索引仍是读取端，
+                // 因此只跳过与 Destination 同一实例的直接寄存器，不跳过整个目标操作数。
+                if (ReferenceEquals(operand, destination))
+                    continue;
+
                 instruction.SetOperand(i, CurrentVersion(register.Number));
             }
             else if (operand is MemoryOperand memory)
