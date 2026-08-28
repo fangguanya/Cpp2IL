@@ -225,6 +225,93 @@ public class SsaAndDominators
     }
 
     /// <summary>
+    /// 构造两个旧 X0 定义汇合后，由新写入选择先读取旧值还是先截断旧值的控制流。
+    /// 显式 Number=0 用于同时验证 ARM64 W0/X0 的同槽覆盖语义。
+    /// </summary>
+    private static (ISILControlFlowGraph Graph, Instruction Kill, Instruction ReadAfterKill)
+        RegisterReuseJoin(bool readBeforeKill, bool useNarrowAlias)
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+
+        Register X0() => new(0, "X0");
+        Register KillRegister() => useNarrowAlias ? new Register(0, "W0") : X0();
+
+        Add(0, OpCode.ConditionalJump, 3, new Register(null, "condition"));
+        Add(1, OpCode.Move, X0(), 1);
+        Add(2, OpCode.Jump, 4);
+        Add(3, OpCode.Move, X0(), 2);
+        if (readBeforeKill)
+            Add(4, OpCode.Move, new Register(null, "oldValue"), X0());
+        var killIndex = instructions.Count;
+        Add(killIndex, OpCode.Move, KillRegister(), new Register(null, "longLivedValue"));
+        var readAfterKillIndex = instructions.Count;
+        Add(readAfterKillIndex, OpCode.Move, new Register(null, "newValue"), X0());
+        Add(instructions.Count, OpCode.Return);
+
+        return (
+            BuildGraph(instructions),
+            instructions[killIndex],
+            instructions[readAfterKillIndex]);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 汇合块先写后读必须截断旧寄存器生命期()
+    {
+        var fixture = RegisterReuseJoin(readBeforeKill: false, useNarrowAlias: false);
+
+        SsaForm.Build(fixture.Graph, new DominatorInfo(fixture.Graph));
+
+        var killDefinition = (Register)fixture.Kill.Operands[0];
+        var readAfterKill = (Register)fixture.ReadAfterKill.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(Phis(fixture.Graph).Any(phi => RegName(phi.Operands[0]) == "X0"), Is.False);
+            Assert.That(readAfterKill.Version, Is.EqualTo(killDefinition.Version));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 汇合块覆盖前读取仍必须建立真实Phi()
+    {
+        var fixture = RegisterReuseJoin(readBeforeKill: true, useNarrowAlias: false);
+
+        SsaForm.Build(fixture.Graph, new DominatorInfo(fixture.Graph));
+
+        var phi = Phis(fixture.Graph).Single(instruction => RegName(instruction.Operands[0]) == "X0");
+        var killDefinition = (Register)fixture.Kill.Operands[0];
+        var readAfterKill = (Register)fixture.ReadAfterKill.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(phi.Operands.Count, Is.EqualTo(3));
+            Assert.That(readAfterKill.Version, Is.EqualTo(killDefinition.Version));
+            Assert.That(readAfterKill.Version, Is.Not.EqualTo(((Register)phi.Operands[0]).Version));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void W0写入必须杀死同编号X0旧值而不建立伪Phi()
+    {
+        var fixture = RegisterReuseJoin(readBeforeKill: false, useNarrowAlias: true);
+
+        SsaForm.Build(fixture.Graph, new DominatorInfo(fixture.Graph));
+
+        var killDefinition = (Register)fixture.Kill.Operands[0];
+        var readAfterKill = (Register)fixture.ReadAfterKill.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(killDefinition.Name, Is.EqualTo("W0"));
+            Assert.That(readAfterKill.Name, Is.EqualTo("W0"));
+            Assert.That(readAfterKill.Version, Is.EqualTo(killDefinition.Version));
+            Assert.That(Phis(fixture.Graph).Any(phi => ((Register)phi.Operands[0]).Number == 0), Is.False);
+        });
+    }
+
+    /// <summary>
     /// 构造两条地址定义路径汇入同一内存写入的控制流。
     /// </summary>
     private static ISILControlFlowGraph MemoryStoreDiamond(bool includeIndex, bool constantAddress)

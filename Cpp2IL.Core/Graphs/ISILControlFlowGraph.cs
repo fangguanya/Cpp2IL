@@ -305,28 +305,115 @@ public class ISILControlFlowGraph
         {
             var use = new List<IOperand>();
             var def = new List<IOperand>();
+            var usedRegisterNumbers = new HashSet<int>();
+            var definedRegisterNumbers = new HashSet<int>();
+            var usedLocals = new HashSet<LocalVariable>();
+            var definedLocals = new HashSet<LocalVariable>();
 
             foreach (var instruction in block.Instructions)
             {
-                foreach (var operand in instruction.Sources.Where(operand => !use.Contains(operand)))
-                    use.Add(operand);
+                // 中文注释：块级 Use 只包含“在本块首次定义之前读取”的变量。旧实现把
+                // 本块先写后读也计为入口活值，pruned SSA 因而会把已经被新写入截断的
+                // 物理寄存器历史生命期接入伪 Phi。先展开复合操作数，再按数据流身份判断，
+                // 同时覆盖内存基址、字段接收者、数组索引和 ARM64 W/X 同槽别名。
+                foreach (var source in instruction.Sources.SelectMany(EnumerateDataFlowVariables))
+                {
+                    switch (source)
+                    {
+                        case Register register when !definedRegisterNumbers.Contains(register.Number)
+                                                    && usedRegisterNumbers.Add(register.Number):
+                            use.Add(register);
+                            break;
+                        case LocalVariable local when !definedLocals.Contains(local)
+                                                      && usedLocals.Add(local):
+                            use.Add(local);
+                            break;
+                    }
+                }
 
-                if (instruction.Destination != null && !def.Contains(instruction.Destination))
-                    def.Add(instruction.Destination);
+                AddDefinition(instruction.Destination);
 
-                if (instruction.ImplicitDefinition is { } clobbered && !def.Contains(clobbered))
-                    def.Add(clobbered);
+                if (instruction.ImplicitDefinition is { } clobbered)
+                    AddDefinition(clobbered);
 
                 if (clobberingAddressTakes?.Contains(instruction) == true)
                 {
                     foreach (var operand in instruction.Operands)
-                        if (operand is AddressOf { Target: { } addressed } && !def.Contains(addressed))
-                            def.Add(addressed);
+                        if (operand is AddressOf { Target: { } addressed })
+                            AddDefinition(addressed);
                 }
             }
 
             block.Use = use;
             block.Def = def;
+
+            void AddDefinition(IOperand? operand)
+            {
+                switch (operand)
+                {
+                    case Register register when definedRegisterNumbers.Add(register.Number):
+                        def.Add(register);
+                        break;
+                    case LocalVariable local when definedLocals.Add(local):
+                        def.Add(local);
+                        break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 展开操作数中真正参与活跃性分析的变量；复合操作数本身不是一个可版本化定义。
+    /// </summary>
+    private static IEnumerable<IOperand> EnumerateDataFlowVariables(IOperand operand)
+    {
+        switch (operand)
+        {
+            case Register or LocalVariable:
+                yield return operand;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base != null)
+                    foreach (var variable in EnumerateDataFlowVariables(memory.Base))
+                        yield return variable;
+                if (memory.Index != null)
+                    foreach (var variable in EnumerateDataFlowVariables(memory.Index))
+                        yield return variable;
+                break;
+            case FieldReference { Field.IsStatic: false } field:
+                yield return field.Local;
+                break;
+            case ArrayAccess access:
+                yield return access.Array;
+                foreach (var variable in EnumerateDataFlowVariables(access.Index))
+                    yield return variable;
+                break;
+            case ArrayLength length:
+                yield return length.Array;
+                break;
+            case StringLength length:
+                yield return length.Value;
+                break;
+            case ListCount count:
+                yield return count.Value;
+                break;
+            case AddressOf address:
+                foreach (var variable in EnumerateDataFlowVariables(address.Target))
+                    yield return variable;
+                break;
+            case HomogeneousFloatingAggregateArgument aggregate:
+                foreach (var component in aggregate.Components)
+                foreach (var variable in EnumerateDataFlowVariables(component))
+                    yield return variable;
+                break;
+            case MetadataStringTableLookup lookup:
+                foreach (var variable in EnumerateDataFlowVariables(lookup.Index))
+                    yield return variable;
+                break;
+            case ReadOnlyUInt16TableLookup lookup:
+                foreach (var variable in EnumerateDataFlowVariables(lookup.Index))
+                    yield return variable;
+                break;
         }
     }
 
