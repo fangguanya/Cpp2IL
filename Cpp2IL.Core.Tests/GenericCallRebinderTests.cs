@@ -191,6 +191,67 @@ public class GenericCallRebinderTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 晚期共享ListFind按调用方声明类型的开放参数重绑定()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.GetAssemblyByName("mscorlib")!;
+        var listDefinition = assembly.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var find = listDefinition.Methods.Single(method =>
+            method.Name == "Find" && method.Parameters.Count == 1);
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Fixture",
+            "OpenDictionaryOwner",
+            app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public);
+        var itemParameter = new GenericParameterTypeAnalysisContext(
+            "TItem",
+            0,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+            GenericParameterAttributes.None,
+            owner);
+        owner.GenericParameters.Add(itemParameter);
+        var caller = owner.InjectMethodContext(
+            "FindItem",
+            itemParameter,
+            MethodAttributes.Public);
+        var oldTarget = new ConcreteGenericMethodAnalysisContext(
+            find,
+            [app.SystemTypes.SystemObjectType],
+            []);
+        var receiver = new LocalVariable(
+            "items",
+            new Register(null, "X0"),
+            listDefinition.MakeGenericInstanceType([itemParameter]));
+        var result = new LocalVariable(
+            "result",
+            new Register(null, "X0", 2),
+            app.SystemTypes.SystemObjectType);
+        var predicate = new LocalVariable(
+            "predicate",
+            new Register(null, "X1"),
+            oldTarget.Parameters[0].ParameterType);
+        var call = new Instruction(0, OpCode.Call, oldTarget, result, receiver, predicate);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            call,
+            new Instruction(1, OpCode.Return, result),
+        ]);
+
+        var changed = GenericCallRebinder.RunOwnedOpenSharedReceiverTargets(caller);
+        var lateClosedChanged = GenericCallRebinder.RunLateSharedReceiverTargets(caller);
+
+        var rebound = (ConcreteGenericMethodAnalysisContext)call.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.EqualTo(1));
+            Assert.That(lateClosedChanged, Is.Zero);
+            Assert.That(rebound.TypeGenericParameters.Single(), Is.SameAs(itemParameter));
+            Assert.That(result.Type, Is.SameAs(itemParameter));
+        });
+    }
+
+    [Test]
     [Category("边界值")]
     public void 晚期共享EnumeratorMoveNext保留布尔返回槽()
     {

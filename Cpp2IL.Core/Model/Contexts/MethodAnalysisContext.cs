@@ -559,6 +559,22 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // 中文注释：共享接收者 Phi 到此才获得最终具体引用类型。只用现成的接收者、
         // methodPtr 与 MethodInfo 双半槽恢复早期未闭合的普通虚调用，不重跑 SSA 前驱分析。
+        // 调用方声明类型自有的开放泛型接收者必须先把 List<object> 共享目标具体化，
+        // 其返回槽才会成为随后虚表接收者的精确类型；封闭接收者仍留给布局恢复后的互斥入口。
+        GenericCallRebinder.RunOwnedOpenSharedReceiverTargets(this);
+        var lateScalarReturnDiagnostics = new List<string>();
+        var lateScalarReturnRecoveries = LocalVariables.ResolveLateVirtualScalarReturnSlotConflicts(
+            this,
+            lateScalarReturnDiagnostics);
+        if (lateScalarReturnDiagnostics.Count > 0
+            && ControlFlowGraph.Instructions.Any(instruction =>
+                instruction.OpCode is OpCode.IndirectCall or OpCode.IndirectJump))
+        {
+            Logger.VerboseNewline(
+                $"晚期标量返回槽检查：method={FullName}，恢复={lateScalarReturnRecoveries}，"
+                + $"诊断={string.Join("|", lateScalarReturnDiagnostics)}",
+                nameof(LocalVariables.ResolveLateVirtualScalarReturnSlotConflicts));
+        }
         LateVirtualCallRecovery.Run(this);
 
         // 中文注释：集合快慢边比较前先删除终态已证明跨值域的 Phi 复制；否则布尔返回槽

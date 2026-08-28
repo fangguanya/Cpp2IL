@@ -1489,6 +1489,247 @@ public class LocalVariablesTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 已解析调用返回类型纠正当前方法返回槽污染()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var returned = new LocalVariable(
+            "returned",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemInt32Type);
+
+        var changed = LocalVariables.BindResolvedCallReturnType(
+            returned,
+            appContext.SystemTypes.SystemStringType,
+            appContext.SystemTypes.SystemInt32Type);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(returned.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已解析调用返回类型相同时保持单调不变()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var returned = new LocalVariable(
+            "returned",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemStringType);
+
+        var changed = LocalVariables.BindResolvedCallReturnType(
+            returned,
+            appContext.SystemTypes.SystemStringType,
+            appContext.SystemTypes.SystemInt32Type);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(returned.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 已解析调用返回类型不得覆盖独立具体类型证据()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var returned = new LocalVariable(
+            "returned",
+            new Register(null, "X0", 1),
+            appContext.SystemTypes.SystemObjectType);
+
+        var changed = LocalVariables.BindResolvedCallReturnType(
+            returned,
+            appContext.SystemTypes.SystemStringType,
+            appContext.SystemTypes.SystemInt32Type);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(returned.Type, Is.SameAs(appContext.SystemTypes.SystemObjectType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 晚期虚调用把引用结果与布尔零返回分离()
+    {
+        var fixture = CreateLateVirtualScalarReturnConflictFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType,
+            includeIndirectReceiver: true);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fixture.Method.ControlFlowGraph!.Instructions[0].Destination, Is.SameAs(fixture.Result));
+            var indirect = fixture.Method.ControlFlowGraph.Instructions.Single(
+                instruction => instruction.OpCode == OpCode.IndirectJump);
+            Assert.That(indirect.Operands.Count, Is.EqualTo(3));
+            Assert.That(indirect.Operands[2], Is.SameAs(fixture.Result));
+            Assert.That(fixture.Method.ControlFlowGraph.Instructions.Count(
+                instruction => ReferenceEquals(instruction.Destination, fixture.Result)), Is.EqualTo(1));
+            Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.Result));
+            Assert.That(GenericCallRebinder.TypesEquivalent(
+                fixture.Result.Type,
+                fixture.Method.ReturnType), Is.True);
+            Assert.That(((MethodAnalysisContext)fixture.Method.ControlFlowGraph.Instructions[0].Operands[0])
+                .ReturnType.IsValueType, Is.False);
+            Assert.That(fixture.Method.ReturnType.FullName, Is.EqualTo("System.Boolean"));
+            Assert.That(((MethodAnalysisContext)fixture.Method.ControlFlowGraph.Instructions[0].Operands[0])
+                .ReturnType, Is.Not.TypeOf<PointerTypeAnalysisContext>());
+            Assert.That(fixture.Method.ControlFlowGraph.Instructions.Any(instruction =>
+                instruction.OpCode is OpCode.IndirectCall or OpCode.IndirectJump
+                && instruction.Operands.Skip(2).Any(operand => ReferenceEquals(operand, fixture.Result))), Is.True);
+        });
+
+        var diagnostics = new List<string>();
+        var recovered = LocalVariables.ResolveLateVirtualScalarReturnSlotConflicts(
+            fixture.Method,
+            diagnostics);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1), string.Join(" | ", diagnostics));
+            Assert.That(fixture.Result.Type, Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType));
+            Assert.That(fixture.Return.Operands[0], Is.TypeOf<Immediate>());
+            Assert.That(((Immediate)fixture.Return.Operands[0]).Value, Is.EqualTo(0));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 晚期虚调用支持整数零返回槽()
+    {
+        var fixture = CreateLateVirtualScalarReturnConflictFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type,
+            includeIndirectReceiver: true);
+
+        var recovered = LocalVariables.ResolveLateVirtualScalarReturnSlotConflicts(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Result.Type, Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType));
+            Assert.That(((Immediate)fixture.Return.Operands[0]).Value, Is.EqualTo(0));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 晚期字段读取与标量零返回共用槽时恢复引用接收者()
+    {
+        var fixture = CreateLateVirtualScalarReturnConflictFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType,
+            includeIndirectReceiver: true,
+            useFieldProducer: true);
+
+        var recovered = LocalVariables.ResolveLateVirtualScalarReturnSlotConflicts(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Result.Type, Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemStringType));
+            Assert.That(fixture.Return.Operands[0], Is.TypeOf<Immediate>());
+            Assert.That(((Immediate)fixture.Return.Operands[0]).Value, Is.EqualTo(0));
+            var headerLoad = fixture.Method.ControlFlowGraph!.Instructions.Single(instruction => instruction.Index == 4);
+            Assert.That(headerLoad.Operands[1], Is.TypeOf<MemoryOperand>());
+            Assert.That(((LocalVariable)headerLoad.Operands[0]).Type, Is.TypeOf<RuntimeClassTypeAnalysisContext>());
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 晚期标量返回没有间接接收者时保持原类型()
+    {
+        var fixture = CreateLateVirtualScalarReturnConflictFixture(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType,
+            includeIndirectReceiver: false);
+
+        var recovered = LocalVariables.ResolveLateVirtualScalarReturnSlotConflicts(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.Zero);
+            Assert.That(fixture.Result.Type, Is.SameAs(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemBooleanType));
+            Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.Result));
+        });
+    }
+
+    /// <summary>构造调用结果、间接接收者与标量零返回共用 X0 的退 SSA 夹具。</summary>
+    private static (MethodAnalysisContext Method, LocalVariable Result, Instruction Return)
+        CreateLateVirtualScalarReturnConflictFixture(
+            TypeAnalysisContext ownerReturnType,
+            bool includeIndirectReceiver,
+            bool useFieldProducer = false)
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var assembly = appContext.Assemblies[0];
+        var owner = new InjectedTypeAnalysisContext(
+            assembly,
+            "Cpp2IL.Core.Tests",
+            "LateVirtualScalarOwner",
+            appContext.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var getter = new InjectedMethodAnalysisContext(
+            owner,
+            "GetText",
+            appContext.SystemTypes.SystemStringType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var method = new InjectedMethodAnalysisContext(
+            owner,
+            "InvokeTail",
+            ownerReturnType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        var result = new LocalVariable("result", new Register(null, "X0", 1), ownerReturnType);
+        var producer = useFieldProducer
+            ? new Instruction(
+                0,
+                OpCode.Move,
+                result,
+                new FieldReference(
+                    new InjectedFieldAnalysisContext(
+                        "_text",
+                        appContext.SystemTypes.SystemStringType,
+                        FieldAttributes.Private,
+                        owner),
+                    new LocalVariable("owner", new Register(null, "X1", 1), owner),
+                    0x10))
+            : new Instruction(0, OpCode.Call, getter, result);
+        var returnInstruction = new Instruction(3, OpCode.Return, result);
+        var instructions = new List<Instruction> { producer };
+        if (useFieldProducer)
+        {
+            // 中文注释：复现标量返回污染把对象头零偏移误绑定成 Boolean.m_value 的真实形态。
+            var scalarField = new InjectedFieldAnalysisContext(
+                "m_value",
+                ownerReturnType,
+                FieldAttributes.Private,
+                ownerReturnType);
+            instructions.Add(new Instruction(
+                4,
+                OpCode.Move,
+                new LocalVariable("klass", new Register(null, "X9", 1), ownerReturnType),
+                new FieldReference(scalarField, result, 0)));
+        }
+        if (includeIndirectReceiver)
+        {
+            var target = new LocalVariable("target", new Register(null, "X2", 1));
+            // 中文注释：条件边把标量零返回块和虚调用块同时保持为可达，复现真实 CBZ 分叉。
+            instructions.Add(new Instruction(1, OpCode.ConditionalJump, returnInstruction, new Immediate(1)));
+            instructions.Add(new Instruction(2, OpCode.IndirectJump, target, result, result));
+        }
+        instructions.Add(returnInstruction);
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        method.Locals = [result];
+        return (method, result, returnInstruction);
+    }
+
+    [Test]
     [Category("边界值")]
     public void 后置字段链必须跨多轮收敛到末端值类型()
     {
@@ -2160,6 +2401,79 @@ public class LocalVariablesTests
         {
             Assert.That(changed, Is.False);
             Assert.That(local.Type, Is.SameAs(structuredLocalType));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Object形参不得覆盖字段已证明的开放泛型参数()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            genericElement);
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(
+            local,
+            appContext.SystemTypes.SystemObjectType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(local.Type, Is.SameAs(genericElement));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void Object形参不得覆盖含开放参数的结构化接口()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var enumerableDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.IEnumerable`1")!;
+        var genericElement = enumerableDefinition.GenericParameters.Single();
+        var structuredType = enumerableDefinition.MakeGenericInstanceType([genericElement]);
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            structuredType);
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(
+            local,
+            appContext.SystemTypes.SystemObjectType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.False);
+            Assert.That(local.Type, Is.SameAs(structuredType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 具体String形参仍须闭合开放泛型参数()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = appContext.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var genericElement = listDefinition.GenericParameters.Single();
+        var local = new LocalVariable(
+            "value",
+            new Register(null, "X1", 1),
+            genericElement);
+
+        var changed = LocalVariables.SetTypeFromClosedCallParameter(
+            local,
+            appContext.SystemTypes.SystemStringType);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(changed, Is.True);
+            Assert.That(local.Type, Is.SameAs(appContext.SystemTypes.SystemStringType));
         });
     }
 

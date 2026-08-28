@@ -42,13 +42,57 @@ public static class GenericCallRebinder
         var reboundCount = 0;
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (!TryRebindLateSharedReceiverTarget(instruction))
+            // 中文注释：调用方自有开放参数已由虚调用前专用入口处理；这里仅消费后续布局恢复
+            // 才出现的封闭接收者，两类目标集合互斥，避免对同一共享调用重复计算。
+            if (IsOwnedOpenSharedReceiverTarget(instruction, method))
+                continue;
+            if (!TryRebindLateSharedReceiverTarget(instruction, method))
                 continue;
 
             reboundCount++;
         }
 
         return reboundCount;
+    }
+
+    /// <summary>
+    /// 在普通虚调用最终闭合前，精确处理调用方声明类型自有的开放泛型接收者。
+    /// UnityDictionary&lt;K,V&gt; 中的 List&lt;UnityKeyValuePair&lt;K,V&gt;&gt;.Find 属于此集合；
+    /// 封闭接收者留给布局恢复后的入口，两者不交叠。
+    /// </summary>
+    internal static int RunOwnedOpenSharedReceiverTargets(MethodAnalysisContext method)
+    {
+        var reboundCount = 0;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (!IsOwnedOpenSharedReceiverTarget(instruction, method)
+                || !TryRebindLateSharedReceiverTarget(instruction, method))
+                continue;
+
+            reboundCount++;
+        }
+
+        return reboundCount;
+    }
+
+    private static bool IsOwnedOpenSharedReceiverTarget(
+        Instruction call,
+        MethodAnalysisContext containingMethod)
+    {
+        if (!call.IsCall
+            || call.Operands.Count < 2
+            || call.Operands[0] is not ConcreteGenericMethodAnalysisContext current
+            || current.IsStatic)
+            return false;
+
+        var firstArgument = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        return firstArgument < call.Operands.Count
+               && OperandType(call.Operands[firstArgument], null) is GenericInstanceTypeAnalysisContext receiver
+               && current.DeclaringType is GenericInstanceTypeAnalysisContext currentOwner
+               && IsSharedObjectPlaceholder(currentOwner, receiver)
+               && receiver.GenericArguments.Any(LocalVariables.ContainsUninstantiatedGenericParameter)
+               && receiver.GenericArguments.All(argument =>
+                   IsClosedOrOwnedByContainingScope(argument, containingMethod));
     }
 
     /// <summary>
@@ -157,7 +201,9 @@ public static class GenericCallRebinder
     /// 仅当调用目标是共享 object 泛型实例、接收者是同一泛型定义的具体实例时执行末次重绑定。
     /// 已经具体化但互相冲突的目标与接收者保持原样，避免末次扫描覆盖业务侧具体类型。
     /// </summary>
-    internal static bool TryRebindLateSharedReceiverTarget(Instruction call)
+    internal static bool TryRebindLateSharedReceiverTarget(
+        Instruction call,
+        MethodAnalysisContext containingMethod)
     {
         if (!call.IsCall
             || call.Operands.Count < 2
@@ -172,7 +218,9 @@ public static class GenericCallRebinder
             || !IsSharedObjectPlaceholder(currentOwner, receiver))
             return false;
 
-        return TryRebind(call);
+        // 中文注释：UnityDictionary<K,V> 等开放类型中的 List<UnityKeyValuePair<K,V>>
+        // 接收者仍含 VAR；必须携带调用方作用域验证其所有权，不能把它当成未封闭噪声丢弃。
+        return TryRebind(call, containingMethod);
     }
 
     internal static bool TryRebind(Instruction call)

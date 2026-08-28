@@ -3065,8 +3065,12 @@ public static class LocalVariables
             // Return value: a constructor yields its declaring type, otherwise the declared return type.
             if (instruction.Destination is LocalVariable returnValue)
             {
-                changed |= SetTypeIfUnknown(returnValue,
-                    calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType);
+                changed |= BindResolvedCallReturnType(
+                    returnValue,
+                    calledMethod.Name is ".ctor" or ".cctor"
+                        ? calledMethod.DeclaringType
+                        : calledMethod.ReturnType,
+                    method.ReturnType);
             }
 
 
@@ -3138,6 +3142,187 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// 已解析直接调用的声明返回类型是该调用目标局部量的权威类型。ARM64 的 X0 会同时承担
+    /// 当前方法返回槽和中间调用返回槽；入口阶段会先按当前方法签名给最终 Return 局部量定型，
+    /// 若同一 SSA 局部随后被证明是一个直接调用的唯一目标，就必须用被调用方法的返回类型纠正。
+    /// 其他具体类型证据保持不变，避免跨字段、Phi 或地址载体作无依据覆盖。
+    /// </summary>
+    internal static bool BindResolvedCallReturnType(
+        LocalVariable returnValue,
+        TypeAnalysisContext? calledReturnType,
+        TypeAnalysisContext? ownerReturnType)
+    {
+        if (calledReturnType == null
+            || GenericCallRebinder.TypesEquivalent(returnValue.Type, calledReturnType))
+            return false;
+
+        if (returnValue.Type == null)
+        {
+            returnValue.Type = calledReturnType;
+            return true;
+        }
+
+        // 中文注释：只替换由当前方法 Return 预播种出的同型污染；若局部量已有其他具体类型，
+        // 说明字段、参数或复制链提供了独立证据，本调用不能覆盖它。
+        if (ownerReturnType == null
+            || !GenericCallRebinder.TypesEquivalent(returnValue.Type, ownerReturnType))
+            return false;
+
+        returnValue.Type = calledReturnType;
+        return true;
+    }
+
+    /// <summary>
+    /// 退 SSA 合并后，ARM64 X0 可能同时表示“引用调用/字段读取结果”和空引用分支上的标量零返回。
+    /// 仅当权威引用生产者是局部量唯一生产者、同一局部确实作为后续间接调用接收者、且当前方法
+    /// 返回布尔或整数时，把生产结果恢复为声明引用类型，并把对该引用的直接 Return 改写为零。
+    /// </summary>
+    internal static int ResolveLateVirtualScalarReturnSlotConflicts(
+        MethodAnalysisContext method,
+        List<string>? diagnostics = null)
+    {
+        if (method.ControlFlowGraph is null)
+        {
+            diagnostics?.Add("CONTROL_FLOW_GRAPH_MISSING");
+            return 0;
+        }
+        if (!IsIntegralScalarReturnType(method.ReturnType))
+        {
+            diagnostics?.Add($"OWNER_RETURN_NOT_INTEGRAL:{method.ReturnType.FullName}");
+            return 0;
+        }
+
+        var instructions = method.ControlFlowGraph.Instructions;
+        var definitionCounts = instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .GroupBy(instruction => (LocalVariable)instruction.Destination!)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var recovered = 0;
+
+        foreach (var producer in instructions.ToArray())
+        {
+            LocalVariable destination;
+            TypeAnalysisContext referenceReturnType;
+            string producerKind;
+            if (producer.OpCode == OpCode.Call
+                && producer.Operands.Count >= 2
+                && producer.Operands[0] is MethodAnalysisContext target
+                && producer.Operands[1] is LocalVariable callDestination)
+            {
+                destination = callDestination;
+                referenceReturnType = target.ReturnType;
+                producerKind = "CALL";
+            }
+            else if (producer.OpCode == OpCode.Move
+                     && producer.Operands.Count >= 2
+                     && producer.Operands[0] is LocalVariable fieldDestination
+                     && producer.Operands[1] is FieldReference fieldReference)
+            {
+                destination = fieldDestination;
+                referenceReturnType = fieldReference.Field.FieldType;
+                producerKind = "FIELD";
+            }
+            else
+            {
+                continue;
+            }
+
+            if (referenceReturnType.IsValueType
+                || referenceReturnType is PointerTypeAnalysisContext
+                || referenceReturnType is ByRefTypeAnalysisContext)
+            {
+                diagnostics?.Add($"PRODUCER_NOT_REFERENCE:{producerKind}:{producer.Index}:{referenceReturnType.FullName}");
+                continue;
+            }
+            if (!definitionCounts.TryGetValue(destination, out var definitionCount)
+                || definitionCount != 1)
+            {
+                diagnostics?.Add($"PRODUCER_DEFINITION_COUNT:{producerKind}:{producer.Index}:{definitionCount}");
+                continue;
+            }
+            if (!GenericCallRebinder.TypesEquivalent(destination.Type, method.ReturnType))
+            {
+                diagnostics?.Add($"PRODUCER_NOT_OWNER_RETURN:{producerKind}:{producer.Index}:{destination.Type?.FullName}");
+                continue;
+            }
+
+            var feedsIndirectReceiver = instructions.Any(instruction =>
+                instruction.OpCode is OpCode.IndirectCall or OpCode.IndirectJump
+                && instruction.Operands.Skip(2).Any(operand => SameLogicalLocal(operand, destination)));
+            if (!feedsIndirectReceiver)
+            {
+                diagnostics?.Add($"INDIRECT_RECEIVER_MISSING:{producerKind}:{producer.Index}");
+                continue;
+            }
+
+            var scalarReturns = instructions
+                .Where(instruction => instruction.OpCode == OpCode.Return
+                                      && instruction.Operands.Count == 1
+                                      && SameLogicalLocal(instruction.Operands[0], destination))
+                .ToArray();
+            if (scalarReturns.Length == 0)
+            {
+                diagnostics?.Add($"SCALAR_RETURN_MISSING:{producerKind}:{producer.Index}");
+                continue;
+            }
+
+            // 中文注释：退 SSA 复制合并可能保留多个对象实例表示同一个名称/寄存器局部；
+            // 调用定义、间接接收者和字段基址必须同步定型，不能只修改其中一个对象引用。
+            foreach (var logicalAlias in instructions
+                         .SelectMany(instruction => instruction.Operands)
+                         .OfType<LocalVariable>()
+                         .Where(local => SameLogicalLocal(local, destination)))
+                logicalAlias.Type = referenceReturnType;
+
+            // 中文注释：标量返回类型曾把对象头零偏移读取误解析成 Boolean/Int32.m_value。
+            // 在引用生产者、虚调用接收者和零返回三项证据已同时成立后，恢复原始对象头读取，
+            // 并把其目标精确定型为该引用的运行时类指针，供晚期虚表槽解析直接消费。
+            var restoredObjectHeaders = 0;
+            foreach (var headerLoad in instructions.Where(instruction =>
+                         instruction.OpCode == OpCode.Move
+                         && instruction.Operands.Count >= 2
+                         && instruction.Operands[0] is LocalVariable
+                         && instruction.Operands[1] is FieldReference))
+            {
+                var klass = (LocalVariable)headerLoad.Operands[0];
+                var pollutedField = (FieldReference)headerLoad.Operands[1];
+                if (pollutedField.Offset != 0
+                    || !SameLogicalLocal(pollutedField.Local, destination)
+                    || !GenericCallRebinder.TypesEquivalent(pollutedField.Field.FieldType, method.ReturnType))
+                    continue;
+
+                headerLoad.SetOperand(1, new MemoryOperand(pollutedField.Local));
+                klass.Type = new RuntimeClassTypeAnalysisContext(
+                    referenceReturnType,
+                    referenceReturnType.DeclaringAssembly);
+                restoredObjectHeaders++;
+            }
+            foreach (var scalarReturn in scalarReturns)
+                scalarReturn.SetOperand(0, new Immediate(0));
+            diagnostics?.Add(
+                $"RECOVERED:{producerKind}:{producer.Index}:{referenceReturnType.FullName}:HEADERS={restoredObjectHeaders}");
+            recovered++;
+        }
+
+        return recovered;
+    }
+
+    /// <summary>比较退 SSA 后由复制合并保留下来的同名、同寄存器逻辑局部。</summary>
+    private static bool SameLogicalLocal(IOperand operand, LocalVariable expected)
+        => operand is LocalVariable local
+           && (ReferenceEquals(local, expected)
+               || local.Name == expected.Name && local.Register == expected.Register);
+
+    /// <summary>零立即数能无损表示的托管布尔与整数返回类型。</summary>
+    private static bool IsIntegralScalarReturnType(TypeAnalysisContext? type)
+        => type?.FullName is "System.Boolean"
+            or "System.SByte" or "System.Byte"
+            or "System.Int16" or "System.UInt16"
+            or "System.Int32" or "System.UInt32"
+            or "System.Int64" or "System.UInt64"
+            or "System.Char";
+
     private static bool SetConstructedReceiverType(
         LocalVariable receiver,
         TypeAnalysisContext constructedType,
@@ -3208,6 +3393,13 @@ public static class LocalVariables
 
         if (local.Type == null)
             return SetTypeIfUnknown(local, parameterType);
+
+        // 中文注释：System.Object 是共享泛型调用约定的最弱载体，不能覆盖字段、Phi 或方法
+        // 签名已经证明的开放泛型类型。否则下一轮字段解析会恢复 K/T/结构化泛型，调用传播
+        // 又写回 Object，形成非单调振荡。String、具体集合等真正封闭的强类型参数仍可晋级。
+        if (parameterType.FullName == "System.Object"
+            && ContainsUninstantiatedGenericParameter(local.Type))
+            return false;
 
         // 中文注释：List<object> 等共享泛型调用形参只是 ABI 宽占位；字段或 Phi 已证明
         // List<WeightedEntry<T>> 等结构化开放类型时，禁止把强类型降回 object，否则字段传播

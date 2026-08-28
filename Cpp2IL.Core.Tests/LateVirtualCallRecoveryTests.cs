@@ -154,6 +154,36 @@ public class LateVirtualCallRecoveryTests
     }
 
     [Test]
+    [Category("边界值")]
+    public void 对象头唯一连接具体接收者时收紧共享Object类指针()
+    {
+        var fixture = CreateFixture(useInterfaceKlass: false, includeMethodInfo: true);
+        fixture.Klass.Type = new RuntimeClassTypeAnalysisContext(
+            fixture.App.SystemTypes.SystemObjectType,
+            fixture.App.SystemTypes.SystemObjectType.DeclaringAssembly);
+        var headerLoad = new Instruction(
+            -1,
+            OpCode.Move,
+            fixture.Klass,
+            new MemoryOperand(fixture.Receiver));
+        fixture.Method.ControlFlowGraph = new ISILControlFlowGraph([
+            headerLoad,
+            fixture.Transfer,
+            new Instruction(3, OpCode.Return),
+        ]);
+
+        var recovered = LateVirtualCallRecovery.Run(fixture.Method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Transfer.OpCode, Is.EqualTo(OpCode.Call));
+            var runtimeClass = (RuntimeClassTypeAnalysisContext)fixture.Klass.Type!;
+            Assert.That(runtimeClass.RepresentedType, Is.SameAs(fixture.Receiver.Type));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 接收者与类指针类型不相容时保持间接调用()
     {

@@ -118,7 +118,8 @@ internal sealed record Arm64JumpTableMatch(
     ulong DispatchAddress,
     ulong TableAddress,
     ulong BranchBaseAddress,
-    Arm64JumpTableBounds Bounds);
+    Arm64JumpTableBounds Bounds,
+    bool UsesClampedIndex);
 
 /// <summary>已读取并验证全部表项的 ARM64 跳转表站点。</summary>
 internal sealed record Arm64JumpTableDispatch(
@@ -2297,7 +2298,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         // 只跨过寄存器到寄存器的 MOV；一旦遇到控制流、内存或算术就停止，避免向前猜测模式。
         var targetAddIndex = branchIndex - 1;
         while (targetAddIndex >= 3
-               && IsIndependentRegisterSnapshotBeforeJump(
+               && IsIndependentRegisterPreparationBeforeJump(
                    nativeInstructions[targetAddIndex],
                    branch.Op0Reg))
         {
@@ -2341,20 +2342,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var protectedGapRegisters = new HashSet<string>(StringComparer.Ordinal)
         {
             Arm64RegisterHelper.CanonicalName(branch.Op0Reg),
-            Arm64RegisterHelper.CanonicalName(branchBaseLoad.Op0Reg),
-            Arm64RegisterHelper.CanonicalName(tableLoad.Op0Reg),
-            Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg),
         };
         for (var index = targetAddIndex + 1; index < branchIndex; index++)
         {
             var snapshot = nativeInstructions[index];
-            if (!IsIndependentRegisterSnapshotBeforeJump(snapshot, branch.Op0Reg)
+            if (!IsIndependentRegisterPreparationBeforeJump(snapshot, branch.Op0Reg)
                 || protectedGapRegisters.Contains(
                     Arm64RegisterHelper.CanonicalName(snapshot.Op0Reg)))
                 return false;
         }
 
         var dispatchStartIndex = targetAddIndex - 2;
+        var adjustedIndexName = Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg);
         var boundaryIndex = -1;
         for (var index = dispatchStartIndex - 1; index >= 1; index--)
         {
@@ -2366,134 +2365,185 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
         }
 
-        if (boundaryIndex < 1)
-            return false;
-
-        var comparison = nativeInstructions[boundaryIndex - 1];
-        var adjustedIndexName = Arm64RegisterHelper.CanonicalName(tableLoad.MemAddendReg);
-        if (comparison.Mnemonic != Arm64Mnemonic.CMP
-            || comparison.Op0Kind != Arm64OperandKind.Register
-            || comparison.Op1Kind != Arm64OperandKind.Immediate
-            || comparison.Op1Imm < 0)
-            return false;
-        var comparisonIndexName = Arm64RegisterHelper.CanonicalName(comparison.Op0Reg);
-
-        var lowerBound = 0L;
-        if (boundaryIndex >= 2)
+        Arm64JumpTableBounds bounds;
+        var usesClampedIndex = boundaryIndex < 1;
+        if (usesClampedIndex)
         {
-            var normalization = nativeInstructions[boundaryIndex - 2];
-            if (normalization.Op0Kind == Arm64OperandKind.Register
-                && Arm64RegisterHelper.CanonicalName(normalization.Op0Reg) == comparisonIndexName)
+            if (!TryMatchClampedJumpTableBounds(
+                    nativeInstructions,
+                    dispatchStartIndex,
+                    tableLoadIndex,
+                    tableLoad.MemAddendReg,
+                    methodStart,
+                    methodEnd,
+                    out boundaryIndex,
+                    out bounds))
+                return false;
+        }
+        else
+        {
+            // 中文注释：CMP 的 NZCV 标志可跨过不改标志的独立载荷供 B.HI/B.CS 消费。
+            // 只向前跨过明确的 LDR 家族，且随后验证其目标没有覆盖被比较索引；算术、调用、
+            // 存储和未知指令均关闭候选，避免把另一段控制流的旧标志误当边界证明。
+            var comparisonIndex = boundaryIndex - 1;
+            while (comparisonIndex >= 1
+                   && IsIndependentFlagPreservingMemoryBeforeBoundary(
+                       nativeInstructions[comparisonIndex]))
             {
-                if (normalization.Mnemonic is not (Arm64Mnemonic.SUB or Arm64Mnemonic.ADD)
-                    || normalization.Op1Kind != Arm64OperandKind.Register
-                    || normalization.Op2Kind != Arm64OperandKind.Immediate
-                    || normalization.Op2Imm < 0)
-                    return false;
-                lowerBound = normalization.Mnemonic == Arm64Mnemonic.SUB
-                    ? normalization.Op2Imm
-                    : -normalization.Op2Imm;
+                comparisonIndex--;
             }
-        }
 
-        // 中文注释：Clang 会在边界检查后用 MOV 把已经验证的 Wn 索引复制到表寻址寄存器。
-        // 两个寄存器不同时只接受一次精确寄存器复制；复制前不得重写比较寄存器，复制后不得
-        // 再写表索引。这样既保留同寄存器旧形状，也不把任意数据搬运误认成已验证索引。
-        var awaitsIndexCopy = comparisonIndexName != adjustedIndexName;
-        for (var index = boundaryIndex + 1; index < tableLoadIndex; index++)
-        {
-            var candidate = nativeInstructions[index];
-            if (candidate.Op0Kind != Arm64OperandKind.Register)
-                continue;
-
-            var destinationName = Arm64RegisterHelper.CanonicalName(candidate.Op0Reg);
-            if (awaitsIndexCopy && destinationName == comparisonIndexName)
+            if (comparisonIndex < 0)
                 return false;
-            if (destinationName != adjustedIndexName)
-                continue;
-            if (!awaitsIndexCopy
-                || candidate.Mnemonic != Arm64Mnemonic.MOV
-                || candidate.Op1Kind != Arm64OperandKind.Register
-                || Arm64RegisterHelper.CanonicalName(candidate.Op1Reg) != comparisonIndexName)
+            var comparison = nativeInstructions[comparisonIndex];
+            if (comparison.Mnemonic != Arm64Mnemonic.CMP
+                || comparison.Op0Kind != Arm64OperandKind.Register
+                || comparison.Op1Kind != Arm64OperandKind.Immediate
+                || comparison.Op1Imm < 0)
                 return false;
-            awaitsIndexCopy = false;
+            var comparisonIndexName = Arm64RegisterHelper.CanonicalName(comparison.Op0Reg);
+            for (var index = comparisonIndex + 1; index < boundaryIndex; index++)
+            {
+                var gap = nativeInstructions[index];
+                if (!IsIndependentFlagPreservingMemoryBeforeBoundary(gap)
+                    || gap.Mnemonic == Arm64Mnemonic.LDR
+                    && Arm64RegisterHelper.CanonicalName(gap.Op0Reg) == comparisonIndexName)
+                    return false;
+            }
+
+            var lowerBound = 0L;
+            if (comparisonIndex >= 1)
+            {
+                var normalization = nativeInstructions[comparisonIndex - 1];
+                if (normalization.Op0Kind == Arm64OperandKind.Register
+                    && Arm64RegisterHelper.CanonicalName(normalization.Op0Reg) == comparisonIndexName
+                    && normalization.Mnemonic is Arm64Mnemonic.SUB or Arm64Mnemonic.ADD)
+                {
+                    if (normalization.Op1Kind != Arm64OperandKind.Register
+                        || normalization.Op2Kind != Arm64OperandKind.Immediate
+                        || normalization.Op2Imm < 0)
+                        return false;
+                    lowerBound = normalization.Mnemonic == Arm64Mnemonic.SUB
+                        ? normalization.Op2Imm
+                        : -normalization.Op2Imm;
+                }
+            }
+
+            // 中文注释：Clang 会在边界检查后用 MOV 把已经验证的 Wn 索引复制到表寻址寄存器。
+            // 两个寄存器不同时只接受一次精确寄存器复制；复制前不得重写比较寄存器，复制后不得
+            // 再写表索引。这样既保留同寄存器旧形状，也不把任意数据搬运误认成已验证索引。
+            var awaitsIndexCopy = comparisonIndexName != adjustedIndexName;
+            for (var index = boundaryIndex + 1; index < tableLoadIndex; index++)
+            {
+                var candidate = nativeInstructions[index];
+                if (candidate.Op0Kind != Arm64OperandKind.Register)
+                    continue;
+
+                var destinationName = Arm64RegisterHelper.CanonicalName(candidate.Op0Reg);
+                if (awaitsIndexCopy && destinationName == comparisonIndexName)
+                    return false;
+                if (destinationName != adjustedIndexName)
+                    continue;
+                if (!awaitsIndexCopy
+                    || candidate.Mnemonic != Arm64Mnemonic.MOV
+                    || candidate.Op1Kind != Arm64OperandKind.Register
+                    || Arm64RegisterHelper.CanonicalName(candidate.Op1Reg) != comparisonIndexName)
+                    return false;
+                awaitsIndexCopy = false;
+            }
+
+            if (awaitsIndexCopy)
+                return false;
+
+            var boundary = nativeInstructions[boundaryIndex];
+            var maximumAdjustedIndex = boundary.MnemonicConditionCode == Arm64ConditionCode.HI
+                ? comparison.Op1Imm
+                : comparison.Op1Imm - 1;
+            if (!TryCreateJumpTableBounds(
+                    lowerBound,
+                    maximumAdjustedIndex,
+                    boundary.BranchTarget,
+                    methodStart,
+                    methodEnd,
+                    out bounds))
+                return false;
         }
-
-        if (awaitsIndexCopy)
-            return false;
-
-        var boundary = nativeInstructions[boundaryIndex];
-        var maximumAdjustedIndex = boundary.MnemonicConditionCode == Arm64ConditionCode.HI
-            ? comparison.Op1Imm
-            : comparison.Op1Imm - 1;
-        if (!TryCreateJumpTableBounds(
-                lowerBound,
-                maximumAdjustedIndex,
-                boundary.BranchTarget,
-                methodStart,
-                methodEnd,
-                out var bounds))
-            return false;
 
         var tableBaseName = Arm64RegisterHelper.CanonicalName(tableLoad.MemBase);
-        var pageAddress = 0UL;
-        var tableAddress = 0UL;
-        var hasPage = false;
-        var hasTableAddress = false;
-        for (var index = boundaryIndex + 1; index < tableLoadIndex; index++)
+        var tableAddIndex = -1;
+        var tablePageIndex = -1;
+        var tableDefinitionSearchFloor = IsCalleeSavedGeneralPurposeRegister(tableLoad.MemBase)
+            ? Math.Max(0, boundaryIndex - 128)
+            : boundaryIndex + 1;
+        for (var index = tableLoadIndex - 1; index >= tableDefinitionSearchFloor; index--)
         {
             var candidate = nativeInstructions[index];
             if (candidate.Op0Kind != Arm64OperandKind.Register
                 || Arm64RegisterHelper.CanonicalName(candidate.Op0Reg) != tableBaseName)
                 continue;
 
-            var candidateAddress = ResolveInstructionAddress(
-                methodStart,
-                index,
-                candidate.Mnemonic,
-                candidate.Address);
-            if (candidate.Mnemonic == Arm64Mnemonic.ADRP
-                && candidate.Op1Kind is Arm64OperandKind.Immediate
-                    or Arm64OperandKind.ImmediatePcRelative)
+            if (tableAddIndex < 0)
             {
-                // 表基址只接受一个 ADRP 和紧随其后的一个 ADD；重复写入无法证明最终地址来源。
-                if (hasPage || hasTableAddress)
+                if (candidate.Mnemonic != Arm64Mnemonic.ADD
+                    || candidate.Op1Kind != Arm64OperandKind.Register
+                    || Arm64RegisterHelper.CanonicalName(candidate.Op1Reg) != tableBaseName
+                    || candidate.Op2Kind != Arm64OperandKind.Immediate
+                    || candidate.Op2Imm < 0)
                     return false;
-                pageAddress = ResolveAdrpPageAddress(candidateAddress, candidate.Op1Imm);
-                hasPage = true;
+                tableAddIndex = index;
+                continue;
             }
-            else if (candidate.Mnemonic == Arm64Mnemonic.ADD
-                     && hasPage
-                     && candidate.Op1Kind == Arm64OperandKind.Register
-                     && Arm64RegisterHelper.CanonicalName(candidate.Op1Reg) == tableBaseName
-                     && candidate.Op2Kind == Arm64OperandKind.Immediate
-                     && candidate.Op2Imm >= 0)
-            {
-                try
-                {
-                    tableAddress = checked(pageAddress + (ulong)candidate.Op2Imm);
-                    hasPage = false;
-                    hasTableAddress = true;
-                }
-                catch (OverflowException)
-                {
-                    return false;
-                }
-            }
-            else
-            {
+
+            if (candidate.Mnemonic != Arm64Mnemonic.ADRP
+                || candidate.Op1Kind is not (
+                    Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative))
                 return false;
-            }
+            tablePageIndex = index;
+            break;
         }
 
-        if (!hasTableAddress || tableAddress % (ulong)entryWidthBytes != 0)
+        if (tablePageIndex < 0 || tableAddIndex < 0)
+            return false;
+
+        // 中文注释：只使用到表读取点的最后两次同寄存器定义。更早的 ADRP/LDR 生命期可复用
+        // 同一物理寄存器加载浮点常量；它已经被最终 ADRP 覆盖，不参与表地址证明。
+        for (var index = tablePageIndex + 1; index < tableLoadIndex; index++)
+        {
+            if (index == tableAddIndex)
+                continue;
+            var candidate = nativeInstructions[index];
+            if (candidate.Op0Kind == Arm64OperandKind.Register
+                && Arm64RegisterHelper.CanonicalName(candidate.Op0Reg) == tableBaseName)
+                return false;
+        }
+
+        var tablePageLoad = nativeInstructions[tablePageIndex];
+        var tableAddressAdd = nativeInstructions[tableAddIndex];
+        var tablePageInstructionAddress = ResolveInstructionAddress(
+            methodStart,
+            tablePageIndex,
+            tablePageLoad.Mnemonic,
+            tablePageLoad.Address);
+        ulong tableAddress;
+        try
+        {
+            tableAddress = checked(
+                ResolveAdrpPageAddress(tablePageInstructionAddress, tablePageLoad.Op1Imm)
+                + (ulong)tableAddressAdd.Op2Imm);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
+        if (tableAddress % (ulong)entryWidthBytes != 0)
             return false;
 
         var boundaryAddress = ResolveInstructionAddress(
             methodStart,
             boundaryIndex,
-            boundary.Mnemonic,
-            boundary.Address);
+            nativeInstructions[boundaryIndex].Mnemonic,
+            nativeInstructions[boundaryIndex].Address);
         var dispatchAddress = ResolveInstructionAddress(
             methodStart,
             branchIndex,
@@ -2502,7 +2552,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if (dispatchAddress < methodStart
             || dispatchAddress >= methodEnd
             || dispatchAddress % sizeof(uint) != 0
-            || (bounds.DefaultTarget >= boundaryAddress
+            || (!usesClampedIndex
+                && bounds.DefaultTarget >= boundaryAddress
                 && bounds.DefaultTarget <= dispatchAddress))
             return false;
 
@@ -2521,8 +2572,231 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             dispatchAddress,
             tableAddress,
             branchBaseAddress,
-            bounds);
+            bounds,
+            usesClampedIndex);
         return true;
+    }
+
+    /// <summary>
+    /// 识别由两次 CSEL 把有符号索引夹紧到闭区间、再用 ADD 平移到零基表索引的形状。
+    /// 该形状没有显式 default 分支，范围必须同时由 CMP/CSEL 上界、CMN/CSEL 下界和最终
+    /// 平移立即数三份一致证据闭合；任一寄存器被重写或条件方向不符时整体拒绝。
+    /// </summary>
+    private static bool TryMatchClampedJumpTableBounds(
+        IReadOnlyList<Arm64Instruction> nativeInstructions,
+        int dispatchStartIndex,
+        int tableLoadIndex,
+        Arm64Register adjustedIndexRegister,
+        ulong methodStart,
+        ulong methodEnd,
+        out int evidenceStartIndex,
+        out Arm64JumpTableBounds bounds)
+    {
+        evidenceStartIndex = -1;
+        bounds = default;
+        if (methodStart >= methodEnd || dispatchStartIndex < 1)
+            return false;
+
+        var adjustedName = Arm64RegisterHelper.CanonicalName(adjustedIndexRegister);
+        static bool Writes(Arm64Instruction instruction, string registerName)
+            => instruction.Op0Kind == Arm64OperandKind.Register
+               && Arm64RegisterHelper.CanonicalName(instruction.Op0Reg) == registerName;
+
+        var normalizationIndex = -1;
+        for (var index = dispatchStartIndex - 1; index >= 0; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (Writes(candidate, adjustedName))
+            {
+                normalizationIndex = index;
+                break;
+            }
+            if (IsNativeControlTransfer(candidate.Mnemonic))
+                return false;
+        }
+
+        if (normalizationIndex < 0)
+            return false;
+        var normalization = nativeInstructions[normalizationIndex];
+        if (normalization.Mnemonic != Arm64Mnemonic.ADD
+            || normalization.Op1Kind != Arm64OperandKind.Register
+            || Arm64RegisterHelper.CanonicalName(normalization.Op1Reg) != adjustedName
+            || normalization.Op2Kind != Arm64OperandKind.Immediate
+            || normalization.Op2Imm <= 0)
+            return false;
+        var bias = normalization.Op2Imm;
+
+        var lowerSelectIndex = -1;
+        for (var index = normalizationIndex - 1; index >= 1; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (Writes(candidate, adjustedName))
+            {
+                lowerSelectIndex = index;
+                break;
+            }
+            if (IsNativeControlTransfer(candidate.Mnemonic))
+                return false;
+        }
+
+        if (lowerSelectIndex < 1)
+            return false;
+        var lowerSelect = nativeInstructions[lowerSelectIndex];
+        if (lowerSelect.Mnemonic != Arm64Mnemonic.CSEL
+            || lowerSelect.FinalOpConditionCode != Arm64ConditionCode.GT
+            || lowerSelect.Op1Kind != Arm64OperandKind.Register
+            || Arm64RegisterHelper.CanonicalName(lowerSelect.Op1Reg) != adjustedName
+            || lowerSelect.Op2Kind != Arm64OperandKind.Register)
+            return false;
+        var lowerConstantName = Arm64RegisterHelper.CanonicalName(lowerSelect.Op2Reg);
+
+        var lowerComparison = nativeInstructions[lowerSelectIndex - 1];
+        var isCmnAlias = lowerComparison.Mnemonic == Arm64Mnemonic.ADDS
+                         && lowerComparison.Op0Kind == Arm64OperandKind.Register
+                         && Arm64RegisterHelper.IsZeroRegister(lowerComparison.Op0Reg)
+                         && lowerComparison.Op1Kind == Arm64OperandKind.Register
+                         && Arm64RegisterHelper.CanonicalName(lowerComparison.Op1Reg) == adjustedName
+                         && lowerComparison.Op2Kind == Arm64OperandKind.Immediate
+                         && lowerComparison.Op2Imm == bias;
+        var isDecodedCmn = lowerComparison.Mnemonic == Arm64Mnemonic.CMN
+                           && lowerComparison.Op0Kind == Arm64OperandKind.Register
+                           && Arm64RegisterHelper.CanonicalName(lowerComparison.Op0Reg) == adjustedName
+                           && lowerComparison.Op1Kind == Arm64OperandKind.Immediate
+                           && lowerComparison.Op1Imm == bias;
+        if (!isCmnAlias && !isDecodedCmn)
+            return false;
+
+        var lowerConstantIndex = -1;
+        for (var index = lowerSelectIndex - 2; index >= 0; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (Writes(candidate, lowerConstantName))
+            {
+                lowerConstantIndex = index;
+                break;
+            }
+            if (IsNativeControlTransfer(candidate.Mnemonic))
+                return false;
+        }
+        if (lowerConstantIndex < 0
+            || nativeInstructions[lowerConstantIndex] is not
+            {
+                Mnemonic: Arm64Mnemonic.MOV,
+                Op1Kind: Arm64OperandKind.Immediate
+            } lowerConstant
+            || GetSignedRegisterImmediate(lowerConstant) != -bias)
+            return false;
+
+        var upperSelectIndex = -1;
+        for (var index = lowerSelectIndex - 2; index >= 0; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (Writes(candidate, adjustedName))
+            {
+                upperSelectIndex = index;
+                break;
+            }
+            if (IsNativeControlTransfer(candidate.Mnemonic))
+                return false;
+        }
+        if (upperSelectIndex < 0)
+            return false;
+        var upperSelect = nativeInstructions[upperSelectIndex];
+        if (upperSelect.Mnemonic != Arm64Mnemonic.CSEL
+            || upperSelect.FinalOpConditionCode != Arm64ConditionCode.LT
+            || upperSelect.Op1Kind != Arm64OperandKind.Register
+            || upperSelect.Op2Kind != Arm64OperandKind.Register
+            || Arm64RegisterHelper.CanonicalName(upperSelect.Op2Reg) != adjustedName)
+            return false;
+        var sourceName = Arm64RegisterHelper.CanonicalName(upperSelect.Op1Reg);
+
+        var upperConstantIndex = -1;
+        for (var index = upperSelectIndex - 1; index >= 0; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (Writes(candidate, adjustedName))
+            {
+                upperConstantIndex = index;
+                break;
+            }
+            if (IsNativeControlTransfer(candidate.Mnemonic))
+                return false;
+        }
+        if (upperConstantIndex < 0
+            || nativeInstructions[upperConstantIndex] is not
+            {
+                Mnemonic: Arm64Mnemonic.MOV,
+                Op1Kind: Arm64OperandKind.Immediate
+            } upperConstant)
+            return false;
+
+        var upperComparisonIndex = -1;
+        for (var index = upperSelectIndex - 1; index >= 0; index--)
+        {
+            var candidate = nativeInstructions[index];
+            if (candidate.Mnemonic == Arm64Mnemonic.CMP)
+            {
+                upperComparisonIndex = index;
+                break;
+            }
+            if (candidate.Mnemonic != Arm64Mnemonic.MOV)
+                return false;
+        }
+        if (upperComparisonIndex < 0)
+            return false;
+        var upperComparison = nativeInstructions[upperComparisonIndex];
+        if (upperComparison.Op0Kind != Arm64OperandKind.Register
+            || Arm64RegisterHelper.CanonicalName(upperComparison.Op0Reg) != sourceName
+            || upperComparison.Op1Kind != Arm64OperandKind.Immediate
+            || upperComparison.Op1Imm != upperConstant.Op1Imm)
+            return false;
+
+        for (var index = upperSelectIndex + 1; index < lowerSelectIndex - 1; index++)
+        {
+            if (Writes(nativeInstructions[index], adjustedName))
+                return false;
+        }
+        for (var index = lowerSelectIndex + 1; index < normalizationIndex; index++)
+        {
+            if (Writes(nativeInstructions[index], adjustedName))
+                return false;
+        }
+        for (var index = normalizationIndex + 1; index < tableLoadIndex; index++)
+        {
+            if (Writes(nativeInstructions[index], adjustedName))
+                return false;
+        }
+
+        var lowerBound = -bias;
+        var upperBound = GetSignedRegisterImmediate(upperConstant);
+        long entryCount;
+        try
+        {
+            entryCount = checked(upperBound - lowerBound + 1);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+        if (entryCount <= 0 || entryCount > MaximumJumpTableEntryCount)
+            return false;
+
+        evidenceStartIndex = upperComparisonIndex;
+        // 中文注释：夹紧形状没有显式 default 边；先保存方法入口作为有效占位，读取并验证
+        // 全部表项后再用首个 case 目标补齐理论上不可达的 CIL 总分支。
+        bounds = new Arm64JumpTableBounds(lowerBound, checked((int)entryCount), methodStart);
+        return true;
+    }
+
+    /// <summary>按目标寄存器宽度还原 MOV 立即数；Disarm 会把 W 寄存器负数保存在 uint 正值中。</summary>
+    private static long GetSignedRegisterImmediate(Arm64Instruction instruction)
+    {
+        if (instruction.Op0Kind == Arm64OperandKind.Register
+            && TryGetSignedIntegerWidthBits(instruction.Op0Reg, out var widthBits)
+            && widthBits == 32)
+            return unchecked((int)(uint)instruction.Op1Imm);
+
+        return instruction.Op1Imm;
     }
 
     private Dictionary<int, Arm64JumpTableDispatch> RecoverJumpTableDispatches(
@@ -2572,10 +2846,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     && target <= match.DispatchAddress))
                 continue;
 
+            var effectiveBounds = match.UsesClampedIndex
+                ? match.Bounds with { DefaultTarget = caseTargets[0] }
+                : match.Bounds;
             result[match.BranchIndex] = new Arm64JumpTableDispatch(
                 match.AdjustedIndexRegister,
                 match.DispatchAddress,
-                match.Bounds,
+                effectiveBounds,
                 caseTargets);
         }
 
@@ -2704,14 +2981,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return isShiftedRegister || isUnsignedExtendedRegister;
     }
 
-    private static bool IsIndependentRegisterSnapshotBeforeJump(
+    private static bool IsIndependentRegisterPreparationBeforeJump(
         Arm64Instruction instruction,
         Arm64Register jumpTargetRegister)
-        => instruction.Mnemonic == Arm64Mnemonic.MOV
+        => instruction.Mnemonic is Arm64Mnemonic.MOV
+               or Arm64Mnemonic.MOVK
+               or Arm64Mnemonic.FMOV
+               or Arm64Mnemonic.MOVI
            && instruction.Op0Kind == Arm64OperandKind.Register
-           && instruction.Op1Kind == Arm64OperandKind.Register
            && Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)
                != Arm64RegisterHelper.CanonicalName(jumpTargetRegister);
+
+    private static bool IsIndependentFlagPreservingMemoryBeforeBoundary(
+        Arm64Instruction instruction)
+        => instruction.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.STR
+           && instruction.Op0Kind == Arm64OperandKind.Register
+           && instruction.Op1Kind == Arm64OperandKind.Memory;
+
+    private static bool IsCalleeSavedGeneralPurposeRegister(Arm64Register register)
+    {
+        var canonicalName = Arm64RegisterHelper.CanonicalName(register);
+        return canonicalName.Length >= 3
+               && canonicalName[0] == 'X'
+               && int.TryParse(canonicalName[1..], out var number)
+               && number is >= 19 and <= 28;
+    }
 
     private static bool IsNativeControlTransfer(Arm64Mnemonic mnemonic)
         => mnemonic is Arm64Mnemonic.B

@@ -2115,6 +2115,273 @@ public class NewArmV8InstructionSetTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 跳转表接受比较与边界之间的独立载荷()
+    {
+        // CMP W8 的 NZCV 跨过 LDR X20,[X22] 后仍由 B.HI 消费；载荷不触碰索引 W8。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0xD4, 0x02, 0x40, 0xF9, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 跳转表接受目标累加后的独立立即数准备()
+    {
+        // ADD X10 后准备返回寄存器 W0；该立即数与跳转目标、表基址、表值和索引均无关。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B,
+                0x00, 0xD0, 0x92, 0x52, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 跳转表接受直接载荷提供零下界索引()
+    {
+        // LDR W8 是 CMP W8 的值来源，不是 SUB/ADD 归一化；零下界由无符号上界分支证明。
+        var instructions = DecodeInstructions(
+            [
+                0x68, 0x12, 0x40, 0xB9, 0x1F, 0x69, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 跳转表恢复双向条件选择夹紧的有符号索引()
+    {
+        // CMP/CSEL 把输入限制到[-6,6]，CMN/CSEL 完成下界夹紧，ADD #6 再映射到13项字节表。
+        var instructions = DecodeInstructions(
+            [
+                0x7F, 0x1A, 0x00, 0x71, 0xC8, 0x00, 0x80, 0x52,
+                0xA9, 0x00, 0x80, 0x12, 0x68, 0xB2, 0x88, 0x1A,
+                0x60, 0x0C, 0x80, 0x12, 0x1F, 0x19, 0x00, 0x31,
+                0x08, 0xC1, 0x89, 0x1A, 0xE9, 0xFF, 0xFF, 0xD0,
+                0x29, 0xE1, 0x2A, 0x91, 0x08, 0x19, 0x00, 0x11,
+                0x8A, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x38,
+                0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+        Assert.That(
+            matches,
+            Has.Count.EqualTo(1),
+            string.Join(
+                Environment.NewLine,
+                instructions.Select((instruction, index) =>
+                    $"{index}: {instruction.Mnemonic} "
+                    + $"O0={instruction.Op0Kind}/{instruction.Op0Reg}/{instruction.Op0Imm} "
+                    + $"O1={instruction.Op1Kind}/{instruction.Op1Reg}/{instruction.Op1Imm} "
+                    + $"O2={instruction.Op2Kind}/{instruction.Op2Reg}/{instruction.Op2Imm} "
+                    + $"CC={instruction.FinalOpConditionCode}/{instruction.MnemonicConditionCode}")));
+        var match = matches.Single();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(match.UsesClampedIndex, Is.True);
+            Assert.That(match.AdjustedIndexRegister, Is.EqualTo(Arm64Register.X8));
+            Assert.That(match.Bounds.LowerBound, Is.EqualTo(-6));
+            Assert.That(match.Bounds.EntryCount, Is.EqualTo(13));
+            Assert.That(match.DispatchAddress, Is.EqualTo(SyntheticByteJumpTableSite + 0x34));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 夹紧跳转表拒绝与下界不一致的零基平移量()
+    {
+        // 下界仍由 CMN #6 和 MOV #-6 证明，但最终只 ADD #5，索引可能为-1，不能读取表前字节。
+        var instructions = DecodeInstructions(
+            [
+                0x7F, 0x1A, 0x00, 0x71, 0xC8, 0x00, 0x80, 0x52,
+                0xA9, 0x00, 0x80, 0x12, 0x68, 0xB2, 0x88, 0x1A,
+                0x60, 0x0C, 0x80, 0x12, 0x1F, 0x19, 0x00, 0x31,
+                0x08, 0xC1, 0x89, 0x1A, 0xE9, 0xFF, 0xFF, 0xD0,
+                0x29, 0xE1, 0x2A, 0x91, 0x08, 0x15, 0x00, 0x11,
+                0x8A, 0x00, 0x00, 0x10, 0x2B, 0x79, 0x68, 0x38,
+                0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Is.Empty);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 夹紧跳转表拒绝下界选择后再次覆盖索引()
+    {
+        // MOV W8,#0 破坏第二次 CSEL 的到达定义，即使后续 ADD 与表尾形状完整也必须关闭候选。
+        var instructions = DecodeInstructions(
+            [
+                0x7F, 0x1A, 0x00, 0x71, 0xC8, 0x00, 0x80, 0x52,
+                0xA9, 0x00, 0x80, 0x12, 0x68, 0xB2, 0x88, 0x1A,
+                0x60, 0x0C, 0x80, 0x12, 0x1F, 0x19, 0x00, 0x31,
+                0x08, 0xC1, 0x89, 0x1A, 0x08, 0x00, 0x80, 0x52,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91,
+                0x08, 0x19, 0x00, 0x11, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B,
+                0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Is.Empty);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 跳转表接受最终表基址覆盖较早寄存器生命期()
+    {
+        // 第一组 ADRP/LDR 使用 X9 读取无关常量；第二组 ADRP/ADD 才是表读取的最终到达定义。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0x09, 0x00, 0x00, 0x90, 0x20, 0x0D, 0x4C, 0xBD,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 跳转表允许目标形成后复用已消费的索引寄存器()
+    {
+        // 表读取与目标 ADD 已消费 W8；随后 MOV W8,#-1 不会改变最终 BR X10。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B,
+                0x08, 0x00, 0x80, 0x12, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 跳转表拒绝边界前载荷覆盖已比较索引()
+    {
+        // LDR X8,[X22] 会覆盖 CMP W8 已验证的值，B.HI 的标志不能证明后续表索引安全。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0xC8, 0x02, 0x40, 0xF9, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 跳转表接受比较与边界之间的独立存储()
+    {
+        // STR WZR,[X20] 不改 NZCV，也不改索引 W8；B.HI 仍精确消费前一条 CMP 的标志。
+        var instructions = DecodeInstructions(
+            [
+                0x1F, 0x69, 0x00, 0x71, 0x9F, 0x12, 0x00, 0xB9, 0x48, 0x6E, 0x00, 0x54,
+                0xE9, 0xFF, 0xFF, 0xD0, 0x29, 0xE1, 0x2A, 0x91, 0x8A, 0x00, 0x00, 0x10,
+                0x2B, 0x79, 0x68, 0x38, 0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 跳转表接受边界前预计算的被调用方保存表基址()
+    {
+        // X19 的 ADRP/ADD 在边界检查前完成，之后没有重写；循环体可安全复用该持久表基址。
+        var instructions = DecodeInstructions(
+            [
+                0xF3, 0xFF, 0xFF, 0xD0, 0x73, 0xE2, 0x2A, 0x91,
+                0x1F, 0x69, 0x00, 0x71, 0x48, 0x6E, 0x00, 0x54,
+                0x8A, 0x00, 0x00, 0x10, 0x6B, 0x7A, 0x68, 0x38,
+                0x4A, 0x09, 0x0B, 0x8B, 0x40, 0x01, 0x1F, 0xD6,
+            ],
+            SyntheticByteJumpTableSite);
+
+        var matches = NewArmV8InstructionSet.FindJumpTableMatches(
+            instructions,
+            SyntheticJumpTableImageStart,
+            SyntheticJumpTableImageEnd);
+
+        Assert.That(matches, Has.Count.EqualTo(1));
+    }
+
+    [Test]
     [Category("边界值")]
     public void 跳转表边界保留非零下界计数与独立默认目标()
     {
