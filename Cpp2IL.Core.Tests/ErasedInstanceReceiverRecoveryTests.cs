@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
@@ -108,6 +109,106 @@ public class ErasedInstanceReceiverRecoveryTests
             Assert.That(rewritten, Is.EqualTo(1));
             Assert.That(call.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
             Assert.That(caller.ParameterLocals.Single().IsThis, Is.True);
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 布尔调用结果复用为实例接收者时恢复This并还原布尔类型()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var booleanProducer = Method(
+            owner,
+            "Compare",
+            app.SystemTypes.SystemBooleanType,
+            isStatic: true);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("reusedX0", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var producerCall = new Instruction(0, OpCode.Call, booleanProducer, receiver);
+        var instanceCall = new Instruction(1, OpCode.Call, target, result, receiver);
+        Prepare(caller, producerCall, instanceCall, receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(instanceCall.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
+            Assert.That(receiver.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 多个布尔调用结果合流复用时只计算一次共识并恢复This()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var firstProducer = Method(
+            owner,
+            "CompareFirst",
+            app.SystemTypes.SystemBooleanType,
+            isStatic: true);
+        var secondProducer = Method(
+            owner,
+            "CompareSecond",
+            app.SystemTypes.SystemBooleanType,
+            isStatic: true);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("mergedX0", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var firstCall = new Instruction(0, OpCode.Call, firstProducer, receiver);
+        var secondCall = new Instruction(1, OpCode.Call, secondProducer, receiver);
+        var instanceCall = new Instruction(2, OpCode.Call, target, result, receiver);
+        Prepare(caller, [firstCall, secondCall, instanceCall], receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.EqualTo(1));
+            Assert.That(instanceCall.Operands[2], Is.SameAs(caller.ParameterLocals.Single()));
+            Assert.That(receiver.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 混合值类型调用结果缺少类型共识时保持原接收者()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = Type("Owner", app.SystemTypes.SystemObjectType);
+        var booleanProducer = Method(
+            owner,
+            "Compare",
+            app.SystemTypes.SystemBooleanType,
+            isStatic: true);
+        var integerProducer = Method(
+            owner,
+            "Count",
+            app.SystemTypes.SystemInt32Type,
+            isStatic: true);
+        var target = Method(owner, "Read", app.SystemTypes.SystemBooleanType, isStatic: false);
+        var caller = Method(owner, "Caller", app.SystemTypes.SystemVoidType, isStatic: false);
+        var receiver = Local("ambiguousX0", owner, 4);
+        var result = Local("result", app.SystemTypes.SystemBooleanType, 5);
+        var booleanCall = new Instruction(0, OpCode.Call, booleanProducer, receiver);
+        var integerCall = new Instruction(1, OpCode.Call, integerProducer, receiver);
+        var instanceCall = new Instruction(2, OpCode.Call, target, result, receiver);
+        Prepare(caller, [booleanCall, integerCall, instanceCall], receiver, result);
+
+        var rewritten = ErasedInstanceReceiverRecovery.RunScalarValueReceivers(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.Zero);
+            Assert.That(instanceCall.Operands[2], Is.SameAs(receiver));
+            Assert.That(receiver.Type, Is.SameAs(owner));
+            Assert.That(caller.ParameterLocals, Is.Empty);
         });
     }
 
@@ -444,6 +545,20 @@ public class ErasedInstanceReceiverRecoveryTests
             definition,
             call,
             new Instruction(call.Index + 1, OpCode.Return),
+        ]);
+        method.Locals = [.. locals];
+        method.ParameterLocals = [];
+    }
+
+    private static void Prepare(
+        MethodAnalysisContext method,
+        IReadOnlyList<Instruction> instructions,
+        params LocalVariable[] locals)
+    {
+        method.ParameterOperands = [new Register(null, "X0")];
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            .. instructions,
+            new Instruction(instructions.Count, OpCode.Return),
         ]);
         method.Locals = [.. locals];
         method.ParameterLocals = [];

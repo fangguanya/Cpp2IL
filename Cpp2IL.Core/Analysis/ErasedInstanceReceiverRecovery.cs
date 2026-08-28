@@ -22,7 +22,7 @@ public static class ErasedInstanceReceiverRecovery
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
             .Where(group => group.Count() == 1)
             .ToDictionary(group => group.Key, group => group.Single());
-        var rewrites = new List<(Instruction Instruction, int ReceiverIndex)>();
+        var rewrites = new List<ReceiverRewrite>();
         foreach (var candidate in EnumerateCandidates(method))
         {
             // 泛型值T既可能是值类型，也可能是引用类型；它对Object实例方法的调用必须由
@@ -41,7 +41,7 @@ public static class ErasedInstanceReceiverRecovery
                 || !method.DeclaringType.IsAssignableTo(candidate.TargetType))
                 continue;
 
-            rewrites.Add((candidate.Instruction, candidate.ReceiverIndex));
+            rewrites.Add(new(candidate.Instruction, candidate.ReceiverIndex));
         }
 
         return RewriteToThis(method, rewrites);
@@ -57,17 +57,28 @@ public static class ErasedInstanceReceiverRecovery
             .Where(instruction => instruction.Destination is LocalVariable)
             .GroupBy(instruction => (LocalVariable)instruction.Destination!)
             .ToDictionary(group => group.Key, group => group.ToList());
-        var rewrites = new List<(Instruction Instruction, int ReceiverIndex)>();
+        var evidenceByReceiver = new Dictionary<LocalVariable, ScalarReceiverEvidence>();
+        var rewrites = new List<ReceiverRewrite>();
         foreach (var candidate in EnumerateCandidates(method))
         {
+            if (!evidenceByReceiver.TryGetValue(candidate.Receiver, out var evidence))
+            {
+                evidence = ResolveScalarReceiverEvidence(candidate.Receiver, allDefinitions);
+                evidenceByReceiver.Add(candidate.Receiver, evidence);
+            }
+
             // 该阶段与早期类型冲突阶段互斥；只处理已被调用签名定型为相容类型的接收者。
             if (candidate.ReceiverType is GenericParameterTypeAnalysisContext
                 || !candidate.ReceiverType.IsAssignableTo(candidate.TargetType)
                 || !method.DeclaringType.IsAssignableTo(candidate.TargetType)
-                || !HasErasedFinalReceiverGraph(candidate.Receiver, allDefinitions))
+                || !evidence.ShouldRewrite)
                 continue;
 
-            rewrites.Add((candidate.Instruction, candidate.ReceiverIndex));
+            rewrites.Add(new(
+                candidate.Instruction,
+                candidate.ReceiverIndex,
+                candidate.Receiver,
+                evidence.RestoredType));
         }
 
         return RewriteToThis(method, rewrites);
@@ -103,7 +114,7 @@ public static class ErasedInstanceReceiverRecovery
 
     private static int RewriteToThis(
         MethodAnalysisContext method,
-        IReadOnlyList<(Instruction Instruction, int ReceiverIndex)> rewrites)
+        IReadOnlyList<ReceiverRewrite> rewrites)
     {
         if (rewrites.Count == 0)
             return 0;
@@ -112,15 +123,20 @@ public static class ErasedInstanceReceiverRecovery
         if (thisLocal == null)
             return 0;
 
-        foreach (var (instruction, receiverIndex) in rewrites)
+        foreach (var rewrite in rewrites)
         {
-            instruction.SetOperand(receiverIndex, thisLocal);
+            rewrite.Instruction.SetOperand(rewrite.ReceiverIndex, thisLocal);
+
+            // 中文注释：调用签名曾把复用的X0定型成实例类型。只有全部原生定义都给出
+            // 同一值类型返回值时才还原局部类型，避免把混合控制流猜成布尔或整数。
+            if (rewrite is { Receiver: not null, RestoredType: not null })
+                rewrite.Receiver.Type = rewrite.RestoredType;
         }
 
         return rewrites.Count;
     }
 
-    private static bool HasErasedFinalReceiverGraph(
+    private static ScalarReceiverEvidence ResolveScalarReceiverEvidence(
         LocalVariable receiver,
         IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions)
     {
@@ -128,10 +144,52 @@ public static class ErasedInstanceReceiverRecovery
         {
             // 中文注释：ARM64 实例接收者固定从 X0 传入；若同类型调用的 X0 完全没有
             // 定义，说明优化器删除了未被被调方法观察的 this。其他参数寄存器不作推断。
-            return receiver.Register.Name == "X0";
+            return new(receiver.Register.Name == "X0", null);
         }
 
-        return HasErasedScalarValueGraph(receiver, allDefinitions);
+        if (TryResolveCallResultType(receiver, allDefinitions, out var restoredType))
+            return new(true, restoredType);
+
+        return new(HasErasedScalarValueGraph(receiver, allDefinitions), null);
+    }
+
+    private static bool TryResolveCallResultType(
+        LocalVariable receiver,
+        IReadOnlyDictionary<LocalVariable, List<Instruction>> allDefinitions,
+        out TypeAnalysisContext? restoredType)
+    {
+        restoredType = null;
+        if (!allDefinitions.TryGetValue(receiver, out var definitions) || definitions.Count == 0)
+            return false;
+
+        foreach (var definition in definitions)
+        {
+            // 中文注释：ARM64会让静态调用的值类型返回值留在X0，并把该X0直接带入
+            // 随后的实例调用。全部定义必须都是同一值类型调用结果，才构成可逆的类型证据。
+            if (!definition.IsCall
+                || definition.Operands.Count < 2
+                || definition.Operands[0] is not MethodAnalysisContext producer
+                || producer.IsVoid
+                || !producer.ReturnType.IsValueType)
+            {
+                restoredType = null;
+                return false;
+            }
+
+            if (restoredType == null)
+            {
+                restoredType = producer.ReturnType;
+                continue;
+            }
+
+            if (!ReferenceEquals(restoredType, producer.ReturnType))
+            {
+                restoredType = null;
+                return false;
+            }
+        }
+
+        return restoredType != null;
     }
 
     private static bool HasErasedScalarValueGraph(
@@ -218,4 +276,14 @@ public static class ErasedInstanceReceiverRecovery
         method.ParameterLocals.Add(entryLocal);
         return entryLocal;
     }
+
+    private readonly record struct ScalarReceiverEvidence(
+        bool ShouldRewrite,
+        TypeAnalysisContext? RestoredType);
+
+    private readonly record struct ReceiverRewrite(
+        Instruction Instruction,
+        int ReceiverIndex,
+        LocalVariable? Receiver = null,
+        TypeAnalysisContext? RestoredType = null);
 }
