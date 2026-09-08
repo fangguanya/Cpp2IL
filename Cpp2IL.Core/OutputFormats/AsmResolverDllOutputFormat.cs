@@ -46,7 +46,7 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
     public sealed override void DoOutput(ApplicationAnalysisContext context, string outputRoot)
     {
-        var ret = BuildAssemblies(context);
+        var ret = BuildAssembliesForOutput(context, outputRoot);
 
         // 具体输出器必须在生成或写入任何 PE 前验证恢复资格。
         ValidateOutputForPublication(outputRoot);
@@ -157,6 +157,9 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     protected virtual void ValidateOutputForPublication(string outputRoot)
     {
     }
+
+    protected virtual List<AssemblyDefinition> BuildAssembliesForOutput(ApplicationAnalysisContext context, string outputRoot)
+        => BuildAssemblies(context);
 
     protected abstract void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext);
 

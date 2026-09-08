@@ -24,7 +24,13 @@ public class DllIlRecoveryEmptyAnalysisTests
         public int Total => AttemptedBodyCount;
         public void Fill(MethodDefinition definition, MethodAnalysisContext context) => FillMethodBody(definition, context);
         public void Receipt(string path) => WriteOutputReceipts(path);
-        public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context) => [];
+        public Exception? BuildFailure;
+        public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
+        {
+            if (BuildFailure != null)
+                throw BuildFailure;
+            return [];
+        }
     }
 
     private sealed class MethodProbe(TypeAnalysisContext owner, TypeAnalysisContext result, string name, ulong address)
@@ -236,6 +242,49 @@ public class DllIlRecoveryEmptyAnalysisTests
             Assert.That(rows.Select(row => (row.GetProperty("assembly").GetString(), row.GetProperty("originalToken").GetUInt32())).Distinct().Count(), Is.EqualTo(rows.Length));
             Assert.That(document.RootElement.GetProperty("sourceRecoveryAccepted").GetBoolean(), Is.False);
         });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 程序集构造异常保存同一账本并保留原异常()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-BuildFailure-" + Guid.NewGuid().ToString("N"));
+        var failure = new InvalidOperationException("测试构造失败");
+        var output = new OutputProbe { BuildFailure = failure };
+        try
+        {
+            Assert.That(Assert.Throws<InvalidOperationException>(() => output.DoOutput(null!, directory)), Is.SameAs(failure));
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.That(receipt.RootElement.GetProperty("pipelineFailure").GetString(), Does.Contain("测试构造失败"));
+            Assert.That(Directory.GetFiles(directory, "*.dll"), Is.Empty);
+            Assert.That(Directory.GetFiles(directory, "*.pending"), Is.Empty);
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 已有输出目录不被新恢复覆盖()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-ExistingOutput-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "existing.txt");
+        File.WriteAllText(path, "原有产物");
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => new OutputProbe().DoOutput(null!, directory));
+            Assert.That(File.ReadAllText(path), Is.EqualTo("原有产物"));
+            Assert.That(Directory.GetFiles(directory), Has.Length.EqualTo(1));
+        }
+        finally
+        {
+            File.Delete(path);
+            Directory.Delete(directory);
+        }
     }
 
 }

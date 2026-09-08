@@ -25,6 +25,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     private string? effectiveMetadataSha256;
     private string? inputUnityVersion;
     private float inputMetadataVersion;
+    private string? activeOutputDirectory;
+    private string? pipelineFailure;
     private readonly ConcurrentDictionary<MethodAnalysisContext, MethodResult> methodResults = new();
 
     private sealed record MethodResult(
@@ -51,6 +53,37 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     public override string OutputFormatId => "dll_il_recovery";
 
     public override string OutputFormatName => "DLL files with IL Recovery";
+
+    protected override List<AssemblyDefinition> BuildAssembliesForOutput(ApplicationAnalysisContext context, string outputRoot)
+    {
+        // 拒绝混入旧产物；失败不覆盖已有工程或历史收据。
+        if (Directory.Exists(outputRoot) && Directory.EnumerateFileSystemEntries(outputRoot).Any())
+            throw new InvalidOperationException("IL 恢复输出目录必须为空。");
+        Directory.CreateDirectory(outputRoot);
+        activeOutputDirectory = outputRoot;
+        pipelineFailure = null;
+        try
+        {
+            return BuildAssemblies(context);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            pipelineFailure = exception.ToCollapsedString();
+            try
+            {
+                WriteOutputReceipts(outputRoot);
+            }
+            catch (Exception receiptException)
+            {
+                throw new AggregateException("IL 恢复失败且账本持久化失败，保留两个原始异常。", exception, receiptException);
+            }
+            throw;
+        }
+        finally
+        {
+            activeOutputDirectory = null;
+        }
+    }
 
     public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
@@ -102,6 +135,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         }
 
         InitializeOriginalMethodLedger(context);
+        // 原始分母先持久化；后续进程被硬限制终止时仍保留诚实的 PENDING 检查点。
+        if (activeOutputDirectory != null)
+            WriteOutputReceipts(activeOutputDirectory);
         try
         {
             var builtAssemblies = base.BuildAssemblies(context);
@@ -121,6 +157,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     internal void InitializeOriginalMethodLedger(ApplicationAnalysisContext context)
     {
         methodResults.Clear();
+        pipelineFailure = null;
         inputBinarySha256 = context.LibCpp2IlContext.InputBinarySha256;
         inputMetadataSha256 = context.LibCpp2IlContext.InputMetadataSha256;
         effectiveMetadataSha256 = context.LibCpp2IlContext.EffectiveMetadataSha256;
@@ -213,11 +250,13 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         SuccessfulMethodCount = RecoveredCilCount;
         Directory.CreateDirectory(outputRoot);
         var path = Path.Combine(outputRoot, "dll-il-recovery-method-ledger.json");
-        using (var stream = File.Create(path))
+        var temporaryPath = path + ".pending";
+        using (var stream = File.Create(temporaryPath))
         using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
         {
             writer.WriteStartObject();
             writer.WriteString("schema", "Cpp2IL.DllIlRecovery.MethodLedger/v2");
+            writer.WriteString("pipelineFailure", pipelineFailure);
             writer.WriteStartObject("input");
             writer.WriteString("binarySha256", inputBinarySha256);
             writer.WriteString("metadataSha256", inputMetadataSha256);
@@ -253,6 +292,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 writer.WriteString("category", row.Category);
                 writer.WriteString("detail", row.Detail);
                 writer.WriteEndObject();
+                // 每条记录立即排出 JSON 缓冲，避免全目标账本额外保留整份编码内容。
+                writer.Flush();
             }
             writer.WriteEndArray();
             writer.WriteStartArray("failures");
@@ -265,10 +306,16 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 writer.WriteString("category", failure.Category);
                 writer.WriteString("detail", failure.Detail);
                 writer.WriteEndObject();
+                writer.Flush();
             }
             writer.WriteEndArray();
             writer.WriteEndObject();
         }
+        // 完整临时文件关闭后再替换，写入失败不破坏上一份有效账本。
+        if (File.Exists(path))
+            File.Replace(temporaryPath, path, null);
+        else
+            File.Move(temporaryPath, path);
         Logger.InfoNewline($"方法恢复账本已写入 {path}；失败 {failures.Length} 个。", "DllOutput");
     }
 
