@@ -195,12 +195,14 @@ internal static class MetadataDeclarationInventoryHelper
             WriteIndex(writer, "fieldIndex", item.fieldIndex.Value, metadata.FieldDefinitions.Count);
             WriteIndex(writer, "typeReferenceIndex", item.typeIndex.Value, binary.NumTypes);
             WriteIndex(writer, "dataIndex", item.dataIndex.Value, metadata.metadataHeader.fieldAndParameterDefaultValueData.Size, true);
+            MetadataDefaultValueHelper.Write(writer, () => item.Value);
         });
         WriteTable(writer, "parameterDefaultValues", metadata.ParameterDefaultValues, (item, index) =>
         {
             WriteIndex(writer, "parameterIndex", item.parameterIndex.Value, metadata.ParameterDefinitions.Count);
             WriteIndex(writer, "typeReferenceIndex", item.typeIndex.Value, binary.NumTypes);
             WriteIndex(writer, "dataIndex", item.dataIndex.Value, metadata.metadataHeader.fieldAndParameterDefaultValueData.Size, true);
+            MetadataDefaultValueHelper.Write(writer, () => item.ContainedDefaultValue);
         });
         writer.WriteNumber("defaultValueDataOffset", metadata.metadataHeader.fieldAndParameterDefaultValueData.Offset);
         writer.WriteNumber("defaultValueDataSize", metadata.metadataHeader.fieldAndParameterDefaultValueData.Size);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using LibCpp2IL.BinaryStructures;
@@ -161,10 +162,11 @@ public static class LibCpp2ILUtils
         var metadata = context.Metadata;
 
         if (dataIndex.IsNull)
-            return null; //Literally null.
+            return null; // 原始空索引表示真实 null，与解码不支持分开。
 
         var pointer = metadata.GetDefaultValueFromIndex(dataIndex);
-        if (pointer <= 0) return null;
+        if (dataIndex.Value < 0 || dataIndex.Value >= metadata.metadataHeader.fieldAndParameterDefaultValueData.Size || pointer <= 0)
+            throw new InvalidDataException("默认值数据索引超出原始数据区段。");
 
         var defaultValueType = context.Binary.GetType(typeIndex);
         metadata.GetLockOrThrow();
@@ -212,7 +214,7 @@ public static class LibCpp2ILUtils
                         LibLogger.WarnNewline("[GetDefaultValue] String length is really large: " + len);
                     return Encoding.UTF8.GetString(metadata.ReadByteArrayAtRawAddressNoLock(pointer + lenLen, len));
                 default:
-                    return null;
+                    throw new NotSupportedException($"默认值类型尚未支持：{defaultValueType.Type}。");
             }
         }
         finally
