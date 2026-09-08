@@ -18,6 +18,11 @@ public sealed class LibCpp2IlContext
     public Il2CppBinary Binary { get; internal set; } = null!;
     public Il2CppMetadata Metadata { get; internal set; } = null!;
 
+    // 身份来自实际加载字节；仅传入已解析对象时保持缺失，禁止猜测来源文件。
+    public string? InputBinarySha256 { get; internal set; }
+    public string? InputMetadataSha256 { get; internal set; }
+    public string? EffectiveMetadataSha256 { get; internal set; }
+
     public Dictionary<ulong, List<Il2CppMethodDefinition>> MethodsByPtr { get; } = new();
 
     public LibCpp2IlReflectionCache ReflectionCache { get; } = new();

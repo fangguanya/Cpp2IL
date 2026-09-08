@@ -3,6 +3,8 @@ using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using System.Security.Cryptography;
+using AssetRipper.Primitives;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
@@ -170,6 +172,70 @@ public class DllIlRecoveryEmptyAnalysisTests
             File.Delete(path);
             Directory.Delete(directory);
         }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("异常输入")]
+    public void 账本绑定已加载字节而非输出时的可变路径()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var binaryDigest = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Paths.Simple2019Game.GameAssembly))).ToLowerInvariant();
+        var metadataDigest = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Paths.Simple2019Game.Metadata))).ToLowerInvariant();
+        var oldOptions = Cpp2IlApi.RuntimeOptions;
+        try
+        {
+            Cpp2IlApi.RuntimeOptions = new Cpp2IlRuntimeArgs { PathToAssembly = "不存在的路径", PathToMetadata = "不存在的路径" };
+            Assert.Multiple(() =>
+            {
+                Assert.That(app.LibCpp2IlContext.InputBinarySha256, Is.EqualTo(binaryDigest));
+                Assert.That(app.LibCpp2IlContext.InputMetadataSha256, Is.EqualTo(metadataDigest));
+                Assert.That(app.LibCpp2IlContext.EffectiveMetadataSha256, Is.EqualTo(metadataDigest));
+            });
+            var output = new OutputProbe();
+            output.InitializeOriginalMethodLedger(app);
+        }
+        finally
+        {
+            Cpp2IlApi.RuntimeOptions = oldOptions;
+        }
+    }
+
+    [Test]
+    [Category("全目标集成")]
+    public void 冻结目标全部方法账本保留输入身份且两次逐字节一致()
+    {
+        var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        var binary = Environment.GetEnvironmentVariable("CPP2IL_ARM64_FIXTURE_BINARY");
+        var metadata = Environment.GetEnvironmentVariable("CPP2IL_ARM64_FIXTURE_METADATA");
+        var unity = Environment.GetEnvironmentVariable("CPP2IL_ARM64_FIXTURE_UNITY_VERSION");
+        if (string.IsNullOrWhiteSpace(root) || string.IsNullOrWhiteSpace(binary) ||
+            string.IsNullOrWhiteSpace(metadata) || string.IsNullOrWhiteSpace(unity))
+            Assert.Ignore("全目标账本回归需要冻结输入路径、版本与独立证据目录。");
+        var firstRoot = Path.Combine(root!, "first");
+        var secondRoot = Path.Combine(root!, "second");
+        Assert.That(Directory.Exists(firstRoot) || Directory.Exists(secondRoot), Is.False, "证据目录已有产物，禁止覆盖。");
+        Cpp2IlApi.InitializeLibCpp2Il(binary!, metadata!, UnityVersion.Parse(unity!));
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var output = new OutputProbe();
+        output.InitializeOriginalMethodLedger(app);
+        output.Receipt(firstRoot);
+        output.InitializeOriginalMethodLedger(app);
+        output.Receipt(secondRoot);
+        var firstPath = Path.Combine(firstRoot, "dll-il-recovery-method-ledger.json");
+        var secondPath = Path.Combine(secondRoot, "dll-il-recovery-method-ledger.json");
+        using var first = File.OpenRead(firstPath);
+        using var second = File.OpenRead(secondPath);
+        Assert.That(SHA256.HashData(first), Is.EqualTo(SHA256.HashData(second)));
+        using var document = JsonDocument.Parse(File.ReadAllText(firstPath));
+        var rows = document.RootElement.GetProperty("methods").EnumerateArray().ToArray();
+        Assert.Multiple(() =>
+        {
+            Assert.That(rows.Length, Is.EqualTo(app.Metadata.MethodDefinitionCount));
+            Assert.That(rows.All(row => row.GetProperty("outcome").GetString() == "PENDING"), Is.True);
+            Assert.That(rows.Select(row => (row.GetProperty("assembly").GetString(), row.GetProperty("originalToken").GetUInt32())).Distinct().Count(), Is.EqualTo(rows.Length));
+            Assert.That(document.RootElement.GetProperty("sourceRecoveryAccepted").GetBoolean(), Is.False);
+        });
     }
 
 }

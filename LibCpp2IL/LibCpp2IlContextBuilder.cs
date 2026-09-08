@@ -23,6 +23,8 @@ public sealed class LibCpp2IlContextBuilder
 
     public void LoadMetadata(byte[] metadataBytes, UnityVersion unityVersion)
     {
+        var inputSha256 = InputIdentityHelper.ComputeSha256(metadataBytes);
+        var effectiveSha256 = inputSha256;
         var start = DateTime.Now;
         LibLogger.InfoNewline("Initializing Metadata...");
 
@@ -41,7 +43,8 @@ public sealed class LibCpp2IlContextBuilder
                 
                 if(fixedBytes == null)
                     throw new Exception("Metadata fixup function returned null, cannot proceed with metadata loading. Original exception follows.", e);
-                
+
+                effectiveSha256 = InputIdentityHelper.ComputeSha256(fixedBytes);
                 metadata = Il2CppMetadata.ReadFrom(fixedBytes, unityVersion);
                 
                 LibLogger.InfoNewline("Metadata read succeeded after fixup.");
@@ -55,10 +58,14 @@ public sealed class LibCpp2IlContextBuilder
         LibLogger.InfoNewline($"Initialized Metadata in {(DateTime.Now - start).TotalMilliseconds:F0}ms");
 
         LoadMetadata(metadata);
+        _context.InputMetadataSha256 = inputSha256;
+        _context.EffectiveMetadataSha256 = effectiveSha256;
     }
 
     public void LoadMetadata(Il2CppMetadata metadata)
     {
+        _context.InputMetadataSha256 = null;
+        _context.EffectiveMetadataSha256 = null;
         _context.Metadata = metadata;
         metadata.SetOwningContext(_context);
 
@@ -70,13 +77,16 @@ public sealed class LibCpp2IlContextBuilder
         if (!_metadataLoaded)
             throw new InvalidOperationException("Metadata must be loaded before the binary can be loaded.");
 
+        var inputSha256 = InputIdentityHelper.ComputeSha256(binaryBytes);
         LibCpp2IlBinaryRegistry.CreateAndInit(binaryBytes, _context);
+        _context.InputBinarySha256 = inputSha256;
 
         _binaryLoaded = true;
     }
 
     public void LoadBinary(Il2CppBinary binary)
     {
+        _context.InputBinarySha256 = null;
         if (!_metadataLoaded)
             throw new InvalidOperationException("Metadata must be loaded before the binary can be loaded.");
 

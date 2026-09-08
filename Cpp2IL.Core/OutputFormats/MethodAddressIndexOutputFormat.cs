@@ -78,8 +78,9 @@ public sealed class MethodAddressIndexOutputFormat : Cpp2IlOutputFormat
         writer.WriteString("unityVersion", context.UnityVersion.ToString());
         writer.WriteNumber("metadataVersion", context.MetadataVersion);
         writer.WriteStartObject("input");
-        writer.WriteString("binarySha256", FileDigest(runtimeOptions!.PathToAssembly));
-        writer.WriteString("metadataSha256", FileDigest(runtimeOptions.PathToMetadata));
+        writer.WriteString("binarySha256", context.LibCpp2IlContext.InputBinarySha256);
+        writer.WriteString("metadataSha256", context.LibCpp2IlContext.InputMetadataSha256);
+        writer.WriteString("effectiveMetadataSha256", context.LibCpp2IlContext.EffectiveMetadataSha256);
         writer.WriteEndObject();
         // 二进制摘要由宿主冻结；库内不假设单文件/AOT 宿主存在独立 DLL 路径。
         writer.WriteString("producerVersion", typeof(MethodAddressIndexOutputFormat).Assembly.GetName().Version?.ToString());

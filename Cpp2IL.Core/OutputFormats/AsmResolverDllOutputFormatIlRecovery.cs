@@ -20,6 +20,11 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     private HashSet<MethodAnalysisContext>? selectedRecoveryMethods;
     private bool hasSelection;
     private bool originalDenominatorValidated;
+    private string? inputBinarySha256;
+    private string? inputMetadataSha256;
+    private string? effectiveMetadataSha256;
+    private string? inputUnityVersion;
+    private float inputMetadataVersion;
     private readonly ConcurrentDictionary<MethodAnalysisContext, MethodResult> methodResults = new();
 
     private sealed record MethodResult(
@@ -116,6 +121,11 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     internal void InitializeOriginalMethodLedger(ApplicationAnalysisContext context)
     {
         methodResults.Clear();
+        inputBinarySha256 = context.LibCpp2IlContext.InputBinarySha256;
+        inputMetadataSha256 = context.LibCpp2IlContext.InputMetadataSha256;
+        effectiveMetadataSha256 = context.LibCpp2IlContext.EffectiveMetadataSha256;
+        inputUnityVersion = context.UnityVersion.ToString();
+        inputMetadataVersion = context.MetadataVersion;
         originalDenominatorValidated = false;
         TotalMethodCount = 0;
         SuccessfulMethodCount = 0;
@@ -208,6 +218,14 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         {
             writer.WriteStartObject();
             writer.WriteString("schema", "Cpp2IL.DllIlRecovery.MethodLedger/v2");
+            writer.WriteStartObject("input");
+            writer.WriteString("binarySha256", inputBinarySha256);
+            writer.WriteString("metadataSha256", inputMetadataSha256);
+            writer.WriteString("effectiveMetadataSha256", effectiveMetadataSha256);
+            writer.WriteString("unityVersion", inputUnityVersion);
+            writer.WriteNumber("metadataVersion", inputMetadataVersion);
+            writer.WriteEndObject();
+            writer.WriteString("producerVersion", typeof(AsmResolverDllOutputFormatIlRecovery).Assembly.GetName().Version?.ToString());
             // 当前收据仍包含诊断输出，不具备完整源码或正式发布的验收资格。
             writer.WriteBoolean("sourceRecoveryAccepted", false);
             writer.WriteBoolean("formalPublishEligible", false);
@@ -257,7 +275,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     protected override void ValidateOutputForPublication(string outputRoot)
     {
         // 不完整结果只持久化同一账本供排错；任何 DLL 都尚未写入。
-        if (!originalDenominatorValidated || hasSelection || methodResults.Values.Any(row =>
+        if (!originalDenominatorValidated || inputBinarySha256 == null || inputMetadataSha256 == null ||
+            inputMetadataSha256 != effectiveMetadataSha256 || hasSelection || methodResults.Values.Any(row =>
                 row.Outcome is not ("CIL_EMITTED" or "DECLARATION")))
         {
             WriteOutputReceipts(outputRoot);
