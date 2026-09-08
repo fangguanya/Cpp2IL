@@ -399,4 +399,65 @@ public class DllIlRecoveryEmptyAnalysisTests
             Directory.Delete(directory);
         }
     }
+    private sealed class UnknownOperand : IOperand
+    {
+        public override string ToString() => "未知夹具操作数";
+    }
+
+    [TestCase("opcode", "UNKNOWN_OPCODE")]
+    [TestCase("return", "RETURN_VALUE")]
+    [TestCase("load", "UNKNOWN_LOAD")]
+    [TestCase("store", "UNKNOWN_STORE")]
+    [TestCase("absolute_store", "MEMORY_STORE")]
+    [TestCase("local_store", "MEMORY_STORE")]
+    [Category("异常输入")]
+    [Category("边界值")]
+    public void 未知读写和缺失返回不伪装为成功(string shape, string operation)
+    {
+        var (context, definition) = Fixture("UnresolvedDataFlow", 32768);
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = definition.DeclaringModule!;
+        var integer = new TypeDefinition("System", "Int32", TypeAttributes.Public | TypeAttributes.Sealed);
+        module.TopLevelTypes.Add(integer);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType", integer);
+        var local = new LocalVariable("value", new Register(null, "X1"), app.SystemTypes.SystemInt32Type);
+        context.Locals = [local];
+        var instruction = shape switch
+        {
+            "opcode" => new Instruction(0, (OpCode)int.MaxValue),
+            "return" => new Instruction(0, OpCode.Return),
+            "load" => new Instruction(0, OpCode.Move, local, new UnknownOperand()),
+            "store" => new Instruction(0, OpCode.Move, new UnknownOperand(), new Immediate(7)),
+            "absolute_store" => new Instruction(0, OpCode.Move, new MemoryOperand(addend: 40960), new Immediate(7)),
+            "local_store" => new Instruction(0, OpCode.Move, new MemoryOperand(baseRegister: local), new Immediate(7)),
+            _ => throw new ArgumentOutOfRangeException(nameof(shape))
+        };
+        if (shape == "return")
+        {
+            context = new MethodProbe(app.SystemTypes.SystemObjectType, app.SystemTypes.SystemInt32Type, "MissingReturn", 36864);
+            definition.Signature = MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32);
+        }
+        var end = new Instruction(1, OpCode.Return);
+        context.ConvertedIsil = [instruction, end];
+        context.ControlFlowGraph = new ISILControlFlowGraph([end]);
+        context.ControlFlowGraph.Blocks.Single(block => block.Instructions.Contains(end)).Instructions.Insert(0, instruction);
+        var output = new OutputProbe();
+        output.Fill(definition, context);
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-UnresolvedData-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            output.Receipt(directory);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.That(output.Successful, Is.Zero, receipt.RootElement.ToString());
+            Assert.That(definition.CilMethodBody, Is.Null);
+            var failure = receipt.RootElement.GetProperty("failures")[0];
+            Assert.That(failure.GetProperty("category").GetString(), Is.EqualTo("UNRESOLVED_CIL_SEMANTICS"), failure.ToString());
+            Assert.That(failure.GetProperty("detail").GetString(), Does.Contain(operation));
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
 }

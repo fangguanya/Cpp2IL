@@ -657,7 +657,7 @@ public static class IlGenerator
                         // 聚合体已由各个 V 返回寄存器重组并压入求值栈。
                     }
                     else
-                        instructions.Add(CilOpCodes.Ldnull); // ret still pops a value even if we lost track of it
+                        throw new UnresolvedCilSemanticException(method.FullName, "RETURN_VALUE", instruction.ToString());
                 }
                 instructions.Add(CilOpCodes.Ret);
                 break;
@@ -1017,9 +1017,7 @@ public static class IlGenerator
                 }
 
             default:
-                instructions.Add(CilOpCodes.Ldstr, $"Unknown instruction: {instruction}");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "UNKNOWN_OPCODE", instruction.ToString());
         }
 
         return instructions.ToList().GetRange(startIndex, instructions.Count - startIndex); // Return added IL
@@ -1397,10 +1395,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Newobj, importer.ImportMethod(constructor.ToMethodDescriptor(module)));
                 break;
             default:
-                instructions.Add(CilOpCodes.Ldstr, "Unknown operand: " + operand.ToString());
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                instructions.Add(CilOpCodes.Ldnull);
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "UNKNOWN_LOAD", operand.ToString() ?? string.Empty);
         }
     }
 
@@ -2005,18 +2000,12 @@ public static class IlGenerator
                         break;
                     }
 
-                    // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
-                    break;
+                    // 原生地址写入与局部变量赋值不同；只有上方已证明的托管引用写入可直接发射。
                 }
-                instructions.Add(CilOpCodes.Pop);
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "MEMORY_STORE", operand.ToString() ?? string.Empty);
 
             default:
-                instructions.Add(CilOpCodes.Ldstr, $"Store into unknown operand: {operand}");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                instructions.Add(CilOpCodes.Pop);
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "UNKNOWN_STORE", operand.ToString() ?? string.Empty);
         }
     }
 }
