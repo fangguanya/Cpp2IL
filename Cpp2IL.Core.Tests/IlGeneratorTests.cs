@@ -2349,6 +2349,79 @@ public class IlGeneratorTests
         }
     }
 
+    [TestCase("System.Int64", 0L)]
+    [TestCase("System.Int64", 1L)]
+    [TestCase("System.Int64", long.MinValue)]
+    [TestCase("System.UInt64", 0L)]
+    [TestCase("System.UInt64", 1L)]
+    [TestCase("System.UInt64", -1L)]
+    [TestCase("System.IntPtr", 0L)]
+    [TestCase("System.IntPtr", -1L)]
+    [TestCase("System.UIntPtr", 0L)]
+    [TestCase("System.UIntPtr", -1L)]
+    [Category("边界值")]
+    public void 目标类型常量生成PE后实际执行保持位模式(string typeName, long value)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var returnType = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName(typeName)!;
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,
+            "ReadConstant", returnType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([new Instruction(0, OpCode.Return, new Immediate(value))]);
+        context.Locals = [];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("TypedImmediate.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemObjectType, "Object", TypeAttributes.Public);
+        var signature = typeName switch
+        {
+            "System.Int64" => module.CorLibTypeFactory.Int64,
+            "System.UInt64" => module.CorLibTypeFactory.UInt64,
+            "System.IntPtr" => module.CorLibTypeFactory.IntPtr,
+            "System.UIntPtr" => module.CorLibTypeFactory.UIntPtr,
+            _ => throw new InvalidOperationException("测试返回类型缺少真实运行签名。")
+        };
+        var host = new TypeDefinition("Fixture", "TypedImmediateHost", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("ReadConstant", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(signature));
+        host.Methods.Add(definition);
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("TypedImmediate", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        byte[] pe = stream.ToArray();
+        var runtime = System.Reflection.Assembly.Load(pe);
+        object result = runtime.GetType("Fixture.TypedImmediateHost", true)!.GetMethod("ReadConstant")!.Invoke(null, null)!;
+        // 按 CLR 实际返回类型读取位模式，不在测试侧重写待验证的方法体。
+        ulong actualBits = result switch
+        {
+            long signed => unchecked((ulong)signed),
+            ulong unsigned => unsigned,
+            IntPtr signedPointer => unchecked((ulong)signedPointer.ToInt64()),
+            UIntPtr unsignedPointer => unsignedPointer.ToUInt64(),
+            _ => throw new InvalidOperationException("运行结果类型不符合生成签名。")
+        };
+        ulong expectedBits = unchecked((ulong)value);
+        if (typeName == "System.UIntPtr" && IntPtr.Size == 4) expectedBits &= uint.MaxValue;
+        Assert.That(actualBits, Is.EqualTo(expectedBits));
+        string? root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        if (!string.IsNullOrWhiteSpace(root))
+        {
+            string directory = System.IO.Path.Combine(root, $"typed-immediate-{returnType.Name}-{unchecked((ulong)value):X16}");
+            System.IO.Directory.CreateDirectory(directory);
+            using (var output = new System.IO.FileStream(System.IO.Path.Combine(directory, "TypedImmediate.dll"), System.IO.FileMode.CreateNew)) output.Write(pe);
+            using var receipt = new System.IO.FileStream(System.IO.Path.Combine(directory, "runtime-bits.json"), System.IO.FileMode.CreateNew);
+            System.Text.Json.JsonSerializer.Serialize(receipt, new
+            {
+                schema = "TypedImmediateRuntime/v1", typeName, value, expectedBits, actualBits,
+                pointerSize = IntPtr.Size, runtimeExecutionProved = true, sourceRoundTripProved = false,
+                assemblySha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(pe)).ToLowerInvariant()
+            });
+        }
+    }
+
     private delegate void 引用零写委托(ref long value);
 
     [TestCase("managed_reference")]
