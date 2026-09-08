@@ -150,9 +150,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             methodContext.Analyze();
 
             if (methodContext.ConvertedIsil.Count == 0)
-                methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
-            else
-                IlGenerator.GenerateIl(methodContext, methodDefinition);
+                throw new EmptyMethodAnalysisException(methodContext);
+
+            // 原版合法返回仍由指令与 CFG 生成，不用默认方法体代替缺失的分析。
+            IlGenerator.GenerateIl(methodContext, methodDefinition);
 
             CilStackValidator.Validate(methodDefinition.CilMethodBody!, methodContext.FullName);
             Interlocked.Increment(ref validatedMethodCount);
@@ -176,7 +177,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 methodContext.DeclaringType?.DeclaringAssembly.Name ?? string.Empty,
                 methodContext.DeclaringType?.FullName ?? string.Empty,
                 methodContext.FullName,
-                ClassifyFailure(detail),
+                e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" : ClassifyFailure(detail),
                 detail));
 
             // 保留失败方法的最终 CFG，账本中的 CIL 窗口可由同一方法图追溯到具体 SSA/边复制。
@@ -214,6 +215,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         {
             writer.WriteStartObject();
             writer.WriteString("schema", "Cpp2IL.DllIlRecovery.MethodLedger/v1");
+            // 当前收据仍包含诊断输出，不具备完整源码或正式发布的验收资格。
+            writer.WriteBoolean("sourceRecoveryAccepted", false);
+            writer.WriteBoolean("formalPublishEligible", false);
             writer.WriteNumber("selectedMethods", selectedMethodCount);
             writer.WriteNumber("totalMethodsWithBody", TotalMethodCount);
             writer.WriteNumber("successfulMethods", SuccessfulMethodCount);
