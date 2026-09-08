@@ -47,6 +47,21 @@ public class NativeZeroBlockExecutionTests
         Assert.That(definition.Signature.ParameterTypes.Select(type => type.FullName), Is.EqualTo(
             new[] { "System.String", "UnityEngine.Bindings.ManagedSpanWrapper&" }));
         Assert.That(original.AnalysisWarnings, Is.Empty);
+        // 完整原始方法中的零指针存储与宽整数调用必须保持真实求值栈种类。
+        Assert.That(body.Instructions.Any(instruction => instruction.OpCode.Code ==
+            AsmResolver.PE.DotNet.Cil.CilCode.Conv_U), Is.True);
+        for (int index = 1; index < body.Instructions.Count; index++)
+        {
+            var instruction = body.Instructions[index];
+            if (instruction.OpCode.Code == AsmResolver.PE.DotNet.Cil.CilCode.Stfld)
+                Assert.That(body.Instructions[index - 1].OpCode.Code,
+                    Is.Not.EqualTo(AsmResolver.PE.DotNet.Cil.CilCode.Ldnull));
+            if (instruction.Operand is IMethodDescriptor called
+                && called.Signature?.ParameterTypes.Count == 1
+                && called.Signature.ParameterTypes[0].FullName == "System.UInt64")
+                Assert.That(body.Instructions[index - 1].OpCode.Code,
+                    Is.EqualTo(AsmResolver.PE.DotNet.Cil.CilCode.Ldc_I8));
+        }
         var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
         Assert.That(root, Is.Not.Null.And.Not.Empty);
         Directory.CreateDirectory(root!);

@@ -2078,6 +2078,49 @@ public class IlGeneratorTests
         => appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.RuntimeTypeHandle")!;
 
+    [TestCase("System.Int64", 0L)]
+    [TestCase("System.Int64", 1L)]
+    [TestCase("System.Int64", long.MinValue)]
+    [TestCase("System.UInt64", 1L)]
+    [TestCase("System.UInt64", -1L)]
+    [TestCase("System.UInt64", long.MaxValue)]
+    [Category("边界值")]
+    public void 八字节目标立即数保持完整I8栈类型(string typeName, long value)
+    {
+        var type = Cpp2IlApi.CurrentAppContext!.GetAssemblyByName("mscorlib")!.GetTypeByFullName(typeName)!;
+        var emitted = 生成局部量立即数赋值Cil(type, value);
+        Assert.That(emitted[0].OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
+        Assert.That(emitted[0].Operand, Is.EqualTo(value));
+        Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldc_I4), Is.False);
+    }
+
+    [TestCase("System.IntPtr", 0L, true)]
+    [TestCase("System.IntPtr", -1L, true)]
+    [TestCase("System.UIntPtr", 1L, false)]
+    [TestCase("pointer", 0L, false)]
+    [TestCase("pointer", -1L, false)]
+    [Category("基本功能")]
+    public void 原生地址立即数使用目标宽度而非托管空引用(string typeName, long value, bool signed)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var type = typeName == "pointer" ? new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type)
+            : app.GetAssemblyByName("mscorlib")!.GetTypeByFullName(typeName)!;
+        var emitted = 生成局部量立即数赋值Cil(type, value);
+        Assert.That(emitted[0].OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
+        Assert.That(emitted[0].Operand, Is.EqualTo(value));
+        Assert.That(emitted[1].OpCode, Is.EqualTo(signed ? CilOpCodes.Conv_I : CilOpCodes.Conv_U));
+        Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 整数零不伪造托管引用()
+    {
+        var error = Assert.Throws<UnresolvedCilSemanticException>(() => 生成局部量立即数赋值Cil(
+            Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type.MakeByReferenceType(), 0));
+        Assert.That(error!.Message, Does.Contain("IMMEDIATE_MANAGED_BYREF"));
+    }
+
     private static CilInstruction[] 生成局部量立即数赋值Cil(
         TypeAnalysisContext? localType,
         long value)
@@ -2110,14 +2153,17 @@ public class IlGeneratorTests
             TypeAttributes.Public | TypeAttributes.Class);
         if (localType != null && !ReferenceEquals(localType, systemObject))
         {
-            var separator = localType.FullName.LastIndexOf('.');
-            var name = separator >= 0 ? localType.FullName[(separator + 1)..] : localType.FullName;
+            // 包装类型的签名递归引用元素，测试绑定必须落到真实元素声明。
+            var boundType = localType;
+            while (boundType is WrappedTypeAnalysisContext wrapped) boundType = wrapped.ElementType;
+            var separator = boundType.FullName.LastIndexOf('.');
+            var name = separator >= 0 ? boundType.FullName[(separator + 1)..] : boundType.FullName;
             绑定AsmResolver系统类型(
                 module,
-                localType,
+                boundType,
                 name,
                 TypeAttributes.Public
-                | (localType.IsValueType
+                | (boundType.IsValueType
                     ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout
                     : TypeAttributes.Class));
         }

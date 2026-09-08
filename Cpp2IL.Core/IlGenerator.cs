@@ -1129,8 +1129,27 @@ public static class IlGenerator
         var module = method.DeclaringModule!;
         var importer = module.DefaultImporter!;
 
-        // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
-        // and read back as a cast from a number.
+        // 常量的求值栈种类由使用位置的真实签名决定，不按数值大小猜测 I4。
+        if (operand is Immediate typedImmediate && expectedType != null)
+        {
+            if (expectedType is ByRefTypeAnalysisContext)
+                throw new UnresolvedCilSemanticException(method.FullName, "IMMEDIATE_MANAGED_BYREF",
+                    "整数常量没有可证明的托管引用来源。");
+            var storageType = expectedType.IsEnumType ? expectedType.EnumUnderlyingType : expectedType;
+            if (expectedType is PointerTypeAnalysisContext || storageType?.FullName is "System.IntPtr" or "System.UIntPtr")
+            {
+                instructions.Add(CilOpCodes.Ldc_I8, typedImmediate.Value);
+                instructions.Add(storageType?.FullName == "System.IntPtr" ? CilOpCodes.Conv_I : CilOpCodes.Conv_U);
+                return;
+            }
+            if (storageType?.FullName is "System.Int64" or "System.UInt64")
+            {
+                instructions.Add(CilOpCodes.Ldc_I8, typedImmediate.Value);
+                return;
+            }
+        }
+
+        // 托管引用的整数零表示 null；非托管指针已在上方按 native int 发射。
         if (expectedType is { IsValueType: false } && IsZeroConstant(operand))
         {
             instructions.Add(CilOpCodes.Ldnull);
