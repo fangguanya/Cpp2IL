@@ -146,7 +146,7 @@ public static class PackedFieldStoreRecovery
         if (affected.Length < 2
             || affected.Any(layout => !IsCovered(layout.Range, ranges))
             || HasOverlappingFields(affected)
-            || HasIntermediateObservation(block, candidates, affected, receiver))
+            || HasIntermediateObservation(block, candidates))
             return 0;
 
         foreach (var candidate in candidates)
@@ -258,15 +258,12 @@ public static class PackedFieldStoreRecovery
 
     private static bool HasIntermediateObservation(
         Block block,
-        IReadOnlyList<StoreCandidate> candidates,
-        IReadOnlyCollection<FieldLayout> fields,
-        LocalVariable receiver)
+        IReadOnlyList<StoreCandidate> candidates)
     {
         var candidateInstructions = new HashSet<Instruction>(candidates
             .Select(candidate => candidate.Instruction));
         var first = candidates.Min(candidate => block.Instructions.IndexOf(candidate.Instruction));
         var last = candidates.Max(candidate => block.Instructions.IndexOf(candidate.Instruction));
-        var affectedFields = new HashSet<FieldAnalysisContext>(fields.Select(field => field.Field));
 
         for (var index = first; index <= last; index++)
         {
@@ -283,9 +280,9 @@ public static class PackedFieldStoreRecovery
 
             foreach (var operand in instruction.Operands)
             {
-                if (operand is FieldReference field
-                    && ReferenceEquals(field.Local, receiver)
-                    && affectedFields.Contains(field.Field))
+                // 尚无内存别名不相交证明时，原始内存或其他局部接收者的字段都可能观察本次写入。
+                // 只跨越纯局部计算，不能仅按接收者引用相等就认定没有中间观察或覆盖。
+                if (operand is MemoryOperand or FieldReference)
                     return true;
             }
         }

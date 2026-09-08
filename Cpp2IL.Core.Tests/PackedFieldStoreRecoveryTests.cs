@@ -122,6 +122,44 @@ public class PackedFieldStoreRecoveryTests
         });
     }
 
+    [TestCase("memory_read", false)]
+    [TestCase("memory_write", false)]
+    [TestCase("field_alias", false)]
+    [TestCase("pure_local", true)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 宽零写合并只跨越已知纯局部计算(string kind, bool expectedRewrite)
+    {
+        var fixture = CreateFixture(0, 64, 0, true, 5, 64, true);
+        var block = fixture.Graph.Blocks.Single(b => b.Instructions.Contains(fixture.FirstStore));
+        var observation = block.Instructions[block.Instructions.IndexOf(fixture.FirstStore) + 1];
+        var field = (FieldReference)observation.Operands[1];
+        var value = observation.Operands[0];
+        var memory = (MemoryOperand)fixture.FirstStore.Operands[0];
+        switch (kind)
+        {
+            case "memory_read":
+                observation.SetOperands(value, new MemoryOperand(memory.Base!, addend: 4));
+                break;
+            case "memory_write":
+                observation.SetOperands(new MemoryOperand(memory.Base!, addend: 4), new Immediate(1));
+                break;
+            case "field_alias":
+                var alias = new LocalVariable("alias", new Register(null, "X20"), field.Local.Type);
+                observation.SetOperands(value, new FieldReference(field.Field, alias, field.Offset));
+                break;
+            case "pure_local":
+                observation.SetOperands(value, new Immediate(1));
+                break;
+        }
+
+        Assert.That(PackedFieldStoreRecovery.Run(fixture.Method), Is.EqualTo(expectedRewrite ? 3 : 0));
+        Assert.That(fixture.FirstStore.OpCode, Is.EqualTo(expectedRewrite ? OpCode.Nop : OpCode.Move));
+        Assert.That(fixture.SecondStore!.OpCode, Is.EqualTo(expectedRewrite ? OpCode.Nop : OpCode.Move));
+        Assert.That(PackedFieldStoreRecovery.Run(fixture.Method), Is.Zero, "重复分析应保持原有判定与图稳定。");
+    }
+
     private static Fixture CreateFixture(
         long firstAddend,
         int firstWidthBits,
