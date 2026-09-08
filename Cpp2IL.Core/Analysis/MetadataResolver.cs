@@ -1007,6 +1007,13 @@ public static class MetadataResolver
                         || fieldLayout.Size * 8 != instruction.MemoryAccessWidthBits))
                     continue;
 
+                // 整结构与首字段可能同宽且同偏移；已知强类型的读写值必须与字段声明一致。
+                if (local.Type is ByRefTypeAnalysisContext
+                    && instruction.Operands[1 - i] is LocalVariable { Type: { } valueType }
+                    && valueType.FullName != "System.Object"
+                    && !GenericCallRebinder.TypesEquivalent(valueType, fieldReference.Field.FieldType))
+                    continue;
+
                 instruction.SetOperand(i, fieldReference);
                 changed = true;
             }

@@ -2231,6 +2231,20 @@ public class MetadataResolverTests
         Assert.That(before, Is.TypeOf<MemoryOperand>());
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    [Category("边界值")]
+    public void 零偏移整结构读写不得因同宽而误认成首字段(bool store)
+    {
+        var fixture = CreateByRefFieldFixture(0, 32, store);
+        var value = (LocalVariable)fixture.Access.Operands[store ? 1 : 0];
+        value.Type = ((ByRefTypeAnalysisContext)fixture.Receiver.Type!).ElementType;
+        value.Type.Fields.RemoveAll(field => field.Offset != 0);
+        var memory = fixture.Access.Operands[store ? 0 : 1];
+        Assert.That(MetadataResolver.ResolveFieldOffsets(fixture.Method), Is.False);
+        Assert.That(fixture.Access.Operands[store ? 0 : 1], Is.SameAs(memory));
+    }
+
     private static (MethodAnalysisContext Method, Instruction Access, FieldAnalysisContext Field, LocalVariable Receiver)
         CreateByRefFieldFixture(int offset, int width, bool store, bool overlap = false, bool referenceElement = false)
     {

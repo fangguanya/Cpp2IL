@@ -6,6 +6,8 @@ using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Utils;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils.AsmResolver;
@@ -1220,6 +1222,56 @@ public class IlGeneratorTests
                 il.Any(instruction => instruction.Operand is int value && value == 0x43870000),
                 Is.True);
         }
+    }
+
+    [TestCase(0)]
+    [TestCase(4)]
+    [TestCase(12)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 托管结构字段解析后发射精确字段读写且保持引用接收者(int offset)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.GetAssemblyByName("mscorlib")!, "Fixture", "ReferencedStruct" + offset,
+            app.SystemTypes.SystemValueTypeType, ReflectionTypeAttributes.Public | ReflectionTypeAttributes.SequentialLayout);
+        var field = owner.InjectFieldContext("Value", app.SystemTypes.SystemInt32Type, System.Reflection.FieldAttributes.Public);
+        field.OverrideOffset = offset;
+        var receiver = new LocalVariable("receiver", new Register(null, "X1"), owner.MakeByReferenceType());
+        var value = new LocalVariable("value", new Register(null, "X2"), app.SystemTypes.SystemInt32Type);
+        var read = new Instruction(0, OpCode.Move, value, new MemoryOperand(receiver, addend: offset)) { MemoryAccessWidthBits = 32 };
+        var write = new Instruction(1, OpCode.Move, new MemoryOperand(receiver, addend: offset), value) { MemoryAccessWidthBits = 32 };
+        var context = owner.InjectMethodContext("ReadWrite" + offset, app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, owner.MakeByReferenceType());
+        context.ControlFlowGraph = new ISILControlFlowGraph([read, write, new Instruction(2, OpCode.Return)]);
+        context.ParameterLocals = [receiver];
+        context.Locals = [value];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("ByRefFieldIntegration.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        // 集成夹具自行构造程序集，显式绑定局部值类型，保持与生产程序集填充阶段相同的前置条件。
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemInt32Type, "Int32", TypeAttributes.Public | TypeAttributes.Sealed);
+        var type = new TypeDefinition("Fixture", owner.Name, TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(type);
+        owner.PutExtraData("AsmResolverType", type);
+        var fieldDefinition = new FieldDefinition("Value", FieldAttributes.Public, module.CorLibTypeFactory.Int32);
+        type.Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var definition = new MethodDefinition(context.Name, MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [new TypeDefOrRefSignature(type, true).MakeByReferenceType()]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "receiver", (ParameterAttributes)0));
+        type.Methods.Add(definition);
+
+        Assert.That(MetadataResolver.ResolveFieldOffsets(context), Is.True);
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var instructions = definition.CilMethodBody!.Instructions;
+        Assert.That(instructions.Count(instruction => instruction.OpCode == CilOpCodes.Ldfld), Is.EqualTo(1));
+        Assert.That(instructions.Count(instruction => instruction.OpCode == CilOpCodes.Stfld), Is.EqualTo(1));
+        foreach (var instruction in instructions.Where(instruction => instruction.OpCode == CilOpCodes.Ldfld || instruction.OpCode == CilOpCodes.Stfld))
+            Assert.That(((IFieldDescriptor)instruction.Operand!).FullName, Is.EqualTo(fieldDefinition.FullName));
+        Assert.That(instructions.Count(instruction => instruction.OpCode == CilOpCodes.Ldarg), Is.EqualTo(2));
+        Assert.That(instructions.Any(instruction => instruction.OpCode == CilOpCodes.Ldarga || instruction.OpCode == CilOpCodes.Ldloca), Is.False);
     }
 
     [Test]
