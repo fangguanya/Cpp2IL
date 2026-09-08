@@ -852,6 +852,29 @@ public class Arm64CallingConventionResolverTests
             Is.EqualTo(1));
     }
 
+    [TestCase(false, 2)]
+    [TestCase(false, 7)]
+    [TestCase(false, 8)]
+    [TestCase(true, 2)]
+    [Category("边界值")]
+    public void 多槽值类型实例地址不挤占后续实参(bool isStatic, int parameterCount)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var definition = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var owner = definition.MakeGenericInstanceType(definition.GenericParameters);
+        Assert.That(Arm64CallingConventionResolver.GeneralRegisterSlotCount(owner), Is.EqualTo(2));
+        var method = new InjectedMethodAnalysisContext(owner, "InspectArguments", app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | (isStatic ? MethodAttributes.Static : 0),
+            Enumerable.Repeat(app.SystemTypes.SystemInt32Type, parameterCount).ToArray());
+        var operands = Arm64CallingConventionResolver.ArgumentOperands(method);
+        int explicitCount = parameterCount + (isStatic ? 0 : 1);
+        for (int index = 0; index < explicitCount; index++)
+        {
+            if (index < 8) Assert.That(((Register)operands[index]).Name, Is.EqualTo($"X{index}"));
+            else Assert.That(operands[index], Is.TypeOf<StackOffset>());
+        }
+    }
+
     [Test]
     [Category("异常输入")]
     public void 普通非泛型方法不追加隐藏MethodInfo()

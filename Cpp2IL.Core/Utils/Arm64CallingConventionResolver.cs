@@ -202,7 +202,11 @@ public static class Arm64CallingConventionResolver
         }
 
         if (!method.IsStatic)
-            AddGeneralArgument(method.DeclaringType!);
+        {
+            // 值类型实例的 this 是地址，不是按值传递的聚合体；只占一个 X 寄存器槽。
+            var owner = method.DeclaringType!;
+            AddGeneralArgument(owner.IsValueType ? owner.MakeByReferenceType() : owner);
+        }
 
         foreach (var parameter in method.Parameters)
         {

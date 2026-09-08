@@ -70,6 +70,21 @@ public class NativeZeroBlockExecutionTests
         var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
         Assert.That(root, Is.Not.Null.And.Not.Empty);
         Directory.CreateDirectory(root!);
+        var dependency = ((ByRefTypeAnalysisContext)original.Parameters[1].ParameterType).ElementType;
+        var constructor = dependency.Methods.Single(method => method.Name == ".ctor" && method.Parameters.Count == 2);
+        Assert.That(constructor.ParameterLocals.Where(local => !local.IsThis && !local.IsMethodInfo)
+            .Select(local => local.Register.Name), Is.EqualTo(new[] { "X1", "X2" }));
+        using (var constructorReceipt = new FileStream(Path.Combine(root!, "native-constructor-parameters.json"), FileMode.CreateNew))
+            JsonSerializer.Serialize(constructorReceipt, new
+            {
+                method = constructor.FullName, address = constructor.UnderlyingPointer,
+                parameterOperands = constructor.ParameterOperands.Select(operand => operand.ToString()).ToArray(),
+                parameterLocals = constructor.ParameterLocals.Select(local => local.ToString()).ToArray(),
+                analysisGraphReleased = constructor.ControlFlowGraph == null,
+                finalInstructions = constructor.ControlFlowGraph?.Instructions.Select(instruction => instruction.ToString()).ToArray(),
+                cil = constructor.GetExtraData<MethodDefinition>("AsmResolverMethod")!.CilMethodBody!.Instructions
+                    .Select(instruction => instruction.ToString()).ToArray(), constructorRuntimeProved = false
+            });
         using var receipt = new FileStream(Path.Combine(root!, "native-full-method-cil.json"), FileMode.CreateNew);
         JsonSerializer.Serialize(receipt, new
         {
