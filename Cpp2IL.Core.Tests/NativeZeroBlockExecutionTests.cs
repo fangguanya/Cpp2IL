@@ -34,7 +34,11 @@ public class NativeZeroBlockExecutionTests
         // 只按原始身份选择回归范围，生产入口负责全部声明绑定和完整原生方法分析。
         var options = Cpp2IlApi.RuntimeOptions ?? throw new InvalidOperationException("原始输入加载器未初始化运行选项。");
         options.IsilDumpAssemblyFilters = [original.DeclaringType!.DeclaringAssembly.Name];
-        options.IsilDumpTypeFilters = [original.DeclaringType.FullName];
+        // 引用值类型的成员也进入同一恢复范围，克隆依赖声明时不混入未恢复构造函数。
+        options.IsilDumpTypeFilters = original.Parameters.Select(parameter => parameter.ParameterType)
+            .OfType<ByRefTypeAnalysisContext>().Select(type => type.ElementType)
+            .Where(type => type.IsValueType).Select(type => type.FullName)
+            .Prepend(original.DeclaringType.FullName).Distinct().ToArray();
         new AsmResolverDllOutputFormatIlRecovery().BuildAssemblies(app);
         var definition = original.GetExtraData<MethodDefinition>("AsmResolverMethod");
         Assert.That(definition, Is.Not.Null);
