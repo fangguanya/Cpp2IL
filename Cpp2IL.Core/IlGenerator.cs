@@ -538,11 +538,17 @@ public static class IlGenerator
                 break;
 
             case OpCode.Throw:
-                if (instruction.Operands is [TypeAnalysisContext exceptionType]
-                    && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)
+                if (instruction.Operands is [TypeAnalysisContext exceptionType])
+                {
+                    var exceptionCtor = exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+                    if (exceptionCtor == null)
+                        throw new UnresolvedCilSemanticException(method.FullName, "THROW_CONSTRUCTOR", instruction.ToString());
                     instructions.Add(CilOpCodes.Newobj, importer.ImportMethod(exceptionCtor.ToMethodDescriptor(module)));
+                }
+                else if (instruction.Operands is [{ } exceptionValue])
+                    LoadOperand(exceptionValue, method, locals, writeLine, stringCtor, context.AppContext.SystemTypes.SystemObjectType);
                 else
-                    instructions.Add(CilOpCodes.Ldnull);
+                    throw new UnresolvedCilSemanticException(method.FullName, "THROW_VALUE", instruction.ToString());
 
                 instructions.Add(CilOpCodes.Throw);
                 break;
@@ -1291,13 +1297,12 @@ public static class IlGenerator
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
+                    if (local2.Type is not ByRefTypeAnalysisContext { ElementType: { } byRefElementType })
+                        throw new UnresolvedCilSemanticException(method.FullName, "MEMORY_LOAD", operand.ToString() ?? string.Empty);
+                    // 读取托管引用必须解引用；普通局部的值不代表其指向地址的内容。
                     LoadLocal(local2, method, locals);
-                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } byRefElementType })
-                    {
-                        // ref/out 参数寄存器保存的是托管地址；读取 [参数] 必须解引用元素，不能把地址交给算术指令。
-                        var importedElementType = importer.ImportTypeSignature(byRefElementType.ToTypeSignature(module));
-                        instructions.Add(CilOpCodes.Ldobj, importedElementType.ToTypeDefOrRef());
-                    }
+                    var importedElementType = importer.ImportTypeSignature(byRefElementType.ToTypeSignature(module));
+                    instructions.Add(CilOpCodes.Ldobj, importedElementType.ToTypeDefOrRef());
                     break;
                 }
                 throw new UnresolvedCilSemanticException(method.FullName, "MEMORY_LOAD", operand.ToString() ?? string.Empty);
@@ -1639,45 +1644,6 @@ public static class IlGenerator
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, local);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloc, local);
-    }
-
-    private static void PushDefaultOf(TypeAnalysisContext type, CilInstructionCollection instructions)
-    {
-        //TODO Remove this, we should be handling arguments correctly in ISIL resolution, this is a hack to emit balanced stacks.
-        //TODO At the *very* least we should emit a console.writeline saying that we did this.
-        if (type is RuntimeClassTypeAnalysisContext
-            or RuntimeMethodInfoAnalysisContext
-            or StaticFieldStorageTypeAnalysisContext
-            or RgctxTableTypeAnalysisContext)
-        {
-            // 四种合成上下文在分析层表示IL2CPP原生指针，虽然IsValueType为false，
-            // 但ToTypeSignature会把它们精确降低为System.IntPtr；默认值必须与最终槽位一致。
-            instructions.Add(CilOpCodes.Ldc_I4_0);
-            instructions.Add(CilOpCodes.Conv_I);
-            return;
-        }
-
-        if (!type.IsValueType)
-        {
-            instructions.Add(CilOpCodes.Ldnull);
-            return;
-        }
-
-        switch (type.FullName)
-        {
-            case "System.Single": instructions.Add(CilOpCodes.Ldc_R4, 0f); break;
-            case "System.Double": instructions.Add(CilOpCodes.Ldc_R8, 0d); break;
-            case "System.Int64" or "System.UInt64": instructions.Add(CilOpCodes.Ldc_I8, 0L); break;
-            case "System.IntPtr":
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
-                break;
-            case "System.UIntPtr":
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_U);
-                break;
-            default: instructions.Add(CilOpCodes.Ldc_I4_0); break;
-        }
     }
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>

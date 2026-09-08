@@ -404,6 +404,9 @@ public class DllIlRecoveryEmptyAnalysisTests
         public override string ToString() => "未知夹具操作数";
     }
 
+    [TestCase("local_load", "MEMORY_LOAD")]
+    [TestCase("empty_throw", "THROW_VALUE")]
+    [TestCase("type_throw", "THROW_CONSTRUCTOR")]
     [TestCase("type", "TYPE_OPERAND")]
     [TestCase("array", "ARRAY_ALLOCATION")]
     [TestCase("object", "OBJECT_ALLOCATION")]
@@ -428,6 +431,9 @@ public class DllIlRecoveryEmptyAnalysisTests
         context.Locals = [local];
         var instruction = shape switch
         {
+            "local_load" => new Instruction(0, OpCode.Move, local, new MemoryOperand(local)),
+            "empty_throw" => new Instruction(0, OpCode.Throw),
+            "type_throw" => new Instruction(0, OpCode.Throw, app.SystemTypes.SystemVoidType),
             "type" => new Instruction(0, OpCode.Move, local, app.SystemTypes.SystemObjectType),
             "array" => new Instruction(0, OpCode.NewArr, local),
             "object" => new Instruction(0, OpCode.Newobj, local),
@@ -578,5 +584,17 @@ public class DllIlRecoveryEmptyAnalysisTests
             File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
             Directory.Delete(directory);
         }
+    }
+    [Test]
+    [Category("基本功能")]
+    public void 原始显式抛出空值仍生成真实Throw()
+    {
+        var (context, definition) = Fixture("ExplicitThrowNull", 53248);
+        context.ConvertedIsil = [new Instruction(0, OpCode.Throw, new Immediate(0))];
+        context.ControlFlowGraph = new ISILControlFlowGraph(context.ConvertedIsil);
+        var output = new OutputProbe();
+        output.Fill(definition, context);
+        Assert.That(output.Successful, Is.EqualTo(1));
+        Assert.That(definition.CilMethodBody!.Instructions.Select(i => i.OpCode), Is.EqualTo(new[] { CilOpCodes.Ldnull, CilOpCodes.Throw }));
     }
 }

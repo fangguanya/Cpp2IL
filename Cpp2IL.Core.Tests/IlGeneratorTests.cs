@@ -1679,7 +1679,7 @@ public class IlGeneratorTests
 
         // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
         var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
-        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
+        Assert.That(error!.Message, Does.Contain("MEMORY_LOAD"));
     }
 
     [Test]
