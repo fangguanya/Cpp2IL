@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
+using System.Text.Json;
+using AssetRipper.Primitives;
+using LibCpp2IL.BinaryStructures;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -2276,6 +2280,99 @@ public class MetadataResolverTests
             ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
         method.ControlFlowGraph = new ISILControlFlowGraph([access, new Instruction(1, OpCode.Return)]);
         return (method, access, selected!, receiver);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("原始输入回归")]
+    public void 冻结原始值类型标量字段按真实布局恢复托管引用读写()
+    {
+        var binary = Environment.GetEnvironmentVariable("CPP2IL_ARM64_FIXTURE_BINARY");
+        var metadata = Environment.GetEnvironmentVariable("CPP2IL_ARM64_FIXTURE_METADATA");
+        var unity = Environment.GetEnvironmentVariable("CPP2IL_ARM64_FIXTURE_UNITY_VERSION");
+        var evidenceRoot = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        if (string.IsNullOrWhiteSpace(binary) || string.IsNullOrWhiteSpace(metadata)
+            || string.IsNullOrWhiteSpace(unity) || string.IsNullOrWhiteSpace(evidenceRoot))
+            Assert.Ignore("原始字段布局回归需要冻结输入与独立证据目录。");
+        Cpp2IlApi.InitializeLibCpp2Il(binary!, metadata!, UnityVersion.Parse(unity!));
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var rows = new List<object>();
+        var excluded = new Dictionary<string, int>();
+        var failures = new List<string>();
+        var zeroOffsets = 0;
+        var nonzeroOffsets = 0;
+        var testedTypes = 0;
+        foreach (var owner in app.Assemblies.SelectMany(assembly => assembly.Types)
+                     .Where(type => type.Definition != null && type.IsValueType))
+        {
+            if (owner.GenericParameters.Count != 0)
+            {
+                excluded["OPEN_GENERIC_TYPE"] = excluded.GetValueOrDefault("OPEN_GENERIC_TYPE") + 1;
+                continue;
+            }
+            var instanceFields = owner.Fields.Where(field => !field.IsStatic
+                && (field.Attributes & System.Reflection.FieldAttributes.Literal) == 0).ToArray();
+            var offsetCounts = instanceFields.GroupBy(field => field.Offset).ToDictionary(group => group.Key, group => group.Count());
+            var instructions = new List<Instruction>();
+            var expected = new List<(Instruction Read, Instruction Write, FieldAnalysisContext Field)>();
+            var receiver = new LocalVariable("receiver", new Register(null, "X1"), owner.MakeByReferenceType());
+            foreach (var field in instanceFields)
+            {
+                // 测试宽度从原始 IL2CPP 类型码独立取得，不复用被测布局 helper 的尺寸结论。
+                var width = field.FieldType.Type switch
+                {
+                    Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN or Il2CppTypeEnum.IL2CPP_TYPE_I1 or Il2CppTypeEnum.IL2CPP_TYPE_U1 => 8,
+                    Il2CppTypeEnum.IL2CPP_TYPE_CHAR or Il2CppTypeEnum.IL2CPP_TYPE_I2 or Il2CppTypeEnum.IL2CPP_TYPE_U2 => 16,
+                    Il2CppTypeEnum.IL2CPP_TYPE_I4 or Il2CppTypeEnum.IL2CPP_TYPE_U4 or Il2CppTypeEnum.IL2CPP_TYPE_R4 => 32,
+                    Il2CppTypeEnum.IL2CPP_TYPE_I8 or Il2CppTypeEnum.IL2CPP_TYPE_U8 or Il2CppTypeEnum.IL2CPP_TYPE_R8 => 64,
+                    _ => 0
+                };
+                var exclusion = field.Offset < 0 ? "UNKNOWN_OFFSET" : offsetCounts[field.Offset] != 1 ? "OVERLAPPING_OFFSET"
+                    : width == 0 ? "NON_SCALAR_FIELD" : null;
+                if (exclusion != null)
+                {
+                    excluded[exclusion] = excluded.GetValueOrDefault(exclusion) + 1;
+                    continue;
+                }
+                var value = new LocalVariable("value" + expected.Count, new Register(null, "V" + expected.Count), field.FieldType);
+                var read = new Instruction(instructions.Count, OpCode.Move, value, new MemoryOperand(receiver, addend: field.Offset)) { MemoryAccessWidthBits = width };
+                instructions.Add(read);
+                var write = new Instruction(instructions.Count, OpCode.Move, new MemoryOperand(receiver, addend: field.Offset), value) { MemoryAccessWidthBits = width };
+                instructions.Add(write);
+                expected.Add((read, write, field));
+            }
+            if (expected.Count == 0)
+                continue;
+            testedTypes++;
+            instructions.Add(new Instruction(instructions.Count, OpCode.Return));
+            // 探针不加入原始类型 Methods 集合，保持 metadata 原始分母不变。
+            var method = new InjectedMethodAnalysisContext(owner, "VerifyOriginalFieldLayout", app.SystemTypes.SystemVoidType,
+                ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+            method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+            MetadataResolver.ResolveFieldOffsets(method);
+            foreach (var entry in expected)
+            {
+                var matched = entry.Read.Operands[1] is FieldReference read && ReferenceEquals(read.Field, entry.Field)
+                    && ReferenceEquals(read.Local, receiver) && entry.Write.Operands[0] is FieldReference write
+                    && ReferenceEquals(write.Field, entry.Field) && ReferenceEquals(write.Local, receiver);
+                rows.Add(new { assembly = owner.DeclaringAssembly.Name, type = owner.FullName, field = entry.Field.Name,
+                    offset = entry.Field.Offset, width = entry.Read.MemoryAccessWidthBits, matched });
+                if (!matched)
+                    failures.Add(owner.FullName + "::" + entry.Field.Name);
+                if (entry.Field.Offset == 0) zeroOffsets++; else nonzeroOffsets++;
+            }
+        }
+        Directory.CreateDirectory(evidenceRoot!);
+        var path = Path.Combine(evidenceRoot!, "original-byref-field-layout.json");
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
+            JsonSerializer.Serialize(stream, new { schema = "OriginalByRefScalarFieldLayout/v1",
+                binarySha256 = app.LibCpp2IlContext.InputBinarySha256, metadataSha256 = app.LibCpp2IlContext.InputMetadataSha256,
+                testedTypes, testedFields = rows.Count, zeroOffsets, nonzeroOffsets, excluded, failures, rows,
+                originalMethodRecoveryProved = false, genericLayoutCoverageProved = false });
+        Assert.That(testedTypes, Is.GreaterThan(1));
+        Assert.That(zeroOffsets, Is.Positive);
+        Assert.That(nonzeroOffsets, Is.Positive);
+        Assert.That(failures, Is.Empty, string.Join("; ", failures.Take(20)));
     }
 
     private sealed record StaticFieldOffsetFixture(
