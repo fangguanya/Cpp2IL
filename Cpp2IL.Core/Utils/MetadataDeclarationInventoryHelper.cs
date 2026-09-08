@@ -195,7 +195,16 @@ internal static class MetadataDeclarationInventoryHelper
             WriteIndex(writer, "fieldIndex", item.fieldIndex.Value, metadata.FieldDefinitions.Count);
             WriteIndex(writer, "typeReferenceIndex", item.typeIndex.Value, binary.NumTypes);
             WriteIndex(writer, "dataIndex", item.dataIndex.Value, metadata.metadataHeader.fieldAndParameterDefaultValueData.Size, true);
-            MetadataDefaultValueHelper.Write(writer, () => item.Value);
+            var field = metadata.FieldDefinitions[item.fieldIndex.Value];
+            if ((binary.GetType(field.typeIndex).Attrs & 0x100) != 0)
+            {
+                var bytes = field.StaticArrayInitialValue;
+                writer.WriteString("decodeStatus", "initializer-data");
+                writer.WriteNumber("initializerLength", bytes.Length);
+                writer.WriteBase64String("initializerBytes", bytes);
+            }
+            else
+                MetadataDefaultValueHelper.Write(writer, () => item.Value);
         });
         WriteTable(writer, "parameterDefaultValues", metadata.ParameterDefaultValues, (item, index) =>
         {

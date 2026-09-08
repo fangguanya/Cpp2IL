@@ -1,3 +1,5 @@
+using System.IO;
+using System.Reflection;
 using LibCpp2IL.BinaryStructures;
 using LibCpp2IL.Reflection;
 
@@ -30,31 +32,20 @@ public class Il2CppFieldDefinition : ReadableClass
     {
         get
         {
-            if (FieldType is not { isArray: false, isPointer: false, isType: true, isGenericType: false })
+            if (RawFieldType is not { } rawType || (rawType.Attrs & (uint)FieldAttributes.HasFieldRVA) == 0)
                 return [];
-
-            var (dataIndex, _) = OwningContext.Metadata.GetFieldDefaultValue(FieldIndex);
-
-            if (dataIndex.IsNull) return [];
-
-            var baseType = FieldType.baseType;
-            if (baseType == null)
-                return [];
-
-            //prefer the N encoded in the type name, as the binary's native_size can be -1 or wrong on some il2cpp versions
-            var length = baseType.Size;
-            if (baseType.Name?.StartsWith("__StaticArrayInitTypeSize=") == true && int.TryParse(baseType.Name["__StaticArrayInitTypeSize=".Length..], out var parsedLength))
-                length = parsedLength;
-
-            if (length <= 0) return [];
-
-            var pointer = OwningContext.Metadata.GetDefaultValueFromIndex(dataIndex);
-
-            if (pointer <= 0) return [];
-
-            var results = OwningContext.Metadata.ReadByteArrayAtRawAddress(pointer, length);
-
-            return results;
+            var fieldType = FieldType;
+            if (fieldType is not { isArray: false, isPointer: false, isType: true, isGenericType: false, baseType: { } baseType })
+                throw new InvalidDataException("FieldRVA 类型缺少可验证的初始化布局。");
+            var metadata = OwningContext.Metadata;
+            var data = DefaultValue ?? throw new InvalidDataException("FieldRVA 缺少原始初始化数据记录。");
+            var length = StaticArrayInitializationHelper.ResolveLength(baseType.Name, baseType.Size);
+            var section = metadata.metadataHeader.fieldAndParameterDefaultValueData;
+            var pointer = StaticArrayInitializationHelper.ResolvePointer(section.Offset, section.Size, data.dataIndex.Value, length, metadata.Length);
+            var result = metadata.ReadByteArrayAtRawAddress(pointer, length);
+            if (result.Length != length)
+                throw new InvalidDataException("FieldRVA 原始初始化数据截断。");
+            return result;
         }
     }
 
