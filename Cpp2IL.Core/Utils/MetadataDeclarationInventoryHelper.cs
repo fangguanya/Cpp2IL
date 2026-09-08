@@ -233,6 +233,41 @@ internal static class MetadataDeclarationInventoryHelper
             writer.WriteNumber("token", item.token);
             writer.WriteNumber("startOffset", item.startOffset);
         });
+        if (metadata.MetadataVersion >= 29)
+        {
+            var ranges = metadata.AttributeDataRanges ?? throw new InvalidDataException("缺少原始特性范围表。");
+            var section = metadata.metadataHeader.attributeData;
+            if (section.Offset < 0 || section.Size < 0 || (long)section.Offset + section.Size > metadata.Length)
+                throw new InvalidDataException("特性数据区段超出原始文件。");
+            var lengths = MetadataAttributeRangeHelper.BuildLengths(ranges.Select(range => range.startOffset).ToArray(), section.Size);
+            if ((ranges[ranges.Count - 1].token & 0x00FFFFFF) != 0)
+                throw new InvalidDataException("特性终止条目不是零 RID 哨兵。");
+            // 区段可以包含末尾对齐字节；保留全部原始内容，不将其拼入最后一个特性。
+            var tailStart = ranges[ranges.Count - 1].startOffset;
+            writer.WriteNumber("attributeSectionTailStart", tailStart);
+            writer.WriteBase64String("attributeSectionTailBytes", metadata.ReadByteArrayAtRawAddress(
+                (long)section.Offset + tailStart, checked(section.Size - (int)tailStart)));
+            var owners = MetadataOwnershipHelper.BuildOwners(lengths.Length,
+                metadata.imageDefinitions.Select((item, index) =>
+                    new MetadataOwnershipHelper.Range(index, item.customAttributeStart, checked((int)item.customAttributeCount))));
+            var identities = new HashSet<(int Image, uint Token)>();
+            // 内容仅从已验证的 metadata 区段读取；末项只提供终止偏移，不生成虚假身份。
+            WriteTable(writer, "attributeBlobs", lengths, (length, index) =>
+            {
+                var range = ranges[index];
+                if (range.token == 0 || !identities.Add((owners[index], range.token)))
+                    throw new InvalidDataException("原始特性对象身份为空或重复。");
+                var bytes = metadata.ReadByteArrayAtRawAddress((long)section.Offset + range.startOffset, length);
+                if (bytes.Length != length)
+                    throw new InvalidDataException("原始特性内容截断。");
+                writer.WriteNumber("imageIndex", owners[index]);
+                writer.WriteNumber("token", range.token);
+                writer.WriteNumber("startOffset", range.startOffset);
+                writer.WriteNumber("byteLength", length);
+                writer.WriteBase64String("bytes", bytes);
+                writer.WriteBoolean("semanticDecodeAccepted", false);
+            });
+        }
         WriteTable(writer, "attributeTypeRanges", metadata.attributeTypeRanges ?? [], (item, index) =>
         {
             writer.WriteNumber("token", item.token);
