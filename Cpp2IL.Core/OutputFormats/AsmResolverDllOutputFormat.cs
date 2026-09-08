@@ -48,6 +48,9 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     {
         var ret = BuildAssemblies(context);
 
+        // 具体输出器必须在生成或写入任何 PE 前验证恢复资格。
+        ValidateOutputForPublication(outputRoot);
+
         var start = DateTime.Now;
         Logger.Verbose("Generating PE images...", "DllOutput");
 
@@ -148,6 +151,10 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     /// 允许具体 DLL 输出器在所有程序集写盘后发布结构化收据。
     /// </summary>
     protected virtual void WriteOutputReceipts(string outputRoot)
+    {
+    }
+
+    protected virtual void ValidateOutputForPublication(string outputRoot)
     {
     }
 

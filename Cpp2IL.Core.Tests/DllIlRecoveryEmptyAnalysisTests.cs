@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using AsmResolver.DotNet;
@@ -17,10 +18,11 @@ public class DllIlRecoveryEmptyAnalysisTests
 {
     private sealed class OutputProbe : AsmResolverDllOutputFormatIlRecovery
     {
-        public int Successful => SuccessfulMethodCount;
-        public int Total => TotalMethodCount;
+        public int Successful => RecoveredCilCount;
+        public int Total => AttemptedBodyCount;
         public void Fill(MethodDefinition definition, MethodAnalysisContext context) => FillMethodBody(definition, context);
         public void Receipt(string path) => WriteOutputReceipts(path);
+        public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context) => [];
     }
 
     private sealed class MethodProbe(TypeAnalysisContext owner, TypeAnalysisContext result, string name, ulong address)
@@ -37,11 +39,11 @@ public class DllIlRecoveryEmptyAnalysisTests
         TestGameLoader.LoadSimple2019Game();
     }
 
-    private static (MethodProbe Context, MethodDefinition Definition) Fixture(string name, ulong address)
+    private static (MethodProbe Context, MethodDefinition Definition) Fixture(string name, ulong address, string moduleName = "EvidenceFixture.dll")
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var context = new MethodProbe(app.SystemTypes.SystemObjectType, app.SystemTypes.SystemVoidType, name, address);
-        var module = new ModuleDefinition("EvidenceFixture.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var module = new ModuleDefinition(moduleName, new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
         var type = new TypeDefinition("Fixture", "Evidence", TypeAttributes.Public);
         module.TopLevelTypes.Add(type);
         var method = new MethodDefinition(name, MethodAttributes.Public | MethodAttributes.Static,
@@ -76,8 +78,8 @@ public class DllIlRecoveryEmptyAnalysisTests
                 Assert.That(root.GetProperty("failures")[0].GetProperty("category").GetString(), Is.EqualTo("EMPTY_ANALYSIS"));
                 Assert.That(root.GetProperty("sourceRecoveryAccepted").GetBoolean(), Is.False);
                 Assert.That(root.GetProperty("formalPublishEligible").GetBoolean(), Is.False);
-                // 旧诊断产物保留供分析，绝不把它视作业务实现或原版 throw。
-                Assert.That(definition.CilMethodBody!.Instructions.Last().OpCode, Is.EqualTo(CilOpCodes.Throw));
+                // 缺失原生实现时只保留账本，不生成诊断业务体。
+                Assert.That(definition.CilMethodBody, Is.Null);
                 Assert.That(context.ConvertedIsil, Is.Null);
             });
         }
@@ -88,12 +90,16 @@ public class DllIlRecoveryEmptyAnalysisTests
         }
     }
 
-    [Test]
+    [TestCase("EvidenceFixture.dll")]
+    [TestCase("UnityEngine.Fixture.dll")]
+    [TestCase("Unity.Fixture.dll")]
+    [TestCase("System.Fixture.dll")]
+    [TestCase("mscorlib.dll")]
     [Category("基本功能")]
     [Category("边界值")]
-    public void 有明确返回指令的最短方法继续走真实生成路径()
+    public void 有明确返回指令的最短方法继续走真实生成路径(string moduleName)
     {
-        var (context, definition) = Fixture("ExplicitReturn", 12288);
+        var (context, definition) = Fixture("ExplicitReturn", 12288, moduleName);
         context.ConvertedIsil = [new Instruction(0, OpCode.Return)];
         context.ControlFlowGraph = new ISILControlFlowGraph(context.ConvertedIsil);
         var output = new OutputProbe();
@@ -105,4 +111,65 @@ public class DllIlRecoveryEmptyAnalysisTests
             Assert.That(context.ConvertedIsil, Is.Null);
         });
     }
+    [Test]
+    [Category("异常输入")]
+    public void 缺失原始分母时在任何DLL写盘前拒绝输出并保存账本()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-Publication-" + Guid.NewGuid().ToString("N"));
+        var output = new OutputProbe();
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => output.DoOutput(null!, directory));
+            Assert.That(Directory.GetFiles(directory, "*.dll"), Is.Empty);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.That(receipt.RootElement.GetProperty("originalDenominatorValidated").GetBoolean(), Is.False);
+            Assert.That(receipt.RootElement.GetProperty("schema").GetString(), Is.EqualTo("Cpp2IL.DllIlRecovery.MethodLedger/v2"));
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 全部原始方法含零入口进入同一账本且重复初始化逐字节一致()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var output = new OutputProbe();
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-Ledger-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "dll-il-recovery-method-ledger.json");
+        try
+        {
+            output.InitializeOriginalMethodLedger(app);
+            output.Receipt(directory);
+            var first = File.ReadAllText(path);
+            using var receipt = JsonDocument.Parse(first);
+            var root = receipt.RootElement;
+            var rows = root.GetProperty("methods").EnumerateArray().ToArray();
+            var expectedZero = app.Assemblies.SelectMany(a => a.Types).SelectMany(t => t.Methods)
+                .Count(m => m.Definition != null && m.UnderlyingPointer == 0);
+            Assert.Multiple(() =>
+            {
+                Assert.That(root.GetProperty("originalDenominatorValidated").GetBoolean(), Is.True);
+                Assert.That(rows.Length, Is.EqualTo(app.Metadata.MethodDefinitionCount));
+                Assert.That(rows.All(row => row.GetProperty("outcome").GetString() == "PENDING"), Is.True);
+                Assert.That(rows.Count(row => row.GetProperty("nativeAddress").GetUInt64() == 0), Is.EqualTo(expectedZero));
+                Assert.That(root.GetProperty("successfulMethods").GetInt32(), Is.Zero);
+            });
+            output.InitializeOriginalMethodLedger(app);
+            output.Receipt(directory);
+            Assert.That(File.ReadAllText(path), Is.EqualTo(first));
+            Assert.Throws<InvalidOperationException>(() => output.DoOutput(app, directory));
+            Assert.That(Directory.GetFiles(directory, "*.dll"), Is.Empty);
+        }
+        finally
+        {
+            File.Delete(path);
+            Directory.Delete(directory);
+        }
+    }
+
 }

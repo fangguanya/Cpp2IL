@@ -4,11 +4,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
-using System.Threading;
 using System.Collections.Concurrent;
 using AsmResolver.DotNet;
-using AsmResolver.DotNet.Signatures;
-using AsmResolver.PE.DotNet.Cil;
 using AssetRipper.CIL;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
@@ -20,18 +17,31 @@ namespace Cpp2IL.Core.OutputFormats;
 
 public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 {
-    private HashSet<TypeAnalysisContext>? selectedRecoveryTypes;
     private HashSet<MethodAnalysisContext>? selectedRecoveryMethods;
-    private int validatedMethodCount;
-    private int selectedMethodCount;
-    private readonly ConcurrentBag<MethodFailure> methodFailures = [];
+    private bool hasSelection;
+    private bool originalDenominatorValidated;
+    private readonly ConcurrentDictionary<MethodAnalysisContext, MethodResult> methodResults = new();
 
-    private sealed record MethodFailure(
-        string Assembly,
-        string Type,
-        string Method,
-        string Category,
-        string Detail);
+    private sealed record MethodResult(
+        string Assembly, uint Token, string Type, string Method, ulong Address,
+        bool Original, bool Selected, string Outcome, bool CilStackValidated,
+        string Category, string Detail);
+
+    protected int RecoveredCilCount => methodResults.Values.Count(row => row.Outcome == "CIL_EMITTED");
+    protected int AttemptedBodyCount => methodResults.Values.Count(row =>
+        row.Outcome is "CIL_EMITTED" or "EMPTY_ANALYSIS" or "UNRESOLVED");
+
+    private void Record(MethodAnalysisContext method, string outcome, bool validated = false,
+        string category = "", string detail = "")
+    {
+        var row = new MethodResult(method.DeclaringType?.DeclaringAssembly.Name ?? string.Empty,
+            method.Definition?.token ?? 0, method.DeclaringType?.FullName ?? string.Empty,
+            method.FullNameWithSignature, method.UnderlyingPointer, method.Definition != null,
+            selectedRecoveryMethods == null || selectedRecoveryMethods.Contains(method),
+            outcome, validated, category, detail);
+        methodResults.AddOrUpdate(method, row, (_, before) => before.Outcome == "PENDING"
+            ? row : throw new InvalidOperationException($"方法恢复结果重复提交：{row.Method}"));
+    }
 
     public override string OutputFormatId => "dll_il_recovery";
 
@@ -43,7 +53,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
         var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
         var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
-        var hasSelection = assemblyFilters.Count != 0 || typeFilters.Count != 0 || methodFilters.Count != 0;
+        hasSelection = assemblyFilters.Count != 0 || typeFilters.Count != 0 || methodFilters.Count != 0;
         if (hasSelection)
         {
             var assemblies = IsilDumpSelectionHelper.SelectExact(
@@ -79,74 +89,71 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 method => method.Definition?.HumanReadableSignature ?? string.Empty,
                 "IL恢复方法");
 
-            selectedRecoveryTypes = new HashSet<TypeAnalysisContext>(types);
             selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(methods);
-            selectedMethodCount = methods.Count;
             Logger.InfoNewline(
                 $"IL恢复已精确选择 {assemblies.Count} 个程序集、{selectedTypeRoots.Count} 个根类型、" +
                 $"{types.Count} 个含嵌套闭包类型与 {methods.Count} 个方法；其他成员只保留声明。",
                 "DllOutput");
         }
 
-        Volatile.Write(ref validatedMethodCount, 0);
-        TotalMethodCount = 0;
-        SuccessfulMethodCount = 0;
-        while (methodFailures.TryTake(out _))
-        {
-        }
+        InitializeOriginalMethodLedger(context);
         try
         {
             var builtAssemblies = base.BuildAssemblies(context);
+            TotalMethodCount = AttemptedBodyCount;
+            SuccessfulMethodCount = RecoveredCilCount;
             Logger.InfoNewline(
-                $"CIL 栈验证通过 {Volatile.Read(ref validatedMethodCount)} 个已选择方法。",
+                $"CIL 栈验证通过 {RecoveredCilCount} 个已选择方法。",
                 "DllOutput");
             return builtAssemblies;
         }
         finally
         {
-            selectedRecoveryTypes = null;
             selectedRecoveryMethods = null;
         }
     }
 
-    protected override bool ShouldFillMethodBody(
-        AssemblyAnalysisContext assemblyContext,
-        TypeAnalysisContext typeContext)
+    internal void InitializeOriginalMethodLedger(ApplicationAnalysisContext context)
     {
-        return selectedRecoveryTypes == null || selectedRecoveryTypes.Contains(typeContext);
+        methodResults.Clear();
+        originalDenominatorValidated = false;
+        TotalMethodCount = 0;
+        SuccessfulMethodCount = 0;
+        var originalMethods = context.Assemblies.SelectMany(assembly => assembly.Types)
+            .SelectMany(type => type.Methods).Where(method => method.Definition != null).ToArray();
+        var expected = context.Assemblies.Where(assembly => assembly.Definition != null)
+            .SelectMany(assembly => assembly.Definition!.Image.Types.SelectMany(type => type.Methods ?? [])
+                .Select(method => new MethodIndexCompletenessHelper.Identity(assembly.Name, method.token)));
+        var completeness = MethodIndexCompletenessHelper.Validate(expected, originalMethods.Select(method =>
+            new MethodIndexCompletenessHelper.Entry(new MethodIndexCompletenessHelper.Identity(
+                method.DeclaringType!.DeclaringAssembly.Name, method.Definition!.token), method.UnderlyingPointer)));
+        if (completeness.ExpectedMethods != context.Metadata.MethodDefinitionCount ||
+            context.Assemblies.Count(assembly => assembly.Definition != null) != context.Metadata.AssemblyDefinitions.Length)
+            throw new InvalidOperationException("方法恢复上下文未覆盖原始 metadata 的全部程序集和方法。");
+        foreach (var method in originalMethods)
+            Record(method, "PENDING");
+        originalDenominatorValidated = true;
     }
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
-        var module = methodDefinition.DeclaringModule!;
-        var moduleName = module.Name!.ToString();
-        var shouldSkip = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.") ||
-                         moduleName.StartsWith("System.") || moduleName == "System" ||
-                         moduleName.StartsWith("mscorlib");
-        var importer = new ReferenceImporter(module);
-
         if (!methodDefinition.IsManagedMethodWithBody())
+        {
+            // 抽象声明无需方法体；其他运行时/原生边界须另行审定，不按名称豁免。
+            Record(methodContext, methodDefinition.IsAbstract ? "DECLARATION" : "EXTERNAL_BOUNDARY_UNRESOLVED");
             return;
+        }
 
         if (selectedRecoveryMethods != null && !selectedRecoveryMethods.Contains(methodContext))
         {
-            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            Record(methodContext, "NOT_SELECTED", category: "SELECTION_EXCLUDED");
             return;
         }
 
         methodDefinition.CilMethodBody = new();
-        var instructions = methodDefinition.CilMethodBody.Instructions;
-
-        if (shouldSkip)
-        {
-            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
-            return;
-        }
 
         try
         {
-            TotalMethodCount++;
-
             methodContext.Analyze();
 
             if (methodContext.ConvertedIsil.Count == 0)
@@ -156,11 +163,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             IlGenerator.GenerateIl(methodContext, methodDefinition);
 
             CilStackValidator.Validate(methodDefinition.CilMethodBody!, methodContext.FullName);
-            Interlocked.Increment(ref validatedMethodCount);
+            Record(methodContext, "CIL_EMITTED", validated: true);
 
             //WriteControlFlowGraph(methodContext, Path.Combine(Environment.CurrentDirectory, "Cpp2IL", "bin", "Debug", "net9.0", "cpp2il_out", "cfg"));
 
-            SuccessfulMethodCount++;
         }
         catch (Exception e)
         {
@@ -173,30 +179,16 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             else
                 Logger.ErrorNewline($"Decompiling {methodContext.FullName} failed: {detail}");
 
-            methodFailures.Add(new MethodFailure(
-                methodContext.DeclaringType?.DeclaringAssembly.Name ?? string.Empty,
-                methodContext.DeclaringType?.FullName ?? string.Empty,
-                methodContext.FullName,
-                e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" : ClassifyFailure(detail),
-                detail));
+            Record(methodContext, e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" : "UNRESOLVED",
+                category: e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" : ClassifyFailure(detail), detail: detail);
 
             // 保留失败方法的最终 CFG，账本中的 CIL 窗口可由同一方法图追溯到具体 SSA/边复制。
             var outputRoot = Cpp2IlApi.RuntimeOptions?.OutputRootDirectory;
             if (!string.IsNullOrWhiteSpace(outputRoot) && methodContext.ControlFlowGraph != null)
                 WriteControlFlowGraph(methodContext, Path.Combine(outputRoot, "FailedMethodGraphs"));
             
-            methodDefinition.CilMethodBody = new();
-            instructions = methodDefinition.CilMethodBody.Instructions;
-
-            var factory = module.CorLibTypeFactory;
-            var exceptionCtor = factory.CorLibScope
-                .CreateTypeReference("System", "Exception")
-                .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void, [factory.String]))
-                .ImportWith(importer);
-
-            instructions.Add(CilOpCodes.Ldstr, detail);
-            instructions.Add(CilOpCodes.Newobj, exceptionCtor);
-            instructions.Add(CilOpCodes.Throw);
+            // 失败只保留证据，不合成诊断 throw 或默认业务方法体。
+            methodDefinition.CilMethodBody = null;
         }
 
         methodContext.ReleaseAnalysisData();
@@ -204,25 +196,47 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     protected override void WriteOutputReceipts(string outputRoot)
     {
-        var failures = methodFailures
-            .OrderBy(failure => failure.Assembly, StringComparer.Ordinal)
-            .ThenBy(failure => failure.Type, StringComparer.Ordinal)
-            .ThenBy(failure => failure.Method, StringComparer.Ordinal)
-            .ToArray();
+        var rows = methodResults.Values.OrderBy(row => row.Assembly, StringComparer.Ordinal)
+            .ThenBy(row => row.Token).ThenBy(row => row.Method, StringComparer.Ordinal).ToArray();
+        var failures = rows.Where(row => row.Outcome is "EMPTY_ANALYSIS" or "UNRESOLVED").ToArray();
+        TotalMethodCount = AttemptedBodyCount;
+        SuccessfulMethodCount = RecoveredCilCount;
+        Directory.CreateDirectory(outputRoot);
         var path = Path.Combine(outputRoot, "dll-il-recovery-method-ledger.json");
         using (var stream = File.Create(path))
         using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
         {
             writer.WriteStartObject();
-            writer.WriteString("schema", "Cpp2IL.DllIlRecovery.MethodLedger/v1");
+            writer.WriteString("schema", "Cpp2IL.DllIlRecovery.MethodLedger/v2");
             // 当前收据仍包含诊断输出，不具备完整源码或正式发布的验收资格。
             writer.WriteBoolean("sourceRecoveryAccepted", false);
             writer.WriteBoolean("formalPublishEligible", false);
-            writer.WriteNumber("selectedMethods", selectedMethodCount);
+            writer.WriteNumber("selectedMethods", rows.Count(row => row.Selected && row.Original));
+            writer.WriteNumber("originalMethods", rows.Count(row => row.Original));
+            writer.WriteBoolean("originalDenominatorValidated", originalDenominatorValidated);
             writer.WriteNumber("totalMethodsWithBody", TotalMethodCount);
             writer.WriteNumber("successfulMethods", SuccessfulMethodCount);
-            writer.WriteNumber("validatedMethods", Volatile.Read(ref validatedMethodCount));
+            writer.WriteNumber("validatedMethods", rows.Count(row => row.CilStackValidated));
             writer.WriteNumber("failedMethods", failures.Length);
+            writer.WriteStartArray("methods");
+            foreach (var row in rows)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("assembly", row.Assembly);
+                writer.WriteNumber("originalToken", row.Token);
+                writer.WriteString("type", row.Type);
+                writer.WriteString("method", row.Method);
+                writer.WriteNumber("nativeAddress", row.Address);
+                writer.WriteBoolean("original", row.Original);
+                writer.WriteBoolean("selected", row.Selected);
+                writer.WriteString("outcome", row.Outcome);
+                writer.WriteBoolean("cilStackValidated", row.CilStackValidated);
+                writer.WriteBoolean("semanticAccepted", false);
+                writer.WriteString("category", row.Category);
+                writer.WriteString("detail", row.Detail);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
             writer.WriteStartArray("failures");
             foreach (var failure in failures)
             {
@@ -238,6 +252,17 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             writer.WriteEndObject();
         }
         Logger.InfoNewline($"方法恢复账本已写入 {path}；失败 {failures.Length} 个。", "DllOutput");
+    }
+
+    protected override void ValidateOutputForPublication(string outputRoot)
+    {
+        // 不完整结果只持久化同一账本供排错；任何 DLL 都尚未写入。
+        if (!originalDenominatorValidated || hasSelection || methodResults.Values.Any(row =>
+                row.Outcome is not ("CIL_EMITTED" or "DECLARATION")))
+        {
+            WriteOutputReceipts(outputRoot);
+            throw new InvalidOperationException("IL 恢复发布失败：方法分母、选择范围或实现结果尚未闭合；详见方法账本。");
+        }
     }
 
     internal static string ClassifyFailure(string detail)
