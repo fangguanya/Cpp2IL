@@ -28,20 +28,9 @@ internal static class ByRefZeroBlockRecovery
             return false;
 
         var owner = byRef.ElementType;
-        var size = TypeSizes.UnboxedSize(owner, pointerSize);
         var bytes = instruction.MemoryAccessWidthBits / 8;
-        // 减法形式避免末地址相加溢出；未知尺寸和任何越界都保留未解决状态。
-        if (size <= 0 || memory.Addend < 0 || memory.Addend > size || bytes > size - memory.Addend)
+        if (!ByRefMemoryAccessHelper.HasKnownUnmanagedRange(owner, pointerSize, memory.Addend, bytes))
             return false;
-
-        foreach (var field in owner.Fields.Where(field => !field.IsStatic))
-        {
-            var fieldType = field.FieldType;
-            if (fieldType is not PointerTypeAnalysisContext && !fieldType.IsValueType
-                || GenericInstanceFieldLayout.GetSizeAndAlignment(fieldType, pointerSize) is not { } layout
-                || field.Offset < 0 || field.Offset > size || layout.Size > size - field.Offset)
-                return false;
-        }
 
         block = new(receiver, memory.Addend, bytes);
         return true;

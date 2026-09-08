@@ -401,6 +401,26 @@ public static class IlGenerator
                 }
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
+                    // 原生代码可按精确字节写入 readonly 字段；保持元数据属性，不伪装为 C# 字段赋值。
+                    if (!field.Field.IsStatic && field.Local.Type is ByRefTypeAnalysisContext
+                        && (field.Field.Attributes & System.Reflection.FieldAttributes.InitOnly) != 0)
+                    {
+                        if (!ByRefMemoryAccessHelper.TryDescribeReadonlyStore(instruction,
+                                context.AppContext.Binary.PointerSizeBytes, out var store))
+                            throw new UnresolvedCilSemanticException(context.FullName, "READONLY_NATIVE_STORE",
+                                "只读字段原生写入缺少精确宽度或非托管布局证据。");
+                        LoadLocal(field.Local, method, locals);
+                        if (field.Offset != 0)
+                        {
+                            instructions.Add(CilOpCodes.Ldc_I8, (long)field.Offset);
+                            instructions.Add(CilOpCodes.Conv_I);
+                            instructions.Add(CilOpCodes.Add);
+                        }
+                        LoadOperand(instruction.Operands[1], method, locals, writeLine, stringCtor, field.Field.FieldType);
+                        instructions.Add(CilOpCodes.Unaligned, (byte)1);
+                        instructions.Add(store);
+                        break;
+                    }
                     if (!field.Field.IsStatic)
                         LoadLocal(field.Local, method, locals);
 

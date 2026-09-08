@@ -48,6 +48,10 @@ public class NativeZeroBlockExecutionTests
         var instructions = body.Instructions.Select(instruction => instruction.ToString()).ToArray();
         Assert.That(body.Instructions.Count(instruction => instruction.OpCode.Code ==
             AsmResolver.PE.DotNet.Cil.CilCode.Initblk), Is.EqualTo(2));
+        Assert.That(body.Instructions.Count(instruction => instruction.OpCode.Code ==
+            AsmResolver.PE.DotNet.Cil.CilCode.Stind_I), Is.EqualTo(2));
+        Assert.That(body.Instructions.Any(instruction => instruction.OpCode.Code ==
+            AsmResolver.PE.DotNet.Cil.CilCode.Stfld), Is.False);
         Assert.That(definition.Signature!.ReturnType.FullName, Is.EqualTo("System.Boolean"));
         Assert.That(definition.Signature.ParameterTypes.Select(type => type.FullName), Is.EqualTo(
             new[] { "System.String", "UnityEngine.Bindings.ManagedSpanWrapper&" }));
@@ -176,6 +180,19 @@ public class NativeZeroBlockExecutionTests
         var original = app.Assemblies.Single(assembly => assembly.Name == "UnityEngine.CoreModule").Types
             .SelectMany(type => type.Methods).Single(method => method.Definition?.token == 0x06000BB4u);
         original.Analyze();
+        var readonlyWrites = original.ControlFlowGraph!.Instructions.Where(instruction =>
+            ByRefMemoryAccessHelper.TryDescribeReadonlyStore(instruction, app.Binary.PointerSizeBytes, out _)).ToArray();
+        Assert.That(readonlyWrites, Has.Length.EqualTo(2));
+        foreach (var write in readonlyWrites)
+        {
+            // 原始同类写入的宽度缺失、窄写与非法指针尺寸均不得进入精确写入分支。
+            foreach (int width in new[] { 0, 7, 32, 128 })
+            {
+                var invalid = new Instruction(write.Index, write.OpCode, write.Operands.ToList()) { MemoryAccessWidthBits = width };
+                Assert.That(ByRefMemoryAccessHelper.TryDescribeReadonlyStore(invalid, app.Binary.PointerSizeBytes, out _), Is.False);
+            }
+            Assert.That(ByRefMemoryAccessHelper.TryDescribeReadonlyStore(write, 0, out _), Is.False);
+        }
         var writes = original.ControlFlowGraph!.Instructions.Where(instruction =>
             ByRefZeroBlockRecovery.TryDescribe(instruction, app.Binary.PointerSizeBytes, out _)).ToArray();
         Assert.That(writes, Has.Length.EqualTo(2));
