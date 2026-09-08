@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Cloning;
 using AsmResolver.DotNet.Signatures;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
@@ -75,6 +76,76 @@ public class NativeZeroBlockExecutionTests
             instructions, cilStackValidated = true, originalFullGraphUsed = true,
             fullMethodRuntimeProved = false, sourceRoundTripProved = false, fullRecoveryProved = false
         });
+        ExecuteFullMethod(original, definition, root!);
+    }
+
+    private static void ExecuteFullMethod(MethodAnalysisContext original, MethodDefinition definition, string root)
+    {
+        var element = ((ByRefTypeAnalysisContext)original.Parameters[1].ParameterType).ElementType;
+        var structure = element.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        var corlib = definition.DeclaringModule!.CorLibTypeFactory.CorLibScope as AssemblyReference
+            ?? throw new InvalidDataException("原始核心库身份不是程序集引用。");
+        var module = new ModuleDefinition("NativeFullMethod.dll", corlib);
+        // 使用库的元数据深复制保留原始完整 CIL；不修改指令、调用目标签名或结构布局。
+        var cloner = new MemberCloner(module);
+        cloner.Include(definition.DeclaringType!, false);
+        cloner.Include(definition);
+        cloner.Include(structure, false);
+        foreach (var field in structure.Fields) cloner.Include(field);
+        var result = cloner.Clone();
+        foreach (var type in result.ClonedTopLevelTypes) module.TopLevelTypes.Add(type);
+        var cloned = result.GetClonedMember(definition);
+        CilStackValidator.Validate(cloned.CilMethodBody!, original.FullName);
+        Assert.That(cloned.CilMethodBody!.Instructions.Select(instruction => instruction.ToString()),
+            Is.EqualTo(definition.CilMethodBody!.Instructions.Select(instruction => instruction.ToString())));
+        var assembly = new AssemblyDefinition("NativeFullMethod", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new MemoryStream();
+        module.Write(stream);
+        byte[] pe = stream.ToArray();
+        string directory = Path.Combine(root, "native-full-method-runtime");
+        Directory.CreateDirectory(directory);
+        using (var output = new FileStream(Path.Combine(directory, "NativeFullMethod.dll"), FileMode.CreateNew)) output.Write(pe);
+        var loaded = Assembly.Load(pe);
+        var runtimeType = loaded.GetType(element.FullName, true)!;
+        Assert.That(System.Runtime.InteropServices.Marshal.SizeOf(runtimeType), Is.EqualTo(16));
+        var method = loaded.GetType(definition.DeclaringType!.FullName, true)!
+            .GetMethod(definition.Name!, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)!;
+        var rows = new System.Collections.Generic.List<object>();
+        foreach (string? input in new string?[] { null, "", "x", "\0", "字符串" })
+        {
+            byte[] bytes = Enumerable.Repeat((byte)0xA5, 32).ToArray();
+            bool actual = (bool)typeof(NativeZeroBlockExecutionTests)
+                .GetMethod(nameof(InvokeFullTyped), BindingFlags.Static | BindingFlags.NonPublic)!
+                .MakeGenericMethod(runtimeType).Invoke(null, [method, input, bytes])!;
+            bool expected = input == null || input.Length == 0;
+            Assert.That(actual, Is.EqualTo(expected));
+            for (int index = 0; index < bytes.Length; index++)
+            {
+                byte value = 0xA5;
+                if (expected && index >= 8 && index < 24)
+                    value = input != null && index == 8 ? (byte)1 : (byte)0;
+                Assert.That(bytes[index], Is.EqualTo(value), $"完整方法输入 {input ?? "<null>"} 的字节 {index} 不一致。");
+            }
+            rows.Add(new { input, actual, bytes = bytes.Select(value => (int)value).ToArray() });
+        }
+        using var receipt = new FileStream(Path.Combine(directory, "runtime-paths.json"), FileMode.CreateNew);
+        JsonSerializer.Serialize(receipt, new
+        {
+            schema = "NativeFullMethodRuntime/v1", method = original.FullName,
+            address = original.UnderlyingPointer, rows, fullCilInstructionsUnchanged = true,
+            assemblySha256 = Convert.ToHexString(SHA256.HashData(pe)).ToLowerInvariant(),
+            runtimeAssembly = typeof(string).Assembly.FullName, clrPathsExecuted = true,
+            originalPlayerComparisonProved = false, sourceRoundTripProved = false, fullRecoveryProved = false
+        });
+    }
+
+    private delegate bool FullMethod<T>(string? input, ref T value) where T : struct;
+    private static bool InvokeFullTyped<T>(MethodInfo method, string? input, byte[] bytes) where T : struct
+    {
+        var invoke = method.CreateDelegate<FullMethod<T>>();
+        ref T value = ref Unsafe.As<byte, T>(ref bytes[8]);
+        return invoke(input, ref value);
     }
 
     [Test]
