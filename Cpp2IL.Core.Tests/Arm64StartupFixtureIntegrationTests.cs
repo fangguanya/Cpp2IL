@@ -231,6 +231,26 @@ public class Arm64StartupFixtureIntegrationTests
             .SelectMany(type => type.Methods).Single(candidate => candidate.Definition?.token == token);
         Assert.That(method.UnderlyingPointer, Is.EqualTo(address));
         var rawHash = Convert.ToHexString(SHA256.HashData(method.RawBytes.AsSpan())).ToLowerInvariant();
+        // 记录指令提升阶段的宽度与操作数，区别源头证据缺失和后续分析丢失。
+        var rawMemoryAccesses = context.InstructionSet.GetIsilFromMethod(method)
+            .Where(instruction => instruction.MemoryAccessWidthBits > 0)
+            .Select(instruction => new { instruction.Index, instruction.MemoryAccessWidthBits,
+                text = instruction.ToString() }).ToArray();
+        var pointerSize = context.Binary.PointerSizeBytes;
+        var byRefLayouts = method.Parameters.Select(parameter => parameter.ParameterType)
+            .OfType<ByRefTypeAnalysisContext>().Select(type => type.ElementType).Distinct()
+            .Where(type => type.IsValueType).Select(type => new
+            {
+                type = type.FullName,
+                boxedSize = type.Definition?.RawSizes.instance_size,
+                nativeSize = type.Definition?.RawSizes.native_size,
+                unboxedSize = TypeSizes.UnboxedSize(type, pointerSize),
+                fields = type.Fields.Where(field => !field.IsStatic).Select(field => new
+                {
+                    field.Name, field.Offset, type = field.FieldType.FullName,
+                    size = GenericInstanceFieldLayout.GetSizeAndAlignment(field.FieldType, pointerSize)?.Size
+                }).ToArray()
+            }).ToArray();
         method.Analyze();
         var final = method.ControlFlowGraph!.Instructions;
         var fields = final.SelectMany(instruction => instruction.Operands).OfType<FieldReference>()
@@ -243,14 +263,23 @@ public class Arm64StartupFixtureIntegrationTests
         Directory.CreateDirectory(root!);
         var path = Path.Combine(root!, $"native-byref-{assemblyName}-{token:X8}.json");
         using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
-            JsonSerializer.Serialize(stream, new { schema = "NativeByRefFieldRegression/v1", assemblyName, token, address,
+            JsonSerializer.Serialize(stream, new { schema = "NativeByRefFieldRegression/v2", assemblyName, token, address,
                 binarySha256 = context.LibCpp2IlContext.InputBinarySha256,
                 metadataSha256 = context.LibCpp2IlContext.InputMetadataSha256, rawHash,
                 fields = fields.Select(field => field.ToString()).ToArray(),
                 remaining = remaining.Select(memory => memory.ToString()).ToArray(),
+                pointerSize, rawMemoryAccesses, byRefLayouts,
+                finalMemoryAccesses = final.Where(instruction => instruction.Operands.Any(operand =>
+                    operand is MemoryOperand or FieldReference)).Select(instruction => new
+                    { instruction.Index, instruction.MemoryAccessWidthBits, text = instruction.ToString() }).ToArray(),
+                paddingBytePreservationProved = false,
                 warnings = method.AnalysisWarnings,
                 finalInstructions = final.Select(instruction => instruction.ToString()).ToArray(),
                 fullMethodSemanticAcceptanceProved = false });
+        Assert.That(rawMemoryAccesses, Is.Not.Empty, "访问宽度应直接来自原生指令提升。");
+        Assert.That(byRefLayouts, Is.Not.Empty, "原始回归须记录实际引用元素布局。");
+        Assert.That(byRefLayouts.All(layout => layout.unboxedSize > 0), Is.True,
+            "当前原始非泛型回归的值类型边界必须有二进制尺寸证据。");
         Assert.That(fields, Is.Not.Empty, "真实机器码中应保留已知结构字段的托管引用身份。");
         Assert.That(remaining, Is.Empty, "非零偏移的结构体引用内存访问仍有未恢复字段。");
     }
