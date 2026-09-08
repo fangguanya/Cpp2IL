@@ -2252,7 +2252,7 @@ public class IlGeneratorTests
         context.AnalysisWarnings = [];
         var module = new ModuleDefinition("ZeroRange.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
         绑定AsmResolver系统类型(module, app.SystemTypes.SystemInt64Type, "Int64", TypeAttributes.Public | TypeAttributes.Sealed);
-        var type = new TypeDefinition("Fixture", "ZeroRange", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        var type = new TypeDefinition("Fixture", "ZeroRangeHost", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(type);
         var definition = new MethodDefinition("ZeroRange", MethodAttributes.Public | MethodAttributes.Static,
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int64.MakeByReferenceType()]));
@@ -2273,8 +2273,9 @@ public class IlGeneratorTests
         assembly.Modules.Add(module);
         using var stream = new System.IO.MemoryStream();
         module.Write(stream);
-        var runtimeAssembly = System.Reflection.Assembly.Load(stream.ToArray());
-        var runtimeMethod = runtimeAssembly.GetType("Fixture.ZeroRange", throwOnError: true)!.GetMethod("ZeroRange")!;
+        var emittedBytes = stream.ToArray();
+        var runtimeAssembly = System.Reflection.Assembly.Load(emittedBytes);
+        var runtimeMethod = runtimeAssembly.GetType("Fixture.ZeroRangeHost", throwOnError: true)!.GetMethod("ZeroRange")!;
         var invoke = runtimeMethod.CreateDelegate<引用零写委托>();
         var bytes = Enumerable.Repeat((byte)0xA5, 32).ToArray();
         ref var target = ref System.Runtime.CompilerServices.Unsafe.As<byte, long>(ref bytes[8]);
@@ -2282,6 +2283,24 @@ public class IlGeneratorTests
         for (var index = 0; index < bytes.Length; index++)
             Assert.That(bytes[index], Is.EqualTo(index >= 8 + offset && index < 8 + offset + width / 8 ? (byte)0 : (byte)0xA5),
                 $"字节 {index} 必须保持原始写入范围，前后哨兵及未覆盖部分均不得改变。");
+
+        var evidenceRoot = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        if (!string.IsNullOrEmpty(evidenceRoot))
+        {
+            // 持久化同一份已执行 PE，后续源码导出使用它而不是重新拼装方法体。
+            var directory = System.IO.Path.Combine(evidenceRoot, $"zero-block-{offset}-{width}");
+            System.IO.Directory.CreateDirectory(directory);
+            using (var output = new System.IO.FileStream(System.IO.Path.Combine(directory, "ZeroRange.dll"), System.IO.FileMode.CreateNew))
+                output.Write(emittedBytes);
+            using var receipt = new System.IO.FileStream(System.IO.Path.Combine(directory, "runtime-bytes.json"), System.IO.FileMode.CreateNew);
+            System.Text.Json.JsonSerializer.Serialize(receipt, new
+            {
+                schema = "GeneratedZeroBlockRuntime/v1", offset, width, receiverOffset = 8,
+                initialByte = 0xA5, actualBytes = bytes.Select(value => (int)value).ToArray(),
+                assemblySha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(emittedBytes)).ToLowerInvariant(),
+                runtimeByteChecksPassed = true, sourceRoundTripProved = false
+            });
+        }
     }
 
     private delegate void 引用零写委托(ref long value);
