@@ -62,7 +62,12 @@ public sealed class MethodAddressIndexOutputFormat : Cpp2IlOutputFormat
             artifacts.Add((assembly.Name, Path.GetFileName(outputPath), rows.Count, FileDigest(outputPath)));
         }
 
-        // 该回执仅证明原始方法盘点；零地址仍在分母中，不自动宣称外部边界或源码恢复成功。
+        // 全部声明表只在无筛选模式输出；诊断程序集选择不伪装成完整声明清单。
+        var declarationsPath = Path.Combine(indexRoot, "raw-declarations.json");
+        if (fullScope)
+            MetadataDeclarationInventoryHelper.Write(context.LibCpp2IlContext, declarationsPath);
+
+        // 该回执仅证明原始盘点；零地址仍在分母中，不自动宣称外部边界或源码恢复成功。
         using var stream = File.Create(Path.Combine(indexRoot, "scope-manifest.json"));
         using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
         writer.WriteStartObject();
@@ -81,6 +86,11 @@ public sealed class MethodAddressIndexOutputFormat : Cpp2IlOutputFormat
         writer.WriteNumber("rawAssemblies", context.Metadata.AssemblyDefinitions.Length);
         writer.WriteNumber("rawTypes", context.Metadata.TypeDefinitionCount);
         writer.WriteNumber("rawMethods", context.Metadata.MethodDefinitionCount);
+        if (fullScope)
+        {
+            writer.WriteString("declarationsFile", Path.GetFileName(declarationsPath));
+            writer.WriteString("declarationsSha256", FileDigest(declarationsPath));
+        }
         writer.WriteStartObject("summary");
         writer.WriteNumber("expectedMethods", summary.ExpectedMethods);
         writer.WriteNumber("indexedMethods", summary.IndexedMethods);

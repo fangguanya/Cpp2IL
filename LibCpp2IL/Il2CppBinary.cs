@@ -57,6 +57,10 @@ public abstract class Il2CppBinary(Stream input) : ClassReadingBinaryReader(inpu
 
     public Il2CppType[] AllTypes => _types;
 
+    // 中文注释：提供原始实例与指针表的只读盘点视图，保留共享实例及零地址项。
+    public IReadOnlyList<Il2CppGenericInst> GenericInstances => _genericInsts;
+    public IReadOnlyList<ulong> GenericMethodPointers => _genericMethodPointers;
+
     /// <summary>
     /// Can be overriden if, like the wasm format, your data has to be unpacked and you need to use a different reader
     /// </summary>

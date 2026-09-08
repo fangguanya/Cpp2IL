@@ -80,6 +80,14 @@ public class Il2CppMetadata : ClassReadingBinaryReader
     public int TypeDefinitionCount => typeDefs.Length;
     public int MethodDefinitionCount => methodDefs.Length;
 
+    // 中文注释：完整盘点复用已解析的原始表，不从声明上下文反推分母或再次解码 metadata。
+    public IReadOnlyList<Il2CppFieldDefinition> FieldDefinitions => fieldDefs;
+    public IReadOnlyList<Il2CppPropertyDefinition> PropertyDefinitions => propertyDefs;
+    public IReadOnlyList<Il2CppEventDefinition> EventDefinitions => eventDefs;
+    public IReadOnlyList<Il2CppParameterDefinition> ParameterDefinitions => parameterDefs;
+    public IReadOnlyList<Il2CppGenericContainer> GenericContainers => genericContainers;
+    public IReadOnlyList<Il2CppGenericParameter> GenericParameters => genericParameters;
+
     public static bool HasMetadataHeader(byte[] bytes) => bytes.Length >= 4 && BitConverter.ToUInt32(bytes, 0) == 0xFAB11BAF;
     
     internal static int GetIndexWidth(int elementCount)
