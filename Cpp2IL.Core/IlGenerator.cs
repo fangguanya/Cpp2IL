@@ -379,6 +379,26 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
+                if (instruction is { MemoryAccessWidthBits: > 0,
+                    Operands: [MemoryOperand { Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType.IsValueType: true } } }, Immediate { Value: 0 }] })
+                {
+                    if (!ByRefZeroBlockRecovery.TryDescribe(instruction, context.AppContext.Binary.PointerSizeBytes, out var zeroBlock))
+                        throw new UnresolvedCilSemanticException(method.FullName, "BYREF_ZERO_BLOCK", instruction.ToString());
+
+                    // 保持原始写入位置和长度，包含字段间隙及尾部填充；不经值类型 stobj 改写范围。
+                    LoadLocal(zeroBlock.Receiver, method, locals);
+                    if (zeroBlock.Offset != 0)
+                    {
+                        instructions.Add(CilOpCodes.Ldc_I8, zeroBlock.Offset);
+                        instructions.Add(CilOpCodes.Conv_I);
+                        instructions.Add(CilOpCodes.Add);
+                    }
+                    instructions.Add(CilOpCodes.Ldc_I4, 0);
+                    instructions.Add(CilOpCodes.Ldc_I4, zeroBlock.ByteCount);
+                    instructions.Add(CilOpCodes.Unaligned, (byte)1);
+                    instructions.Add(CilOpCodes.Initblk);
+                    break;
+                }
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     if (!field.Field.IsStatic)

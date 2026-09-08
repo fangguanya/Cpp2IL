@@ -2207,4 +2207,109 @@ public class IlGeneratorTests
         IlGenerator.GenerateIl(callerContext, callerDefinition);
         return callerDefinition.CilMethodBody!.Instructions.ToArray();
     }
+    [TestCase(0L, 64, true)]
+    [TestCase(4L, 32, true)]
+    [TestCase(7L, 8, true)]
+    [TestCase(8L, 8, false)]
+    [TestCase(-1L, 8, false)]
+    [TestCase(long.MaxValue, 64, false)]
+    [TestCase(0L, 0, false)]
+    [TestCase(0L, 7, false)]
+    [TestCase(0L, 128, false)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 引用零块写仅接受原始值类型边界内的精确字节(long offset, int width, bool accepted)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var receiver = new LocalVariable("receiver", new Register(null, "X1"), app.SystemTypes.SystemInt64Type.MakeByReferenceType());
+        var write = new Instruction(0, OpCode.Move, new MemoryOperand(receiver, addend: offset), new Immediate(0))
+            { MemoryAccessWidthBits = width };
+        Assert.That(ByRefZeroBlockRecovery.TryDescribe(write, app.Binary.PointerSizeBytes, out var block), Is.EqualTo(accepted));
+        if (accepted)
+        {
+            Assert.That(block.Receiver, Is.SameAs(receiver));
+            Assert.That(block.Offset, Is.EqualTo(offset));
+            Assert.That(block.ByteCount, Is.EqualTo(width / 8));
+        }
+    }
+
+    [TestCase(0, 64)]
+    [TestCase(4, 32)]
+    [TestCase(7, 8)]
+    [Category("fixture集成")]
+    public void 引用零块写发射原始范围而非整个值类型写回(int offset, int width)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var receiver = new LocalVariable("receiver", new Register(null, "X1"), app.SystemTypes.SystemInt64Type.MakeByReferenceType());
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "ZeroRange", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [receiver.Type!]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, new MemoryOperand(receiver, addend: offset), new Immediate(0)) { MemoryAccessWidthBits = width },
+            new Instruction(1, OpCode.Return)]);
+        context.ParameterLocals = [receiver];
+        context.Locals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("ZeroRange.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemInt64Type, "Int64", TypeAttributes.Public | TypeAttributes.Sealed);
+        var type = new TypeDefinition("Fixture", "ZeroRange", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var definition = new MethodDefinition("ZeroRange", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int64.MakeByReferenceType()]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "receiver", (ParameterAttributes)0));
+        type.Methods.Add(definition);
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, "Fixture.ZeroRange::ZeroRange");
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Initblk), Is.EqualTo(1));
+        Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Stobj), Is.False);
+        Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Add), Is.EqualTo(offset == 0 ? 0 : 1));
+        var blockIndex = il.ToList().FindIndex(instruction => instruction.OpCode == CilOpCodes.Initblk);
+        Assert.That(il[blockIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Unaligned));
+        Assert.That(il[blockIndex - 2].Operand, Is.EqualTo(width / 8));
+
+        // 执行生产器真正生成的程序集，而非在测试中重写一份 initblk 指令实现。
+        var assembly = new AssemblyDefinition("ZeroRangeRuntime", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeAssembly = System.Reflection.Assembly.Load(stream.ToArray());
+        var runtimeMethod = runtimeAssembly.GetType("Fixture.ZeroRange", throwOnError: true)!.GetMethod("ZeroRange")!;
+        var invoke = runtimeMethod.CreateDelegate<引用零写委托>();
+        var bytes = Enumerable.Repeat((byte)0xA5, 32).ToArray();
+        ref var target = ref System.Runtime.CompilerServices.Unsafe.As<byte, long>(ref bytes[8]);
+        invoke(ref target);
+        for (var index = 0; index < bytes.Length; index++)
+            Assert.That(bytes[index], Is.EqualTo(index >= 8 + offset && index < 8 + offset + width / 8 ? (byte)0 : (byte)0xA5),
+                $"字节 {index} 必须保持原始写入范围，前后哨兵及未覆盖部分均不得改变。");
+    }
+
+    private delegate void 引用零写委托(ref long value);
+
+    [TestCase("managed_reference")]
+    [TestCase("native_pointer")]
+    [TestCase("unknown_layout")]
+    [TestCase("nonzero")]
+    [TestCase("indexed")]
+    [TestCase("invalid_pointer_size")]
+    [Category("异常输入")]
+    public void 引用零块写拒绝类型或访问证据不足(string kind)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        TypeAnalysisContext type = app.SystemTypes.SystemInt64Type.MakeByReferenceType();
+        if (kind == "managed_reference")
+            type = app.SystemTypes.SystemStringType.MakeByReferenceType();
+        if (kind == "native_pointer")
+            type = new PointerTypeAnalysisContext(app.SystemTypes.SystemInt64Type);
+        if (kind == "unknown_layout")
+            type = new InjectedTypeAnalysisContext(app.Assemblies[0], "Fixture", "UnknownLayout",
+                app.SystemTypes.SystemValueTypeType, ReflectionTypeAttributes.Public).MakeByReferenceType();
+        var receiver = new LocalVariable("receiver", new Register(null, "X1"), type);
+        var memory = new MemoryOperand(receiver);
+        if (kind == "indexed")
+            memory = new MemoryOperand(receiver, new Immediate(1));
+        var write = new Instruction(0, OpCode.Move, memory, new Immediate(kind == "nonzero" ? 1 : 0))
+            { MemoryAccessWidthBits = 32 };
+        Assert.That(ByRefZeroBlockRecovery.TryDescribe(write, kind == "invalid_pointer_size" ? 0 : app.Binary.PointerSizeBytes, out _), Is.False);
+    }
 }
