@@ -998,6 +998,15 @@ public static class MetadataResolver
                 if (!TryCreateResolvedFieldReference(local, fieldOffset, out var fieldReference))
                     continue;
 
+                // 托管引用指向未装箱布局；只有完整字段宽度的直接读写才能折成字段，局部切片保持原语义。
+                if (local.Type is ByRefTypeAnalysisContext
+                    && (instruction.OpCode != OpCode.Move || instruction.Operands.Count != 2
+                        || instruction.MemoryAccessWidthBits == 0
+                        || GenericInstanceFieldLayout.GetSizeAndAlignment(fieldReference.Field.FieldType,
+                            method.AppContext.Binary.PointerSizeBytes) is not { } fieldLayout
+                        || fieldLayout.Size * 8 != instruction.MemoryAccessWidthBits))
+                    continue;
+
                 instruction.SetOperand(i, fieldReference);
                 changed = true;
             }
@@ -1284,6 +1293,14 @@ public static class MetadataResolver
 
         var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
         var owner = staticOwner ?? localType;
+        if (owner is ByRefTypeAnalysisContext byRef)
+        {
+            // LibCpp2IL 已将值类型实例偏移转换为未装箱偏移；这里只解开元素身份，不再次调整对象头。
+            // ref class 保存的是对象引用槽，并非实例本身，不能沿此路径解析实例字段。
+            if (!byRef.ElementType.IsValueType)
+                return false;
+            owner = byRef.ElementType;
+        }
         // 中文注释：泛型声明的元数据偏移可能为零，必须先构造具体或开放布局实例，
         // 才能得到 Func<T>、Comparison<T> 等字段的精确托管类型。
         var genericOwner = GenericInstanceFieldLayout.CreateLayoutOwner(owner);

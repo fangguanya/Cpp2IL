@@ -2195,6 +2195,75 @@ public class MetadataResolverTests
         return new StaticFieldOffsetFixture(method, access, runtimeFields);
     }
 
+    [TestCase(0, false)]
+    [TestCase(4, false)]
+    [TestCase(12, false)]
+    [TestCase(0, true)]
+    [TestCase(4, true)]
+    [TestCase(12, true)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 结构体托管引用按未装箱偏移解析完整字段读写(int offset, bool store)
+    {
+        var fixture = CreateByRefFieldFixture(offset, 32, store);
+        Assert.That(MetadataResolver.ResolveFieldOffsets(fixture.Method), Is.True);
+        var operand = fixture.Access.Operands[store ? 0 : 1];
+        Assert.That(operand, Is.TypeOf<FieldReference>());
+        Assert.That(((FieldReference)operand).Field, Is.SameAs(fixture.Field));
+        Assert.That(((FieldReference)operand).Local, Is.SameAs(fixture.Receiver));
+        Assert.That(fixture.Receiver.Type, Is.TypeOf<ByRefTypeAnalysisContext>());
+        Assert.That(MetadataResolver.ResolveFieldOffsets(fixture.Method), Is.False);
+    }
+
+    [TestCase(16, 32, false, false)]
+    [TestCase(-4, 32, false, false)]
+    [TestCase(4, 64, false, false)]
+    [TestCase(4, 0, false, false)]
+    [TestCase(4, 32, true, false)]
+    [TestCase(4, 32, false, true)]
+    [Category("异常输入")]
+    public void 托管引用字段缺失重叠宽度不符或引用槽保持未解析(int offset, int width, bool overlap, bool referenceElement)
+    {
+        var fixture = CreateByRefFieldFixture(offset, width, false, overlap, referenceElement);
+        var before = fixture.Access.Operands[1];
+        Assert.That(MetadataResolver.ResolveFieldOffsets(fixture.Method), Is.False);
+        Assert.That(fixture.Access.Operands[1], Is.SameAs(before));
+        Assert.That(before, Is.TypeOf<MemoryOperand>());
+    }
+
+    private static (MethodAnalysisContext Method, Instruction Access, FieldAnalysisContext Field, LocalVariable Receiver)
+        CreateByRefFieldFixture(int offset, int width, bool store, bool overlap = false, bool referenceElement = false)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.GetAssemblyByName("mscorlib")!, "Fixture", "ByRefFields" + offset,
+            referenceElement ? app.SystemTypes.SystemObjectType : app.SystemTypes.SystemValueTypeType,
+            System.Reflection.TypeAttributes.Public);
+        FieldAnalysisContext? selected = null;
+        foreach (var fieldOffset in new[] { 0, 4, 12 })
+        {
+            var field = owner.InjectFieldContext("Value" + fieldOffset, app.SystemTypes.SystemInt32Type,
+                System.Reflection.FieldAttributes.Public);
+            field.OverrideOffset = fieldOffset;
+            if (fieldOffset == offset)
+                selected = field;
+        }
+        if (overlap)
+        {
+            var field = owner.InjectFieldContext("OverlappingValue", app.SystemTypes.SystemInt32Type,
+                System.Reflection.FieldAttributes.Public);
+            field.OverrideOffset = offset;
+        }
+        var receiver = new LocalVariable("receiver", new Register(null, "X1"), owner.MakeByReferenceType());
+        var value = new LocalVariable("value", new Register(null, "X2"), app.SystemTypes.SystemInt32Type);
+        var memory = new MemoryOperand(receiver, addend: offset);
+        var access = store ? new Instruction(0, OpCode.Move, memory, value) : new Instruction(0, OpCode.Move, value, memory);
+        access.MemoryAccessWidthBits = width;
+        var method = owner.InjectMethodContext("AccessField" + offset + store, app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        method.ControlFlowGraph = new ISILControlFlowGraph([access, new Instruction(1, OpCode.Return)]);
+        return (method, access, selected!, receiver);
+    }
+
     private sealed record StaticFieldOffsetFixture(
         MethodAnalysisContext Method,
         Instruction Access,
