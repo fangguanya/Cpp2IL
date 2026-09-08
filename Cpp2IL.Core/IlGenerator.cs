@@ -233,26 +233,18 @@ public static class IlGenerator
         {
             var target = ResolveBlockEntryInstruction(targetBlock, blockEntryMap);
             if (target == null)
-            {
-                context.AddWarning($"Unable to resolve branch target block: {targetBlock}");
-                branchInstruction.OpCode = CilOpCodes.Nop;
-                branchInstruction.Operand = null;
-                continue;
-            }
+                throw new UnresolvedCilSemanticException(definition.FullName, "BRANCH_TARGET", targetBlock.ToString());
 
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
-        // Add analysis warnings
-        var instructions = body.Instructions;
-        foreach (var warning in context.AnalysisWarnings)
-        {
-            instructions.Add(CilOpCodes.Ldstr, "Warning: " + warning);
-            instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-        }
+        // 未分类分析警告不是业务指令，也不证明语义已闭合；原文进入统一恢复失败证据。
+        if (context.AnalysisWarnings.Count != 0)
+            throw new UnresolvedCilSemanticException(definition.FullName, "ANALYSIS_WARNINGS",
+                string.Join("\n", context.AnalysisWarnings));
 
-        // 分析警告会被附加到方法尾部；若 void 方法尾部仍可顺序落出，则补齐合法的 CIL 返回终结点。
-        // 这里仅修复方法体结构，不把未知的原生异常尾语义标记为已经恢复。
+        var instructions = body.Instructions;
+        // 只维持既有 void 方法结构规则，不借助运行期诊断输出补齐方法尾部。
         if (RequiresTerminalReturn(context.IsVoid, instructions.LastOrDefault()))
             instructions.Add(CilOpCodes.Ret);
     }

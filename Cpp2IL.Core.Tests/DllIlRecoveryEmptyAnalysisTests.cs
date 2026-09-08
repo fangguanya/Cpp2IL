@@ -466,4 +466,65 @@ public class DllIlRecoveryEmptyAnalysisTests
             Directory.Delete(directory);
         }
     }
+    [TestCase(0, false)]
+    [TestCase(1, false)]
+    [TestCase(2, false)]
+    [TestCase(0, true)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 分析警告与丢失桥接目标不注入业务诊断(int warningCount, bool unresolvedBridge)
+    {
+        var (context, definition) = Fixture("DiagnosticEvidence", 45056);
+        context.AnalysisWarnings = Enumerable.Range(0, warningCount).Select(i => "未闭合分析证据" + i).ToList();
+        var terminal = new Instruction(0, unresolvedBridge ? OpCode.Nop : OpCode.Return);
+        context.ConvertedIsil = [terminal];
+        var entry = new Block { ID = 0, BlockType = BlockType.Entry };
+        var exit = new Block { ID = 1, BlockType = BlockType.Exit };
+        var body = new Block { ID = 2, BlockType = BlockType.OneWay, Instructions = [terminal] };
+        var empty = new Block { ID = 3, BlockType = BlockType.OneWay };
+        entry.Successors.Add(body);
+        body.Predecessors.Add(entry);
+        var next = unresolvedBridge ? empty : exit;
+        body.Successors.Add(next);
+        next.Predecessors.Add(body);
+        if (unresolvedBridge)
+        {
+            empty.Successors.Add(exit);
+            exit.Predecessors.Add(empty);
+        }
+        context.ControlFlowGraph = new ISILControlFlowGraph([])
+        {
+            EntryBlock = entry, ExitBlock = exit, Blocks = [entry, body, empty, exit]
+        };
+        var output = new OutputProbe();
+        output.Fill(definition, context);
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-Diagnostics-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            output.Receipt(directory);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            if (warningCount == 0 && !unresolvedBridge)
+            {
+                Assert.That(output.Successful, Is.EqualTo(1), receipt.RootElement.ToString());
+                Assert.That(definition.CilMethodBody!.Instructions.Select(i => i.OpCode), Is.EqualTo(new[] { CilOpCodes.Ret }));
+            }
+            else
+            {
+                Assert.That(output.Successful, Is.Zero);
+                Assert.That(definition.CilMethodBody, Is.Null);
+                var failure = receipt.RootElement.GetProperty("failures")[0];
+                Assert.That(failure.GetProperty("category").GetString(), Is.EqualTo("UNRESOLVED_CIL_SEMANTICS"), failure.ToString());
+                var detail = failure.GetProperty("detail").GetString();
+                Assert.That(detail, Does.Contain(unresolvedBridge ? "BRANCH_TARGET" : "ANALYSIS_WARNINGS"));
+                for (var i = 0; i < warningCount; i++)
+                    Assert.That(detail, Does.Contain("未闭合分析证据" + i));
+            }
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
 }
