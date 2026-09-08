@@ -83,6 +83,8 @@ internal static class MetadataDeclarationInventoryHelper
             writer.WriteNumber("nestedTypeCount", item.NestedTypeCount);
             writer.WriteNumber("interfacesStart", item.InterfacesStart.Value);
             writer.WriteNumber("interfaceCount", item.InterfacesCount);
+            writer.WriteNumber("interfaceOffsetsStart", item.InterfaceOffsetsStart.Value);
+            writer.WriteNumber("interfaceOffsetsCount", item.InterfaceOffsetsCount);
             writer.WriteNumber("vtableStart", item.VtableStart);
             writer.WriteNumber("vtableCount", item.VtableCount);
         });
@@ -103,6 +105,10 @@ internal static class MetadataDeclarationInventoryHelper
             writer.WriteNumber("flags", item.flags);
             writer.WriteNumber("implementationFlags", item.iflags);
             writer.WriteNumber("slot", item.slot);
+            writer.WriteNumber("parameterStart", item.parameterStart.Value);
+            writer.WriteNumber("parameterCount", item.parameterCount);
+            if (metadata.MetadataVersion >= 31)
+                writer.WriteNumber("returnParameterToken", item.returnParameterToken);
             WriteIndex(writer, "returnTypeReferenceIndex", item.returnTypeIdx.Value, binary.NumTypes);
             WriteIndex(writer, "genericContainerIndex", item.genericContainerIndex.Value, metadata.GenericContainers.Count, true);
             // 原生导入仅按原始 PInvokeImpl 标志登记，不凭名称或零指针猜测外部实现。
@@ -183,6 +189,34 @@ internal static class MetadataDeclarationInventoryHelper
             writer.WriteNumber("byref", item.Byref);
             writer.WriteNumber("pinned", item.Pinned);
         });
+        // 默认值保留原始类型、数据索引及来源区段，不把解码失败或空索引解释为默认实现。
+        WriteTable(writer, "fieldDefaultValues", metadata.FieldDefaultValues, (item, index) =>
+        {
+            WriteIndex(writer, "fieldIndex", item.fieldIndex.Value, metadata.FieldDefinitions.Count);
+            WriteIndex(writer, "typeReferenceIndex", item.typeIndex.Value, binary.NumTypes);
+            WriteIndex(writer, "dataIndex", item.dataIndex.Value, metadata.metadataHeader.fieldAndParameterDefaultValueData.Size, true);
+        });
+        WriteTable(writer, "parameterDefaultValues", metadata.ParameterDefaultValues, (item, index) =>
+        {
+            WriteIndex(writer, "parameterIndex", item.parameterIndex.Value, metadata.ParameterDefinitions.Count);
+            WriteIndex(writer, "typeReferenceIndex", item.typeIndex.Value, binary.NumTypes);
+            WriteIndex(writer, "dataIndex", item.dataIndex.Value, metadata.metadataHeader.fieldAndParameterDefaultValueData.Size, true);
+        });
+        writer.WriteNumber("defaultValueDataOffset", metadata.metadataHeader.fieldAndParameterDefaultValueData.Offset);
+        writer.WriteNumber("defaultValueDataSize", metadata.metadataHeader.fieldAndParameterDefaultValueData.Size);
+        if (metadata.MetadataVersion >= 29)
+        {
+            writer.WriteNumber("attributeDataOffset", metadata.metadataHeader.attributeData.Offset);
+            writer.WriteNumber("attributeDataSize", metadata.metadataHeader.attributeData.Size);
+        }
+        WriteTable(writer, "nestedTypes", metadata.NestedTypeIndices, (item, index) =>
+            WriteIndex(writer, "typeDefinitionIndex", item.Value, types.Length));
+        WriteTable(writer, "interfaceOffsets", metadata.InterfaceOffsets, (item, index) =>
+        {
+            WriteIndex(writer, "typeReferenceIndex", item.typeIndex.Value, binary.NumTypes);
+            writer.WriteNumber("offset", item.offset);
+        });
+        WriteNumbers(writer, "encodedVtableMethods", metadata.VTableMethodIndices.Select(value => (long)value));
         WriteTable(writer, "attributeDataRanges", metadata.AttributeDataRanges ?? [], (item, index) =>
         {
             writer.WriteNumber("token", item.token);

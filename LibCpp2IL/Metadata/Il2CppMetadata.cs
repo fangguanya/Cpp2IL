@@ -87,6 +87,10 @@ public class Il2CppMetadata : ClassReadingBinaryReader
     public IReadOnlyList<Il2CppParameterDefinition> ParameterDefinitions => parameterDefs;
     public IReadOnlyList<Il2CppGenericContainer> GenericContainers => genericContainers;
     public IReadOnlyList<Il2CppGenericParameter> GenericParameters => genericParameters;
+    public IReadOnlyList<Il2CppFieldDefaultValue> FieldDefaultValues => fieldDefaultValues;
+    public IReadOnlyList<Il2CppParameterDefaultValue> ParameterDefaultValues => parameterDefaultValues;
+    public IReadOnlyList<Il2CppNestedTypeIndex> NestedTypeIndices => nestedTypeIndices;
+    public IReadOnlyList<Il2CppInterfaceOffset> InterfaceOffsets => interfaceOffsets;
 
     public static bool HasMetadataHeader(byte[] bytes) => bytes.Length >= 4 && BitConverter.ToUInt32(bytes, 0) == 0xFAB11BAF;
     
