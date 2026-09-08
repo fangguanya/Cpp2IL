@@ -11,6 +11,7 @@ using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.OutputFormats;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL.BinaryStructures;
 using ManagedTypeAttributes = AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes;
@@ -22,6 +23,45 @@ namespace Cpp2IL.Core.Tests;
 [NonParallelizable]
 public class NativeZeroBlockExecutionTests
 {
+    [Test]
+    [Category("fixture集成")]
+    public void 原始完整方法通过生产发射并保留两处零块写()
+    {
+        var app = Arm64StartupFixtureIntegrationTests.LoadFixture();
+        var original = app.Assemblies.Single(assembly => assembly.Name == "UnityEngine.CoreModule").Types
+            .SelectMany(type => type.Methods).Single(method => method.Definition?.token == 0x06000BB4u);
+        // 只按原始身份选择回归范围，生产入口负责全部声明绑定和完整原生方法分析。
+        var options = Cpp2IlApi.RuntimeOptions ?? throw new InvalidOperationException("原始输入加载器未初始化运行选项。");
+        options.IsilDumpAssemblyFilters = [original.DeclaringType!.DeclaringAssembly.Name];
+        options.IsilDumpTypeFilters = [original.DeclaringType.FullName];
+        new AsmResolverDllOutputFormatIlRecovery().BuildAssemblies(app);
+        var definition = original.GetExtraData<MethodDefinition>("AsmResolverMethod");
+        Assert.That(definition, Is.Not.Null);
+        Assert.That(definition!.CilMethodBody, Is.Not.Null);
+        var body = definition.CilMethodBody!;
+        CilStackValidator.Validate(body, original.FullName);
+        var instructions = body.Instructions.Select(instruction => instruction.ToString()).ToArray();
+        Assert.That(body.Instructions.Count(instruction => instruction.OpCode.Code ==
+            AsmResolver.PE.DotNet.Cil.CilCode.Initblk), Is.EqualTo(2));
+        Assert.That(definition.Signature!.ReturnType.FullName, Is.EqualTo("System.Boolean"));
+        Assert.That(definition.Signature.ParameterTypes.Select(type => type.FullName), Is.EqualTo(
+            new[] { "System.String", "UnityEngine.Bindings.ManagedSpanWrapper&" }));
+        Assert.That(original.AnalysisWarnings, Is.Empty);
+        var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        Assert.That(root, Is.Not.Null.And.Not.Empty);
+        Directory.CreateDirectory(root!);
+        using var receipt = new FileStream(Path.Combine(root!, "native-full-method-cil.json"), FileMode.CreateNew);
+        JsonSerializer.Serialize(receipt, new
+        {
+            schema = "NativeFullMethodCilRegression/v1", method = original.FullName,
+            address = original.UnderlyingPointer,
+            binarySha256 = app.LibCpp2IlContext.InputBinarySha256,
+            metadataSha256 = app.LibCpp2IlContext.InputMetadataSha256,
+            instructions, cilStackValidated = true, originalFullGraphUsed = true,
+            fullMethodRuntimeProved = false, sourceRoundTripProved = false, fullRecoveryProved = false
+        });
+    }
+
     [Test]
     [Category("fixture集成")]
     public void 原始带填充值类型的零块写保持完整范围与外部哨兵()
