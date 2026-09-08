@@ -1300,6 +1300,37 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         };
     }
 
+    /// <summary>
+    /// 标量后索引栈访问先使用旧 SP 的零偏移槽，再写回 SP；与 LDP 共用栈增量解码规则。
+    /// </summary>
+    internal bool TryCreatePostIndexedScalarStackAccess(Arm64Instruction instruction, out List<Instruction> recovered)
+    {
+        recovered = [];
+        var isLoad = IsScalarLoadMnemonic(instruction.Mnemonic);
+        if ((!isLoad && !IsScalarStoreMnemonic(instruction.Mnemonic))
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Memory
+            || instruction.MemAddendReg != Arm64Register.INVALID
+            || !TryDecodePostIndexedStackAdjustment(instruction.MemIndexMode, instruction.MemBase,
+                instruction.MemOffset, out var stackDelta))
+            return false;
+
+        var width = isLoad ? instruction.Mnemonic switch
+        {
+            Arm64Mnemonic.LDRB => 8,
+            Arm64Mnemonic.LDRH or Arm64Mnemonic.LDURH => 16,
+            Arm64Mnemonic.LDRSW => 32,
+            _ => Arm64RegisterHelper.SizeBytes(instruction.Op0Reg) * 8
+        } : GetScalarStoreWidthBits(instruction.Mnemonic, instruction.Op0Reg);
+        var slot = new StackOffset(0);
+        var access = isLoad
+            ? new Instruction(0, OpCode.Move, ConvertOperand(instruction, 0), slot)
+            : new Instruction(0, OpCode.Move, slot, ConvertStoreSourceOperand(instruction));
+        access.MemoryAccessWidthBits = width;
+        recovered.Add(access);
+        recovered.Add(new Instruction(1, OpCode.ShiftStack, new Immediate(stackDelta)));
+        return true;
+    }
     internal static bool IsScalarLoadMnemonic(Arm64Mnemonic mnemonic)
     {
         return mnemonic is Arm64Mnemonic.LDR
@@ -3525,6 +3556,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
         }
 
+        if (TryCreatePostIndexedScalarStackAccess(instruction, out var stackAccess))
+        {
+            if (IsScalarLoadMnemonic(instruction.Mnemonic))
+                adrpOffsets.Remove(instruction.Op0Reg);
+            foreach (var recovered in stackAccess)
+                AddMemory(address, recovered.MemoryAccessWidthBits, recovered.OpCode, recovered.Operands.ToList());
+            return;
+        }
         switch (instruction.Mnemonic)
         {
             case Arm64Mnemonic.MOV:

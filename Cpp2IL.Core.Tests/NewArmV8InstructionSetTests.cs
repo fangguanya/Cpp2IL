@@ -2980,4 +2980,36 @@ public class NewArmV8InstructionSetTests
                 out _),
             Is.False);
     }
+    [TestCase(0xF84107FEu, 0x1000UL, true, 16, 64)]
+    [TestCase(0xF84107FEu, 0x8000UL, true, 16, 64)]
+    [TestCase(0xF80107E0u, 0x2000UL, false, 16, 64)]
+    [TestCase(0xF85F07FEu, 0x3000UL, true, -16, 64)]
+    [TestCase(0xF84007FEu, 0x4000UL, true, 0, 64)]
+    [TestCase(0x384017E0u, 0x5000UL, true, 1, 8)]
+    [TestCase(0x380017E0u, 0x6000UL, false, 1, 8)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 标量后索引栈访问先读写旧槽再调整SP(uint machineCode, ulong address, bool load, int delta, int width)
+    {
+        var native = DecodeSingleInstruction(BitConverter.GetBytes(machineCode), address);
+        var decoded = new NewArmV8InstructionSet().TryCreatePostIndexedScalarStackAccess(native, out var instructions);
+        Assert.That(decoded, Is.True, native.ToString());
+        Assert.That(instructions.Select(i => i.OpCode), Is.EqualTo(new[] { OpCode.Move, OpCode.ShiftStack }));
+        Assert.That(instructions[0].MemoryAccessWidthBits, Is.EqualTo(width));
+        Assert.That(instructions[0].Operands[load ? 1 : 0], Is.TypeOf<StackOffset>());
+        Assert.That(((StackOffset)instructions[0].Operands[load ? 1 : 0]).Offset, Is.Zero);
+        Assert.That(((Immediate)instructions[1].Operands[0]).Value, Is.EqualTo(delta));
+        Assert.That(instructions[1].MemoryAccessWidthBits, Is.Zero);
+    }
+
+    [TestCase(0xF8410660u)]
+    [TestCase(0xF8410FFEu)]
+    [TestCase(0xF94003FEu)]
+    [Category("异常输入")]
+    public void 非SP后索引或其他寻址模式不进入标量栈写回(uint machineCode)
+    {
+        var native = DecodeSingleInstruction(BitConverter.GetBytes(machineCode), 0x9000);
+        Assert.That(new NewArmV8InstructionSet().TryCreatePostIndexedScalarStackAccess(native, out var instructions), Is.False);
+        Assert.That(instructions, Is.Empty);
+    }
 }
