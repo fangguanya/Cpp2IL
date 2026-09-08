@@ -3012,4 +3012,20 @@ public class NewArmV8InstructionSetTests
         Assert.That(new NewArmV8InstructionSet().TryCreatePostIndexedScalarStackAccess(native, out var instructions), Is.False);
         Assert.That(instructions, Is.Empty);
     }
+    [TestCase(Arm64Mnemonic.LDR, Arm64Register.W8, 32)]
+    [TestCase(Arm64Mnemonic.LDR, Arm64Register.X8, 64)]
+    [TestCase(Arm64Mnemonic.LDUR, Arm64Register.W9, 32)]
+    [TestCase(Arm64Mnemonic.LDRB, Arm64Register.W8, 8)]
+    [TestCase(Arm64Mnemonic.LDRH, Arm64Register.W8, 16)]
+    [TestCase(Arm64Mnemonic.LDURH, Arm64Register.W8, 16)]
+    [TestCase(Arm64Mnemonic.LDRSW, Arm64Register.X8, 32)]
+    [TestCase(Arm64Mnemonic.MOV, Arm64Register.X8, 0)]
+    [TestCase(Arm64Mnemonic.STR, Arm64Register.X8, 0)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 加载访问宽度不被目标扩展或普通移动污染(Arm64Mnemonic mnemonic, Arm64Register register, int expected)
+    {
+        Assert.That(NewArmV8InstructionSet.GetScalarLoadWidthBits(mnemonic, register), Is.EqualTo(expected));
+    }
 }

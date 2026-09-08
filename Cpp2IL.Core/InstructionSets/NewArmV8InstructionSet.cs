@@ -1315,13 +1315,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 instruction.MemOffset, out var stackDelta))
             return false;
 
-        var width = isLoad ? instruction.Mnemonic switch
-        {
-            Arm64Mnemonic.LDRB => 8,
-            Arm64Mnemonic.LDRH or Arm64Mnemonic.LDURH => 16,
-            Arm64Mnemonic.LDRSW => 32,
-            _ => Arm64RegisterHelper.SizeBytes(instruction.Op0Reg) * 8
-        } : GetScalarStoreWidthBits(instruction.Mnemonic, instruction.Op0Reg);
+        var width = isLoad
+            ? GetScalarLoadWidthBits(instruction.Mnemonic, instruction.Op0Reg)
+            : GetScalarStoreWidthBits(instruction.Mnemonic, instruction.Op0Reg);
         var slot = new StackOffset(0);
         var access = isLoad
             ? new Instruction(0, OpCode.Move, ConvertOperand(instruction, 0), slot)
@@ -1331,6 +1327,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         recovered.Add(new Instruction(1, OpCode.ShiftStack, new Immediate(stackDelta)));
         return true;
     }
+    /// <summary>
+    /// 加载宽度描述实际内存读取范围，符号扩展到 X 寄存器也不扩大内存覆盖范围。
+    /// 所有加载寻址分支共用此规则，普通寄存器移动保持零访存宽度。
+    /// </summary>
+    internal static int GetScalarLoadWidthBits(Arm64Mnemonic mnemonic, Arm64Register destinationRegister)
+    {
+        return mnemonic switch
+        {
+            Arm64Mnemonic.LDRB => 8,
+            Arm64Mnemonic.LDRH or Arm64Mnemonic.LDURH => 16,
+            Arm64Mnemonic.LDRSW => 32,
+            Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR => Arm64RegisterHelper.SizeBytes(destinationRegister) * 8,
+            _ => 0
+        };
+    }
+
     internal static bool IsScalarLoadMnemonic(Arm64Mnemonic mnemonic)
     {
         return mnemonic is Arm64Mnemonic.LDR
@@ -3609,7 +3621,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                         if (instruction.Op0Kind == Arm64OperandKind.Register)
                             adrpOffsets.Remove(instruction.Op0Reg);
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), vectorSource);
+                        AddMemory(address, 128, OpCode.Move, ConvertOperand(instruction, 0), vectorSource);
                         break;
                     }
                 }
@@ -3627,7 +3639,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         // X19= X19, #0x30
                         Add(address, OpCode.Add, register, register, Imm(operand.Addend));
                         //X8 = [X19]
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), new MemoryOperand(new Register(null, register.ToString()!.ToUpperInvariant())));
+                        AddMemory(address, GetScalarLoadWidthBits(instruction.Mnemonic, instruction.Op0Reg), OpCode.Move, ConvertOperand(instruction, 0), new MemoryOperand(new Register(null, register.ToString()!.ToUpperInvariant())));
                         break;
                     }
                 }
@@ -3645,7 +3657,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (instruction.Op0Kind == Arm64OperandKind.Register)
                         adrpOffsets.Remove(instruction.Op0Reg);
 
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), absoluteLoadSource);
+                    AddMemory(address, GetScalarLoadWidthBits(instruction.Mnemonic, instruction.Op0Reg), OpCode.Move, ConvertOperand(instruction, 0), absoluteLoadSource);
                     break;
                 }
 
@@ -3696,7 +3708,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     moveSource = ConvertMoveSourceOperand(instruction);
                 }
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), moveSource);
+                AddMemory(address, GetScalarLoadWidthBits(instruction.Mnemonic, instruction.Op0Reg), OpCode.Move, ConvertOperand(instruction, 0), moveSource);
                 // MOV、FMOV、SXTW 与 LDR 家族均不写 NZCV。保留此前 CMP/TST 等标志生产者，
                 // 使跨加载的 CSEL/条件分支继续读取原生指令流中的真实条件。
                 break;
@@ -3913,20 +3925,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                     else if (dest3 is MemoryOperand memory)
                     {
-                        var firstRegister = ConvertOperand(instruction, 0);
+                        var firstRegister = ConvertStorePairSourceOperand(instruction, 0);
                         var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
                         AddMemory(address, size * 8, OpCode.Move, dest3, firstRegister); // [REG + offset] = REG1
                         memory = new MemoryOperand((Register)memory.Base!, addend: memory.Addend + size);
                         dest3 = memory;
-                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertOperand(instruction, 1)); // [REG + offset + size] = REG2
+                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertStorePairSourceOperand(instruction, 1)); // [REG + offset + size] = REG2
                     }
                     else // reg pointer
                     {
-                        var firstRegister = ConvertOperand(instruction, 0);
+                        var firstRegister = ConvertStorePairSourceOperand(instruction, 0);
                         var size = Arm64RegisterHelper.SizeBytes(instruction.Op0Reg);
                         AddMemory(address, size * 8, OpCode.Move, dest3, firstRegister);
                         Add(address, OpCode.Add, dest3, dest3, Imm(size));
-                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertOperand(instruction, 1));
+                        AddMemory(address, size * 8, OpCode.Move, dest3, ConvertStorePairSourceOperand(instruction, 1));
                     }
                 }
                 break;
@@ -3978,8 +3990,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     mem2 = new MemoryOperand((Register)memInternal.Base!, addend: memInternal.Addend + destRegSize);
                 }
 
-                Add(address, OpCode.Move, dest1, mem);
-                Add(address, OpCode.Move, dest2, mem2);
+                // 成对加载拆分后仍须保留每个元素的真实访问宽度，供字段与聚合布局恢复验证。
+                AddMemory(address, destRegSize * 8, OpCode.Move, dest1, mem);
+                AddMemory(address, destRegSize * 8, OpCode.Move, dest2, mem2);
                 if (TryDecodePostIndexedStackAdjustment(
                         instruction.MemIndexMode,
                         instruction.MemBase,

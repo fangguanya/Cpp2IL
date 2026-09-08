@@ -2760,7 +2760,7 @@ public static class LocalVariables
         return changed;
     }
 
-    private static bool PropagateMove(Instruction move, int pointerSize)
+    internal static bool PropagateMove(Instruction move, int pointerSize)
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
@@ -2787,7 +2787,8 @@ public static class LocalVariables
         // Move local, [obj]: offset 0 of a reference-typed value is its klass pointer.
         if (destination is LocalVariable { Type: null } klassDest
             && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: { } baseType } }
-            && baseType is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext)
+            && baseType is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
             && !baseType.IsValueType)
             return SetTypeIfUnknown(klassDest, new RuntimeClassTypeAnalysisContext(baseType, baseType.DeclaringAssembly));
 

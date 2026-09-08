@@ -4489,6 +4489,32 @@ public class LocalVariablesTests
         });
     }
 
+    [TestCase("reference", true)]
+    [TestCase("byref_value", false)]
+    [TestCase("byref_reference", false)]
+    [TestCase("pointer", false)]
+    [Category("基本功能")]
+    [Category("异常输入")]
+    public void 零偏移类指针推断只适用于真实托管对象(string kind, bool expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var sourceType = kind switch
+        {
+            "reference" => app.SystemTypes.SystemObjectType,
+            "byref_value" => app.SystemTypes.SystemInt32Type.MakeByReferenceType(),
+            "byref_reference" => app.SystemTypes.SystemObjectType.MakeByReferenceType(),
+            _ => app.SystemTypes.SystemInt32Type.MakePointerType()
+        };
+        var source = new LocalVariable("source", new Register(null, "X1"), sourceType);
+        var destination = new LocalVariable("destination", new Register(null, "X2"));
+        var move = new Instruction(0, OpCode.Move, destination, new MemoryOperand(source));
+        Assert.That(LocalVariables.PropagateMove(move, app.Binary.PointerSizeBytes), Is.EqualTo(expected));
+        if (expected)
+            Assert.That(destination.Type, Is.TypeOf<RuntimeClassTypeAnalysisContext>());
+        else
+            Assert.That(destination.Type, Is.Null);
+    }
+
     private static InjectedMethodAnalysisContext CreateConstructorFixture(
         TypeAnalysisContext declaringType,
         string name,

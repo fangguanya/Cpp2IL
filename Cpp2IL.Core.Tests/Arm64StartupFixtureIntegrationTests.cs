@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text.Json;
 using AssetRipper.Primitives;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Api;
@@ -217,6 +218,41 @@ public class Arm64StartupFixtureIntegrationTests
                 || source is LocalVariable local
                     && local.Type == context.SystemTypes.SystemStringType)), Is.True);
         }
+    }
+
+    [TestCase("AWSSDK.Core", 0x0600000Bu, 0x386E004UL)]
+    [TestCase("UnityEngine.CoreModule", 0x06000BB4u, 0x536B5C4UL)]
+    [Category("fixture集成")]
+    public void 原始机器码的结构体引用字段进入最终恢复图(string assemblyName, uint token, ulong address)
+    {
+        var context = LoadFixture();
+        // 身份和地址仅固定原始回归样本，不进入生产算法的任何分派。
+        var method = context.Assemblies.Single(assembly => assembly.Name == assemblyName).Types
+            .SelectMany(type => type.Methods).Single(candidate => candidate.Definition?.token == token);
+        Assert.That(method.UnderlyingPointer, Is.EqualTo(address));
+        var rawHash = Convert.ToHexString(SHA256.HashData(method.RawBytes.AsSpan())).ToLowerInvariant();
+        method.Analyze();
+        var final = method.ControlFlowGraph!.Instructions;
+        var fields = final.SelectMany(instruction => instruction.Operands).OfType<FieldReference>()
+            .Where(field => field.Local.Type is ByRefTypeAnalysisContext).ToArray();
+        var remaining = final.SelectMany(instruction => instruction.Operands).OfType<MemoryOperand>()
+            .Where(memory => memory.Base is LocalVariable { Type: ByRefTypeAnalysisContext { ElementType.IsValueType: true } }
+                && memory.Index == null && memory.Scale == 0 && memory.Addend > 0).ToArray();
+        var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        Assert.That(root, Is.Not.Null.And.Not.Empty, "原始回归需要独立证据目录。");
+        Directory.CreateDirectory(root!);
+        var path = Path.Combine(root!, $"native-byref-{assemblyName}-{token:X8}.json");
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
+            JsonSerializer.Serialize(stream, new { schema = "NativeByRefFieldRegression/v1", assemblyName, token, address,
+                binarySha256 = context.LibCpp2IlContext.InputBinarySha256,
+                metadataSha256 = context.LibCpp2IlContext.InputMetadataSha256, rawHash,
+                fields = fields.Select(field => field.ToString()).ToArray(),
+                remaining = remaining.Select(memory => memory.ToString()).ToArray(),
+                warnings = method.AnalysisWarnings,
+                finalInstructions = final.Select(instruction => instruction.ToString()).ToArray(),
+                fullMethodSemanticAcceptanceProved = false });
+        Assert.That(fields, Is.Not.Empty, "真实机器码中应保留已知结构字段的托管引用身份。");
+        Assert.That(remaining, Is.Empty, "非零偏移的结构体引用内存访问仍有未恢复字段。");
     }
 
     private static ApplicationAnalysisContext LoadFixture()
