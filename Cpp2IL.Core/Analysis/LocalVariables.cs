@@ -958,7 +958,7 @@ public static class LocalVariables
             } => nullableType,
             _ => null,
         };
-    
+
     //Handles typing of locals for ref/out params
     public static void TypeAddressedLocals(MethodAnalysisContext method)
     {

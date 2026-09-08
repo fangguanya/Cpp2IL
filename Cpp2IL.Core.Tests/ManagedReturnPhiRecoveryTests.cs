@@ -35,7 +35,7 @@ public class ManagedReturnPhiRecoveryTests
             Assert.That(assignment.Operands[1], Is.SameAs(fixture.Candidate));
             Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.DefaultResult));
             Assert.That(fixture.NoMatchExit.Instructions, Has.None.Matches<Instruction>(instruction =>
-                instruction.OpCode == OpCode.Move
+                instruction is { OpCode: OpCode.Move }
                 && instruction.Operands.Contains(fixture.Candidate)));
         });
     }
@@ -54,7 +54,7 @@ public class ManagedReturnPhiRecoveryTests
         {
             Assert.That(recovered, Is.Zero);
             Assert.That(fixture.MatchExit.Instructions, Has.None.Matches<Instruction>(instruction =>
-                instruction.OpCode == OpCode.Move));
+                instruction is { OpCode: OpCode.Move }));
             Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.DefaultResult));
         });
     }
@@ -73,7 +73,7 @@ public class ManagedReturnPhiRecoveryTests
         {
             Assert.That(recovered, Is.Zero);
             Assert.That(fixture.MatchExit.Instructions, Has.None.Matches<Instruction>(instruction =>
-                instruction.OpCode == OpCode.Move
+                instruction is { OpCode: OpCode.Move }
                 && instruction.Operands.Contains(fixture.Candidate)));
             Assert.That(fixture.Return.Operands[0], Is.SameAs(fixture.DefaultResult));
         });

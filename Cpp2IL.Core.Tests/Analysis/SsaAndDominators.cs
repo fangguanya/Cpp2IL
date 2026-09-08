@@ -554,7 +554,7 @@ public class SsaAndDominators
         Assert.Multiple(() =>
         {
             Assert.That(x8Phis, Is.Not.Empty);
-            Assert.That(x8Phis, Has.All.Matches<Instruction>(phi => phi.Operands.Skip(1)
+            Assert.That(x8Phis, Has.All.Matches<Instruction>(phi => phi is not null && phi.Operands.Skip(1)
                 .OfType<LocalVariable>()
                 .All(source => source.Register.Name == "X8")));
         });

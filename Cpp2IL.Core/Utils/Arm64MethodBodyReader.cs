@@ -1,5 +1,6 @@
 using System;
 using LibCpp2IL;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Utils;
 
@@ -7,9 +8,10 @@ internal static class Arm64MethodBodyReader
 {
     internal readonly record struct RawMethodRange(int Start, int Length);
 
-    public static bool TryReadManagedMethodBody(Il2CppBinary binary, ulong startVirtualAddress, out BinarySlice body)
+    public static bool TryReadManagedMethodBody(ApplicationAnalysisContext appContext, ulong startVirtualAddress, out BinarySlice body)
     {
-        var endVirtualAddress = MiscUtils.GetAddressOfNextFunctionStart(startVirtualAddress, binary);
+        var binary = appContext.Binary;
+        var endVirtualAddress = appContext.GetAddressOfNextFunctionStart(startVirtualAddress);
         if (endVirtualAddress == 0)
         {
             body = BinarySlice.Empty;

@@ -1171,7 +1171,7 @@ public static class KeyFunctionRecovery
         instruction.OpCode = OpCode.Nop;
         instruction.SetOperands();
     }
-    
+
     private static void RewriteObjectNew(Instruction instruction)
     {
         // Needs the function name, the result, and the class argument.

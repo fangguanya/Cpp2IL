@@ -1660,10 +1660,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         // 普通托管方法使用相邻虚拟地址确定动态边界，再由二进制格式映射器得到文件区间。
         if (context is not ConcreteGenericMethodAnalysisContext &&
-            Arm64MethodBodyReader.TryReadManagedMethodBody(binary, context.UnderlyingPointer, out var body))
+            Arm64MethodBodyReader.TryReadManagedMethodBody(context.AppContext, context.UnderlyingPointer, out var body))
             return body;
 
-        var result = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(binary, context.UnderlyingPointer);
+        var result = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
         var lastInsn = result.LastValid();
 
         var start = (int)binary.MapVirtualAddressToRaw(context.UnderlyingPointer);
@@ -1686,7 +1686,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
-        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
+        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
 
         if (adrpOffsets == null!) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();

@@ -75,7 +75,7 @@ public static class ContextToTypeSignature
 
     public static ArrayTypeSignature ToTypeSignature(this ArrayTypeAnalysisContext context, ModuleDefinition parentModule)
     {
-        return context.ElementType.ToTypeSignature(parentModule).MakeArrayTypeWithLowerBounds(context.Rank);
+        return CreateArrayTypeWithZeroLowerBounds(context.ElementType.ToTypeSignature(parentModule), context.Rank);
     }
 
     public static PinnedTypeSignature ToTypeSignature(this PinnedTypeAnalysisContext context, ModuleDefinition parentModule)
@@ -171,3 +171,38 @@ public static class ContextToTypeSignature
         => context.ElementType.ToTypeSignature().MakeByReferenceType();
 
     public static ArrayTypeSignature ToTypeSignature(this ArrayTypeAnalysisContext context)
+    {
+        return CreateArrayTypeWithZeroLowerBounds(context.ElementType.ToTypeSignature(), context.Rank);
+    }
+
+    public static PinnedTypeSignature ToTypeSignature(this PinnedTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakePinnedType();
+
+    public static BoxedTypeSignature ToTypeSignature(this BoxedTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature().MakeBoxedType();
+
+    public static CustomModifierTypeSignature ToTypeSignature(this CustomModifierTypeAnalysisContext context)
+        => context.ElementType.ToTypeSignature()
+            .MakeModifierType(context.ModifierType.ToTypeSignature().ToTypeDefOrRef(), context.Required);
+
+    public static TypeSignature ToTypeSignature(this ParameterAnalysisContext context)
+        => context.ParameterType.ToTypeSignature();
+
+    public static TypeSignature ToTypeSignature(this FieldAnalysisContext context)
+        => context.FieldType.ToTypeSignature();
+
+    public static TypeSignature ToTypeSignature(this EventAnalysisContext context)
+        => context.EventType.ToTypeSignature();
+
+    public static TypeSignature ToTypeSignature(this PropertyAnalysisContext context)
+        => context.PropertyType.ToTypeSignature();
+    // 中文注释：两种签名入口共用同一数组维度构造，保持上游零下界合同。
+    internal static ArrayTypeSignature CreateArrayTypeWithZeroLowerBounds(TypeSignature elementType, int rank)
+    {
+        var result = new ArrayTypeSignature(elementType, rank);
+        for (var i = 0; i < rank; i++)
+            result.Dimensions[i] = new(null, 0);
+        return result;
+    }
+
+}

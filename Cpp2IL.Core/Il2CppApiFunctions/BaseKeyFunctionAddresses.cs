@@ -137,7 +137,7 @@ public abstract class BaseKeyFunctionAddresses
         var type = ReflectionCache.GetType("Exception", "System")!;
         Logger.VerboseNewline("\t\tType Located. Ensuring method exists...");
         var targetMethod = type.Methods!.FirstOrDefault(m => m.Name == "get_Message");
-        if (targetMethod != null) //Check struct contains valid data 
+        if (targetMethod != null) //Check struct contains valid data
         {
             Logger.VerboseNewline($"\t\tTarget Method Located at {targetMethod.MethodPointer}. Taking first CALL as the (version-specific) metadata initialization function...");
 

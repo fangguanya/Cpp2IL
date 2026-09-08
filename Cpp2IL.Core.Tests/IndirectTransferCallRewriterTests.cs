@@ -229,7 +229,7 @@ public class IndirectTransferCallRewriterTests
         {
             Assert.That(block.Instructions, Has.Count.EqualTo(2));
             Assert.That(block.Instructions, Has.None.Matches<Instruction>(instruction =>
-                instruction.OpCode == OpCode.CastClass));
+                instruction is { OpCode: OpCode.CastClass }));
             Assert.That(block.Instructions[^1].OpCode, Is.EqualTo(OpCode.Return));
             Assert.That(block.Instructions[^1].Operands.Single(), Is.SameAs(transfer.Operands[1]));
         });
@@ -261,7 +261,7 @@ public class IndirectTransferCallRewriterTests
             Assert.That(transfer.Operands[1], Is.Not.SameAs(equivalentResult));
             Assert.That(block.Instructions, Has.Count.EqualTo(1));
             Assert.That(block.Instructions, Has.None.Matches<Instruction>(instruction =>
-                instruction.OpCode == OpCode.CastClass));
+                instruction is { OpCode: OpCode.CastClass }));
             Assert.That(equivalentResult.Type, Is.SameAs(app.SystemTypes.SystemStringType));
         });
     }

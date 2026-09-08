@@ -276,7 +276,7 @@ public class Arm64StartupFixtureIntegrationTests
         string expectedSha256)
     {
         var instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(
-            context.Binary,
+            context,
             method.UnderlyingPointer);
         var actualSha256 = Convert.ToHexString(SHA256.HashData(method.RawBytes.AsSpan())).ToLowerInvariant();
 

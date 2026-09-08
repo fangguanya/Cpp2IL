@@ -79,7 +79,7 @@ public static class ThrowHelperRecovery
 
         try
         {
-            body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, appContext.Binary);
+            body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, appContext);
         }
         catch
         {
@@ -112,7 +112,7 @@ public static class ThrowHelperRecovery
         try
         {
             body = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(
-                appContext.Binary,
+                appContext,
                 address,
                 managed: false,
                 count: MaxArm64InstructionCount);
