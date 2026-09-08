@@ -404,6 +404,9 @@ public class DllIlRecoveryEmptyAnalysisTests
         public override string ToString() => "未知夹具操作数";
     }
 
+    [TestCase("array", "ARRAY_ALLOCATION")]
+    [TestCase("object", "OBJECT_ALLOCATION")]
+    [TestCase("empty_object", "OBJECT_ALLOCATION")]
     [TestCase("opcode", "UNKNOWN_OPCODE")]
     [TestCase("return", "RETURN_VALUE")]
     [TestCase("load", "UNKNOWN_LOAD")]
@@ -424,6 +427,9 @@ public class DllIlRecoveryEmptyAnalysisTests
         context.Locals = [local];
         var instruction = shape switch
         {
+            "array" => new Instruction(0, OpCode.NewArr, local),
+            "object" => new Instruction(0, OpCode.Newobj, local),
+            "empty_object" => new Instruction(0, OpCode.Newobj),
             "opcode" => new Instruction(0, (OpCode)int.MaxValue),
             "return" => new Instruction(0, OpCode.Return),
             "load" => new Instruction(0, OpCode.Move, local, new UnknownOperand()),

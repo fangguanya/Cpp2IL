@@ -429,14 +429,15 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Newarr, importer.ImportTypeSignature(newArrayElement.ToTypeSignature(module)).ToTypeDefOrRef());
                 }
                 else
-                    instructions.Add(CilOpCodes.Ldnull);
+                    throw new UnresolvedCilSemanticException(method.FullName, "ARRAY_ALLOCATION", instruction.ToString());
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
             case OpCode.Newobj:
-                // Try and fuse our Newobj + the follow up constructor CallVoid into one IL newobj.
-                // If we can't, just fall back to an Ldnull.
+                // 仅融合有调用点证据的分配与构造；缺少配对构造时记录恢复缺口。
+                if (instruction.Operands.Count == 0)
+                    throw new UnresolvedCilSemanticException(method.FullName, "OBJECT_ALLOCATION", instruction.ToString());
                 if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
                 {
                     // 中文注释：IL2CPP 把分配和构造器拆开后，两者之间可能还有为构造实参
@@ -467,13 +468,7 @@ public static class IlGenerator
                     constructorCall.SetOperands();
                 }
                 else
-                {
-                    if (DestinationType(instruction.Operands[0]) is { } destinationType)
-                        PushDefaultOf(destinationType, instructions);
-                    else
-                        instructions.Add(CilOpCodes.Ldnull);
-                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
-                }
+                    throw new UnresolvedCilSemanticException(method.FullName, "OBJECT_ALLOCATION", instruction.ToString());
                 break;
 
             case OpCode.Box:

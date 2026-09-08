@@ -1832,7 +1832,7 @@ public class IlGeneratorTests
 
     [Test]
     [Category("边界值")]
-    public void 未配对Newobj写入UIntPtr生成无符号原生零值()
+    public void 未配对Newobj不以UIntPtr零值冒充分配()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1870,15 +1870,10 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_U), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
-        }
+        // 原生分配不是整数零；直接发射器应抛出恢复异常，不通过旧默认值断言掩盖缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("OBJECT_ALLOCATION"));
+        Assert.That(definition.CilMethodBody!.Instructions, Is.Empty);
     }
 
     [Test]
