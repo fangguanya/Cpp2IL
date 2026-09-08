@@ -284,7 +284,7 @@ public class Arm64StartupFixtureIntegrationTests
         Assert.That(remaining, Is.Empty, "非零偏移的结构体引用内存访问仍有未恢复字段。");
     }
 
-    private static ApplicationAnalysisContext LoadFixture()
+    internal static ApplicationAnalysisContext LoadFixture()
     {
         var binaryPath = Environment.GetEnvironmentVariable(BinaryEnvironmentVariable);
         var metadataPath = Environment.GetEnvironmentVariable(MetadataEnvironmentVariable);
