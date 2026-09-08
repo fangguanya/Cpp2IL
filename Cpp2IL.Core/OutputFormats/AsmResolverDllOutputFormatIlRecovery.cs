@@ -227,7 +227,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 Logger.ErrorNewline($"Decompiling {methodContext.FullName} failed: {detail}");
 
             Record(methodContext, e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" : "UNRESOLVED",
-                category: e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" : ClassifyFailure(detail), detail: detail);
+                category: e is EmptyMethodAnalysisException ? "EMPTY_ANALYSIS" :
+                    e is UnresolvedCilSemanticException ? "UNRESOLVED_CIL_SEMANTICS" : ClassifyFailure(detail), detail: detail);
 
             // 保留失败方法的最终 CFG，账本中的 CIL 窗口可由同一方法图追溯到具体 SSA/边复制。
             var outputRoot = Cpp2IlApi.RuntimeOptions?.OutputRootDirectory;

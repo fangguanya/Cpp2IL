@@ -287,4 +287,58 @@ public class DllIlRecoveryEmptyAnalysisTests
         }
     }
 
+    [TestCase(OpCode.Invalid)]
+    [TestCase(OpCode.NotImplemented)]
+    [TestCase(OpCode.Phi)]
+    [TestCase(OpCode.IndirectJump)]
+    [TestCase(OpCode.ShiftStack)]
+    [TestCase(OpCode.Interrupt)]
+    [TestCase(OpCode.Call)]
+    [TestCase(OpCode.CallVoid)]
+    [TestCase(OpCode.Move)]
+    [Category("异常输入")]
+    public void 未解决语义不生成诊断CIL或计入成功(OpCode operation)
+    {
+        var (context, definition) = Fixture("UnresolvedOperation", 16384);
+        var instruction = new Instruction(0, operation);
+        if (operation is OpCode.Call or OpCode.CallVoid)
+            instruction = new Instruction(0, operation, new Immediate(20480));
+        if (operation == OpCode.Move)
+        {
+            // 固定夹具也须绑定实际发射器需要的类型定义，避免提前失败于局部表构造。
+            var integerType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type;
+            var integerDefinition = new TypeDefinition("System", "Int32", TypeAttributes.Public | TypeAttributes.Sealed);
+            definition.DeclaringModule!.TopLevelTypes.Add(integerDefinition);
+            integerType.PutExtraData("AsmResolverType", integerDefinition);
+            var local = new LocalVariable("loaded", new Register(null, "X0"), integerType);
+            context.Locals = [local];
+            instruction = new Instruction(0, operation, local, new MemoryOperand(addend: 24576));
+        }
+        var end = new Instruction(1, OpCode.Return);
+        context.ConvertedIsil = [instruction, end];
+        // 单独固定有效结构图，只让本测试的未知语义进入实际发射器。
+        context.ControlFlowGraph = new ISILControlFlowGraph([end]);
+        context.ControlFlowGraph.Blocks.Single(block => block.Instructions.Contains(end)).Instructions.Insert(0, instruction);
+        var output = new OutputProbe();
+        output.Fill(definition, context);
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-Unresolved-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            output.Receipt(directory);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.Multiple(() =>
+            {
+                Assert.That(output.Successful, Is.Zero);
+                Assert.That(definition.CilMethodBody, Is.Null);
+                Assert.That(receipt.RootElement.GetProperty("methods")[0].GetProperty("outcome").GetString(), Is.EqualTo("UNRESOLVED"));
+                Assert.That(receipt.RootElement.GetProperty("failures")[0].GetProperty("category").GetString(), Is.EqualTo("UNRESOLVED_CIL_SEMANTICS"), receipt.RootElement.GetProperty("failures")[0].GetProperty("detail").GetString());
+            });
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
+
 }

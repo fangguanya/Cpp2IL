@@ -374,16 +374,14 @@ public static class IlGenerator
         switch (instruction.OpCode)
         {
             case OpCode.Invalid:
-                instructions.Add(CilOpCodes.Ldstr, $"Invalid instruction: {instruction}");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "Invalid", instruction.ToString());
 
             case OpCode.NotImplemented:
-                instructions.Add(CilOpCodes.Ldstr, $"Not implemented instruction: {instruction.Operands[0]}");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "NotImplemented", instruction.ToString());
 
             case OpCode.Interrupt:
+                throw new UnresolvedCilSemanticException(method.FullName, "Interrupt", instruction.ToString());
+
             case OpCode.Nop:
                 instructions.Add(CilOpCodes.Nop);
                 break;
@@ -563,22 +561,12 @@ public static class IlGenerator
                 break;
 
             case OpCode.Phi:
-                instructions.Add(CilOpCodes.Ldstr, $"Phi opcodes should not exist at this point in decompilation ({instruction})");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "Phi", instruction.ToString());
 
             case OpCode.Call:
             case OpCode.CallVoid:
-                if (instruction.Operands[0] is not MethodAnalysisContext targetMethod)
-                {
-                    if (instruction.Operands[0] is Immediate targetAddress)
-                        instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
-                    else // Probably key function
-                        instructions.Add(CilOpCodes.Ldstr, $"Unknown call target operand: {instruction}");
-
-                    instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                    break;
-                }
+                if (instruction.Operands.Count == 0 || instruction.Operands[0] is not MethodAnalysisContext targetMethod)
+                    throw new UnresolvedCilSemanticException(method.FullName, "CALL_TARGET", instruction.ToString());
 
                 var importedMethod = importer.ImportMethod(targetMethod.ToMethodDescriptor(module));
 
@@ -720,14 +708,10 @@ public static class IlGenerator
                 break;
 
             case OpCode.IndirectJump:
-                instructions.Add(CilOpCodes.Ldstr, $"Indirect jump: {instruction} (should have been resolved before IL gen)");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "IndirectJump", instruction.ToString());
 
             case OpCode.ShiftStack:
-                instructions.Add(CilOpCodes.Ldstr, $"Stack shift: {instruction} (stack analysis should have removed these)");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "ShiftStack", instruction.ToString());
 
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
@@ -1341,11 +1325,7 @@ public static class IlGenerator
                     }
                     break;
                 }
-                instructions.Add(CilOpCodes.Ldstr, "Unmanaged memory load: " + operand.ToString());
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "MEMORY_LOAD", operand.ToString() ?? string.Empty);
             case ReadOnlyUInt16TableLookup tableLookup:
                 instructions.Add(CilOpCodes.Ldstr, tableLookup.Values);
                 LoadOperand(tableLookup.Index, method, locals, writeLine, stringCtor,
