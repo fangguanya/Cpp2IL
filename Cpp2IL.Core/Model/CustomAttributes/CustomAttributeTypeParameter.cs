@@ -15,6 +15,8 @@ public class CustomAttributeTypeParameter : BaseCustomAttributeTypeParameter
 {
     private Il2CppType? _type;
     private TypeAnalysisContext? _typeContext;
+    // 原始类型事实供身份投影复用，不从格式化名称反推类型。
+    public Il2CppType? RawType => _type;
 
     public override TypeAnalysisContext? TypeContext
     {

@@ -269,32 +269,6 @@ public abstract class HasCustomAttributes(uint token, ApplicationAnalysisContext
             return;
 
         using var blobStream = new MemoryStream(RawIl2CppCustomAttributeData.ToArray());
-        var attributeCount = blobStream.ReadUnityCompressedUint();
-        var constructors = V29AttributeUtils.ReadConstructors(blobStream, attributeCount, AppContext);
-
-        //Diagnostic data
-        var startOfData = blobStream.Position;
-        var perAttributeStartOffsets = new Dictionary<MethodAnalysisContext, long>();
-
-        CustomAttributes = [];
-        foreach (var constructor in constructors)
-        {
-            perAttributeStartOffsets[constructor] = blobStream.Position;
-
-            try
-            {
-                CustomAttributes.Add(V29AttributeUtils.ReadAttribute(blobStream, constructor, AppContext));
-            }
-            catch (Exception e)
-            {
-                Logger.ErrorNewline($"Failed to read attribute data for {constructor}, which has parameters {string.Join(", ", constructor.Parameters.Select(p => p.ParameterType))}", "CA Restore");
-                Logger.ErrorNewline($"This member ({ToString()}) has {RawIl2CppCustomAttributeData.Length} bytes of data starting at 0x{GetV29BlobOffsets()!.Value.blobStart:X}", "CA Restore");
-                Logger.ErrorNewline($"The post-constructor data started at 0x{startOfData:X} bytes into our blob", "CA Restore");
-                Logger.ErrorNewline($"Data for this constructor started at 0x{perAttributeStartOffsets[constructor]:X} bytes into our blob, we are now 0x{blobStream.Position:X} bytes into the blob", "CA Restore");
-                Logger.ErrorNewline($"The exception message was {e.Message}", "CA Restore");
-
-                throw;
-            }
-        }
+        CustomAttributes = V29AttributeUtils.ReadAttributeBlob(blobStream, AppContext);
     }
 }

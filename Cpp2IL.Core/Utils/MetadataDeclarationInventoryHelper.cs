@@ -5,14 +5,16 @@ using System.Linq;
 using System.Text.Json;
 using LibCpp2IL;
 using LibCpp2IL.Metadata;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Utils;
 
 /// <summary>投影全部原始声明与泛型表；仅提供来源和身份，不生成托管业务实现。</summary>
 internal static class MetadataDeclarationInventoryHelper
 {
-    internal static void Write(LibCpp2IlContext context, string path)
+    internal static void Write(ApplicationAnalysisContext application, string path)
     {
+        var context = application.LibCpp2IlContext;
         var metadata = context.Metadata;
         var binary = context.Binary;
         var types = metadata.typeDefs;
@@ -266,6 +268,7 @@ internal static class MetadataDeclarationInventoryHelper
                 writer.WriteNumber("byteLength", length);
                 writer.WriteBase64String("bytes", bytes);
                 writer.WriteBoolean("semanticDecodeAccepted", false);
+                MetadataAttributeDecodeHelper.Write(writer, bytes, application);
             });
         }
         WriteTable(writer, "attributeTypeRanges", metadata.attributeTypeRanges ?? [], (item, index) =>

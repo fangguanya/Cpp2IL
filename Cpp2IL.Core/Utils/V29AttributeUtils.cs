@@ -14,6 +14,31 @@ namespace Cpp2IL.Core.Utils;
 
 public static class V29AttributeUtils
 {
+    /// <summary>共享完整 blob 解析入口，保留失败位置并拒绝未消费内容。</summary>
+    public static List<AnalyzedCustomAttribute> ReadAttributeBlob(Stream stream, ApplicationAnalysisContext context)
+    {
+        var count = stream.ReadUnityCompressedUint();
+        if ((long)count * sizeof(uint) > stream.Length - stream.Position)
+            throw new InvalidDataException("特性构造器表超出当前 blob。");
+        var constructors = ReadConstructors(stream, count, context);
+        var result = new List<AnalyzedCustomAttribute>();
+        for (var index = 0; index < constructors.Length; index++)
+        {
+            var start = stream.Position;
+            try
+            {
+                result.Add(ReadAttribute(stream, constructors[index], context));
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                throw new InvalidDataException($"特性序号 {index}，构造器 token {constructors[index].Token:X8}，起点 {start}，失败位置 {stream.Position}。", error);
+            }
+        }
+        if (stream.Position != stream.Length)
+            throw new InvalidDataException($"特性 blob 尚有 {stream.Length - stream.Position} 字节未消费。");
+        return result;
+    }
+
     public static MethodAnalysisContext[] ReadConstructors(Stream stream, uint count, ApplicationAnalysisContext context)
     {
         using var reader = new BinaryReader(stream, Encoding.UTF8, true);

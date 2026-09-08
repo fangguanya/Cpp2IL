@@ -65,7 +65,7 @@ public sealed class MethodAddressIndexOutputFormat : Cpp2IlOutputFormat
         // 全部声明表只在无筛选模式输出；诊断程序集选择不伪装成完整声明清单。
         var declarationsPath = Path.Combine(indexRoot, "raw-declarations.json");
         if (fullScope)
-            MetadataDeclarationInventoryHelper.Write(context.LibCpp2IlContext, declarationsPath);
+            MetadataDeclarationInventoryHelper.Write(context, declarationsPath);
 
         // 该回执仅证明原始盘点；零地址仍在分母中，不自动宣称外部边界或源码恢复成功。
         using var stream = File.Create(Path.Combine(indexRoot, "scope-manifest.json"));
