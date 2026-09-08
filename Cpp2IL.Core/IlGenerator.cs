@@ -606,18 +606,12 @@ public static class IlGenerator
                             LoadOperand(receiverOperand, method, locals, writeLine, stringCtor, targetMethod.DeclaringType);
                     }
                     else
-                    {
-                        instructions.Add(CilOpCodes.Ldstr, $"Non static method called without 'this' param ({instruction})");
-                        instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                        instructions.Add(CilOpCodes.Ldnull);
-                    }
+                    throw new UnresolvedCilSemanticException(method.FullName, "CALL_RECEIVER", instruction.ToString());
                 }
 
                 // Load normal params
                 var callParamIndex = instruction.OpCode == OpCode.Call ? (targetMethod.IsStatic ? 2 : 3) : (targetMethod.IsStatic ? 1 : 2);
-                // A call whose target was only identified after lifting still carries the operands the
-                // unknown-callee convention gave it, which may be fewer than the method actually takes.
-                // The stack still has to match the signature, so anything missing gets a placeholder.
+                // 迟绑定目标同样必须拥有真实实参，缺项交给统一装载器记录失败。
                 LoadCallParameters(instruction.Operands, callParamIndex, targetMethod, method, locals, writeLine, stringCtor);
 
                 if (constrainedReceiver != null)
@@ -645,9 +639,7 @@ public static class IlGenerator
                 break;
 
             case OpCode.IndirectCall:
-                instructions.Add(CilOpCodes.Ldstr, $"Indirect call: {instruction} (should have been resolved before IL gen)");
-                instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "INDIRECT_CALL", instruction.ToString());
 
             case OpCode.Return:
                 if (!context.IsVoid)
@@ -1882,14 +1874,13 @@ public static class IlGenerator
         Dictionary<LocalVariable, CilLocalVariable> locals, MemberReference writeLine, MemberReference stringCtor)
     {
         var availableArgs = operands.Count - firstParameterIndex;
+        // 形参缺失是原生实参恢复缺口，即使声明可选也不代表调用点传入默认值。
+        if (availableArgs < targetMethod.Parameters.Count)
+            throw new UnresolvedCilSemanticException(method.FullName, "CALL_ARGUMENTS",
+                $"target={targetMethod.FullName}; required={targetMethod.Parameters.Count}; available={availableArgs}");
         for (var i = 0; i < targetMethod.Parameters.Count; i++)
-        {
-            var parameterType = targetMethod.Parameters[i].ParameterType;
-            if (i < availableArgs)
-                LoadOperand(operands[firstParameterIndex + i], method, locals, writeLine, stringCtor, parameterType);
-            else
-                PushDefaultOf(parameterType, method.CilMethodBody!.Instructions);
-        }
+            LoadOperand(operands[firstParameterIndex + i], method, locals, writeLine, stringCtor,
+                targetMethod.Parameters[i].ParameterType);
     }
     
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>

@@ -291,6 +291,7 @@ public class DllIlRecoveryEmptyAnalysisTests
     [TestCase(OpCode.NotImplemented)]
     [TestCase(OpCode.Phi)]
     [TestCase(OpCode.IndirectJump)]
+    [TestCase(OpCode.IndirectCall)]
     [TestCase(OpCode.ShiftStack)]
     [TestCase(OpCode.Interrupt)]
     [TestCase(OpCode.Call)]
@@ -341,4 +342,61 @@ public class DllIlRecoveryEmptyAnalysisTests
         }
     }
 
+    [TestCase(true, 0, 0, true)]
+    [TestCase(true, 1, 1, true)]
+    [TestCase(true, 2, 1, false)]
+    [TestCase(true, 1, 0, false)]
+    [TestCase(false, 0, 0, false)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 调用缺失实参或接收者不合成默认值(bool isStatic, int required, int supplied, bool accepted)
+    {
+        var (context, definition) = Fixture("CallArgumentEvidence", 28672);
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = definition.DeclaringModule!;
+        var integer = new TypeDefinition("System", "Int32", TypeAttributes.Public | TypeAttributes.Sealed);
+        module.TopLevelTypes.Add(integer);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType", integer);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Consume",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | (isStatic ? System.Reflection.MethodAttributes.Static : 0),
+            Enumerable.Repeat(app.SystemTypes.SystemInt32Type, required).ToArray());
+        var parameters = Enumerable.Repeat<TypeSignature>(module.CorLibTypeFactory.Int32, required).ToArray();
+        var signature = isStatic ? MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, parameters)
+            : MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, parameters);
+        var targetDefinition = new MethodDefinition("Consume", MethodAttributes.Public | (isStatic ? MethodAttributes.Static : 0), signature);
+        definition.DeclaringType!.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var operands = new List<IOperand> { target };
+        for (var i = 0; i < supplied; i++)
+            operands.Add(new Immediate(i + 7));
+        var call = new Instruction(0, OpCode.CallVoid, operands);
+        var end = new Instruction(1, OpCode.Return);
+        context.ConvertedIsil = [call, end];
+        context.ControlFlowGraph = new ISILControlFlowGraph(context.ConvertedIsil);
+        var output = new OutputProbe();
+        output.Fill(definition, context);
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-CallArguments-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            output.Receipt(directory);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.That(output.Successful, Is.EqualTo(accepted ? 1 : 0), receipt.RootElement.ToString());
+            if (accepted)
+                Assert.That(definition.CilMethodBody!.Instructions.Count(i => i.OpCode == CilOpCodes.Call), Is.EqualTo(1));
+            else
+            {
+                Assert.That(definition.CilMethodBody, Is.Null);
+                var failure = receipt.RootElement.GetProperty("failures")[0];
+                Assert.That(failure.GetProperty("category").GetString(), Is.EqualTo("UNRESOLVED_CIL_SEMANTICS"), failure.ToString());
+                Assert.That(failure.GetProperty("detail").GetString(), Does.Contain(isStatic ? "CALL_ARGUMENTS" : "CALL_RECEIVER"));
+            }
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
 }
