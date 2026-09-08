@@ -25,8 +25,12 @@ public class DllIlRecoveryEmptyAnalysisTests
         public void Fill(MethodDefinition definition, MethodAnalysisContext context) => FillMethodBody(definition, context);
         public void Receipt(string path) => WriteOutputReceipts(path);
         public Exception? BuildFailure;
+        public Action? DuringBuild;
+        public TimeSpan CheckpointInterval = TimeSpan.FromSeconds(60);
+        protected override TimeSpan ProgressCheckpointInterval => CheckpointInterval;
         public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
         {
+            DuringBuild?.Invoke();
             if (BuildFailure != null)
                 throw BuildFailure;
             return [];
@@ -45,6 +49,111 @@ public class DllIlRecoveryEmptyAnalysisTests
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 方法处理中按间隔发布同一账本且计数一致(bool due)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-Progress-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "dll-il-recovery-method-ledger.json");
+        var output = new OutputProbe { CheckpointInterval = due ? TimeSpan.Zero : TimeSpan.MaxValue };
+        output.DuringBuild = () =>
+        {
+            output.Receipt(directory);
+            var (context, definition) = Fixture("ProgressReturn", 0x1000);
+            context.ConvertedIsil = [new Instruction(0, OpCode.Return)];
+            context.ControlFlowGraph = new ISILControlFlowGraph(context.ConvertedIsil);
+            output.Fill(definition, context);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(path));
+            var root = receipt.RootElement;
+            var expected = due ? 1 : 0;
+            Assert.That(root.GetProperty("methods").GetArrayLength(), Is.EqualTo(expected));
+            Assert.That(root.GetProperty("totalMethodsWithBody").GetInt32(), Is.EqualTo(expected));
+            Assert.That(root.GetProperty("successfulMethods").GetInt32(), Is.EqualTo(expected));
+            Assert.That(root.GetProperty("validatedMethods").GetInt32(), Is.EqualTo(expected));
+            Assert.That(File.Exists(path + ".pending"), Is.False);
+        };
+        try
+        {
+            // 探针没有原始分母，最终发布仍应失败；断言在构造回调内部验证处理中状态。
+            Assert.Throws<InvalidOperationException>(() => output.DoOutput(null!, directory));
+        }
+        finally
+        {
+            File.Delete(path);
+            Directory.Delete(directory);
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 处理中写盘失败保留上一账本且不重复提交方法结果()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-ProgressFailure-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "dll-il-recovery-method-ledger.json");
+        var output = new OutputProbe { CheckpointInterval = TimeSpan.Zero };
+        FileStream? heldFile = null;
+        byte[] previous = [];
+        output.DuringBuild = () =>
+        {
+            output.Receipt(directory);
+            previous = File.ReadAllBytes(path);
+            heldFile = new FileStream(path + ".pending", FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            var (context, definition) = Fixture("ProgressFailure", 0x2000);
+            definition.Attributes |= MethodAttributes.Abstract;
+            output.Fill(definition, context);
+        };
+        try
+        {
+            var error = Assert.Throws<AggregateException>(() => output.DoOutput(null!, directory));
+            Assert.That(error!.InnerExceptions, Has.Count.EqualTo(2));
+            Assert.That(error.ToString(), Does.Not.Contain("方法恢复结果重复提交"));
+            Assert.That(File.ReadAllBytes(path), Is.EqualTo(previous));
+            Assert.That(Directory.GetFiles(directory, "*.dll"), Is.Empty);
+        }
+        finally
+        {
+            heldFile?.Dispose();
+            File.Delete(path + ".pending");
+            File.Delete(path);
+            Directory.Delete(directory);
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 并行方法检查点共用单写者且最终快照不丢记录()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-ProgressParallel-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "dll-il-recovery-method-ledger.json");
+        var output = new OutputProbe { CheckpointInterval = TimeSpan.Zero };
+        var fixtures = Enumerable.Range(0, 32).Select(index => Fixture("Declaration" + index, (ulong)(0x3000 + index * 4))).ToArray();
+        foreach (var fixture in fixtures)
+            fixture.Definition.Attributes |= MethodAttributes.Abstract;
+        output.DuringBuild = () =>
+        {
+            output.Receipt(directory);
+            System.Threading.Tasks.Parallel.ForEach(fixtures, fixture => output.Fill(fixture.Definition, fixture.Context));
+            output.Receipt(directory);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(path));
+            var rows = receipt.RootElement.GetProperty("methods").EnumerateArray().ToArray();
+            Assert.That(rows, Has.Length.EqualTo(fixtures.Length));
+            Assert.That(rows.All(row => row.GetProperty("outcome").GetString() == "DECLARATION"), Is.True);
+            Assert.That(receipt.RootElement.GetProperty("totalMethodsWithBody").GetInt32(), Is.Zero);
+            Assert.That(File.Exists(path + ".pending"), Is.False);
+        };
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => output.DoOutput(null!, directory));
+        }
+        finally
+        {
+            File.Delete(path);
+            Directory.Delete(directory);
+        }
     }
 
     private static (MethodProbe Context, MethodDefinition Definition) Fixture(string name, ulong address, string moduleName = "EvidenceFixture.dll")

@@ -5,6 +5,8 @@ using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading;
 using AsmResolver.DotNet;
 using AssetRipper.CIL;
 using Cpp2IL.Core.Extensions;
@@ -28,6 +30,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     private string? activeOutputDirectory;
     private string? pipelineFailure;
     private readonly ConcurrentDictionary<MethodAnalysisContext, MethodResult> methodResults = new();
+    private readonly object receiptLock = new();
+    private readonly Stopwatch checkpointClock = Stopwatch.StartNew();
+    protected virtual TimeSpan ProgressCheckpointInterval => TimeSpan.FromSeconds(60);
 
     private sealed record MethodResult(
         string Assembly, uint Token, string Type, string Method, ulong Address,
@@ -184,6 +189,23 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
+        FillRecoveredMethodBody(methodDefinition, methodContext);
+        // 写盘位于方法分析的捕获范围之外；持久化失败必须上送，不得伪装成第二次方法失败。
+        if (activeOutputDirectory == null || !Monitor.TryEnter(receiptLock))
+            return;
+        try
+        {
+            if (checkpointClock.Elapsed >= ProgressCheckpointInterval)
+                WriteOutputReceipts(activeOutputDirectory);
+        }
+        finally
+        {
+            Monitor.Exit(receiptLock);
+        }
+    }
+
+    private void FillRecoveredMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
+    {
         if (!methodDefinition.IsManagedMethodWithBody())
         {
             // 抽象声明无需方法体；其他运行时/原生边界须另行审定，不按名称豁免。
@@ -244,11 +266,22 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     protected override void WriteOutputReceipts(string outputRoot)
     {
+        // 单写者发布同一账本；并行方法继续更新不可变结果，不争用临时文件。
+        lock (receiptLock)
+        {
+            WriteMethodLedgerSnapshot(outputRoot);
+            checkpointClock.Restart();
+        }
+    }
+
+    private void WriteMethodLedgerSnapshot(string outputRoot)
+    {
         var rows = methodResults.Values.OrderBy(row => row.Assembly, StringComparer.Ordinal)
             .ThenBy(row => row.Token).ThenBy(row => row.Method, StringComparer.Ordinal).ToArray();
         var failures = rows.Where(row => row.Outcome is "EMPTY_ANALYSIS" or "UNRESOLVED").ToArray();
-        TotalMethodCount = AttemptedBodyCount;
-        SuccessfulMethodCount = RecoveredCilCount;
+        // 统计必须来自这一份快照，避免写盘期间新增结果导致头部和逐方法记录不一致。
+        TotalMethodCount = rows.Count(row => row.Outcome is "CIL_EMITTED" or "EMPTY_ANALYSIS" or "UNRESOLVED");
+        SuccessfulMethodCount = rows.Count(row => row.Outcome == "CIL_EMITTED");
         Directory.CreateDirectory(outputRoot);
         var path = Path.Combine(outputRoot, "dll-il-recovery-method-ledger.json");
         var temporaryPath = path + ".pending";
