@@ -404,6 +404,7 @@ public class DllIlRecoveryEmptyAnalysisTests
         public override string ToString() => "未知夹具操作数";
     }
 
+    [TestCase("type", "TYPE_OPERAND")]
     [TestCase("array", "ARRAY_ALLOCATION")]
     [TestCase("object", "OBJECT_ALLOCATION")]
     [TestCase("empty_object", "OBJECT_ALLOCATION")]
@@ -427,6 +428,7 @@ public class DllIlRecoveryEmptyAnalysisTests
         context.Locals = [local];
         var instruction = shape switch
         {
+            "type" => new Instruction(0, OpCode.Move, local, app.SystemTypes.SystemObjectType),
             "array" => new Instruction(0, OpCode.NewArr, local),
             "object" => new Instruction(0, OpCode.Newobj, local),
             "empty_object" => new Instruction(0, OpCode.Newobj),
@@ -519,6 +521,56 @@ public class DllIlRecoveryEmptyAnalysisTests
                 Assert.That(detail, Does.Contain(unresolvedBridge ? "BRANCH_TARGET" : "ANALYSIS_WARNINGS"));
                 for (var i = 0; i < warningCount; i++)
                     Assert.That(detail, Does.Contain("未闭合分析证据" + i));
+            }
+        }
+        finally
+        {
+            File.Delete(Path.Combine(directory, "dll-il-recovery-method-ledger.json"));
+            Directory.Delete(directory);
+        }
+    }
+    [TestCase(true)]
+    [TestCase(false)]
+    [Category("基本功能")]
+    [Category("异常输入")]
+    public void 方法句柄只在已支持的方法指针目标发射Ldftn(bool pointerTarget)
+    {
+        var (context, definition) = Fixture("MethodHandleEvidence", 49152);
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = definition.DeclaringModule!;
+        var slotType = pointerTarget ? app.SystemTypes.SystemIntPtrType : app.SystemTypes.SystemInt32Type;
+        var slotDefinition = new TypeDefinition("System", pointerTarget ? "IntPtr" : "Int32", TypeAttributes.Public | TypeAttributes.Sealed);
+        module.TopLevelTypes.Add(slotDefinition);
+        slotType.PutExtraData("AsmResolverType", slotDefinition);
+        context.PutExtraData("AsmResolverMethod", definition);
+        var local = new LocalVariable("pointer", new Register(null, "X1"), slotType);
+        var methodHandle = new RuntimeMethodInfoAnalysisContext(context, context.DeclaringType!.DeclaringAssembly);
+        var move = new Instruction(0, OpCode.Move, local, methodHandle);
+        var end = new Instruction(1, OpCode.Return);
+        context.Locals = [local];
+        context.ConvertedIsil = [move, end];
+        context.ControlFlowGraph = new ISILControlFlowGraph(context.ConvertedIsil);
+        var output = new OutputProbe();
+        output.Fill(definition, context);
+        var directory = Path.Combine(Path.GetTempPath(), "Cpp2IL-MethodHandle-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            output.Receipt(directory);
+            using var receipt = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.That(output.Successful, Is.EqualTo(pointerTarget ? 1 : 0), receipt.RootElement.ToString());
+            if (pointerTarget)
+            {
+                var instructions = definition.CilMethodBody!.Instructions;
+                Assert.That(instructions.Count(i => i.OpCode == CilOpCodes.Ldftn), Is.EqualTo(1));
+                Assert.That(instructions.Single(i => i.OpCode == CilOpCodes.Ldftn).Operand, Is.SameAs(definition));
+                Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ldc_I4_0 || i.OpCode == CilOpCodes.Ldnull), Is.False);
+            }
+            else
+            {
+                Assert.That(definition.CilMethodBody, Is.Null);
+                var failure = receipt.RootElement.GetProperty("failures")[0];
+                Assert.That(failure.GetProperty("category").GetString(), Is.EqualTo("UNRESOLVED_CIL_SEMANTICS"), failure.ToString());
+                Assert.That(failure.GetProperty("detail").GetString(), Does.Contain("RUNTIME_METHOD_HANDLE"));
             }
         }
         finally

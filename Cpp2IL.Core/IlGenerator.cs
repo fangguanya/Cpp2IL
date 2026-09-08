@@ -1286,9 +1286,7 @@ public static class IlGenerator
                     }
                     && baseType is not RuntimeClassTypeAnalysisContext)
                 {
-                    // 中文注释：Il2CppClass布局探针不是托管实例字段，禁止把IEnumerator等引用压入nint槽。
-                    PushDefaultOf(expectedType, instructions);
-                    break;
+                    throw new UnresolvedCilSemanticException(method.FullName, "RUNTIME_CLASS_LAYOUT", operand.ToString() ?? string.Empty);
                 }
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
@@ -1319,10 +1317,7 @@ public static class IlGenerator
                     break;
                 }
 
-                //Not fully implemented, these basically shouldn't actually ever exist in the final IL.
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
-                break;
+                throw new UnresolvedCilSemanticException(method.FullName, "RUNTIME_METHOD_HANDLE", operand.ToString() ?? string.Empty);
             case TypeAnalysisContext type:
                 if (expectedType?.FullName == "System.RuntimeTypeHandle")
                 {
@@ -1335,52 +1330,8 @@ public static class IlGenerator
                     break;
                 }
 
-                if (expectedType is RuntimeClassTypeAnalysisContext
-                    or StaticFieldStorageTypeAnalysisContext
-                    or RgctxTableTypeAnalysisContext
-                    or RuntimeMethodInfoAnalysisContext
-                    || expectedType?.FullName is "System.IntPtr" or "System.UIntPtr")
-                {
-                    // 中文注释：托管类型操作数落入原生整数槽时，它表示未知的原生地址载体；
-                    // 生成原生零值，避免把托管构造器伪装成 nint 并阻塞恢复源码编译。
-                    if (expectedType != null)
-                        PushDefaultOf(expectedType, instructions);
-                    else
-                    {
-                        instructions.Add(CilOpCodes.Ldc_I4_0);
-                        instructions.Add(CilOpCodes.Conv_I);
-                    }
-                    break;
-                }
-
-                if (type.Name == "T")
-                {
-                    // idk what to do here
-                    instructions.Add(CilOpCodes.Ldstr, "<T>");
-                    instructions.Add(CilOpCodes.Newobj, importer.ImportMethod(stringCtor));
-                    break;
-                }
-
-                // Try to first get constructor without params
-                var constructor = type.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
-                constructor ??= type.Methods.FirstOrDefault(m => m.Name == ".ctor");
-
-                if (constructor == null)
-                {
-                    instructions.Add(CilOpCodes.Ldstr, $"Constructor not found for: {operand} (probably static type)");
-                    instructions.Add(CilOpCodes.Call, importer.ImportMethod(writeLine));
-                    // 元数据类型操作数可能只是原生类地址占位；必须按目标槽位生成可赋值的默认值。
-                    if (expectedType != null)
-                        PushDefaultOf(expectedType, instructions);
-                    else
-                        instructions.Add(CilOpCodes.Ldnull);
-                    break;
-                }
-
-                foreach (var param2 in constructor.Parameters)
-                    instructions.Add(CilOpCodes.Ldstr, "Constructor param: " + param2);
-                instructions.Add(CilOpCodes.Newobj, importer.ImportMethod(constructor.ToMethodDescriptor(module)));
-                break;
+                // 类型描述不是对象实例或已解析原生地址，不按名称猜构造器或填入零值。
+                throw new UnresolvedCilSemanticException(method.FullName, "TYPE_OPERAND", type.FullName);
             default:
                 throw new UnresolvedCilSemanticException(method.FullName, "UNKNOWN_LOAD", operand.ToString() ?? string.Empty);
         }

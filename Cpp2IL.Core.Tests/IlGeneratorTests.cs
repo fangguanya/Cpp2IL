@@ -1357,7 +1357,7 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
-    public void 无构造器类型操作数写入IntPtr生成原生零值()
+    public void 无构造器类型操作数写入IntPtr拒绝无证据零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1395,21 +1395,14 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
-        }
+        // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
     }
 
     [Test]
     [Category("基本功能")]
-    public void 运行时类型句柄默认值按IntPtr生成原生零值()
+    public void 运行时类型句柄默认值按IntPtr拒绝无证据零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1442,21 +1435,14 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
-        }
+        // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
     }
 
     [Test]
     [Category("基本功能")]
-    public void 托管类型操作数写入IntPtr槽时生成原生零值()
+    public void 托管类型操作数写入IntPtr槽时拒绝无证据零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1494,21 +1480,14 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Newobj), Is.False);
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
-        }
+        // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
     }
 
     [Test]
     [Category("基本功能")]
-    public void 托管引用上的运行时类布局探针生成原生零值()
+    public void 托管引用上的运行时类布局探针拒绝无证据零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1545,15 +1524,9 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.True);
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.True);
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloc), Is.False);
-        }
+        // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("RUNTIME_CLASS_LAYOUT"));
     }
 
     [Test]
@@ -1658,7 +1631,7 @@ public class IlGeneratorTests
 
     [Test]
     [Category("基本功能")]
-    public void 原生内存值与无构造器类型比较时生成同型原生零值()
+    public void 原生内存值与无构造器类型比较时拒绝无证据零值()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1704,15 +1677,9 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ceq), Is.EqualTo(1));
-        }
+        // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
     }
 
     [Test]
@@ -1878,7 +1845,7 @@ public class IlGeneratorTests
 
     [Test]
     [Category("异常输入")]
-    public void 无构造器类型操作数写入引用仍生成Null()
+    public void 无构造器类型操作数写入引用拒绝无证据Null()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
         var systemObject = appContext.SystemTypes.SystemObjectType;
@@ -1915,16 +1882,9 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         typeDefinition.Methods.Add(definition);
 
-        IlGenerator.GenerateIl(context, definition);
-
-        var il = definition.CilMethodBody!.Instructions;
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.EqualTo(1));
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.False);
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Conv_U), Is.False);
-            Assert.That(il.Count(instruction => instruction.OpCode == CilOpCodes.Stloc), Is.EqualTo(1));
-        }
+        // 旧测试曾要求无证据默认值；当前合同要求保留明确恢复缺口。
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
     }
 
     [Test]
@@ -2055,21 +2015,13 @@ public class IlGeneratorTests
 
     [Test]
     [Category("异常输入")]
-    public void 类型操作数进入IntPtr形参保持原生地址语义()
+    public void 类型操作数进入IntPtr形参拒绝猜测原生地址()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
-        var emitted = 生成类型实参加载Cil(
-            appContext.SystemTypes.SystemObjectType,
-            appContext.SystemTypes.SystemIntPtrType);
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(emitted.Any(instruction => instruction.OpCode == CilOpCodes.Ldtoken), Is.False);
-            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Ldc_I4_0), Is.EqualTo(1));
-            Assert.That(emitted.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
-        });
+        var error = Assert.Throws<Cpp2IL.Core.Utils.UnresolvedCilSemanticException>(() =>
+            生成类型实参加载Cil(appContext.SystemTypes.SystemObjectType, appContext.SystemTypes.SystemIntPtrType));
+        Assert.That(error!.Message, Does.Contain("TYPE_OPERAND"));
     }
-
     private static TypeAnalysisContext 获取运行时类型句柄(ApplicationAnalysisContext appContext)
         => appContext.GetAssemblyByName("mscorlib")!
             .GetTypeByFullName("System.RuntimeTypeHandle")!;
