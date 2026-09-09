@@ -41,6 +41,7 @@ public class ByRefRegressionEvidenceTests
         var expectedOutcome = Environment.GetEnvironmentVariable("CPP2IL_REGRESSION_EXPECTED_OUTCOME");
         var requiredCilFragments = SplitExpectedFragments("CPP2IL_REGRESSION_REQUIRED_CIL_FRAGMENTS");
         var forbiddenCilFragments = SplitExpectedFragments("CPP2IL_REGRESSION_FORBIDDEN_CIL_FRAGMENTS");
+        var forbiddenRawIsilFragments = SplitExpectedFragments("CPP2IL_REGRESSION_FORBIDDEN_RAW_ISIL_FRAGMENTS");
         var samples = document.RootElement.GetProperty("methods").EnumerateArray()
             .Where(row => row.GetProperty("operation").GetString() == operation).ToArray();
         Assert.That(samples, Is.Not.Empty);
@@ -57,24 +58,33 @@ public class ByRefRegressionEvidenceTests
         {
             var selected = samples.Select(row => methods[(row.GetProperty("assembly").GetString()!,
                 row.GetProperty("originalToken").GetUInt32())].Single()).ToArray();
-            File.WriteAllText(Path.Combine(root!, "original-raw-isil.json"), JsonSerializer.Serialize(
-                selected.Select(method => new
-                {
-                    method = method.FullNameWithSignature,
-                    address = method.UnderlyingPointer,
-                    instructions = method.AppContext.InstructionSet.GetIsilFromMethod(method)
-                        .Select(instruction => new
+            // 原始 ISIL 只生成一次，同时作为输出回执与通用禁止片段断言的唯一数据源。
+            var rawIsil = selected.Select(method => new
+            {
+                method = method.FullNameWithSignature,
+                address = method.UnderlyingPointer,
+                instructions = method.AppContext.InstructionSet.GetIsilFromMethod(method)
+                    .Select(instruction => new
+                    {
+                        instruction.Index,
+                        opcode = instruction.OpCode.ToString(),
+                        text = instruction.ToString(),
+                        operands = instruction.Operands.Select(operand => new
                         {
-                            instruction.Index,
-                            opcode = instruction.OpCode.ToString(),
-                            text = instruction.ToString(),
-                            operands = instruction.Operands.Select(operand => new
-                            {
-                                kind = operand.GetType().Name,
-                                text = operand.ToString()
-                            }).ToArray()
+                            kind = operand.GetType().Name,
+                            text = operand.ToString()
                         }).ToArray()
-                }).ToArray(), new JsonSerializerOptions { WriteIndented = true }));
+                    }).ToArray()
+            }).ToArray();
+            foreach (var method in rawIsil)
+            {
+                var text = string.Join("\n", method.instructions.Select(instruction => instruction.text));
+                foreach (var fragment in forbiddenRawIsilFragments)
+                    Assert.That(text, Does.Not.Contain(fragment),
+                        $"原始回归ISIL仍包含禁止的未恢复语义片段：{fragment}；方法：{method.method}");
+            }
+            File.WriteAllText(Path.Combine(root!, "original-raw-isil.json"), JsonSerializer.Serialize(
+                rawIsil, new JsonSerializerOptions { WriteIndented = true }));
             File.WriteAllText(Path.Combine(root!, "original-parameter-abi.json"), JsonSerializer.Serialize(selected.Select(method => new
             {
                 method = method.FullNameWithSignature, address = method.UnderlyingPointer,
@@ -154,7 +164,8 @@ public class ByRefRegressionEvidenceTests
             {
                 schema = "OriginalByRefEmissionRegression/v1", count = rows.Length,
                 outcomes = rows.GroupBy(row => row.GetProperty("outcome").GetString()!).ToDictionary(group => group.Key, group => group.Count()),
-                methods = rows, expectedOutcome, requiredCilFragments, forbiddenCilFragments, filteredRegression = true,
+                methods = rows, expectedOutcome, requiredCilFragments, forbiddenCilFragments,
+                forbiddenRawIsilFragments, filteredRegression = true,
                 semanticEquivalenceProved = false, fullRecoveryProved = false
             }, new JsonSerializerOptions { WriteIndented = true }));
             return;

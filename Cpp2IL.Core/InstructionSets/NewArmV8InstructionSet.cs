@@ -674,6 +674,106 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
+    /// 恢复 ARM64 LSL 的立即数别名和寄存器移位形态。
+    /// 寄存器移位按操作数宽度显式保留低 5/6 位，避免 W 源因内部 W/X
+    /// 统一寄存器身份而错误采用 64 位移位计数；结果仍携带原生目标宽度。
+    /// </summary>
+    internal static bool TryCreateLogicalShiftLeftInstructions(
+        Arm64Instruction instruction,
+        out Instruction[] recovered)
+    {
+        recovered = [];
+        if (instruction.Mnemonic != Arm64Mnemonic.LSL
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
+            || sourceWidthBits != widthBits)
+            return false;
+
+        if (instruction.Op2Kind == Arm64OperandKind.Immediate)
+        {
+            if (instruction.Op2Imm < 0 || instruction.Op2Imm >= widthBits)
+                return false;
+
+            if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+            {
+                recovered = [new Instruction(0, OpCode.Nop)];
+                return true;
+            }
+
+            recovered =
+            [
+                new Instruction(
+                    0,
+                    OpCode.ShiftLeft,
+                    new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
+                    Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg)
+                        ? Imm(0)
+                        : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op1Reg)),
+                    Imm(instruction.Op2Imm))
+                {
+                    IntegerWidthBits = widthBits,
+                },
+            ];
+            return true;
+        }
+
+        if (instruction.Op2Kind != Arm64OperandKind.Register
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op2Reg, out var shiftWidthBits)
+            || shiftWidthBits != widthBits)
+            return false;
+
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+        {
+            recovered = [new Instruction(0, OpCode.Nop)];
+            return true;
+        }
+
+        IOperand shift = Arm64RegisterHelper.IsZeroRegister(instruction.Op2Reg)
+            ? Imm(0)
+            : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op2Reg));
+        IOperand source = Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg)
+            ? Imm(0)
+            : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op1Reg));
+        if (shift is Immediate)
+        {
+            recovered =
+            [
+                new Instruction(
+                    0,
+                    OpCode.ShiftLeft,
+                    new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
+                    source,
+                    shift)
+                {
+                    IntegerWidthBits = widthBits,
+                },
+            ];
+            return true;
+        }
+
+        var maskedShift = new Register(null, $"LSL_SHIFT_COUNT_{instruction.Address:X}");
+        recovered =
+        [
+            new Instruction(0, OpCode.And, maskedShift, shift, Imm(widthBits - 1))
+            {
+                IntegerWidthBits = widthBits,
+            },
+            new Instruction(
+                1,
+                OpCode.ShiftLeft,
+                new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
+                source,
+                maskedShift)
+            {
+                IntegerWidthBits = widthBits,
+            },
+        ];
+        return true;
+    }
+
+    /// <summary>
     /// 将 Disarm 暴露的 UBFM、LSR 与 UBFIZ 别名统一还原为 UBFM 的 immr/imms。
     /// </summary>
     private static bool TryDecodeUnsignedBitfieldImmediates(
@@ -4379,6 +4479,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (!TryCreateUnsignedBitfieldMoveInstructions(instruction, out var recovered))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral("Instruction UBFM operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                }
+                break;
+
+            case Arm64Mnemonic.LSL:
+                {
+                    if (!TryCreateLogicalShiftLeftInstructions(instruction, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction LSL operand widths are not exactly modeled."));
                         break;
                     }
 

@@ -1424,6 +1424,94 @@ public class NewArmV8InstructionSetTests
         });
     }
 
+    [TestCase(new byte[] { 0x25, 0xF1, 0x7D, 0xD3 }, 64, 3L, "X5", "X9",
+        TestName = "基本_64位LSL立即数保留左移与宽度")]
+    [TestCase(new byte[] { 0x13, 0x71, 0x1D, 0x53 }, 32, 3L, "X19", "X8",
+        TestName = "基本_32位LSL立即数保留左移与宽度")]
+    [TestCase(new byte[] { 0xD9, 0x7E, 0x60, 0xD3 }, 64, 32L, "X25", "X22",
+        TestName = "边界_64位LSL立即数接受32位移距")]
+    [Category("基本功能")]
+    public void LslImmediateAliasBecomesSizedLeftShift(
+        byte[] machineCode,
+        int expectedWidth,
+        long expectedShift,
+        string expectedDestination,
+        string expectedSource)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftLeftInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Has.Length.EqualTo(1));
+            Assert.That(recovered[0].OpCode, Is.EqualTo(OpCode.ShiftLeft));
+            Assert.That(recovered[0].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, expectedSource)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(expectedShift)));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(expectedWidth));
+        });
+    }
+
+    [TestCase(new byte[] { 0x29, 0x21, 0xC8, 0x1A }, 32, 31L, "X9", "X8",
+        TestName = "边界_32位LSL寄存器移距显式掩码低5位")]
+    [TestCase(new byte[] { 0x08, 0x23, 0xC8, 0x9A }, 64, 63L, "X8", "X8",
+        TestName = "边界_64位LSL寄存器移距显式掩码低6位")]
+    [Category("边界值")]
+    public void LslRegisterShiftMasksAmountByNativeWidth(
+        byte[] machineCode,
+        int expectedWidth,
+        long expectedMask,
+        string expectedDestination,
+        string expectedShiftSource)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x2000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftLeftInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { OpCode.And, OpCode.ShiftLeft }));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, expectedShiftSource)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(expectedMask)));
+            Assert.That(recovered[1].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
+            Assert.That(recovered[1].Operands[2], Is.EqualTo(recovered[0].Operands[0]));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == expectedWidth), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void LslWriteToZeroRegisterHasNoDataFlowDefinition()
+    {
+        var native = DecodeSingleInstruction([0x3F, 0x20, 0xC2, 0x1A], 0x3000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftLeftInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+        Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { OpCode.Nop }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void AsrMustNotEnterLogicalShiftLeftRecovery()
+    {
+        var native = DecodeSingleInstruction([0x09, 0xFD, 0x7F, 0x93], 0x4000);
+
+        Assert.That(
+            NewArmV8InstructionSet.TryCreateLogicalShiftLeftInstructions(native, out var recovered),
+            Is.False);
+        Assert.That(recovered, Is.Empty);
+    }
+
     [Test]
     [Category("基本功能")]
     public void BirthPlaceWordAddCarriesThirtyTwoBitDestinationEvidence()
