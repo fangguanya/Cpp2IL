@@ -7,6 +7,37 @@ namespace Cpp2IL.Core.Tests;
 
 public class GenericInstanceFieldLayoutTests
 {
+    [TestCase(false, 56L)]
+    [TestCase(true, 64L)]
+    [Category("边界值")]
+    public void 同名跨程序集泛型实参不共享错误布局(bool reverse, long expectedSize)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assemblies = app.Assemblies.Take(2).ToArray();
+        Assert.That(assemblies.Length, Is.EqualTo(2));
+        var valueType = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.ValueType");
+        var first = new InjectedTypeAnalysisContext(assemblies[0], "IdentityFixture", "SameName", valueType,
+            TypeAttributes.Public | TypeAttributes.SequentialLayout);
+        var second = new InjectedTypeAnalysisContext(assemblies[1], "IdentityFixture", "SameName", valueType,
+            TypeAttributes.Public | TypeAttributes.SequentialLayout);
+        first.InjectFieldContext("x", app.SystemTypes.SystemInt64Type, FieldAttributes.Public);
+        second.InjectFieldContext("x", app.SystemTypes.SystemInt64Type, FieldAttributes.Public);
+        second.InjectFieldContext("y", app.SystemTypes.SystemInt64Type, FieldAttributes.Public);
+        var pair = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var small = pair.MakeGenericInstanceType([app.SystemTypes.SystemInt64Type, first.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type])]);
+        var large = pair.MakeGenericInstanceType([app.SystemTypes.SystemInt64Type, second.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type])]);
+        Assert.That(small.FullName, Is.EqualTo(large.FullName));
+        Assert.That(small, Is.Not.SameAs(large));
+        var outer = CreateValue("IdentityCarrier");
+        outer.InjectFieldContext("first", reverse ? large : small, FieldAttributes.Public);
+        outer.InjectFieldContext("second", reverse ? small : large, FieldAttributes.Public);
+        outer.InjectFieldContext("repeat", reverse ? large : small, FieldAttributes.Public);
+        var instance = outer.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(instance, 8), Is.EqualTo((expectedSize, 8L)));
+        Assert.That(GenericInstanceFieldLayout.GetConcreteFieldLayout(instance)!.Select(field => field.Size),
+            Is.EqualTo(reverse ? new long[] { 24, 16, 24 } : new long[] { 16, 24, 16 }));
+    }
+
     [TestCase(4, 8L)]
     [TestCase(8, 16L)]
     [Category("基本功能")]

@@ -17,8 +17,8 @@ public static class GenericInstanceFieldLayout
     // 每次布局查询独立持有缓存和递归路径，不跨应用保留类型图。
     private sealed class LayoutTraversal
     {
-        internal readonly HashSet<string> Active = [];
-        internal readonly Dictionary<string, IReadOnlyList<ConcreteFieldLayout>?> Completed = [];
+        internal readonly HashSet<GenericInstanceTypeAnalysisContext> Active = [];
+        internal readonly Dictionary<GenericInstanceTypeAnalysisContext, IReadOnlyList<ConcreteFieldLayout>?> Completed = [];
     }
 
     /// <summary>
@@ -56,7 +56,8 @@ public static class GenericInstanceFieldLayout
         GenericInstanceTypeAnalysisContext type, int pointerSize, LayoutTraversal traversal)
     {
         if (pointerSize is not (4 or 8)) return null;
-        var key = type.GenericType.DeclaringAssembly.Name + ":" + type.FullName;
+        // 实例上下文保留全部泛型实参身份；显示名称不包含实参程序集，不能作为布局键。
+        var key = type;
         if (traversal.Completed.TryGetValue(key, out var cached)) return cached;
         if (traversal.Active.Count >= 64 || !traversal.Active.Add(key)) return null;
         try
