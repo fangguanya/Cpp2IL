@@ -1813,6 +1813,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     internal static ulong ResolveAdrAddress(ulong instructionAddress, long pcRelativeImmediate)
         => unchecked((ulong)(unchecked((long)instructionAddress) + pcRelativeImmediate));
 
+    /// <summary>
+    /// 将 ADR 的有符号 PC 相对立即数恢复为绝对原生地址。
+    /// 地址只由当前指令地址和编码立即数决定，不借用方法身份或邻接符号。
+    /// </summary>
+    internal static bool TryCreatePcRelativeAddressInstruction(
+        Arm64Instruction instruction,
+        ulong instructionAddress,
+        out Instruction recovered)
+    {
+        recovered = null!;
+        if (instruction.Mnemonic != Arm64Mnemonic.ADR
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op0Reg is < Arm64Register.X0 or > Arm64Register.X31
+            || instruction.Op1Kind is not (
+                Arm64OperandKind.Immediate or Arm64OperandKind.ImmediatePcRelative))
+            return false;
+
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+        {
+            recovered = new Instruction(0, OpCode.Nop);
+            return true;
+        }
+
+        recovered = new Instruction(
+            0,
+            OpCode.Move,
+            new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
+            Imm(ResolveAdrAddress(instructionAddress, instruction.Op1Imm)))
+        {
+            IntegerWidthBits = 64,
+        };
+        return true;
+    }
+
     internal static OpCode? GetConditionalFalseTransformOpCode(Arm64Mnemonic mnemonic)
     {
         return mnemonic switch
@@ -4260,6 +4294,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         AddMemory(address, size * 8, OpCode.Move, dest3, ConvertStorePairSourceOperand(instruction, 1));
                     }
                 }
+                break;
+            case Arm64Mnemonic.ADR:
+                if (!TryCreatePcRelativeAddressInstruction(instruction, address, out var pcRelativeAddress))
+                {
+                    Add(address, OpCode.NotImplemented, new StringLiteral("Instruction ADR operands are not exactly modeled."));
+                    break;
+                }
+                var emittedPcRelativeAddress = Add(
+                    address,
+                    pcRelativeAddress.OpCode,
+                    pcRelativeAddress.Operands.ToList());
+                emittedPcRelativeAddress.IntegerWidthBits = pcRelativeAddress.IntegerWidthBits;
                 break;
             case Arm64Mnemonic.ADRP:
                 // ADRP立即数相对当前指令页；ISIL局部量与后续内存折叠统一保存绝对页地址。

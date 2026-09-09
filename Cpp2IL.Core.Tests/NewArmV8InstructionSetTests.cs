@@ -364,6 +364,65 @@ public class NewArmV8InstructionSetTests
             Is.EqualTo(0x05E74000UL));
     }
 
+    [TestCase(new byte[] { 0x8A, 0x00, 0x00, 0x10 }, 0x022658BCUL, 0x022658CCUL,
+        TestName = "基本_ADR恢复向前PC相对地址")]
+    [TestCase(new byte[] { 0x0A, 0xFF, 0xFF, 0x10 }, 0x02AB6C9CUL, 0x02AB6C7CUL,
+        TestName = "边界_ADR恢复向后PC相对地址")]
+    [Category("基本功能")]
+    public void AdrBecomesAbsoluteNativeAddress(
+        byte[] machineCode,
+        ulong instructionAddress,
+        ulong expectedAddress)
+    {
+        var native = DecodeSingleInstruction(machineCode, instructionAddress);
+
+        var recognized = NewArmV8InstructionSet.TryCreatePcRelativeAddressInstruction(
+            native,
+            instructionAddress,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic} / {native.Op1Kind}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(recovered.Operands[0], Is.EqualTo(new Register(null, "X10")));
+            Assert.That(recovered.Operands[1], Is.EqualTo(new Immediate(unchecked((long)expectedAddress))));
+            Assert.That(recovered.IntegerWidthBits, Is.EqualTo(64));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void AdrWriteToZeroRegisterHasNoDataFlowDefinition()
+    {
+        var native = DecodeSingleInstruction([0x9F, 0x00, 0x00, 0x10], 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreatePcRelativeAddressInstruction(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.OpCode, Is.EqualTo(OpCode.Nop));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void AddMustNotEnterPcRelativeAddressRecovery()
+    {
+        var native = DecodeSingleInstruction([0x08, 0x01, 0x09, 0x0B], 0x1000);
+
+        Assert.That(
+            NewArmV8InstructionSet.TryCreatePcRelativeAddressInstruction(
+                native,
+                native.Address,
+                out _),
+            Is.False);
+    }
+
     [Test]
     [Category("边界值")]
     public void AdrpStoreAcceptsZeroByteOffset()
