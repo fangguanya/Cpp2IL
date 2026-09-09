@@ -707,25 +707,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
-    /// 恢复 ARM64 LSL/LSR 的立即数和寄存器移位形态。
+    /// 恢复 ARM64 LSL/LSR/ASR 的立即数和寄存器移位形态。
     /// 寄存器移位按操作数宽度显式保留低 5/6 位，避免 W 源因内部 W/X
     /// 统一寄存器身份而错误采用 64 位移位计数；结果仍携带原生目标宽度。
     /// </summary>
-    internal static bool TryCreateLogicalShiftInstructions(
+    internal static bool TryCreateScalarShiftInstructions(
         Arm64Instruction instruction,
         out Instruction[] recovered)
     {
         recovered = [];
-        if (instruction.Mnemonic is not (Arm64Mnemonic.LSL or Arm64Mnemonic.LSR)
+        if (instruction.Mnemonic is not (Arm64Mnemonic.LSL or Arm64Mnemonic.LSR or Arm64Mnemonic.ASR)
             || instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
             || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
             || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
             || sourceWidthBits != widthBits)
             return false;
-        var shiftOpCode = instruction.Mnemonic == Arm64Mnemonic.LSL
-            ? OpCode.ShiftLeft
-            : OpCode.ShiftRightUnsigned;
+        var shiftOpCode = instruction.Mnemonic switch
+        {
+            Arm64Mnemonic.LSL => OpCode.ShiftLeft,
+            Arm64Mnemonic.LSR => OpCode.ShiftRightUnsigned,
+            _ => OpCode.ShiftRight,
+        };
 
         if (instruction.Op2Kind == Arm64OperandKind.Immediate)
         {
@@ -4708,10 +4711,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             case Arm64Mnemonic.LSL:
             case Arm64Mnemonic.LSR:
+            case Arm64Mnemonic.ASR:
                 {
-                    if (!TryCreateLogicalShiftInstructions(instruction, out var recovered))
+                    if (!TryCreateScalarShiftInstructions(instruction, out var recovered))
                     {
-                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction logical shift operand widths are not exactly modeled."));
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction scalar shift operand widths are not exactly modeled."));
                         break;
                     }
 

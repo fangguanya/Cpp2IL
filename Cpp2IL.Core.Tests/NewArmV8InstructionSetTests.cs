@@ -1499,7 +1499,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction(machineCode, 0x0271BCAC);
 
-        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
             native,
             out var recovered);
 
@@ -1536,7 +1536,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction(machineCode, 0x1000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
             native,
             out var recovered);
 
@@ -1566,7 +1566,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction(machineCode, 0x2000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
             native,
             out var recovered);
 
@@ -1597,7 +1597,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction(machineCode, 0x2500);
 
-        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
             native,
             out var recovered);
 
@@ -1618,13 +1618,79 @@ public class NewArmV8InstructionSetTests
         });
     }
 
+    [TestCase(new byte[] { 0x18, 0x7D, 0x01, 0x13 }, 32, 1L, "X24", "X8",
+        TestName = "基本_32位ASR立即数保留符号补位")]
+    [TestCase(new byte[] { 0x09, 0xFC, 0x7F, 0x93 }, 64, 63L, "X9", "X0",
+        TestName = "边界_64位ASR立即数接受最大移距")]
+    [Category("基本功能")]
+    public void AsrImmediateAliasBecomesSizedArithmeticRightShift(
+        byte[] machineCode,
+        int expectedWidth,
+        long expectedShift,
+        string expectedDestination,
+        string expectedSource)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x2800);
+
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Has.Length.EqualTo(1));
+            Assert.That(recovered[0].OpCode, Is.EqualTo(OpCode.ShiftRight));
+            Assert.That(recovered[0].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, expectedSource)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(expectedShift)));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(expectedWidth));
+        });
+    }
+
+    [TestCase(new byte[] { 0x41, 0x2B, 0xD3, 0x1A }, 32, 31L, "X1", "X26", "X19",
+        TestName = "基本_32位ASR寄存器移距显式掩码低5位")]
+    [TestCase(new byte[] { 0x41, 0x2B, 0xD3, 0x9A }, 64, 63L, "X1", "X26", "X19",
+        TestName = "边界_64位ASR寄存器移距显式掩码低6位")]
+    [Category("边界值")]
+    public void AsrRegisterShiftMasksAmountByNativeWidth(
+        byte[] machineCode,
+        int expectedWidth,
+        long expectedMask,
+        string expectedDestination,
+        string expectedSource,
+        string expectedShiftSource)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x2900);
+
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.And,
+                OpCode.ShiftRight,
+            }));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, expectedShiftSource)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(expectedMask)));
+            Assert.That(recovered[1].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
+            Assert.That(recovered[1].Operands[1], Is.EqualTo(new Register(null, expectedSource)));
+            Assert.That(recovered[1].Operands[2], Is.EqualTo(recovered[0].Operands[0]));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == expectedWidth), Is.True);
+        });
+    }
+
     [Test]
     [Category("边界值")]
     public void LslWriteToZeroRegisterHasNoDataFlowDefinition()
     {
         var native = DecodeSingleInstruction([0x3F, 0x20, 0xC2, 0x1A], 0x3000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateLogicalShiftInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateScalarShiftInstructions(
             native,
             out var recovered);
 
@@ -1634,12 +1700,12 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("异常输入")]
-    public void AsrMustNotEnterLogicalShiftRecovery()
+    public void AddMustNotEnterScalarShiftRecovery()
     {
-        var native = DecodeSingleInstruction([0x09, 0xFD, 0x7F, 0x93], 0x4000);
+        var native = DecodeSingleInstruction([0x08, 0x01, 0x09, 0x0B], 0x4000);
 
         Assert.That(
-            NewArmV8InstructionSet.TryCreateLogicalShiftInstructions(native, out var recovered),
+            NewArmV8InstructionSet.TryCreateScalarShiftInstructions(native, out var recovered),
             Is.False);
         Assert.That(recovered, Is.Empty);
     }
