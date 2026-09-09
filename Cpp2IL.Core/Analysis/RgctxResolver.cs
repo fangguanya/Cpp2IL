@@ -110,6 +110,129 @@ public static class RgctxResolver
         return null;
     }
 
+    /// <summary>
+    /// 证明调用隐藏参数来自 MethodInfo::rgctx_data 表项。
+    /// 只接受两个连续的唯一无索引内存读取：先取固定 rgctx_data 字段，再按指针
+    /// 对齐读取表项。普通 MethodInfo 参数、绝对元数据槽和歧义定义均不参与延迟绑定；
+    /// 表项的最终 METHOD 身份仍由后续 RgctxResolver 与同一开放方法定义共同验收。
+    /// </summary>
+    internal static bool IsMethodRgctxEntryCarrier(
+        MethodAnalysisContext containingMethod,
+        IOperand operand)
+    {
+        if (operand is not LocalVariable carrier)
+            return false;
+
+        var pointerSize = containingMethod.AppContext.Binary.is32Bit ? 4 : 8;
+        var methodRgctxOffset = containingMethod.AppContext.Binary.is32Bit ? 0x1C : 0x38;
+        var definitions = containingMethod.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+        if (definitions[carrier].Take(2).ToArray() is not
+            [
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [
+                        LocalVariable _,
+                        MemoryOperand
+                        {
+                            Index: null,
+                            Scale: 0,
+                            Base: LocalVariable tableCarrier
+                        } entryMemory
+                    ]
+                }
+            ]
+            || entryMemory.Addend < 0
+            || entryMemory.Addend % pointerSize != 0)
+            return false;
+
+        var accepted = ResolveMethodRgctxRoot(
+            tableCarrier,
+            definitions,
+            methodRgctxOffset,
+            []) != null;
+        return accepted;
+    }
+
+    /// <summary>
+    /// 沿唯一 Move/Phi 证明每条入边均读取同一个 MethodInfo 的 rgctx_data 字段。
+    /// 初始化慢路径会把调用前后两次字段读取合并成 Phi，因此不能只接受直接读取。
+    /// </summary>
+    private static LocalVariable? ResolveMethodRgctxRoot(
+        LocalVariable carrier,
+        ILookup<LocalVariable, Instruction> definitions,
+        long methodRgctxOffset,
+        HashSet<LocalVariable> visited)
+    {
+        if (!visited.Add(carrier)
+            || definitions[carrier].Take(2).ToArray() is not [{ } definition])
+            return null;
+
+        if (definition is
+            {
+                OpCode: OpCode.Move,
+                Operands:
+                [
+                    LocalVariable _,
+                    MemoryOperand
+                    {
+                        Index: null,
+                        Scale: 0,
+                        Base: LocalVariable methodInfoCarrier
+                    } memory
+                ]
+            }
+            && memory.Addend == methodRgctxOffset)
+            return ResolveUniqueMoveRoot(methodInfoCarrier, definitions);
+
+        if (definition is
+            {
+                OpCode: OpCode.Move,
+                Operands: [LocalVariable _, LocalVariable previous]
+            })
+            return ResolveMethodRgctxRoot(previous, definitions, methodRgctxOffset, [.. visited]);
+
+        if (definition.OpCode != OpCode.Phi
+            || definition.Sources.OfType<LocalVariable>().ToArray() is not { Length: > 0 } sources
+            || sources.Length != definition.Sources.Count)
+            return null;
+
+        LocalVariable? commonRoot = null;
+        foreach (var source in sources)
+        {
+            var root = ResolveMethodRgctxRoot(source, definitions, methodRgctxOffset, [.. visited]);
+            if (root == null || commonRoot != null && !ReferenceEquals(commonRoot, root))
+                return null;
+            commonRoot ??= root;
+        }
+        return commonRoot;
+    }
+
+    private static LocalVariable? ResolveUniqueMoveRoot(
+        LocalVariable carrier,
+        ILookup<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var current = carrier;
+        while (visited.Add(current))
+        {
+            var candidates = definitions[current].Take(2).ToArray();
+            if (candidates.Length == 0)
+                return current;
+            if (candidates is not
+                [
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [LocalVariable _, LocalVariable previous]
+                    }
+                ])
+                return null;
+            current = previous;
+        }
+        return null;
+    }
     internal static bool DescribesSameThing(TypeAnalysisContext? existing, TypeAnalysisContext candidate) =>
         (existing, candidate) switch
         {

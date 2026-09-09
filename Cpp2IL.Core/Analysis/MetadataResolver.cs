@@ -1559,7 +1559,10 @@ public static class MetadataResolver
             // 单一地址候选也可能只是共享泛型原生体的一个具体代表。此时隐藏 MethodInfo
             // 才是调用点精确类型身份；立即绑定代表会在 RGCTX 解析前把 T 永久收窄为
             // Byte/Object。保留立即地址，交给 ResolveCallsViaMethodInfo 在不动点后精确绑定。
-            if (ShouldDeferUniqueConcreteGenericTarget(singleTargetMethod))
+            if (ShouldDeferUniqueConcreteGenericTarget(singleTargetMethod)
+                && RgctxResolver.IsMethodRgctxEntryCarrier(
+                    method,
+                    callInstruction.Operands[^1]))
                 continue;
 
             TryBindCallTarget(method, callInstruction, singleTargetMethod);
