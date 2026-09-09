@@ -33,8 +33,10 @@ public class ByRefRegressionEvidenceTests
         using var document = JsonDocument.Parse(File.ReadAllText(input!));
         Assert.That(document.RootElement.GetProperty("schema").GetString(),
             Is.EqualTo("FullRecoveryEmissionRegressionProjection/v1"));
+        // 同一账本取证入口按失败操作选择样本；选择条件只影响测试，不进入生产恢复规则。
+        var operation = Environment.GetEnvironmentVariable("CPP2IL_REGRESSION_OPERATION") ?? "IMMEDIATE_MANAGED_BYREF";
         var samples = document.RootElement.GetProperty("methods").EnumerateArray()
-            .Where(row => row.GetProperty("operation").GetString() == "IMMEDIATE_MANAGED_BYREF").ToArray();
+            .Where(row => row.GetProperty("operation").GetString() == operation).ToArray();
         Assert.That(samples, Is.Not.Empty);
         var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
         Assert.That(root, Is.Not.Null.And.Not.Empty);
@@ -119,7 +121,7 @@ public class ByRefRegressionEvidenceTests
         }
         File.WriteAllText(Path.Combine(output, "summary.json"), JsonSerializer.Serialize(new
         {
-            count = samples.Length, inputSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(input!))).ToLowerInvariant(),
+            operation, count = samples.Length, inputSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(input!))).ToLowerInvariant(),
             originalGraphsCaptured = true, causeVerified = false, fullRecoveryProved = false
         }));
     }
