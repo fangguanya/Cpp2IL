@@ -1512,6 +1512,96 @@ public class NewArmV8InstructionSetTests
         Assert.That(recovered, Is.Empty);
     }
 
+    [TestCase(new byte[] { 0x00, 0x01, 0x20, 0x0A }, 32, OpCode.Xor,
+        TestName = "基本_32位BIC无移位恢复取反与位与")]
+    [TestCase(new byte[] { 0x49, 0x00, 0x20, 0x8A }, 64, OpCode.Xor,
+        TestName = "基本_64位BIC无移位恢复取反与位与")]
+    [TestCase(new byte[] { 0xA8, 0x06, 0x20, 0x0A }, 32, OpCode.ShiftLeft,
+        TestName = "基本_32位BIC左移源保持移位语义")]
+    [TestCase(new byte[] { 0x49, 0x11, 0x69, 0x0A }, 32, OpCode.ShiftRightUnsigned,
+        TestName = "边界_32位BIC逻辑右移源保持无符号语义")]
+    [TestCase(new byte[] { 0x16, 0x7D, 0xA8, 0x0A }, 32, OpCode.ShiftRight,
+        TestName = "边界_32位BIC算术右移31位保持符号语义")]
+    [TestCase(new byte[] { 0x08, 0xFD, 0xA8, 0x8A }, 64, OpCode.ShiftRight,
+        TestName = "边界_64位BIC算术右移63位保持符号语义")]
+    [Category("基本功能")]
+    public void BicRestoresWidthAndShiftedBitClear(
+        byte[] machineCode,
+        int expectedWidth,
+        OpCode expectedFirstOperation)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x5000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic} {native.Op3ShiftType}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered[0].OpCode, Is.EqualTo(expectedFirstOperation));
+            Assert.That(recovered[^2].OpCode, Is.EqualTo(OpCode.Xor));
+            Assert.That(recovered[^2].Operands[2],
+                Is.EqualTo(new Immediate(expectedWidth == 32 ? 0xFFFFFFFFL : -1L)));
+            Assert.That(recovered[^1].OpCode, Is.EqualTo(OpCode.And));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == expectedWidth), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void BicRotateRightExpandsWithinWordWidth()
+    {
+        var native = DecodeSingleInstruction([0xF8, 0x54, 0xF5, 0x0A], 0x6000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic} {native.Op3ShiftType}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.ShiftRightUnsigned,
+                OpCode.ShiftLeft,
+                OpCode.Or,
+                OpCode.Xor,
+                OpCode.And,
+            }));
+            Assert.That(recovered[3].Operands[2], Is.EqualTo(new Immediate(0xFFFFFFFFL)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Immediate(21)));
+            Assert.That(recovered[1].Operands[2], Is.EqualTo(new Immediate(11)));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == 32), Is.True);
+        });
+    }
+
+    [TestCase(new byte[] { 0x1F, 0x01, 0x20, 0x0A }, OpCode.Nop,
+        TestName = "边界_BIC写零寄存器不产生定义")]
+    [TestCase(new byte[] { 0xE0, 0x03, 0x20, 0x0A }, OpCode.Move,
+        TestName = "边界_BIC左源为零精确生成零值")]
+    [TestCase(new byte[] { 0x00, 0x01, 0x3F, 0x0A }, OpCode.Move,
+        TestName = "边界_BIC取反源为零保留左源")]
+    [Category("边界值")]
+    public void BicZeroRegisterSemanticsAreExplicit(byte[] machineCode, OpCode expectedOperation)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x7000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { expectedOperation }));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void BicsMustNotEnterFlaglessBitClearRecovery()
+    {
+        var native = DecodeSingleInstruction([0x00, 0x01, 0x20, 0x6A], 0x8000);
+
+        Assert.That(NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered), Is.False);
+        Assert.That(recovered, Is.Empty);
+    }
+
     [Test]
     [Category("基本功能")]
     public void BirthPlaceWordAddCarriesThirtyTwoBitDestinationEvidence()

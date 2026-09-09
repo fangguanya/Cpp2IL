@@ -774,6 +774,138 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
+    /// 恢复 ARM64 BIC 的位清除和可选移位源：Rn AND NOT(Shift(Rm))。
+    /// 所有中间结果携带原生 W/X 位宽；ROR 展开为同宽逻辑右移、左移和按位或，
+    /// 避免依赖宿主整数符号或内部统一寄存器名称推断轮转宽度。
+    /// </summary>
+    internal static bool TryCreateBitClearInstructions(
+        Arm64Instruction instruction,
+        out Instruction[] recovered)
+    {
+        recovered = [];
+        if (instruction.Mnemonic != Arm64Mnemonic.BIC
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || instruction.Op2Kind != Arm64OperandKind.Register
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var leftWidthBits)
+            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op2Reg, out var rightWidthBits)
+            || leftWidthBits != widthBits
+            || rightWidthBits != widthBits)
+            return false;
+
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+        {
+            recovered = [new Instruction(0, OpCode.Nop)];
+            return true;
+        }
+
+        var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
+        IOperand left = Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg)
+            ? Imm(0)
+            : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op1Reg));
+        if (left is Immediate)
+        {
+            recovered =
+            [
+                new Instruction(0, OpCode.Move, destination, Imm(0))
+                {
+                    IntegerWidthBits = widthBits,
+                },
+            ];
+            return true;
+        }
+
+        IOperand right = Arm64RegisterHelper.IsZeroRegister(instruction.Op2Reg)
+            ? Imm(0)
+            : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op2Reg));
+        if (right is Immediate)
+        {
+            recovered =
+            [
+                new Instruction(0, OpCode.Move, destination, left)
+                {
+                    IntegerWidthBits = widthBits,
+                },
+            ];
+            return true;
+        }
+
+        // Disarm 将逻辑移位寄存器格式的类型附在第 4 个显示操作数上；
+        // FinalOpShiftType 专用于另一类最终修饰符，不能用来读取 BIC 编码。
+        var shiftType = instruction.Op3ShiftType;
+        if (instruction.Op3Kind != Arm64OperandKind.Immediate
+            || instruction.Op3Imm < 0
+            || instruction.Op3Imm >= widthBits)
+            return false;
+        var shift = instruction.Op3Imm;
+
+        var instructions = new List<Instruction>();
+        IOperand shifted = right;
+        if (shift != 0)
+        {
+            if (shiftType == Arm64ShiftType.ROR)
+            {
+                var low = new Register(null, $"BIC_ROR_LOW_{instruction.Address:X}");
+                var high = new Register(null, $"BIC_ROR_HIGH_{instruction.Address:X}");
+                var rotated = new Register(null, $"BIC_ROR_{instruction.Address:X}");
+                instructions.Add(new Instruction(0, OpCode.ShiftRightUnsigned, low, right, Imm(shift))
+                {
+                    IntegerWidthBits = widthBits,
+                });
+                instructions.Add(new Instruction(1, OpCode.ShiftLeft, high, right, Imm(widthBits - shift))
+                {
+                    IntegerWidthBits = widthBits,
+                });
+                instructions.Add(new Instruction(2, OpCode.Or, rotated, low, high)
+                {
+                    IntegerWidthBits = widthBits,
+                });
+                shifted = rotated;
+            }
+            else
+            {
+                var shiftOpCode = shiftType switch
+                {
+                    Arm64ShiftType.LSL => OpCode.ShiftLeft,
+                    Arm64ShiftType.LSR => OpCode.ShiftRightUnsigned,
+                    Arm64ShiftType.ASR => OpCode.ShiftRight,
+                    _ => OpCode.Invalid,
+                };
+                if (shiftOpCode == OpCode.Invalid)
+                    return false;
+                var temporary = new Register(null, $"BIC_SHIFTED_{instruction.Address:X}");
+                instructions.Add(new Instruction(0, shiftOpCode, temporary, right, Imm(shift))
+                {
+                    IntegerWidthBits = widthBits,
+                });
+                shifted = temporary;
+            }
+        }
+        else if (shiftType is not (Arm64ShiftType.NONE or Arm64ShiftType.LSL
+                     or Arm64ShiftType.LSR or Arm64ShiftType.ASR or Arm64ShiftType.ROR))
+        {
+            return false;
+        }
+
+        // 用同宽全一掩码异或表达整数补码，避免与 ISIL 的布尔逻辑非共用 Not 操作码。
+        // 32 位掩码必须保留为 0xFFFFFFFF，再由 IntegerWidthBits 统一收窄；64 位的 -1
+        // 与全一位模式完全相同。这样类型传播和 CIL 生成始终沿数值二元运算路径处理。
+        var complementMask = widthBits == 32 ? 0xFFFFFFFFL : -1L;
+        var inverted = new Register(null, $"BIC_INVERTED_{instruction.Address:X}");
+        instructions.Add(new Instruction(instructions.Count, OpCode.Xor, inverted, shifted, Imm(complementMask))
+        {
+            IntegerWidthBits = widthBits,
+        });
+        instructions.Add(new Instruction(instructions.Count, OpCode.And, destination, left, inverted)
+        {
+            IntegerWidthBits = widthBits,
+        });
+        recovered = instructions.ToArray();
+        return true;
+    }
+
+    /// <summary>
     /// 将 Disarm 暴露的 UBFM、LSR 与 UBFIZ 别名统一还原为 UBFM 的 immr/imms。
     /// </summary>
     private static bool TryDecodeUnsignedBitfieldImmediates(
@@ -4704,6 +4836,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.AND:
                 //And is (dest, src1, src2)
                 AddInteger(address, OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+
+            case Arm64Mnemonic.BIC:
+                {
+                    if (!TryCreateBitClearInstructions(instruction, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction BIC operand widths or shift are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                }
                 break;
 
             case Arm64Mnemonic.ADDS:
