@@ -7,6 +7,67 @@ namespace Cpp2IL.Core.Tests;
 
 public class GenericInstanceFieldLayoutTests
 {
+    [TestCase(4, 8L)]
+    [TestCase(8, 16L)]
+    [Category("基本功能")]
+    public void 嵌套泛型字段复用布局且保留尾部填充(int pointerSize, long expectedSize)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var inner = CreateValue("NestedPointer");
+        inner.InjectFieldContext("pointer", app.SystemTypes.SystemIntPtrType, FieldAttributes.Public);
+        var nested = inner.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]);
+        var outer = CreateValue("NestedPair");
+        outer.InjectFieldContext("nested", nested, FieldAttributes.Public);
+        outer.InjectFieldContext("length", app.SystemTypes.SystemInt32Type, FieldAttributes.Public);
+        var instance = outer.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(instance, pointerSize), Is.EqualTo((expectedSize, (long)pointerSize)));
+        if (pointerSize == 8)
+        {
+            Assert.That(GenericInstanceFieldLayout.GetConcreteFieldLayout(instance)!.Select(field => field.Offset), Is.EqualTo(new long[] { 0, 8 }));
+            Assert.That(Cpp2IL.Core.Utils.Arm64CallingConventionResolver.GeneralRegisterSlotCount(instance), Is.EqualTo(2));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 值类型循环字段布局保持未知且不无限递归()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateValue("RecursiveLayout");
+        var instance = owner.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]);
+        owner.InjectFieldContext("cycle", instance, FieldAttributes.Public);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(instance, 8), Is.Null);
+    }
+
+    [TestCase(0)]
+    [TestCase(16)]
+    [Category("异常输入")]
+    public void 未知架构不猜测嵌套布局(int pointerSize)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateValue("UnknownArchitecture");
+        owner.InjectFieldContext("value", app.SystemTypes.SystemIntPtrType, FieldAttributes.Public);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(owner.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]), pointerSize), Is.Null);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 显式泛型布局不套用顺序布局()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = CreateValue("ExplicitLayout");
+        owner.Attributes = (owner.Attributes & ~TypeAttributes.LayoutMask) | TypeAttributes.ExplicitLayout;
+        owner.InjectFieldContext("value", app.SystemTypes.SystemIntPtrType, FieldAttributes.Public);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(owner.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]), 8), Is.Null);
+    }
+
+    private static InjectedTypeAnalysisContext CreateValue(string name)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        return new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly, "LayoutFixture", name,
+            app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.ValueType"), TypeAttributes.Public | TypeAttributes.SequentialLayout);
+    }
+
     [SetUp]
     public void Setup()
     {

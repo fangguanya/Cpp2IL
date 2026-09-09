@@ -11,7 +11,15 @@ public static class GenericInstanceFieldLayout
     internal readonly record struct ConcreteFieldLayout(
         FieldAnalysisContext Field,
         long Offset,
-        long Size);
+        long Size,
+        long Alignment);
+
+    // 每次布局查询独立持有缓存和递归路径，不跨应用保留类型图。
+    private sealed class LayoutTraversal
+    {
+        internal readonly HashSet<string> Active = [];
+        internal readonly Dictionary<string, IReadOnlyList<ConcreteFieldLayout>?> Completed = [];
+    }
 
     /// <summary>
     /// 将具体泛型实例或开放泛型声明统一转换为可计算字段布局的泛型实例。
@@ -42,27 +50,47 @@ public static class GenericInstanceFieldLayout
     /// </summary>
     internal static IReadOnlyList<ConcreteFieldLayout>? GetConcreteFieldLayout(
         GenericInstanceTypeAnalysisContext type)
-    {
-        var pointerSize = type.AppContext.Binary.PointerSizeBytes;
-        if (GetDeclaredFieldStart(type, pointerSize) is not { } offset)
-            return null;
+        => GetConcreteFieldLayout(type, type.AppContext.Binary.PointerSizeBytes, new LayoutTraversal());
 
-        var layout = new List<ConcreteFieldLayout>();
-        foreach (var field in type.GenericType.Fields.Where(field => !field.IsStatic))
+    private static IReadOnlyList<ConcreteFieldLayout>? GetConcreteFieldLayout(
+        GenericInstanceTypeAnalysisContext type, int pointerSize, LayoutTraversal traversal)
+    {
+        if (pointerSize is not (4 or 8)) return null;
+        var key = type.GenericType.DeclaringAssembly.Name + ":" + type.FullName;
+        if (traversal.Completed.TryGetValue(key, out var cached)) return cached;
+        if (traversal.Active.Count >= 64 || !traversal.Active.Add(key)) return null;
+        try
         {
-            var concreteFieldType = GenericInstantiation.Instantiate(field.FieldType, type.GenericArguments, []);
-            if (GetSizeAndAlignment(concreteFieldType, pointerSize) is not var (size, alignment))
+            if (GetDeclaredFieldStart(type, pointerSize) is not { } offset)
                 return null;
 
-            offset = (offset + alignment - 1) & ~(alignment - 1);
-            layout.Add(new(
-                new ConcreteGenericFieldAnalysisContext(field, type),
-                offset,
-                size));
-            offset += size;
-        }
+            // 显式布局及指定类尺寸需额外原始尺寸证据，不能套用顺序字段算法。
+            var definition = type.GenericType.Definition;
+            if (type.IsValueType
+                && ((type.Attributes & System.Reflection.TypeAttributes.LayoutMask) == System.Reflection.TypeAttributes.ExplicitLayout
+                    || definition is { ClassSizeIsDefault: false })) return null;
+            var packing = definition?.PackingSize ?? 0;
 
-        return layout;
+            var layout = new List<ConcreteFieldLayout>();
+            foreach (var field in type.GenericType.Fields.Where(field => !field.IsStatic))
+            {
+                var concreteFieldType = GenericInstantiation.Instantiate(field.FieldType, type.GenericArguments, []);
+                if (GetSizeAndAlignment(concreteFieldType, pointerSize, traversal) is not var (size, alignment))
+                    return null;
+                if (packing != 0) alignment = System.Math.Min(alignment, packing);
+
+                offset = checked(offset + alignment - 1) & ~(alignment - 1);
+                layout.Add(new(
+                    new ConcreteGenericFieldAnalysisContext(field, type),
+                    offset,
+                    size, alignment));
+                offset = checked(offset + size);
+            }
+
+            traversal.Completed[key] = layout;
+            return layout;
+        }
+        finally { traversal.Active.Remove(key); }
     }
 
     /// <summary>
@@ -135,13 +163,27 @@ public static class GenericInstanceFieldLayout
     }
 
     internal static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
+        => GetSizeAndAlignment(fieldType, pointerSize, new LayoutTraversal());
+
+    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize,
+        LayoutTraversal traversal)
     {
-        // TODO support user-defined value types
+        if (pointerSize is not (4 or 8)) return null;
         if (fieldType is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !fieldType.IsValueType)
             return (pointerSize, pointerSize);
 
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
-            return GetSizeAndAlignment(underlying.FieldType, pointerSize);
+            return GetSizeAndAlignment(underlying.FieldType, pointerSize, traversal);
+
+        if (fieldType is GenericInstanceTypeAnalysisContext generic)
+        {
+            var fields = GetConcreteFieldLayout(generic, pointerSize, traversal);
+            if (fields is not { Count: > 0 }) return null;
+            var alignment = fields.Max(field => field.Alignment);
+            var end = fields.Max(field => checked(field.Offset + field.Size));
+            // 数组步长及外层后续字段必须包含尾部对齐填充，不仅是最后字段末尾。
+            return (checked(end + alignment - 1) & ~(alignment - 1), alignment);
+        }
 
         return fieldType.FullName switch
         {

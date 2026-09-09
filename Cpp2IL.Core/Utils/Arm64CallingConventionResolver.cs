@@ -335,6 +335,7 @@ public static class Arm64CallingConventionResolver
                 .Select(field => new GenericInstanceFieldLayout.ConcreteFieldLayout(
                     field,
                     field.Offset,
+                    PointerSize,
                     PointerSize))
                 .ToArray();
         if (instanceFields == null)
@@ -386,10 +387,7 @@ public static class Arm64CallingConventionResolver
         if (!type.IsValueType)
             return 1;
 
-        var size = type is GenericInstanceTypeAnalysisContext generic
-                   && GenericInstanceFieldLayout.GetConcreteFieldLayout(generic) is { Count: > 0 } layout
-            ? layout.Max(field => field.Offset + field.Size)
-            : TypeSizes.UnboxedSize(type, PointerSize);
+        var size = KnownArgumentSize(type);
         return size is > 0 and <= 16
             ? checked((int)((size + PointerSize - 1) / PointerSize))
             : 1;
@@ -413,9 +411,15 @@ public static class Arm64CallingConventionResolver
         if (type.FullName == "System.Double")
             return sizeof(double);
 
-        var size = TypeSizes.UnboxedSize(type, PointerSize);
+        var size = KnownArgumentSize(type);
         return size is > 0 and <= int.MaxValue ? checked((int)size) : PointerSize;
     }
+
+    // 寄存器槽和溢出栈参数共用包含尾部填充的实例尺寸，避免两处独立推算。
+    private static long KnownArgumentSize(TypeAnalysisContext type)
+        => type is GenericInstanceTypeAnalysisContext
+            ? GenericInstanceFieldLayout.GetSizeAndAlignment(type, PointerSize)?.Size ?? 0
+            : TypeSizes.UnboxedSize(type, PointerSize);
 
     private static int AlignUp(int value, int alignment)
         => checked((value + alignment - 1) / alignment * alignment);
