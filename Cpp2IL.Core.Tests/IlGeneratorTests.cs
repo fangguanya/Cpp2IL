@@ -18,6 +18,106 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    private delegate ref byte 字节引用偏移委托(ref byte value);
+
+    [TestCase(false, false, 0L)]
+    [TestCase(false, false, 7L)]
+    [TestCase(false, false, -7L)]
+    [TestCase(false, true, 7L)]
+    [TestCase(false, true, -7L)]
+    [TestCase(true, false, 7L)]
+    [TestCase(true, false, -7L)]
+    [Category("边界值")]
+    public void 托管引用字节偏移生成真实PE保持引用身份(bool subtract, bool commuted, long offset)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var element = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Byte")!;
+        var reference = element.MakeByReferenceType();
+        var source = new LocalVariable("value", new Register(null, "X0"), reference);
+        var result = new LocalVariable("result", new Register(null, "X1"), reference);
+        var operation = new Instruction(0, subtract ? OpCode.Subtract : OpCode.Add, result,
+            commuted ? new Immediate(offset) : source, commuted ? source : new Immediate(offset));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,
+            "Offset", reference, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [reference]);
+        context.ParameterLocals = [source];
+        context.Locals = [result];
+        context.AnalysisWarnings = [];
+        context.ControlFlowGraph = new ISILControlFlowGraph([operation, new Instruction(1, OpCode.Return, result)]);
+        var module = new ModuleDefinition("ByRefOffset.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemObjectType, "Object", TypeAttributes.Public);
+        // 基元声明属于真实核心库身份；不在输出程序集定义同名伪 Byte 类型。
+        var core = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(core);
+        绑定AsmResolver系统类型(core, element, "Byte", TypeAttributes.Public | TypeAttributes.Sealed);
+        var host = new TypeDefinition("Fixture", "ByRefOffsetHost", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var signature = module.CorLibTypeFactory.Byte.MakeByReferenceType();
+        var method = new MethodDefinition("Offset", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(signature, [signature]));
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        host.Methods.Add(method);
+        IlGenerator.GenerateIl(context, method);
+        CilStackValidator.Validate(method.CilMethodBody!, context.FullName);
+        Assert.That(method.CilMethodBody!.Instructions.Count(instruction => instruction.OpCode == CilOpCodes.Conv_I), Is.EqualTo(1));
+        Assert.That(method.CilMethodBody.Instructions.Any(instruction => instruction.OpCode == CilOpCodes.Ldnull), Is.False);
+        var assembly = new AssemblyDefinition("ByRefOffset", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var pe = stream.ToArray();
+        var runtime = System.Reflection.Assembly.Load(pe).GetType("Fixture.ByRefOffsetHost")!.GetMethod("Offset")!
+            .CreateDelegate<字节引用偏移委托>();
+        var bytes = Enumerable.Repeat((byte)0xA5, 32).ToArray();
+        ref var actual = ref runtime(ref bytes[16]);
+        var index = checked(16 + (int)(subtract ? -offset : offset));
+        Assert.That(System.Runtime.CompilerServices.Unsafe.AreSame(ref actual, ref bytes[index]), Is.True);
+        actual = 0x39;
+        // 写入返回引用，核对全部前后哨兵，而非只核对返回数值。
+        for (var i = 0; i < bytes.Length; i++) Assert.That(bytes[i], Is.EqualTo(i == index ? (byte)0x39 : (byte)0xA5));
+        var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        if (!string.IsNullOrEmpty(root))
+        {
+            var directory = System.IO.Path.Combine(root, $"byref-offset-{subtract}-{commuted}-{offset}");
+            System.IO.Directory.CreateDirectory(directory);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(directory, "ByRefOffset.dll"), pe);
+            System.IO.File.WriteAllText(System.IO.Path.Combine(directory, "runtime.json"), System.Text.Json.JsonSerializer.Serialize(new
+            {
+                subtract, commuted, offset, index, actualBytes = bytes.Select(value => (int)value).ToArray(),
+                peSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(pe)).ToLowerInvariant(),
+                sameReferenceProved = true, sourceRoundTripProved = false, fullRecoveryProved = false
+            }));
+        }
+    }
+
+    [TestCase(0, 0)]
+    [TestCase(8, 32)]
+    [TestCase(4, 64)]
+    [Category("异常输入")]
+    public void 引用偏移排除未知架构及截断宽度(int pointerSize, int width)
+    {
+        var type = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type.MakeByReferenceType();
+        var source = new LocalVariable("source", new Register(null, "X0"), type);
+        var result = new LocalVariable("result", new Register(null, "X1"), type);
+        var instruction = new Instruction(0, OpCode.Add, result, source, new Immediate(1)) { IntegerWidthBits = width };
+        Assert.That(ByRefMemoryAccessHelper.TryDescribeByteOffset(instruction, pointerSize, out _, out _), Is.False);
+    }
+
+    [TestCase(OpCode.Multiply)]
+    [TestCase(OpCode.And)]
+    [TestCase(OpCode.Or)]
+    [Category("异常输入")]
+    public void 位运算和乘法不冒充引用偏移(OpCode operation)
+    {
+        var type = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type.MakeByReferenceType();
+        var source = new LocalVariable("source", new Register(null, "X0"), type);
+        var result = new LocalVariable("result", new Register(null, "X1"), type);
+        Assert.That(ByRefMemoryAccessHelper.TryDescribeByteOffset(new Instruction(0, operation, result, source, new Immediate(1)),
+            8, out _, out _), Is.False);
+        Assert.That(ByRefMemoryAccessHelper.TryDescribeByteOffset(new Instruction(0, OpCode.Subtract, result, new Immediate(1), source),
+            8, out _, out _), Is.False);
+    }
+
     private static void 绑定AsmResolver系统类型(
         ModuleDefinition module,
         TypeAnalysisContext context,

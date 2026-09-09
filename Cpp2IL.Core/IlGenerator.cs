@@ -761,6 +761,17 @@ public static class IlGenerator
             case OpCode.And:
             case OpCode.Or:
             case OpCode.Xor:
+                if (ByRefMemoryAccessHelper.TryDescribeByteOffset(instruction, context.AppContext.Binary.PointerSizeBytes,
+                        out var referenceBase, out var byteOffset))
+                {
+                    // 保留托管引用来源及 GC 跟踪；偏移按原生宽度加载，不按引用类型加载整数。
+                    LoadLocal(referenceBase, method, locals);
+                    instructions.Add(CilOpCodes.Ldc_I8, byteOffset);
+                    instructions.Add(CilOpCodes.Conv_I);
+                    instructions.Add(instruction.OpCode == OpCode.Subtract ? CilOpCodes.Sub : CilOpCodes.Add);
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
                 if (TryEmitNullablePresenceTest(instruction, method, locals))
                 {
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);

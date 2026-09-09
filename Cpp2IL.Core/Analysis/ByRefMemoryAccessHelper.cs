@@ -9,6 +9,35 @@ namespace Cpp2IL.Core.Analysis;
 /// <summary>统一验证原始非托管值类型的字节边界，供零块写与只读字段原生写共享。</summary>
 internal static class ByRefMemoryAccessHelper
 {
+    /// <summary>引用地址与字节偏移是不同栈种类；只接受真实 ByRef 来源，不把整数构造成引用。</summary>
+    internal static bool TryDescribeByteOffset(Instruction instruction, int pointerSize,
+        out LocalVariable receiver, out long offset)
+    {
+        receiver = null!;
+        offset = 0;
+        if (pointerSize is not (4 or 8)
+            || instruction.IntegerWidthBits != 0 && instruction.IntegerWidthBits != pointerSize * 8
+            || instruction.OpCode is not (OpCode.Add or OpCode.Subtract)
+            || instruction.Operands.Count != 3
+            || instruction.Operands[0] is not LocalVariable { Type: ByRefTypeAnalysisContext })
+            return false;
+        if (instruction.Operands[1] is LocalVariable { Type: ByRefTypeAnalysisContext } left
+            && instruction.Operands[2] is Immediate right)
+        {
+            receiver = left;
+            offset = right.Value;
+            return true;
+        }
+        if (instruction.OpCode == OpCode.Add && instruction.Operands[1] is Immediate first
+            && instruction.Operands[2] is LocalVariable { Type: ByRefTypeAnalysisContext } second)
+        {
+            receiver = second;
+            offset = first.Value;
+            return true;
+        }
+        return false;
+    }
+
     internal static bool HasKnownUnmanagedRange(TypeAnalysisContext owner, int pointerSize, long offset, int bytes)
     {
         if (pointerSize is not (4 or 8) || !owner.IsValueType || owner is GenericInstanceTypeAnalysisContext
