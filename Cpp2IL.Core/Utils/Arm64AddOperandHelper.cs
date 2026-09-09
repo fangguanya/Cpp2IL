@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Cpp2IL.Core.ISIL;
 using Disarm;
+using Disarm.InternalDisassembly;
 
 namespace Cpp2IL.Core.Utils;
 
@@ -21,14 +22,33 @@ public static class Arm64AddOperandHelper
         IOperand source,
         Func<OpCode, List<IOperand>, Instruction> emit,
         out IOperand transformed)
-        => TryEmit(
-            instruction.FinalOpExtendType,
-            instruction.FinalOpShiftType,
+    {
+        transformed = source;
+        var extendType = instruction.FinalOpExtendType;
+        var shiftType = instruction.FinalOpShiftType;
+        if (extendType == Arm64ExtendType.NONE && shiftType == Arm64ShiftType.NONE)
+            return true;
+
+        if (instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || instruction.Op2Kind != Arm64OperandKind.Register
+            || !TryGetRegisterWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetRegisterWidthBits(instruction.Op1Reg, out var leftWidthBits)
+            || !TryGetRegisterWidthBits(instruction.Op2Reg, out var sourceWidthBits)
+            || leftWidthBits != widthBits
+            || !IsModifierSourceWidthValid(extendType, widthBits, sourceWidthBits))
+            return false;
+
+        return TryEmit(
+            extendType,
+            shiftType,
             instruction.Op3Kind,
             instruction.Op3Imm,
+            widthBits,
             source,
             emit,
             out transformed);
+    }
 
     /// <summary>
     /// 使用已解码的 ARM64 修饰符展开 ADD 操作数，供转换器与测试共享同一计算入口。
@@ -38,6 +58,7 @@ public static class Arm64AddOperandHelper
         Arm64ShiftType shiftType,
         Arm64OperandKind shiftOperandKind,
         long shift,
+        int integerWidthBits,
         IOperand source,
         Func<OpCode, List<IOperand>, Instruction> emit,
         out IOperand transformed)
@@ -47,30 +68,98 @@ public static class Arm64AddOperandHelper
 
         transformed = source;
 
+        if (integerWidthBits is not (32 or 64))
+            return false;
+
         if (extendType == Arm64ExtendType.NONE && shiftType == Arm64ShiftType.NONE)
             return true;
 
         if (extendType != Arm64ExtendType.NONE && shiftType != Arm64ShiftType.NONE)
             return false;
 
-        if (shiftOperandKind != Arm64OperandKind.Immediate || shift is < 0 or > 63)
+        if (shiftOperandKind == Arm64OperandKind.None)
+        {
+            if (shift != 0)
+                return false;
+        }
+        else if (shiftOperandKind != Arm64OperandKind.Immediate)
             return false;
 
         var temporary = new Register(null, "TEMP_ADD_OPERAND");
+        Instruction EmitSizedShift(OpCode opCode, List<IOperand> operands)
+        {
+            var instruction = emit(opCode, operands);
+            instruction.IntegerWidthBits = integerWidthBits;
+            return instruction;
+        }
 
-        if (!TryEmitExtension(extendType, source, temporary, emit, out transformed))
+        if (extendType != Arm64ExtendType.NONE)
+        {
+            // 扩展寄存器编码只允许 0..4 位左移；无显式第四操作数即移距零。
+            if (shiftType != Arm64ShiftType.NONE || shift is < 0 or > 4
+                || !TryEmitExtension(extendType, source, temporary, emit, out transformed))
+                return false;
+            if (shift == 0)
+                return true;
+
+            // 扩展链描述的是参与最终 ADD 的索引值，而不是独立的托管 Int64 载体；
+            // 最终 ADD 自身保留目标寄存器位宽，避免在字段恢复前把未知地址基址定型成整数。
+            emit(OpCode.ShiftLeft, [temporary, transformed, new Immediate(shift)]);
+            transformed = temporary;
+            return true;
+        }
+
+        // 移位寄存器编码按目标 W/X 位宽约束移距，并区分逻辑与算术右移。
+        if (shift is < 0 || shift >= integerWidthBits)
             return false;
-
-        // ARM64 扩展寄存器格式中的立即数同样表示左移位数。
+        var shiftOpCode = shiftType switch
+        {
+            Arm64ShiftType.LSL => OpCode.ShiftLeft,
+            Arm64ShiftType.LSR => OpCode.ShiftRightUnsigned,
+            Arm64ShiftType.ASR => OpCode.ShiftRight,
+            _ => OpCode.NotImplemented,
+        };
+        if (shiftOpCode == OpCode.NotImplemented)
+            return false;
         if (shift == 0)
             return true;
 
-        if (shiftType is not (Arm64ShiftType.NONE or Arm64ShiftType.LSL))
-            return false;
-
-        emit(OpCode.ShiftLeft, [temporary, transformed, new Immediate(shift)]);
+        EmitSizedShift(shiftOpCode, [temporary, transformed, new Immediate(shift)]);
         transformed = temporary;
         return true;
+    }
+
+    private static bool IsModifierSourceWidthValid(
+        Arm64ExtendType extendType,
+        int destinationWidthBits,
+        int sourceWidthBits)
+        => extendType switch
+        {
+            Arm64ExtendType.NONE => sourceWidthBits == destinationWidthBits,
+            Arm64ExtendType.UXTB or Arm64ExtendType.UXTH or Arm64ExtendType.UXTW
+                or Arm64ExtendType.SXTB or Arm64ExtendType.SXTH or Arm64ExtendType.SXTW
+                => sourceWidthBits == 32,
+            Arm64ExtendType.UXTX or Arm64ExtendType.SXTX
+                => destinationWidthBits == 64 && sourceWidthBits == 64,
+            _ => false,
+        };
+
+    private static bool TryGetRegisterWidthBits(Arm64Register register, out int widthBits)
+    {
+        if (register is >= Arm64Register.W0 and <= Arm64Register.W31)
+        {
+            widthBits = 32;
+            return true;
+        }
+
+        if (register is >= Arm64Register.X0 and <= Arm64Register.X31)
+        {
+            widthBits = 64;
+            return true;
+        }
+
+        widthBits = 0;
+        return false;
     }
 
     /// <summary>
