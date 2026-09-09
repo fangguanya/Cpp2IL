@@ -6,6 +6,8 @@ using System.Text.Json;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.OutputFormats;
+using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -47,6 +49,15 @@ public class ByRefRegressionEvidenceTests
         {
             var selected = samples.Select(row => methods[(row.GetProperty("assembly").GetString()!,
                 row.GetProperty("originalToken").GetUInt32())].Single()).ToArray();
+            File.WriteAllText(Path.Combine(root!, "original-parameter-abi.json"), JsonSerializer.Serialize(selected.Select(method => new
+            {
+                method = method.FullNameWithSignature, address = method.UnderlyingPointer,
+                operands = Arm64CallingConventionResolver.ArgumentOperands(method).Select(operand => operand.ToString()).ToArray(),
+                parameters = method.Parameters.Select(parameter => new
+                {
+                    name = parameter.ParameterName, layout = DescribeType(parameter.ParameterType, 0)
+                }).ToArray()
+            }), new JsonSerializerOptions { WriteIndented = true }));
             var options = Cpp2IlApi.RuntimeOptions!;
             options.IsilDumpAssemblyFilters = selected.Select(method => method.DeclaringType!.DeclaringAssembly.Name).Distinct().ToArray();
             options.IsilDumpTypeFilters = selected.Select(method => method.DeclaringType!.Definition!.FullName ?? throw new InvalidDataException("原始类型名称缺失。")).Distinct().ToArray();
@@ -120,5 +131,25 @@ public class ByRefRegressionEvidenceTests
             BuildAssembliesForOutput(app, directory);
             WriteOutputReceipts(directory);
         }
+    }
+
+    private static object DescribeType(TypeAnalysisContext type, int depth)
+    {
+        // 只输出有界原始布局证据，不在测试中重新实现生产 ABI 尺寸算法。
+        var layout = GenericInstanceFieldLayout.GetSizeAndAlignment(type, 8);
+        var generic = type as GenericInstanceTypeAnalysisContext;
+        return new
+        {
+            type = type.FullName, type.IsValueType,
+            slots = Arm64CallingConventionResolver.GeneralRegisterSlotCount(type),
+            unboxedSize = TypeSizes.UnboxedSize(type, 8), knownLayout = layout != null,
+            size = layout?.Size, alignment = layout?.Alignment,
+            concreteLayout = generic == null ? null : GenericInstanceFieldLayout.GetConcreteFieldLayout(generic)?
+                .Select(field => new { field = field.Field.Name, field.Offset, field.Size }).ToArray(),
+            fields = depth >= 3 ? null : type.Fields.Where(field => !field.IsStatic).Select(field => new
+            {
+                field = field.Name, field.Offset, type = DescribeType(field.FieldType, depth + 1)
+            }).ToArray()
+        };
     }
 }
