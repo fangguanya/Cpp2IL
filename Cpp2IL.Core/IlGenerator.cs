@@ -381,6 +381,9 @@ public static class IlGenerator
             case OpCode.NotImplemented:
                 throw new UnresolvedCilSemanticException(method.FullName, "NotImplemented", instruction.ToString());
 
+            case OpCode.ReadSystemRegister:
+                throw new UnresolvedCilSemanticException(method.FullName, "SYSTEM_REGISTER_READ", instruction.ToString());
+
             case OpCode.Interrupt:
                 throw new UnresolvedCilSemanticException(method.FullName, "Interrupt", instruction.ToString());
 

@@ -1972,6 +1972,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var addresses = new List<ulong>();
         var flagState = Arm64FlagState.None;
         var conditionalComparisonFallbackNzcv = 0L;
+        var injectedStackGuardIndices =
+            Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(insns);
         var jumpTableDispatches = RecoverJumpTableDispatches(insns, context);
         var jumpTableTargets = new HashSet<ulong>(jumpTableDispatches.Values
             .SelectMany(dispatch => dispatch.CaseTargets.Append(dispatch.Bounds.DefaultTarget)));
@@ -1984,6 +1986,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 index,
                 instruction.Mnemonic,
                 instruction.Address);
+
+            // 栈保护只在完整 TPIDR_EL0、保存槽、比较边与唯一前向失败调用闭合时删除。
+            // MRS 的值可能先经编译器栈槽搬运再被覆盖；闭合后以不可观察的零值维持搬运数据流。
+            if (injectedStackGuardIndices.Contains(index))
+            {
+                var replacement = instruction.Mnemonic == Arm64Mnemonic.MRS
+                    ? new Instruction(
+                        instructions.Count,
+                        OpCode.Move,
+                        ConvertOperand(instruction, 0),
+                        new Immediate(0))
+                    {
+                        IntegerWidthBits = 64,
+                    }
+                    : new Instruction(instructions.Count, OpCode.Nop);
+                instructions.Add(replacement);
+                addresses.Add(address);
+                continue;
+            }
 
             // 跳转表目标可能落在普通转换不产出 ISIL 的原生指令上；显式锚点保证地址修复不漂移。
             if (jumpTableTargets.Contains(address))
@@ -3980,6 +4001,26 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, OpCode.Move, temp2, ConvertOperand(instruction, 1));
                     Add(address, OpCode.Not, temp2, temp2);
                     Add(address, OpCode.Move, ConvertOperand(instruction, 0), temp2);
+                    break;
+                }
+            case Arm64Mnemonic.MRS:
+                {
+                    var machineCode = ReadMachineCodeAtAddress(context, address);
+                    if (!Arm64StackGuardHelper.TryCreateThreadPointerRead(
+                            instruction,
+                            machineCode,
+                            out var systemRegisterRead))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral(
+                            "Instruction MRS system register or destination is not exactly modeled."));
+                        break;
+                    }
+
+                    var emitted = Add(
+                        address,
+                        systemRegisterRead.OpCode,
+                        systemRegisterRead.Operands.ToList());
+                    emitted.IntegerWidthBits = systemRegisterRead.IntegerWidthBits;
                     break;
                 }
             case Arm64Mnemonic.MOVI:

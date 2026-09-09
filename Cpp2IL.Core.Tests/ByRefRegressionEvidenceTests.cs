@@ -94,6 +94,22 @@ public class ByRefRegressionEvidenceTests
                     name = parameter.ParameterName, layout = DescribeType(parameter.ParameterType, 0)
                 }).ToArray()
             }), new JsonSerializerOptions { WriteIndented = true }));
+            if (Environment.GetEnvironmentVariable("CPP2IL_BYREF_REGRESSION_RAW_ONLY") == "1")
+            {
+                // 全量原始 ISIL 审计不经过按类型筛选的程序集发射；用于一次性量化通用原生匹配覆盖面。
+                File.WriteAllText(Path.Combine(root!, "raw-isil-summary.json"), JsonSerializer.Serialize(new
+                {
+                    schema = "OriginalRegressionRawIsilSummary/v1",
+                    count = rawIsil.Length,
+                    opcodes = rawIsil.SelectMany(method => method.instructions)
+                        .GroupBy(instruction => instruction.opcode)
+                        .ToDictionary(group => group.Key, group => group.Count()),
+                    rawOnly = true,
+                    semanticEquivalenceProved = false,
+                    fullRecoveryProved = false
+                }, new JsonSerializerOptions { WriteIndented = true }));
+                return;
+            }
             var options = Cpp2IlApi.RuntimeOptions!;
             options.IsilDumpAssemblyFilters = selected.Select(method => method.DeclaringType!.DeclaringAssembly.Name).Distinct().ToArray();
             options.IsilDumpTypeFilters = selected.Select(method => method.DeclaringType!.Definition!.FullName ?? throw new InvalidDataException("原始类型名称缺失。")).Distinct().ToArray();

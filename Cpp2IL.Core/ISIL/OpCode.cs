@@ -26,6 +26,9 @@ public enum OpCode
     /// <summary>Moves op 2 into op 1</summary>
     Move,
 
+    /// <summary>把 op 2 标识的 ARM64 系统寄存器值读入 op 1；生成 CIL 前必须由精确的编译器注入语义消解。</summary>
+    ReadSystemRegister,
+
     /// <summary>Moves the result of phi function into op 1, other operands are inputs</summary>
     Phi,
 

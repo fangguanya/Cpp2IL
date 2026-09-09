@@ -105,6 +105,7 @@ public class Instruction : IOperand
         switch (OpCode)
         {
             case OpCode.Move:
+            case OpCode.ReadSystemRegister:
             case OpCode.Phi:
             case OpCode.ConditionalSelect:
             case OpCode.Add:

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Utils;
@@ -1600,6 +1601,41 @@ public class NewArmV8InstructionSetTests
 
         Assert.That(NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered), Is.False);
         Assert.That(recovered, Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void MrsTpidrEl0KeepsExplicitSystemRegisterEvidence()
+    {
+        var native = DecodeSingleInstruction([0x59, 0xD0, 0x3B, 0xD5], 0x9000);
+
+        var recognized = Arm64StackGuardHelper.TryCreateThreadPointerRead(
+            native,
+            0xD53BD059,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.OpCode, Is.EqualTo(OpCode.ReadSystemRegister));
+            Assert.That(recovered.Operands[0], Is.EqualTo(new Register(null, "X25")));
+            Assert.That(recovered.Operands[1], Is.EqualTo(new Immediate(Arm64StackGuardHelper.TpidrEl0Encoding)));
+            Assert.That(recovered.IntegerWidthBits, Is.EqualTo(64));
+        });
+    }
+
+    [TestCase(new byte[] { 0x59, 0xD0, 0x3B, 0xD5 }, 0xD53BD058u,
+        TestName = "异常_MRS机器码目的寄存器与解码不一致")]
+    [TestCase(new byte[] { 0x59, 0xD0, 0x3B, 0xD5 }, 0xD53BD079u,
+        TestName = "异常_MRS系统寄存器编码不属于TPIDR_EL0")]
+    [Category("异常输入")]
+    public void MrsRequiresMatchingTpidrEl0Encoding(byte[] bytes, uint machineCode)
+    {
+        var native = DecodeSingleInstruction(bytes, 0xA000);
+
+        Assert.That(
+            Arm64StackGuardHelper.TryCreateThreadPointerRead(native, machineCode, out _),
+            Is.False);
     }
 
     [Test]
@@ -3205,5 +3241,248 @@ public class NewArmV8InstructionSetTests
     public void 加载访问宽度不被目标扩展或普通移动污染(Arm64Mnemonic mnemonic, Arm64Register register, int expected)
     {
         Assert.That(NewArmV8InstructionSet.GetScalarLoadWidthBits(mnemonic, register), Is.EqualTo(expected));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 完整TpidrEl0栈保护序言与尾声被统一识别()
+    {
+        // 真实 Clang 序言/尾声形态：MRS -> [TP+0x28] -> [FP-8]，NE 边指向唯一末尾失败调用。
+        var native = DecodeInstructions(
+        [
+            0x59, 0xD0, 0x3B, 0xD5, // MRS X25, TPIDR_EL0
+            0xF4, 0x03, 0x02, 0xAA, // MOV X20, X2
+            0xF3, 0x03, 0x01, 0xAA, // MOV X19, X1
+            0x28, 0x17, 0x40, 0xF9, // LDR X8, [X25, #0x28]
+            0xF6, 0x03, 0x00, 0xAA, // MOV X22, X0
+            0xA8, 0x83, 0x1F, 0xF8, // STUR X8, [X29, #-8]
+            0x28, 0x17, 0x40, 0xF9, // LDR X8, [X25, #0x28]
+            0xA9, 0x83, 0x5F, 0xF8, // LDUR X9, [X29, #-8]
+            0x1F, 0x01, 0x09, 0xEB, // CMP X8, X9
+            0x01, 0x01, 0x00, 0x54, // B.NE +0x20
+            0xBF, 0x03, 0x00, 0x91, // MOV SP, X29
+            0xF4, 0x4F, 0x44, 0xA9, // LDP X20, X19, [SP, #0x40]
+            0xF9, 0x0B, 0x40, 0xF9, // LDR X25, [SP, #0x10]
+            0xF6, 0x57, 0x43, 0xA9, // LDP X22, X21, [SP, #0x30]
+            0xF8, 0x5F, 0x42, 0xA9, // LDP X24, X23, [SP, #0x20]
+            0xFD, 0x7B, 0xC5, 0xA8, // LDP X29, X30, [SP], #0x50
+            0xC0, 0x03, 0x5F, 0xD6, // RET
+            0x18, 0x4E, 0x6D, 0x94, // BL __stack_chk_fail
+            0xFF, 0xC3, 0x00, 0xD1, // 相邻函数 SUB SP, SP, #0x30
+            0xFD, 0x7B, 0x01, 0xA9, // 相邻函数 STP X29, X30, [SP, #0x10]
+        ], 0x1000);
+
+        var matched = Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native);
+
+        Assert.That(matched.OrderBy(index => index), Is.EqualTo(new[] { 0, 3, 5, 6, 7, 8, 9, 17 }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 多个返回路径的栈保护检查全部指向同一失败调用()
+    {
+        // 同一方法可有多个尾声；不得只删除首个检查。
+        var native = DecodeInstructions(
+        [
+            0x59, 0xD0, 0x3B, 0xD5, // MRS X25, TPIDR_EL0
+            0x28, 0x17, 0x40, 0xF9, // LDR X8, [X25, #0x28]
+            0xA8, 0x83, 0x1F, 0xF8, // STUR X8, [X29, #-8]
+            0x28, 0x17, 0x40, 0xF9, // 第一个尾声
+            0xA9, 0x83, 0x5F, 0xF8,
+            0x1F, 0x01, 0x09, 0xEB,
+            0x01, 0x01, 0x00, 0x54, // B.NE -> 索引14
+            0x1F, 0x20, 0x03, 0xD5, // NOP
+            0x28, 0x17, 0x40, 0xF9, // 第二个尾声
+            0xA9, 0x83, 0x5F, 0xF8,
+            0x1F, 0x01, 0x09, 0xEB,
+            0x61, 0x00, 0x00, 0x54, // B.NE -> 索引14
+            0x02, 0x00, 0x00, 0x14, // B -> 同一失败汇点；属于编译器生成的 no-return 落点
+            0xC0, 0x03, 0x5F, 0xD6, // RET
+            0x00, 0x00, 0x00, 0x94, // BL __stack_chk_fail
+        ], 0x2000);
+
+        var matched = Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native);
+
+        Assert.That(
+            matched.OrderBy(index => index),
+            Is.EqualTo(new[] { 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 14 }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 异常路径经无条件分支汇入共享栈保护比较()
+    {
+        var native = DecodeInstructions(
+        [
+            0x54, 0xD0, 0x3B, 0xD5, // MRS X20, TPIDR_EL0
+            0x88, 0x16, 0x40, 0xF9, // LDR X8, [X20, #0x28]
+            0xA8, 0x83, 0x1F, 0xF8, // STUR X8, [X29, #-8]
+            0x88, 0x16, 0x40, 0xF9, // 主返回路径当前 canary
+            0xA9, 0x83, 0x5F, 0xF8,
+            0x1F, 0x01, 0x09, 0xEB,
+            0x21, 0x01, 0x00, 0x54, // B.NE -> 索引15
+            0xC0, 0x03, 0x5F, 0xD6,
+            0x88, 0x16, 0x40, 0xF9, // 异常路径先读取当前 canary
+            0x03, 0x00, 0x00, 0x14, // B -> 索引12的共享保存值加载
+            0x1F, 0x20, 0x03, 0xD5,
+            0x08, 0x15, 0x40, 0xF9, // 另一异常路径经别名寄存器读取当前 canary
+            0xA9, 0x83, 0x5F, 0xF8,
+            0x1F, 0x01, 0x09, 0xEB,
+            0x21, 0x00, 0x00, 0x54, // B.NE -> 索引15
+            0x00, 0x00, 0x00, 0x94,
+        ], 0x2800);
+
+        var matched = Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native);
+
+        Assert.That(
+            matched.OrderBy(index => index),
+            Is.EqualTo(new[] { 0, 1, 2, 3, 4, 5, 6, 8, 11, 12, 13, 14, 15 }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 托管返回值选择可位于Canary加载与比较之间()
+    {
+        // UnityEngine 返回结构体的真实形态：两个 CSEL 先组装返回值，随后才比较 canary。
+        var native = DecodeInstructions(
+        [
+            0xFF, 0xC3, 0x00, 0xD1, 0xFE, 0x4F, 0x02, 0xA9,
+            0x53, 0xD0, 0x3B, 0xD5, 0xE2, 0x03, 0x00, 0x91,
+            0x68, 0x16, 0x40, 0xF9, 0xE8, 0x0F, 0x00, 0xF9,
+            0xFF, 0x7F, 0x00, 0xA9, 0xFF, 0x0B, 0x00, 0xF9,
+            0x53, 0xFE, 0xFF, 0x97, 0xE8, 0x07, 0x40, 0xF9,
+            0xE9, 0x13, 0x40, 0xB9, 0x1F, 0x00, 0x00, 0x72,
+            0x6A, 0x16, 0x40, 0xF9, 0xEB, 0x0F, 0x40, 0xF9,
+            0x2C, 0x00, 0xC0, 0xD2, 0x00, 0x11, 0x9F, 0x9A,
+            0x21, 0x11, 0x8C, 0x9A, 0x5F, 0x01, 0x0B, 0xEB,
+            0x81, 0x00, 0x00, 0x54, 0xFE, 0x4F, 0x42, 0xA9,
+            0xFF, 0xC3, 0x00, 0x91, 0xC0, 0x03, 0x5F, 0xD6,
+            0x25, 0xAE, 0x0A, 0x94,
+        ], 0x54F7A64);
+
+        var matched = Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native);
+
+        Assert.That(matched.OrderBy(index => index), Is.EqualTo(new[] { 2, 4, 5, 12, 13, 17, 18, 22 }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 直接保存线程指针不被误判为栈保护()
+    {
+        // 孤立线程指针保存没有 [TP+0x28] 证据链。
+        var native = DecodeInstructions(
+        [
+            0x59, 0xD0, 0x3B, 0xD5,
+            0xB9, 0x83, 0x1F, 0xF8, // STUR X25, [X29, #-8]
+            0xC0, 0x03, 0x5F, 0xD6,
+        ], 0x3000);
+
+        Assert.That(Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native), Is.Empty);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 成对保存线程指针后仍按完整栈保护证据闭合()
+    {
+        // 大栈帧会把线程指针与业务参数成对保存；STP 读取源寄存器，不构成线程指针覆盖。
+        var native = DecodeInstructions(
+        [
+            0x48, 0xD0, 0x3B, 0xD5, // MRS X8, TPIDR_EL0
+            0xE8, 0x07, 0x00, 0xA9, // STP X8, X1, [SP]
+            0x08, 0x15, 0x40, 0xF9, // LDR X8, [X8, #0x28]
+            0xE8, 0x27, 0x00, 0xF9, // STR X8, [SP, #0x48]
+            0xE8, 0x03, 0x40, 0xF9, // LDR X8, [SP]
+            0x08, 0x15, 0x40, 0xF9, // LDR X8, [X8, #0x28]
+            0xE9, 0x27, 0x40, 0xF9, // LDR X9, [SP, #0x48]
+            0x1F, 0x01, 0x09, 0xEB, // CMP X8, X9
+            0x41, 0x00, 0x00, 0x54, // B.NE -> 索引10
+            0xC0, 0x03, 0x5F, 0xD6, // RET
+            0x00, 0x00, 0x00, 0x94, // BL __stack_chk_fail
+        ], 0x3500);
+
+        var matched = Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native);
+
+        Assert.That(matched.OrderBy(index => index), Is.EqualTo(new[] { 0, 2, 3, 5, 6, 7, 8, 10 }));
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 大栈帧在线程指针首次覆盖前按数据流寻找栈保护值()
+    {
+        // 参数搬运会把 canary 读取推迟到原固定窗口之外；线程指针定义仍保持不变。
+        var native = DecodeInstructions(
+        [
+            0x48, 0xD0, 0x3B, 0xD5, // MRS X8, TPIDR_EL0
+            0xA9, 0x37, 0x40, 0xF9, // LDR X9, [X29, #0x68]
+            0xAA, 0x43, 0x00, 0xD1, // SUB X10, X29, #0x10
+            0xA8, 0x83, 0x18, 0xF8, // STUR X8, [X29, #-0x78]：保存线程指针
+            0xB3, 0x3F, 0x40, 0xF9, // LDR X19, [X29, #0x78]
+            0xF8, 0x03, 0x01, 0xAA, // MOV X24, X1
+            0x49, 0x01, 0x10, 0xF8, // STUR X9, [X10, #-0x100]
+            0xA9, 0x33, 0x40, 0xF9, // LDR X9, [X29, #0x60]
+            0xF7, 0x03, 0x00, 0xAA, // MOV X23, X0
+            0xA9, 0x83, 0x10, 0xF8, // STUR X9, [X29, #-0xF8]
+            0x08, 0x15, 0x40, 0xF9, // LDR X8, [X8, #0x28]
+            0xA8, 0x03, 0x1F, 0xF8, // STUR X8, [X29, #-0x10]
+            0xA8, 0x83, 0x58, 0xF8, // LDUR X8, [X29, #-0x78]
+            0x08, 0x15, 0x40, 0xF9, // LDR X8, [X8, #0x28]
+            0xA9, 0x03, 0x5F, 0xF8, // LDUR X9, [X29, #-0x10]
+            0x1F, 0x01, 0x09, 0xEB, // CMP X8, X9
+            0x41, 0x00, 0x00, 0x54, // B.NE -> 索引18
+            0xC0, 0x03, 0x5F, 0xD6, // RET
+            0x00, 0x00, 0x00, 0x94, // BL __stack_chk_fail
+        ], 0x3800);
+
+        var matched = Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native);
+
+        Assert.That(matched.OrderBy(index => index), Is.EqualTo(new[] { 0, 10, 11, 13, 14, 15, 16, 18 }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 线程指针覆盖后出现相同偏移读取不闭合为栈保护()
+    {
+        var native = DecodeInstructions(
+        [
+            0x48, 0xD0, 0x3B, 0xD5, // MRS X8, TPIDR_EL0
+            0xE8, 0x03, 0x00, 0xAA, // MOV X8, X0：线程指针定义已被覆盖
+            0x08, 0x15, 0x40, 0xF9, // LDR X8, [X8, #0x28]
+            0xC0, 0x03, 0x5F, 0xD6,
+        ], 0x3C00);
+
+        Assert.That(Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native), Is.Empty);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 栈保护线程指针寄存器被覆盖复用不影响闭合识别()
+    {
+        var bytes = new byte[]
+        {
+            0x59, 0xD0, 0x3B, 0xD5,
+            0xF4, 0x03, 0x19, 0xAA, // MOV X20, X25：线性布局中寄存器可在其他路径被覆盖复用
+            0xF3, 0x03, 0x01, 0xAA,
+            0x28, 0x17, 0x40, 0xF9,
+            0xF6, 0x03, 0x00, 0xAA,
+            0xA8, 0x83, 0x1F, 0xF8,
+            0x28, 0x17, 0x40, 0xF9,
+            0xA9, 0x83, 0x5F, 0xF8,
+            0x1F, 0x01, 0x09, 0xEB,
+            0x01, 0x01, 0x00, 0x54,
+            0xBF, 0x03, 0x00, 0x91,
+            0xF4, 0x4F, 0x44, 0xA9,
+            0xF9, 0x0B, 0x40, 0xF9,
+            0xF6, 0x57, 0x43, 0xA9,
+            0xF8, 0x5F, 0x42, 0xA9,
+            0xFD, 0x7B, 0xC5, 0xA8,
+            0xC0, 0x03, 0x5F, 0xD6,
+            0x18, 0x4E, 0x6D, 0x94,
+        };
+
+        var native = DecodeInstructions(bytes, 0x4000);
+
+        Assert.That(
+            Arm64StackGuardHelper.FindInjectedStackGuardInstructionIndices(native).OrderBy(index => index),
+            Is.EqualTo(new[] { 0, 3, 5, 6, 7, 8, 9, 17 }));
     }
 }
