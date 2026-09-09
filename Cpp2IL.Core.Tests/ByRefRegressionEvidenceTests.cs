@@ -5,12 +5,23 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.OutputFormats;
 
 namespace Cpp2IL.Core.Tests;
 
 [NonParallelizable]
 public class ByRefRegressionEvidenceTests
 {
+    [TearDown]
+    public void 释放原始全声明图并隔离后续夹具()
+    {
+        // 全声明发射会持有核心库及原始类型图；测试结束先清除静态根，再回收，保持既定内存上限。
+        Cpp2IlApi.ResetInternalState();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
     [Test]
     [Category("fixture集成")]
     public void 全量回退样本保留原始身份及即时数引用分析图()
@@ -32,6 +43,36 @@ public class ByRefRegressionEvidenceTests
         var methods = app.Assemblies.SelectMany(assembly => assembly.Types.SelectMany(type => type.Methods))
             .Where(method => method.Definition != null)
             .ToLookup(method => (method.DeclaringType!.DeclaringAssembly.Name, method.Definition!.token));
+        if (Environment.GetEnvironmentVariable("CPP2IL_BYREF_REGRESSION_EMIT") == "1")
+        {
+            var selected = samples.Select(row => methods[(row.GetProperty("assembly").GetString()!,
+                row.GetProperty("originalToken").GetUInt32())].Single()).ToArray();
+            var options = Cpp2IlApi.RuntimeOptions!;
+            options.IsilDumpAssemblyFilters = selected.Select(method => method.DeclaringType!.DeclaringAssembly.Name).Distinct().ToArray();
+            options.IsilDumpTypeFilters = selected.Select(method => method.DeclaringType!.Definition!.FullName ?? throw new InvalidDataException("原始类型名称缺失。")).Distinct().ToArray();
+            options.IsilDumpMethodFilters = selected.Select(method => method.Definition!.HumanReadableSignature ?? throw new InvalidDataException("原始方法签名缺失。")).Distinct().ToArray();
+            var directory = Path.Combine(root!, "byref-original-emission");
+            // 使用同一生产分析与发射流程，仅以回归输入界定测试范围；不发布局部程序集。
+            new RegressionEmitter().BuildWithReceipt(app, directory);
+            using var ledger = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            var rows = ledger.RootElement.GetProperty("methods").EnumerateArray()
+                .Where(row => row.GetProperty("original").GetBoolean() && row.GetProperty("selected").GetBoolean()).ToArray();
+            Assert.That(rows.Length, Is.EqualTo(samples.Length));
+            foreach (var sample in samples)
+            {
+                var row = rows.Single(row => row.GetProperty("assembly").GetString() == sample.GetProperty("assembly").GetString()
+                    && row.GetProperty("originalToken").GetUInt32() == sample.GetProperty("originalToken").GetUInt32());
+                Assert.That(row.GetProperty("nativeAddress").GetUInt64(), Is.EqualTo(sample.GetProperty("nativeAddress").GetUInt64()));
+                Assert.That(row.GetProperty("outcome").GetString(), Is.Not.EqualTo("PENDING"));
+            }
+            File.WriteAllText(Path.Combine(directory, "regression-summary.json"), JsonSerializer.Serialize(new
+            {
+                schema = "OriginalByRefEmissionRegression/v1", count = rows.Length,
+                outcomes = rows.GroupBy(row => row.GetProperty("outcome").GetString()!).ToDictionary(group => group.Key, group => group.Count()),
+                methods = rows, filteredRegression = true, semanticEquivalenceProved = false, fullRecoveryProved = false
+            }, new JsonSerializerOptions { WriteIndented = true }));
+            return;
+        }
         foreach (var row in samples)
         {
             var assembly = row.GetProperty("assembly").GetString()!;
@@ -70,5 +111,14 @@ public class ByRefRegressionEvidenceTests
             count = samples.Length, inputSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(input!))).ToLowerInvariant(),
             originalGraphsCaptured = true, causeVerified = false, fullRecoveryProved = false
         }));
+    }
+
+    private sealed class RegressionEmitter : AsmResolverDllOutputFormatIlRecovery
+    {
+        internal void BuildWithReceipt(ApplicationAnalysisContext app, string directory)
+        {
+            BuildAssembliesForOutput(app, directory);
+            WriteOutputReceipts(directory);
+        }
     }
 }
