@@ -359,6 +359,20 @@ public static class MetadataInitGuardRemover
             })
             return true;
 
+        // 新版共享泛型方法还会通过一个未登记为托管方法或公开关键函数的原生包装器，
+        // 按需填充当前 MethodInfo::rgctx_data。地址本身不稳定，因此只接受已经由外层
+        // 零值守卫证明、首个调用实参与守卫同源且调用结果无消费的唯一原生调用。
+        // 这些约束同时排除普通立即地址调用、不同 MethodInfo 以及返回值参与业务计算的分支。
+        if (instruction.Operands.FirstOrDefault() is Immediate { UnsignedValue: > 0 }
+            && instruction.Sources.FirstOrDefault() is LocalVariable nativeCallCarrier
+            && ResolveRuntimeMethodInfo(nativeCallCarrier, definitions) is { } nativeRepresented
+            && SameMethod(nativeRepresented.RepresentedMethod, guardedMethod)
+            && ReferenceEquals(
+                ResolveUniqueMoveRoot(nativeCallCarrier, definitions),
+                ResolveUniqueMoveRoot(guardCarrier, definitions))
+            && IsCallResultUnconsumed(containingMethod, instruction))
+            return true;
+
         if (instruction.Operands.FirstOrDefault() is not MethodAnalysisContext called)
             return false;
 
@@ -389,6 +403,14 @@ public static class MetadataInitGuardRemover
             ReferenceEquals(candidate, instruction)
             || candidate.Sources.All(source => !ReferenceEquals(source, discardedResult)));
     }
+
+    private static bool IsCallResultUnconsumed(
+        MethodAnalysisContext containingMethod,
+        Instruction instruction) =>
+        instruction.Destination is not LocalVariable result
+        || containingMethod.ControlFlowGraph!.Instructions.All(candidate =>
+            ReferenceEquals(candidate, instruction)
+            || candidate.Sources.All(source => !ReferenceEquals(source, result)));
 
     private static RuntimeMethodInfoAnalysisContext? ResolveRuntimeMethodInfo(
         LocalVariable carrier,

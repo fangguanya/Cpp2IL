@@ -1556,6 +1556,12 @@ public static class MetadataResolver
             // 当原始 X0 返回值已经进入 VirtualInvokeData 的双路 Phi 时，先绑定 void 方法会删除
             // 这个真实返回槽，令后续接口分派只能看到快速路径。此处只延迟具有完整消费者形状的
             // 共享地址调用；接口、槽位和 vtable 证据仍由 InterfaceDispatchRecovery 统一验收。
+            // 单一地址候选也可能只是共享泛型原生体的一个具体代表。此时隐藏 MethodInfo
+            // 才是调用点精确类型身份；立即绑定代表会在 RGCTX 解析前把 T 永久收窄为
+            // Byte/Object。保留立即地址，交给 ResolveCallsViaMethodInfo 在不动点后精确绑定。
+            if (ShouldDeferUniqueConcreteGenericTarget(singleTargetMethod))
+                continue;
+
             TryBindCallTarget(method, callInstruction, singleTargetMethod);
         }
 
@@ -1563,6 +1569,14 @@ public static class MetadataResolver
             method.ControlFlowGraph.RemoveUnreachableBlocks();
         method.ControlFlowGraph.MergeCallBlocks();
     }
+
+    /// <summary>
+    /// 判定唯一地址候选是否仍依赖调用点的隐藏 MethodInfo 才能确定泛型身份。
+    /// 仅延迟具体泛型上下文；开放声明和普通非泛型唯一目标仍沿原路径立即绑定。
+    /// </summary>
+    internal static bool ShouldDeferUniqueConcreteGenericTarget(MethodAnalysisContext target)
+        => target is ConcreteGenericMethodAnalysisContext
+           && Arm64CallingConventionResolver.RequiresHiddenMethodInfo(target);
 
     /// <summary>
     /// 把已解析的方法身份绑定到调用，并同步修正返回槽形状。
@@ -1783,6 +1797,15 @@ public static class MetadataResolver
                 continue;
             }
 
+            // ResolveCalls 有意留下的单一具体泛型候选只是共享原生体的地址代表；
+            // 若隐藏 MethodInfo 指向同一开放方法定义，以它携带的精确实参完成绑定。
+            if (candidates is [{ } singleCandidate])
+            {
+                if (CanBindUniqueDeferredTarget(singleCandidate, representedMethod))
+                    changed |= TryBindCallTarget(method, instruction, representedMethod);
+                continue;
+            }
+
             if (candidates.Count < 2)
                 continue;
 
@@ -1796,6 +1819,16 @@ public static class MetadataResolver
 
         return changed;
     }
+
+    /// <summary>
+    /// 验证隐藏 MethodInfo 是否能取代唯一地址上的具体泛型代表。
+    /// 两者必须来自同一开放方法定义，防止无关元数据载体改写调用目标。
+    /// </summary>
+    internal static bool CanBindUniqueDeferredTarget(
+        MethodAnalysisContext addressCandidate,
+        MethodAnalysisContext representedMethod)
+        => ShouldDeferUniqueConcreteGenericTarget(addressCandidate)
+           && ReferenceEquals(BaseMethodOf(addressCandidate), BaseMethodOf(representedMethod));
 
     /// <summary>
     /// 所有托管调用身份绑定共用同一共享地址保护门，防止直接地址、接收者推导和 MethodInfo

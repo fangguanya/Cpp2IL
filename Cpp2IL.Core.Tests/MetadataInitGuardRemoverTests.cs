@@ -219,6 +219,83 @@ public class MetadataInitGuardRemoverTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 同源MethodInfo实参证明未解析原生Rgctx初始化包装器()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            unresolvedNativeTarget: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(removed, Is.True);
+            Assert.That(fixture.Graph.Blocks, Does.Not.Contain(fixture.Init));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 保存寄存器同源实参仍证明未解析原生Rgctx初始化包装器()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: true,
+            ordinaryRecursiveCall: false,
+            unresolvedNativeTarget: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.True);
+        Assert.That(fixture.Guard.Successors, Is.EqualTo(new[] { fixture.Merge }));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未解析原生调用使用不同MethodInfo时保留业务分支()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            unresolvedNativeTarget: true,
+            useUnrelatedCallCarrier: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.False);
+        Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 未解析原生调用返回值被消费时保留业务分支()
+    {
+        var fixture = CreateMethodRgctxGuard(
+            useSavedCarrier: false,
+            ordinaryRecursiveCall: false,
+            unresolvedNativeTarget: true,
+            consumeCallResult: true);
+
+        var removed = MetadataInitGuardRemover.RemoveMethodRgctxInitGuards(
+            fixture.Method,
+            fixture.Graph,
+            0x38);
+
+        Assert.That(removed, Is.False);
+        Assert.That(fixture.Graph.Blocks, Does.Contain(fixture.Init));
+    }
+
+    [Test]
     [Category("边界值")]
     public void 嵌套MethodInfo守卫按内层到外层一次性完整删除()
     {
@@ -667,7 +744,8 @@ public class MetadataInitGuardRemoverTests
         bool omitCallCarrier = false,
         bool consumeCallResult = false,
         bool useMisboundCallTarget = false,
-        bool useUnrelatedCallCarrier = false)
+        bool useUnrelatedCallCarrier = false,
+        bool unresolvedNativeTarget = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var objectType = app.SystemTypes.SystemObjectType;
@@ -754,7 +832,11 @@ public class MetadataInitGuardRemoverTests
                 : new Instruction(
                     4,
                     OpCode.Call,
-                    useMisboundCallTarget ? misboundCallTarget : concreteCallTarget,
+                    unresolvedNativeTarget
+                        ? new Immediate(0x1234)
+                        : useMisboundCallTarget
+                            ? misboundCallTarget
+                            : concreteCallTarget,
                     callResult,
                     ordinaryRecursiveCall
                         ? receiver

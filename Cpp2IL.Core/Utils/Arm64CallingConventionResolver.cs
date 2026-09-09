@@ -426,7 +426,14 @@ public static class Arm64CallingConventionResolver
 
     public static bool RequiresHiddenMethodInfo(MethodAnalysisContext method)
         => method.GenericParameters.Count > 0
-           || method.DeclaringType?.GenericParameters.Count > 0;
+           || method.DeclaringType?.GenericParameters.Count > 0
+           // ConcreteGenericMethodAnalysisContext 已把声明类型和方法参数具体化，
+           // 因而上面两个开放参数集合通常为空；但 IL2CPP 的共享原生体仍真实接收
+           // 隐藏 MethodInfo。必须读取具体上下文本身保存的实参数量，不能把它误判
+           // 为普通非泛型方法而丢失调用点 RGCTX 证据。
+           || method is ConcreteGenericMethodAnalysisContext concrete
+              && (concrete.TypeGenericParameters.Count > 0
+                  || concrete.MethodGenericParameters.Count > 0);
 
     public static bool ReturnsViaHiddenBuffer(MethodAnalysisContext method)
     {

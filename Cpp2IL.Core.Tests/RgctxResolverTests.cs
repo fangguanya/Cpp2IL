@@ -3,6 +3,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using LibCpp2IL.BinaryStructures;
 using System.Linq;
+using System.Reflection;
 
 namespace Cpp2IL.Core.Tests;
 
@@ -66,6 +67,54 @@ public class RgctxResolverTests
             [app.SystemTypes.SystemBooleanType]);
         var first = new RuntimeClassTypeAnalysisContext(integerOwner, integerOwner.DeclaringAssembly);
         var second = new RuntimeClassTypeAnalysisContext(booleanOwner, booleanOwner.DeclaringAssembly);
+
+        Assert.That(RgctxResolver.DescribesSameThing(first, second), Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 相同具体方法的MethodInfo包装器必须收敛()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var firstMethod = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemByteType], []);
+        var secondMethod = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemByteType], []);
+        var first = new RuntimeMethodInfoAnalysisContext(firstMethod, add.DeclaringType!.DeclaringAssembly);
+        var second = new RuntimeMethodInfoAnalysisContext(secondMethod, add.DeclaringType!.DeclaringAssembly);
+
+        Assert.That(RgctxResolver.DescribesSameThing(first, second), Is.True);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同具体方法实参的MethodInfo包装器不得合并()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var byteMethod = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemByteType], []);
+        var stringMethod = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemStringType], []);
+        var first = new RuntimeMethodInfoAnalysisContext(byteMethod, add.DeclaringType!.DeclaringAssembly);
+        var second = new RuntimeMethodInfoAnalysisContext(stringMethod, add.DeclaringType!.DeclaringAssembly);
+
+        Assert.That(RgctxResolver.DescribesSameThing(first, second), Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同具体方法实参的MethodRgctx表不得合并()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var byteMethod = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemByteType], []);
+        var stringMethod = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemStringType], []);
+        var first = new MethodRgctxTableTypeAnalysisContext(byteMethod, add.DeclaringType!.DeclaringAssembly);
+        var second = new MethodRgctxTableTypeAnalysisContext(stringMethod, add.DeclaringType!.DeclaringAssembly);
 
         Assert.That(RgctxResolver.DescribesSameThing(first, second), Is.False);
     }
@@ -166,5 +215,80 @@ public class RgctxResolverTests
         var resolved = RgctxResolver.ResolveForwardedRuntimeMetadataType(saved, definitions);
 
         Assert.That(resolved, Is.Null);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 方法Rgctx目标的外层方法参数进入声明类型实参()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var foreignOwner = CreateGenericMethodOwner("ForeignOwner");
+        var currentOwner = CreateGenericMethodOwner("CurrentOwner");
+        var foreignParameter = foreignOwner.GenericParameters.Single();
+        var currentParameter = currentOwner.GenericParameters.Single();
+        var represented = new ConcreteGenericMethodAnalysisContext(add, [foreignParameter], []);
+
+        var instantiated = (ConcreteGenericMethodAnalysisContext)RgctxResolver.InstantiateMethodEntryTarget(
+            represented,
+            [],
+            [currentParameter]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(instantiated, Is.Not.SameAs(represented));
+            Assert.That(instantiated.TypeGenericParameters.Single(), Is.SameAs(currentParameter));
+            Assert.That(instantiated.Parameters.Single().ParameterType, Is.SameAs(currentParameter));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 方法Rgctx目标的具体实参保持原身份()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var represented = new ConcreteGenericMethodAnalysisContext(add, [app.SystemTypes.SystemByteType], []);
+
+        var instantiated = RgctxResolver.InstantiateMethodEntryTarget(represented, [], []);
+
+        Assert.That(instantiated, Is.SameAs(represented));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 非泛型方法Rgctx目标不生成伪具体实例()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var represented = app.SystemTypes.SystemObjectType.Methods.First(method => method.Name == "ToString");
+
+        var instantiated = RgctxResolver.InstantiateMethodEntryTarget(
+            represented,
+            [app.SystemTypes.SystemStringType],
+            [app.SystemTypes.SystemInt32Type]);
+
+        Assert.That(instantiated, Is.SameAs(represented));
+    }
+
+    private static InjectedMethodAnalysisContext CreateGenericMethodOwner(string name)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            name,
+            app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static,
+            []);
+        owner.GenericParameters.Add(new GenericParameterTypeAnalysisContext(
+            "T",
+            0,
+            Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+            GenericParameterAttributes.None,
+            owner));
+        return owner;
     }
 }

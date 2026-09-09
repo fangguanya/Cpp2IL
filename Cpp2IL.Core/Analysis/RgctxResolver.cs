@@ -120,9 +120,45 @@ public static class RgctxResolver
             (RgctxTableTypeAnalysisContext a, RgctxTableTypeAnalysisContext b) =>
                 GenericCallRebinder.TypesEquivalent(a.OwnerType, b.OwnerType),
             (MethodRgctxTableTypeAnalysisContext a, MethodRgctxTableTypeAnalysisContext b) =>
-                ReferenceEquals(BaseMethod(a.OwnerMethod), BaseMethod(b.OwnerMethod)),
+                MethodsEquivalent(a.OwnerMethod, b.OwnerMethod),
+            (RuntimeMethodInfoAnalysisContext a, RuntimeMethodInfoAnalysisContext b) =>
+                MethodsEquivalent(a.RepresentedMethod, b.RepresentedMethod),
             _ => GenericCallRebinder.TypesEquivalent(existing, candidate),
         };
+
+    private static bool MethodsEquivalent(MethodAnalysisContext left, MethodAnalysisContext right)
+    {
+        if (!ReferenceEquals(BaseMethod(left), BaseMethod(right)))
+            return false;
+
+        var leftTypeArguments = left is ConcreteGenericMethodAnalysisContext leftConcrete
+            ? leftConcrete.TypeGenericParameters
+            : left.DeclaringType?.GenericParameters ?? [];
+        var rightTypeArguments = right is ConcreteGenericMethodAnalysisContext rightConcrete
+            ? rightConcrete.TypeGenericParameters
+            : right.DeclaringType?.GenericParameters ?? [];
+        var leftMethodArguments = left is ConcreteGenericMethodAnalysisContext
+            {
+                MethodGenericParameters.Count: > 0
+            } leftConcreteMethod
+                ? leftConcreteMethod.MethodGenericParameters
+                : left.GenericParameters;
+        var rightMethodArguments = right is ConcreteGenericMethodAnalysisContext
+            {
+                MethodGenericParameters.Count: > 0
+            } rightConcreteMethod
+                ? rightConcreteMethod.MethodGenericParameters
+                : right.GenericParameters;
+        return TypeListsEquivalent(leftTypeArguments, rightTypeArguments)
+               && TypeListsEquivalent(leftMethodArguments, rightMethodArguments);
+    }
+
+    private static bool TypeListsEquivalent(
+        IReadOnlyList<TypeAnalysisContext> left,
+        IReadOnlyList<TypeAnalysisContext> right) =>
+        left.Count == right.Count
+        && left.Select((argument, index) =>
+            GenericCallRebinder.TypesEquivalent(argument, right[index])).All(equivalent => equivalent);
 
     private static MethodAnalysisContext BaseMethod(MethodAnalysisContext method)
         => method is ConcreteGenericMethodAnalysisContext concrete
@@ -164,11 +200,14 @@ public static class RgctxResolver
         {
             var represented = app.ResolveContextForMethod(
                 new Cpp2IlMethodRef(entry.MethodSpec));
-            return represented == null
+            var instantiated = represented == null
+                ? null
+                : InstantiateMethodEntryTarget(represented, typeArguments, methodArguments);
+            return instantiated == null
                 ? null
                 : new RuntimeMethodInfoAnalysisContext(
-                    represented,
-                    represented.DeclaringType!.DeclaringAssembly);
+                    instantiated,
+                    instantiated.DeclaringType!.DeclaringAssembly);
         }
 
         if (entry.type is not (Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CLASS
@@ -181,6 +220,39 @@ public static class RgctxResolver
             typeArguments,
             methodArguments);
         return new RuntimeClassTypeAnalysisContext(inflated, inflated.DeclaringAssembly);
+    }
+
+    /// <summary>
+    /// 方法RGCTXData中的MethodSpec允许把当前外层方法参数作为目标声明类型的实参。
+    /// 应用上下文先解析出的具体方法仍携带MethodSpec自身的MVAR/VAR；在消费该条目的
+    /// 方法作用域内必须再实例化一次，防止共享原生体的具体代表类型覆盖外层开放参数。
+    /// </summary>
+    internal static MethodAnalysisContext InstantiateMethodEntryTarget(
+        MethodAnalysisContext represented,
+        IReadOnlyList<TypeAnalysisContext> typeArguments,
+        IReadOnlyList<TypeAnalysisContext> methodArguments)
+    {
+        if (represented is not ConcreteGenericMethodAnalysisContext concrete)
+            return represented;
+
+        var instantiatedTypeArguments = concrete.TypeGenericParameters
+            .Select(argument => GenericInstantiation.Instantiate(argument, typeArguments, methodArguments))
+            .ToArray();
+        var instantiatedMethodArguments = concrete.MethodGenericParameters
+            .Select(argument => GenericInstantiation.Instantiate(argument, typeArguments, methodArguments))
+            .ToArray();
+        var changed = instantiatedTypeArguments
+                          .Where((argument, index) => !ReferenceEquals(argument, concrete.TypeGenericParameters[index]))
+                          .Any()
+                      || instantiatedMethodArguments
+                          .Where((argument, index) => !ReferenceEquals(argument, concrete.MethodGenericParameters[index]))
+                          .Any();
+        return changed
+            ? new ConcreteGenericMethodAnalysisContext(
+                concrete.BaseMethodContext,
+                instantiatedTypeArguments,
+                instantiatedMethodArguments)
+            : represented;
     }
 
     internal static TypeAnalysisContext? ResolveEntry(TypeAnalysisContext instance, int index)

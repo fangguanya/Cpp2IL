@@ -892,6 +892,64 @@ public class Arm64CallingConventionResolverTests
 
     [Test]
     [Category("基本功能")]
+    public void 具体泛型声明类型仍追加隐藏MethodInfo并保留真实寄存器槽()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var definition = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = definition.Methods.First(method =>
+            method.Name == "Add" && method.Parameters.Count == 1);
+        var concrete = new ConcreteGenericMethodAnalysisContext(
+            add,
+            [app.SystemTypes.SystemByteType],
+            []);
+
+        var operands = Arm64CallingConventionResolver.ArgumentOperands(concrete);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Arm64CallingConventionResolver.RequiresHiddenMethodInfo(concrete), Is.True);
+            Assert.That(operands, Has.Count.EqualTo(3));
+            Assert.That(((Register)operands[0]).Name, Is.EqualTo("X0"));
+            Assert.That(((Register)operands[1]).Name, Is.EqualTo("X1"));
+            Assert.That(((Register)operands[2]).Name, Is.EqualTo("X2"));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 开放泛型声明与其具体实例都要求隐藏MethodInfo()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var concrete = new ConcreteGenericMethodAnalysisContext(
+            add,
+            [app.SystemTypes.SystemStringType],
+            []);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Arm64CallingConventionResolver.RequiresHiddenMethodInfo(add), Is.True);
+            Assert.That(Arm64CallingConventionResolver.RequiresHiddenMethodInfo(concrete), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 无泛型实参的具体上下文不伪造隐藏MethodInfo()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var toString = app.SystemTypes.SystemObjectType.Methods.Single(method =>
+            method.Name == "ToString" && method.Parameters.Count == 0);
+        var concrete = new ConcreteGenericMethodAnalysisContext(toString, [], []);
+
+        Assert.That(Arm64CallingConventionResolver.RequiresHiddenMethodInfo(concrete), Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void Hfa实参由连续浮点寄存器组成一个托管操作数()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

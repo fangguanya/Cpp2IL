@@ -93,6 +93,90 @@ public class MetadataResolverTests
 
     [Test]
     [Category("基本功能")]
+    public void 唯一具体泛型地址候选延迟到MethodInfo解析()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var concrete = new ConcreteGenericMethodAnalysisContext(
+            add,
+            [app.SystemTypes.SystemByteType],
+            []);
+
+        Assert.That(MetadataResolver.ShouldDeferUniqueConcreteGenericTarget(concrete), Is.True);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void 同一开放定义的MethodInfo取代唯一具体泛型地址代表()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var addressCandidate = new ConcreteGenericMethodAnalysisContext(
+            add,
+            [app.SystemTypes.SystemByteType],
+            []);
+        var represented = new ConcreteGenericMethodAnalysisContext(
+            add,
+            [list.GenericParameters.Single()],
+            []);
+
+        Assert.That(
+            MetadataResolver.CanBindUniqueDeferredTarget(addressCandidate, represented),
+            Is.True);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 开放泛型声明仍沿既有唯一目标路径处理()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+
+        Assert.That(MetadataResolver.ShouldDeferUniqueConcreteGenericTarget(add), Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 不同开放定义的MethodInfo不得取代唯一地址代表()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.GetAssemblyByName("mscorlib")!
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = list.Methods.First(method => method.Name == "Add" && method.Parameters.Count == 1);
+        var contains = list.Methods.First(method => method.Name == "Contains" && method.Parameters.Count == 1);
+        var addressCandidate = new ConcreteGenericMethodAnalysisContext(
+            add,
+            [app.SystemTypes.SystemByteType],
+            []);
+        var represented = new ConcreteGenericMethodAnalysisContext(
+            contains,
+            [list.GenericParameters.Single()],
+            []);
+
+        Assert.That(
+            MetadataResolver.CanBindUniqueDeferredTarget(addressCandidate, represented),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void 普通非泛型唯一目标不被延迟()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var toString = app.SystemTypes.SystemObjectType.Methods.Single(method =>
+            method.Name == "ToString" && method.Parameters.Count == 0);
+
+        Assert.That(MetadataResolver.ShouldDeferUniqueConcreteGenericTarget(toString), Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 泛型参数虚表槽映射到对象声明()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
