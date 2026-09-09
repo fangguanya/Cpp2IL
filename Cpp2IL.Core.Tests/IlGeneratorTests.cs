@@ -2219,6 +2219,7 @@ public class IlGeneratorTests
         var error = Assert.Throws<UnresolvedCilSemanticException>(() => 生成局部量立即数赋值Cil(
             Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type.MakeByReferenceType(), 0));
         Assert.That(error!.Message, Does.Contain("IMMEDIATE_MANAGED_BYREF"));
+        Assert.That(error.Message, Does.Contain("expectedType=System.Int32&").And.Contain("isil=0 Move").And.Contain("value=0"));
     }
 
     private static CilInstruction[] 生成局部量立即数赋值Cil(

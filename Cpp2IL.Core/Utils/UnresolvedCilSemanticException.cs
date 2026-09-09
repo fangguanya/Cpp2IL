@@ -4,4 +4,6 @@ namespace Cpp2IL.Core.Utils;
 internal sealed class UnresolvedCilSemanticException(string method, string operation, string evidence)
     : DecompilerException($"CIL 语义未解决：method={method}; operation={operation}; evidence={evidence}")
 {
+    internal string Operation { get; } = operation;
+    internal string Evidence { get; } = evidence;
 }

@@ -171,7 +171,17 @@ public static class IlGenerator
 
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, stringCtor);
+                List<CilInstruction> generated;
+                try
+                {
+                    generated = GenerateInstructions(instruction, context, definition, locals, writeLine, stringCtor);
+                }
+                catch (UnresolvedCilSemanticException error)
+                {
+                    // 保持原失败分类，附加实际抛错指令；不靠扫描共现操作数推测发射失败位置。
+                    throw new UnresolvedCilSemanticException(definition.FullName, error.Operation,
+                        $"{error.Evidence}; isil={instruction}; integerWidth={instruction.IntegerWidthBits}; memoryWidth={instruction.MemoryAccessWidthBits}");
+                }
                 instructionMap.Add(instruction, generated);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
@@ -1165,7 +1175,7 @@ public static class IlGenerator
         {
             if (expectedType is ByRefTypeAnalysisContext)
                 throw new UnresolvedCilSemanticException(method.FullName, "IMMEDIATE_MANAGED_BYREF",
-                    "整数常量没有可证明的托管引用来源。");
+                    $"整数常量没有可证明的托管引用来源：value={operand}; expectedType={expectedType.FullName}。");
             var storageType = expectedType.IsEnumType ? expectedType.EnumUnderlyingType : expectedType;
             if (expectedType is PointerTypeAnalysisContext || storageType?.FullName is "System.IntPtr" or "System.UIntPtr")
             {
