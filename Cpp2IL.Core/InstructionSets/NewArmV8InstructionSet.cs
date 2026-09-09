@@ -562,29 +562,36 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
-    /// 将 ARM64 SMADDL/SMULL 精确展开为两个有符号拓宽、一次64位乘法和一次64位加法。
-    /// W 源必须先按 int32 符号扩展，禁止把负数当作 uint32 零扩展后参与乘法。
+    /// 将 ARM64 SMADDL/SMULL/UMADDL/UMULL 统一展开为 W 源拓宽、64 位乘法和累加。
+    /// 有符号族直接符号扩展；无符号族在符号扩展后以低 32 位掩码恢复精确零扩展位型。
     /// </summary>
-    internal static bool TryCreateSignedMultiplyAddLongInstructions(
+    internal static bool TryCreateMultiplyAddLongInstructions(
         Arm64Instruction instruction,
         ulong address,
         out Instruction[] recovered)
     {
         recovered = [];
-        var isMultiplyAlias = instruction.Mnemonic == Arm64Mnemonic.SMULL;
-        if (instruction.Mnemonic is not (Arm64Mnemonic.SMADDL or Arm64Mnemonic.SMULL)
+        var isSigned = instruction.Mnemonic is Arm64Mnemonic.SMADDL or Arm64Mnemonic.SMULL;
+        var isUnsigned = instruction.Mnemonic is Arm64Mnemonic.UMADDL or Arm64Mnemonic.UMULL;
+        var isMultiplyAlias = instruction.Mnemonic is Arm64Mnemonic.SMULL or Arm64Mnemonic.UMULL;
+        if (!isSigned && !isUnsigned
             || instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
             || instruction.Op2Kind != Arm64OperandKind.Register
-            || instruction.Op0Reg is < Arm64Register.X0 or > Arm64Register.X30
+            || instruction.Op0Reg is < Arm64Register.X0 or > Arm64Register.X31
             // Disarm 各版本可能把 Wn/Wm 保留为 W，也可能规范化为同槽位 X；
-            // 32位有符号源宽度由 SMADDL/SMULL 操作码本身保证。
+            // 32 位源宽度由 multiply-add-long 操作码族本身保证。
             || !IsWordSourceRegister(instruction.Op1Reg)
             || !IsWordSourceRegister(instruction.Op2Reg)
+            || isMultiplyAlias && instruction.Op3Kind != Arm64OperandKind.None
             || !isMultiplyAlias
             && (instruction.Op3Kind != Arm64OperandKind.Register
                 || instruction.Op3Reg is < Arm64Register.X0 or > Arm64Register.X31))
             return false;
+
+        // Rd==XZR 只丢弃结果且不改标志；操作数形态合法即视为已精确建模，不制造伪定义。
+        if (instruction.Op0Reg == Arm64Register.X31)
+            return true;
 
         static bool IsWordSourceRegister(Arm64Register register)
             => register is >= Arm64Register.W0 and <= Arm64Register.W31
@@ -596,20 +603,46 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 : new Register(null, Arm64RegisterHelper.CanonicalName(register));
 
         var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
-        var left64 = new Register(null, $"SMADDL_LEFT_SIGNED64_{address:X}");
-        var right64 = new Register(null, $"SMADDL_RIGHT_SIGNED64_{address:X}");
-        var product = new Register(null, $"SMADDL_PRODUCT64_{address:X}");
+        var left64 = new Register(null, isSigned
+            ? $"SMADDL_LEFT_SIGNED64_{address:X}"
+            : $"UMADDL_LEFT_UNSIGNED64_{address:X}");
+        var right64 = new Register(null, isSigned
+            ? $"SMADDL_RIGHT_SIGNED64_{address:X}"
+            : $"UMADDL_RIGHT_UNSIGNED64_{address:X}");
+        var product = new Register(null, isSigned
+            ? $"SMADDL_PRODUCT64_{address:X}"
+            : $"UMADDL_PRODUCT64_{address:X}");
         var leftSource = RegisterOrZero(instruction.Op1Reg);
         var rightSource = RegisterOrZero(instruction.Op2Reg);
         var accumulator = isMultiplyAlias ? Imm(0) : RegisterOrZero(instruction.Op3Reg);
 
-        recovered =
-        [
+        var instructions = new List<Instruction>
+        {
             new Instruction(0, OpCode.ConvertSignedIntegerWidth, left64, leftSource, Imm(64), Imm(32)),
             new Instruction(1, OpCode.ConvertSignedIntegerWidth, right64, rightSource, Imm(64), Imm(32)),
-            new Instruction(2, OpCode.Multiply, product, left64, right64) { IntegerWidthBits = 64 },
-            new Instruction(3, OpCode.Add, destination, accumulator, product) { IntegerWidthBits = 64 },
-        ];
+        };
+        if (isUnsigned)
+        {
+            // conv.i8 先建立统一 64 位栈种类，再以低 32 位掩码精确实现 W 源零扩展。
+            instructions.Add(new Instruction(instructions.Count, OpCode.And, left64, left64, Imm(0xFFFFFFFFL))
+            {
+                IntegerWidthBits = 64,
+            });
+            instructions.Add(new Instruction(instructions.Count, OpCode.And, right64, right64, Imm(0xFFFFFFFFL))
+            {
+                IntegerWidthBits = 64,
+            });
+        }
+
+        instructions.Add(new Instruction(instructions.Count, OpCode.Multiply, product, left64, right64)
+        {
+            IntegerWidthBits = 64,
+        });
+        instructions.Add(new Instruction(instructions.Count, OpCode.Add, destination, accumulator, product)
+        {
+            IntegerWidthBits = 64,
+        });
+        recovered = instructions.ToArray();
         return true;
     }
 
@@ -4685,10 +4718,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
             case Arm64Mnemonic.SMADDL:
             case Arm64Mnemonic.SMULL:
+            case Arm64Mnemonic.UMADDL:
+            case Arm64Mnemonic.UMULL:
                 {
-                    if (!TryCreateSignedMultiplyAddLongInstructions(instruction, address, out var recovered))
+                    if (!TryCreateMultiplyAddLongInstructions(instruction, address, out var recovered))
                     {
-                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction SMADDL operand widths are not exactly modeled."));
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction multiply-add-long operand widths are not exactly modeled."));
                         break;
                     }
 

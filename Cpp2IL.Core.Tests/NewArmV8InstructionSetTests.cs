@@ -1316,7 +1316,7 @@ public class NewArmV8InstructionSetTests
         // 真实出生地方法指令：SMULL X8, W10, W8，即 SMADDL X8, W10, W8, XZR。
         var native = DecodeSingleInstruction([0x48, 0x7D, 0x28, 0x9B], 0x0271BCA8);
 
-        var recognized = NewArmV8InstructionSet.TryCreateSignedMultiplyAddLongInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
             native,
             native.Address,
             out var recovered);
@@ -1354,7 +1354,7 @@ public class NewArmV8InstructionSetTests
         // SMADDL X8, W10, W8, X9；累加器必须保持为64位 X9，且不能与乘数换槽。
         var native = DecodeSingleInstruction([0x48, 0x25, 0x28, 0x9B], 0x1000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateSignedMultiplyAddLongInstructions(
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
             native,
             native.Address,
             out var recovered);
@@ -1383,12 +1383,107 @@ public class NewArmV8InstructionSetTests
         var native = DecodeSingleInstruction([0x48, 0x25, 0x08, 0x9B], 0x1000);
 
         Assert.That(
-            NewArmV8InstructionSet.TryCreateSignedMultiplyAddLongInstructions(
+            NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
                 native,
                 native.Address,
                 out var recovered),
             Is.False);
         Assert.That(recovered, Is.Empty);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void UmullAliasZeroExtendsBothWordSourcesBeforeWideMultiply()
+    {
+        // 冻结输入真实编码：UMULL X9, W8, W9；两个 W 源必须按 uint32 零扩展。
+        var native = DecodeSingleInstruction([0x09, 0x7D, 0xA9, 0x9B], 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.ConvertSignedIntegerWidth,
+                OpCode.ConvertSignedIntegerWidth,
+                OpCode.And,
+                OpCode.And,
+                OpCode.Multiply,
+                OpCode.Add,
+            }));
+            Assert.That(recovered[2].Operands[2], Is.EqualTo(new Immediate(0xFFFFFFFFL)));
+            Assert.That(recovered[3].Operands[2], Is.EqualTo(new Immediate(0xFFFFFFFFL)));
+            Assert.That(recovered[4].IntegerWidthBits, Is.EqualTo(64));
+            Assert.That(recovered[5].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered[5].IntegerWidthBits, Is.EqualTo(64));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void UmaddlPreservesWideAccumulatorAfterUnsignedWordExpansion()
+    {
+        // UMADDL X8, W9, W10, X11；累加器保持 X11，不参与 32 位零扩展。
+        var native = DecodeSingleInstruction([0x28, 0x2D, 0xAA, 0x9B], 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered, Has.Length.EqualTo(6));
+            Assert.That(recovered[5].Operands[0], Is.EqualTo(new Register(null, "X8")));
+            Assert.That(recovered[5].Operands[1], Is.EqualTo(new Register(null, "X11")));
+            Assert.That(recovered[5].Operands[2], Is.EqualTo(recovered[4].Operands[0]));
+        });
+    }
+
+    [TestCase(new byte[] { 0xE9, 0x7F, 0xA9, 0x9B }, 0,
+        TestName = "边界_UMULL左侧WZR按无符号零扩展")]
+    [TestCase(new byte[] { 0x09, 0x7D, 0xBF, 0x9B }, 1,
+        TestName = "边界_UMULL右侧WZR按无符号零扩展")]
+    [Category("边界值")]
+    public void UmullZeroWordSourceUsesExactZeroOperand(byte[] machineCode, int conversionIndex)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered[conversionIndex].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered.SelectMany(item => item.Operands).OfType<Register>()
+                .Any(register => register.Name is "W31" or "X31"), Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void UmullZeroDestinationProducesNoDataFlowDefinition()
+    {
+        var native = DecodeSingleInstruction([0x1F, 0x7D, 0xA9, 0x9B], 0x1000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAddLongInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered, Is.Empty);
+        });
     }
 
     [TestCase(new byte[] { 0x09, 0xFD, 0x7F, 0xD3 }, 63L, "X9", "X8",
