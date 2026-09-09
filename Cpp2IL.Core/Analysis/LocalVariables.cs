@@ -3444,7 +3444,11 @@ public static class LocalVariables
             if (!visited.Add(current))
                 continue;
 
-            changed |= BindResolvedInstanceReceiverType(current, calledMethod);
+            if (uniqueDefinitions.TryGetValue(current, out var addressDefinition)
+                && TryBindValueTypeFieldAddressReceiver(current, addressDefinition, calledMethod))
+                changed = true;
+            else
+                changed |= BindResolvedInstanceReceiverType(current, calledMethod);
             if (!uniqueDefinitions.TryGetValue(current, out var definition))
                 continue;
 
@@ -3463,6 +3467,30 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    /// <summary>字段地址作为值类型实例接收者时保留 ByRef；不将字段地址降为字段值。</summary>
+    internal static bool TryBindValueTypeFieldAddressReceiver(LocalVariable receiver, Instruction definition,
+        MethodAnalysisContext calledMethod)
+    {
+        var target = calledMethod.DeclaringType;
+        if (calledMethod.IsStatic || target is not { IsValueType: true }
+            || definition is not { OpCode: OpCode.Add, Operands: [LocalVariable destination,
+                LocalVariable { Type: ByRefTypeAnalysisContext source }, Immediate offset] }
+            || !ReferenceEquals(destination, receiver)
+            || definition.IntegerWidthBits != 0 && definition.IntegerWidthBits != calledMethod.AppContext.Binary.PointerSizeBytes * 8
+            || receiver.Type != null && !GenericCallRebinder.TypesEquivalent(receiver.Type, target))
+            return false;
+        var owner = source.ElementType;
+        if (!owner.IsValueType || offset.Value < 0) return false;
+        var fields = owner is GenericInstanceTypeAnalysisContext generic
+            ? GenericInstanceFieldLayout.GetConcreteFieldLayout(generic)?.Where(field => field.Offset == offset.Value)
+                .Select(field => field.Field).ToArray()
+            : owner.Fields.Where(field => !field.IsStatic && field.Offset == offset.Value).ToArray();
+        if (fields is not { Length: 1 } || !GenericCallRebinder.TypesEquivalent(fields[0].FieldType, target))
+            return false;
+        receiver.Type = target.MakeByReferenceType();
+        return true;
     }
 
     /// <summary>

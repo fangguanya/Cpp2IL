@@ -10,6 +10,52 @@ namespace Cpp2IL.Core.Tests;
 
 public class LocalVariablesTests
 {
+    [TestCase(false)]
+    [TestCase(true)]
+    [Category("基本功能")]
+    public void 字段地址实例接收者保留引用且重复传播不变(bool pretyped)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var scalar = app.SystemTypes.SystemSingleType;
+        var owner = new InjectedTypeAnalysisContext(scalar.DeclaringAssembly, "AddressFixture", "Owner",
+            app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.ValueType"), TypeAttributes.Public);
+        owner.Fields.Add(new InjectedFieldAnalysisContext("value", scalar, FieldAttributes.Public, owner, 8));
+        var source = new LocalVariable("source", new Register(null, "X0"), owner.MakeByReferenceType());
+        var receiver = new LocalVariable("receiver", new Register(null, "X20"), pretyped ? scalar : null);
+        var definition = new Instruction(0, OpCode.Add, receiver, source, new Immediate(8));
+        var method = scalar.Methods.First(method => !method.IsStatic && method.Name == "Equals");
+        var definitions = new Dictionary<LocalVariable, Instruction> { [receiver] = definition };
+        Assert.That(LocalVariables.BindResolvedInstanceReceiverCopySources(receiver, method, definitions), Is.True);
+        Assert.That(receiver.Type, Is.TypeOf<ByRefTypeAnalysisContext>());
+        Assert.That(((ByRefTypeAnalysisContext)receiver.Type!).ElementType, Is.SameAs(scalar));
+        Assert.That(LocalVariables.BindResolvedInstanceReceiverCopySources(receiver, method, definitions), Is.False);
+    }
+
+    [TestCase("offset")]
+    [TestCase("width")]
+    [TestCase("conflict")]
+    [TestCase("duplicate")]
+    [TestCase("reference_owner")]
+    [Category("异常输入")]
+    public void 字段地址接收者的证据冲突不强行改型(string mode)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var scalar = app.SystemTypes.SystemSingleType;
+        var owner = new InjectedTypeAnalysisContext(scalar.DeclaringAssembly, "AddressFixture", "InvalidOwner",
+            mode == "reference_owner" ? app.SystemTypes.SystemObjectType
+                : app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.ValueType"), TypeAttributes.Public);
+        owner.Fields.Add(new InjectedFieldAnalysisContext("value", scalar, FieldAttributes.Public, owner, 8));
+        if (mode == "duplicate") owner.Fields.Add(new InjectedFieldAnalysisContext("other", scalar, FieldAttributes.Public, owner, 8));
+        var source = new LocalVariable("source", new Register(null, "X0"), owner.MakeByReferenceType());
+        var original = mode == "conflict" ? app.SystemTypes.SystemInt32Type : scalar;
+        var receiver = new LocalVariable("receiver", new Register(null, "X20"), original);
+        var definition = new Instruction(0, OpCode.Add, receiver, source, new Immediate(mode == "offset" ? 7 : 8))
+            { IntegerWidthBits = mode == "width" ? 7 : 0 };
+        var method = scalar.Methods.First(method => !method.IsStatic && method.Name == "Equals");
+        Assert.That(LocalVariables.TryBindValueTypeFieldAddressReceiver(receiver, definition, method), Is.False);
+        Assert.That(receiver.Type, Is.SameAs(original));
+    }
+
     [SetUp]
     public void Setup()
     {
