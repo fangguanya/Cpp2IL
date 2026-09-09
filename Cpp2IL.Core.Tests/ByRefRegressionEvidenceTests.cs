@@ -141,14 +141,19 @@ public class ByRefRegressionEvidenceTests
         return new
         {
             type = type.FullName, type.IsValueType,
+            contextKind = type.GetType().Name,
+            genericDefinition = generic?.GenericType.FullName,
+            genericArguments = generic?.GenericArguments.Select(argument => argument.FullName).ToArray(),
             slots = Arm64CallingConventionResolver.GeneralRegisterSlotCount(type),
             unboxedSize = TypeSizes.UnboxedSize(type, 8), knownLayout = layout != null,
             size = layout?.Size, alignment = layout?.Alignment,
             concreteLayout = generic == null ? null : GenericInstanceFieldLayout.GetConcreteFieldLayout(generic)?
                 .Select(field => new { field = field.Field.Name, field.Offset, field.Size }).ToArray(),
-            fields = depth >= 3 ? null : type.Fields.Where(field => !field.IsStatic).Select(field => new
+            fields = depth >= 3 ? null : (generic?.GenericType ?? type).Fields.Where(field => !field.IsStatic).Select(field => new
             {
-                field = field.Name, field.Offset, type = DescribeType(field.FieldType, depth + 1)
+                field = field.Name, field.Offset, declaredType = field.FieldType.FullName,
+                type = DescribeType(generic == null ? field.FieldType
+                    : GenericInstantiation.Instantiate(field.FieldType, generic.GenericArguments, []), depth + 1)
             }).ToArray()
         };
     }
