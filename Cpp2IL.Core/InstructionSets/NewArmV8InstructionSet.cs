@@ -707,22 +707,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
-    /// 恢复 ARM64 LSL 的立即数别名和寄存器移位形态。
+    /// 恢复 ARM64 LSL/LSR 的立即数和寄存器移位形态。
     /// 寄存器移位按操作数宽度显式保留低 5/6 位，避免 W 源因内部 W/X
     /// 统一寄存器身份而错误采用 64 位移位计数；结果仍携带原生目标宽度。
     /// </summary>
-    internal static bool TryCreateLogicalShiftLeftInstructions(
+    internal static bool TryCreateLogicalShiftInstructions(
         Arm64Instruction instruction,
         out Instruction[] recovered)
     {
         recovered = [];
-        if (instruction.Mnemonic != Arm64Mnemonic.LSL
+        if (instruction.Mnemonic is not (Arm64Mnemonic.LSL or Arm64Mnemonic.LSR)
             || instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
             || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
             || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
             || sourceWidthBits != widthBits)
             return false;
+        var shiftOpCode = instruction.Mnemonic == Arm64Mnemonic.LSL
+            ? OpCode.ShiftLeft
+            : OpCode.ShiftRightUnsigned;
 
         if (instruction.Op2Kind == Arm64OperandKind.Immediate)
         {
@@ -739,7 +742,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             [
                 new Instruction(
                     0,
-                    OpCode.ShiftLeft,
+                    shiftOpCode,
                     new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
                     Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg)
                         ? Imm(0)
@@ -775,7 +778,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             [
                 new Instruction(
                     0,
-                    OpCode.ShiftLeft,
+                    shiftOpCode,
                     new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
                     source,
                     shift)
@@ -786,7 +789,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return true;
         }
 
-        var maskedShift = new Register(null, $"LSL_SHIFT_COUNT_{instruction.Address:X}");
+        var maskedShift = new Register(null, $"LOGICAL_SHIFT_COUNT_{instruction.Address:X}");
         recovered =
         [
             new Instruction(0, OpCode.And, maskedShift, shift, Imm(widthBits - 1))
@@ -795,7 +798,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             },
             new Instruction(
                 1,
-                OpCode.ShiftLeft,
+                shiftOpCode,
                 new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg)),
                 source,
                 maskedShift)
@@ -939,7 +942,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
-    /// 将 Disarm 暴露的 UBFM、LSR 与 UBFIZ 别名统一还原为 UBFM 的 immr/imms。
+    /// 将 Disarm 暴露的 UBFM、UBFX 与 UBFIZ 别名统一还原为 UBFM 的 immr/imms。
     /// </summary>
     private static bool TryDecodeUnsignedBitfieldImmediates(
         Arm64Instruction instruction,
@@ -965,12 +968,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 mostSignificantBit = (int)instruction.Op3Imm;
                 return rotateRight < widthBits && mostSignificantBit < widthBits;
 
-            case Arm64Mnemonic.LSR:
-                if (instruction.Op2Imm < 0 || instruction.Op2Imm >= widthBits)
+            case Arm64Mnemonic.UBFX:
+                if (instruction.Op3Kind != Arm64OperandKind.Immediate)
                     return false;
 
-                rotateRight = (int)instruction.Op2Imm;
-                mostSignificantBit = widthBits - 1;
+                var bitfieldStart = (int)instruction.Op2Imm;
+                var bitfieldWidth = (int)instruction.Op3Imm;
+                if (bitfieldStart < 0
+                    || bitfieldWidth <= 0
+                    || bitfieldStart + bitfieldWidth > widthBits)
+                    return false;
+
+                rotateRight = bitfieldStart;
+                mostSignificantBit = bitfieldStart + bitfieldWidth - 1;
                 return true;
 
             case Arm64Mnemonic.UBFIZ:
@@ -4679,7 +4689,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
                 break;
             case Arm64Mnemonic.UBFM:
-            case Arm64Mnemonic.LSR:
+            case Arm64Mnemonic.UBFX:
             case Arm64Mnemonic.UBFIZ:
                 {
                     if (!TryCreateUnsignedBitfieldMoveInstructions(instruction, out var recovered))
@@ -4697,10 +4707,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
 
             case Arm64Mnemonic.LSL:
+            case Arm64Mnemonic.LSR:
                 {
-                    if (!TryCreateLogicalShiftLeftInstructions(instruction, out var recovered))
+                    if (!TryCreateLogicalShiftInstructions(instruction, out var recovered))
                     {
-                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction LSL operand widths are not exactly modeled."));
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction logical shift operand widths are not exactly modeled."));
                         break;
                     }
 
