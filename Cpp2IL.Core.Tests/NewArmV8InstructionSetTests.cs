@@ -1368,6 +1368,158 @@ public class NewArmV8InstructionSetTests
         }
     }
 
+    [TestCase(new byte[] { 0x28, 0x2D, 0x0A, 0x1B }, 32, OpCode.Add, "X8", "X9", "X10", "X11",
+        TestName = "基本_MADD的W寄存器展开为32位乘加")]
+    [TestCase(new byte[] { 0x28, 0x2D, 0x0A, 0x9B }, 64, OpCode.Add, "X8", "X9", "X10", "X11",
+        TestName = "边界_MADD的X寄存器展开为64位乘加")]
+    [TestCase(new byte[] { 0x28, 0xAD, 0x0A, 0x1B }, 32, OpCode.Subtract, "X8", "X9", "X10", "X11",
+        TestName = "基本_MSUB的W寄存器展开为32位累加器减乘积")]
+    [TestCase(new byte[] { 0x28, 0xAD, 0x0A, 0x9B }, 64, OpCode.Subtract, "X8", "X9", "X10", "X11",
+        TestName = "边界_MSUB的X寄存器展开为64位累加器减乘积")]
+    [Category("基本功能")]
+    public void MultiplyAccumulateFamilyPreservesOperandOrderAndWidth(
+        byte[] machineCode,
+        int expectedWidthBits,
+        OpCode expectedAccumulatorOperation,
+        string expectedDestination,
+        string expectedLeft,
+        string expectedRight,
+        string expectedAccumulator)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x1234);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAccumulateInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.Multiply,
+                expectedAccumulatorOperation,
+            }));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == expectedWidthBits), Is.True);
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Register(null, expectedLeft)));
+            Assert.That(recovered[0].Operands[2], Is.EqualTo(new Register(null, expectedRight)));
+            Assert.That(recovered[1].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
+            Assert.That(recovered[1].Operands[1], Is.EqualTo(new Register(null, expectedAccumulator)));
+            Assert.That(recovered[1].Operands[2], Is.EqualTo(recovered[0].Operands[0]));
+        });
+    }
+
+    [TestCase(new byte[] { 0x28, 0x2D, 0x1F, 0x1B },
+        TestName = "边界_MADD右乘数WZR转换为常量零")]
+    [TestCase(new byte[] { 0xE8, 0x2F, 0x0A, 0x1B },
+        TestName = "边界_MADD左乘数WZR转换为常量零")]
+    [Category("边界值")]
+    public void MultiplyAccumulateZeroMultiplierUsesExactZeroOperand(byte[] machineCode)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x1234);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAccumulateInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered[0].Operands.Skip(1), Does.Contain(new Immediate(0)));
+            Assert.That(
+                recovered.SelectMany(item => item.Operands).OfType<Register>()
+                    .Any(register => register.Name is "W31" or "X31"),
+                Is.False);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void MaddZeroAccumulatorAliasUsesDirectMultiply()
+    {
+        // MADD W8, W9, W10, WZR 被规范化为 MUL，结果无需再与零相加。
+        var native = DecodeSingleInstruction([0x28, 0x7D, 0x0A, 0x1B], 0x1234);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAccumulateInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered, Has.Length.EqualTo(1));
+            Assert.That(recovered[0].OpCode, Is.EqualTo(OpCode.Multiply));
+            Assert.That(recovered[0].Operands[0], Is.EqualTo(new Register(null, "X8")));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void MsubZeroAccumulatorAliasUsesZeroMinusProduct()
+    {
+        // MSUB W8, W9, W10, WZR 被规范化为 MNEG，顺序必须保持为零减乘积。
+        var native = DecodeSingleInstruction([0x28, 0xFD, 0x0A, 0x1B], 0x1234);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAccumulateInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.Multiply,
+                OpCode.Subtract,
+            }));
+            Assert.That(recovered[1].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered[1].Operands[2], Is.EqualTo(recovered[0].Operands[0]));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void MultiplyAccumulateZeroDestinationProducesNoDataFlowDefinition()
+    {
+        // MADD WZR, W9, W10, W11。
+        var native = DecodeSingleInstruction([0x3F, 0x2D, 0x0A, 0x1B], 0x1234);
+
+        var recognized = NewArmV8InstructionSet.TryCreateMultiplyAccumulateInstructions(
+            native,
+            native.Address,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void UnrelatedIntegerAddIsNotMisclassifiedAsMultiplyAccumulate()
+    {
+        // ADD W8, W9, W10 不属于乘加减编码族。
+        var native = DecodeSingleInstruction([0x28, 0x01, 0x0A, 0x0B], 0x1234);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryCreateMultiplyAccumulateInstructions(
+                    native,
+                    native.Address,
+                    out var recovered),
+                Is.False);
+            Assert.That(recovered, Is.Empty);
+        });
+    }
+
     [Test]
     [Category("基本功能")]
     public void SmullAliasExpandsToSignedWordMultiplyAndWideAdd()

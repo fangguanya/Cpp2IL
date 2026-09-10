@@ -543,15 +543,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
-    internal static bool TryGetSignedIntegerWidthBits(Arm64Register register, out int bits)
+    internal static bool TryGetGeneralPurposeValueWidthBits(Arm64Register register, out int bits)
     {
-        if (register is >= Arm64Register.W0 and <= Arm64Register.W30)
+        if (register is >= Arm64Register.W0 and <= Arm64Register.W31)
         {
             bits = 32;
             return true;
         }
 
-        if (register is >= Arm64Register.X0 and <= Arm64Register.X30)
+        if (register is >= Arm64Register.X0 and <= Arm64Register.X31)
         {
             bits = 64;
             return true;
@@ -559,6 +559,95 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         bits = 0;
         return false;
+    }
+
+    internal static bool TryGetSignedIntegerWidthBits(Arm64Register register, out int bits)
+    {
+        // 31号通用值寄存器表示常量零，不是承载有符号载荷的可分配寄存器。
+        if (!Arm64RegisterHelper.IsZeroRegister(register)
+            && TryGetGeneralPurposeValueWidthBits(register, out bits))
+            return true;
+
+        bits = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// 将 ARM64 MADD/MSUB 及其 MUL/MNEG 零累加器别名统一展开为同宽乘法与累加或累减。
+    /// 四个通用寄存器必须严格同宽；31号值寄存器按 WZR/XZR 处理，目标为零寄存器时不制造伪定义。
+    /// </summary>
+    internal static bool TryCreateMultiplyAccumulateInstructions(
+        Arm64Instruction instruction,
+        ulong address,
+        out Instruction[] recovered)
+    {
+        recovered = [];
+        var isAddition = instruction.Mnemonic is Arm64Mnemonic.MADD or Arm64Mnemonic.MUL;
+        var isSubtraction = instruction.Mnemonic is Arm64Mnemonic.MSUB or Arm64Mnemonic.MNEG;
+        var isZeroAccumulatorAlias = instruction.Mnemonic is Arm64Mnemonic.MUL or Arm64Mnemonic.MNEG;
+        if (!isAddition && !isSubtraction
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || instruction.Op2Kind != Arm64OperandKind.Register
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op1Reg, out var leftWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op2Reg, out var rightWidthBits)
+            || leftWidthBits != widthBits
+            || rightWidthBits != widthBits
+            || isZeroAccumulatorAlias && instruction.Op3Kind != Arm64OperandKind.None
+            || !isZeroAccumulatorAlias
+            && (instruction.Op3Kind != Arm64OperandKind.Register
+                || !TryGetGeneralPurposeValueWidthBits(instruction.Op3Reg, out var accumulatorWidthBits)
+                || accumulatorWidthBits != widthBits))
+            return false;
+
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+            return true;
+
+        static IOperand RegisterOrZero(Arm64Register register)
+            => Arm64RegisterHelper.IsZeroRegister(register)
+                ? Imm(0)
+                : new Register(null, Arm64RegisterHelper.CanonicalName(register));
+
+        var operationName = isAddition ? "MADD" : "MSUB";
+        var product = new Register(null, $"{operationName}_PRODUCT{widthBits}_{address:X}");
+        var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
+        var left = RegisterOrZero(instruction.Op1Reg);
+        var right = RegisterOrZero(instruction.Op2Reg);
+        if (instruction.Mnemonic == Arm64Mnemonic.MUL)
+        {
+            recovered =
+            [
+                new Instruction(0, OpCode.Multiply, destination, left, right)
+                {
+                    IntegerWidthBits = widthBits,
+                },
+            ];
+            return true;
+        }
+
+        recovered =
+        [
+            new Instruction(
+                0,
+                OpCode.Multiply,
+                product,
+                left,
+                right)
+            {
+                IntegerWidthBits = widthBits,
+            },
+            new Instruction(
+                1,
+                isAddition ? OpCode.Add : OpCode.Subtract,
+                destination,
+                isZeroAccumulatorAlias ? Imm(0) : RegisterOrZero(instruction.Op3Reg),
+                product)
+            {
+                IntegerWidthBits = widthBits,
+            },
+        ];
+        return true;
     }
 
     /// <summary>
@@ -4773,10 +4862,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
                 break;
 
+            case Arm64Mnemonic.MADD:
+            case Arm64Mnemonic.MSUB:
             case Arm64Mnemonic.MUL:
-                // 整数乘法保留目标寄存器位宽，供退SSA后的标量载体定型。
-                AddInteger(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
-                break;
+            case Arm64Mnemonic.MNEG:
+                {
+                    if (!TryCreateMultiplyAccumulateInstructions(instruction, address, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction multiply accumulate operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                    break;
+                }
             case Arm64Mnemonic.SMADDL:
             case Arm64Mnemonic.SMULL:
             case Arm64Mnemonic.UMADDL:
