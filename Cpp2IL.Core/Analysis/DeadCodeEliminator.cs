@@ -187,7 +187,7 @@ public static class DeadCodeEliminator
         opCode switch
         {
             OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
-                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.Not or OpCode.Negate

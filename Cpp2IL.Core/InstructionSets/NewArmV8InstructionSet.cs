@@ -573,6 +573,64 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
+    /// 将 ARM64 SDIV/UDIV 恢复为同宽有符号或无符号整数除法。
+    /// 三个操作数必须同为 W 或 X；零目标不制造定义，编码级零除数按 ARM64 结果零处理。
+    /// </summary>
+    internal static bool TryCreateIntegerDivideInstructions(
+        Arm64Instruction instruction,
+        out Instruction[] recovered)
+    {
+        recovered = [];
+        var isSigned = instruction.Mnemonic == Arm64Mnemonic.SDIV;
+        var isUnsigned = instruction.Mnemonic == Arm64Mnemonic.UDIV;
+        if (!isSigned && !isUnsigned
+            || instruction.Op0Kind != Arm64OperandKind.Register
+            || instruction.Op1Kind != Arm64OperandKind.Register
+            || instruction.Op2Kind != Arm64OperandKind.Register
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op1Reg, out var dividendWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op2Reg, out var divisorWidthBits)
+            || dividendWidthBits != widthBits
+            || divisorWidthBits != widthBits)
+            return false;
+
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op0Reg))
+            return true;
+
+        static IOperand RegisterOrZero(Arm64Register register)
+            => Arm64RegisterHelper.IsZeroRegister(register)
+                ? Imm(0)
+                : new Register(null, Arm64RegisterHelper.CanonicalName(register));
+
+        var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
+        if (Arm64RegisterHelper.IsZeroRegister(instruction.Op2Reg))
+        {
+            recovered =
+            [
+                new Instruction(0, OpCode.Move, destination, Imm(0))
+                {
+                    IntegerWidthBits = widthBits,
+                },
+            ];
+            return true;
+        }
+
+        recovered =
+        [
+            new Instruction(
+                0,
+                isSigned ? OpCode.Divide : OpCode.DivideUnsigned,
+                destination,
+                RegisterOrZero(instruction.Op1Reg),
+                RegisterOrZero(instruction.Op2Reg))
+            {
+                IntegerWidthBits = widthBits,
+            },
+        ];
+        return true;
+    }
+
+    /// <summary>
     /// 将 ARM64 MADD/MSUB 及其 MUL/MNEG 零累加器别名统一展开为同宽乘法与累加或累减。
     /// 四个通用寄存器必须严格同宽；31号值寄存器按 WZR/XZR 处理，目标为零寄存器时不制造伪定义。
     /// </summary>
@@ -2601,7 +2659,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         return instruction.OpCode is
             OpCode.ConditionalSelect or OpCode.Add or OpCode.Subtract or OpCode.Multiply
-            or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
+            or OpCode.Divide or OpCode.DivideUnsigned or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
             or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
             or OpCode.AbsoluteNumber or OpCode.AbsoluteDifference or OpCode.MaximumNumber
             or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
@@ -2659,7 +2717,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             OpCode.Call or OpCode.IndirectCall => 1,
             OpCode.Move or OpCode.Phi or OpCode.ConditionalSelect
-                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned or OpCode.And or OpCode.Or
                 or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.AbsoluteNumber
                 or OpCode.AbsoluteDifference or OpCode.MaximumNumber
@@ -4881,6 +4939,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (!TryCreateMultiplyAddLongInstructions(instruction, address, out var recovered))
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral("Instruction multiply-add-long operand widths are not exactly modeled."));
+                        break;
+                    }
+
+                    foreach (var recoveredInstruction in recovered)
+                    {
+                        var emitted = Add(address, recoveredInstruction.OpCode, recoveredInstruction.Operands.ToList());
+                        emitted.IntegerWidthBits = recoveredInstruction.IntegerWidthBits;
+                    }
+                    break;
+                }
+            case Arm64Mnemonic.SDIV:
+            case Arm64Mnemonic.UDIV:
+                {
+                    if (!TryCreateIntegerDivideInstructions(instruction, out var recovered))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction integer divide operand widths are not exactly modeled."));
                         break;
                     }
 

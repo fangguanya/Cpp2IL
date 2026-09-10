@@ -112,6 +112,7 @@ public class Instruction : IOperand
             case OpCode.Subtract:
             case OpCode.Multiply:
             case OpCode.Divide:
+            case OpCode.DivideUnsigned:
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
             case OpCode.ShiftRightUnsigned:
@@ -220,7 +221,8 @@ public class Instruction : IOperand
                 => [_operands[1]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
-                or OpCode.Divide or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
+                or OpCode.Divide or OpCode.DivideUnsigned
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 or OpCode.AbsoluteDifference or OpCode.MaximumNumber
                 => [_operands[2], _operands[1]],

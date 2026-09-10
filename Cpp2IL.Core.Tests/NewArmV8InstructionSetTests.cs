@@ -2116,6 +2116,108 @@ public class NewArmV8InstructionSetTests
         });
     }
 
+    [TestCase(new byte[] { 0x08, 0x0D, 0xC9, 0x1A }, OpCode.Divide, 32,
+        TestName = "基本_冻结输入32位SDIV恢复有符号除法")]
+    [TestCase(new byte[] { 0x00, 0x0D, 0xCA, 0x9A }, OpCode.Divide, 64,
+        TestName = "边界_冻结输入64位SDIV保持原生宽度")]
+    [TestCase(new byte[] { 0x4B, 0x09, 0xC0, 0x1A }, OpCode.DivideUnsigned, 32,
+        TestName = "基本_冻结输入32位UDIV恢复无符号除法")]
+    [TestCase(new byte[] { 0x61, 0x08, 0xCB, 0x9A }, OpCode.DivideUnsigned, 64,
+        TestName = "边界_冻结输入64位UDIV保持无符号语义")]
+    [Category("基本功能")]
+    public void IntegerDivideRestoresSignednessAndNativeWidth(
+        byte[] machineCode,
+        OpCode expectedOpCode,
+        int expectedWidth)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0xE000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateIntegerDivideInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+            Assert.That(recovered, Has.Length.EqualTo(1));
+            Assert.That(recovered[0].OpCode, Is.EqualTo(expectedOpCode));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(expectedWidth));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void IntegerDivideZeroDividendStillPreservesDivisionObservation()
+    {
+        // SDIV W0, WZR, W1：保留除法，避免在除数也为零时提前折叠掉可观察行为。
+        var native = DecodeSingleInstruction([0xE0, 0x0F, 0xC1, 0x1A], 0xE100);
+
+        var recognized = NewArmV8InstructionSet.TryCreateIntegerDivideInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { OpCode.Divide }));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void IntegerDivideEncodedZeroDivisorUsesArm64ZeroResult()
+    {
+        // SDIV W0, W1, WZR：ARM64 对编码级零除数产生零结果。
+        var native = DecodeSingleInstruction([0x20, 0x0C, 0xDF, 0x1A], 0xE200);
+
+        var recognized = NewArmV8InstructionSet.TryCreateIntegerDivideInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { OpCode.Move }));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void IntegerDivideZeroDestinationProducesNoDefinition()
+    {
+        // UDIV WZR, W1, W2：结果被丢弃且指令不改标志。
+        var native = DecodeSingleInstruction([0x3F, 0x08, 0xC2, 0x1A], 0xE300);
+
+        var recognized = NewArmV8InstructionSet.TryCreateIntegerDivideInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered, Is.Empty);
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void FloatingDivideMustNotEnterIntegerDivideRecovery()
+    {
+        var native = DecodeSingleInstruction([0x00, 0x18, 0x21, 0x1E], 0xE400);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryCreateIntegerDivideInstructions(native, out var recovered),
+                Is.False);
+            Assert.That(recovered, Is.Empty);
+        });
+    }
+
     [Test]
     [Category("基本功能")]
     public void MrsTpidrEl0KeepsExplicitSystemRegisterEvidence()

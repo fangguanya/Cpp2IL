@@ -537,7 +537,7 @@ public static class KeyFunctionRecovery
                      && SameSsaLocal(fieldSource, value))
                 candidateType = field.Field.FieldType;
             else if (candidate.OpCode is
-                         OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                         OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
                          or OpCode.And or OpCode.Or or OpCode.Xor
                      && candidate.Operands is [LocalVariable arithmeticDestination, { } leftOperand, { } rightOperand]
                      && (ReferencesLocal(leftOperand, value) || ReferencesLocal(rightOperand, value)))

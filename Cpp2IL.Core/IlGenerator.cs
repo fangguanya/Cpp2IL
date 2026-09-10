@@ -26,6 +26,7 @@ public static class IlGenerator
         OpCode.Subtract => CilOpCodes.Sub,
         OpCode.Multiply => CilOpCodes.Mul,
         OpCode.Divide => CilOpCodes.Div,
+        OpCode.DivideUnsigned => CilOpCodes.Div_Un,
         OpCode.ShiftLeft => CilOpCodes.Shl,
         OpCode.ShiftRight => CilOpCodes.Shr,
         OpCode.ShiftRightUnsigned => CilOpCodes.Shr_Un,
@@ -766,6 +767,7 @@ public static class IlGenerator
             case OpCode.Subtract:
             case OpCode.Multiply:
             case OpCode.Divide:
+            case OpCode.DivideUnsigned:
 
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
@@ -855,6 +857,7 @@ public static class IlGenerator
                     case OpCode.Subtract:
                     case OpCode.Multiply:
                     case OpCode.Divide:
+                    case OpCode.DivideUnsigned:
                     case OpCode.ShiftLeft:
                     case OpCode.ShiftRight:
                     case OpCode.ShiftRightUnsigned:

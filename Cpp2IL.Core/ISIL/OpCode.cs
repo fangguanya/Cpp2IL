@@ -71,6 +71,9 @@ public enum OpCode
     /// <summary>Divides op 2 by op 3, and moves the result into op 1</summary>
     Divide,
 
+    /// <summary>按无符号整数解释操作数，将 op 2 除以 op 3，并把结果写入 op 1</summary>
+    DivideUnsigned,
+
     /// <summary>Divides op 2 by op 3, and moves the remainder into op 1</summary>
     Modulo,
 

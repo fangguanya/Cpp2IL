@@ -1608,7 +1608,7 @@ public static class InterfaceDispatchRecovery
                 var harmless = instruction.OpCode switch
                 {
                     OpCode.Nop or OpCode.Jump or OpCode.ConditionalJump or OpCode.Phi => true,
-                    OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                    OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
                         or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                         or OpCode.And or OpCode.Or or OpCode.Xor
                         or OpCode.Not or OpCode.Negate

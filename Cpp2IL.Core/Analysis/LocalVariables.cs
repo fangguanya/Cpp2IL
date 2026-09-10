@@ -2569,7 +2569,7 @@ public static class LocalVariables
         ApplicationAnalysisContext appContext)
     {
         if (instruction.OpCode is not (
-                OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor)
             || instruction.Operands.Count != 3
@@ -2599,7 +2599,7 @@ public static class LocalVariables
             return false;
 
         var promotesBooleanArithmetic = exactOperandType != null
-            && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+            && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
             && !locals.Any(local => GenericCallRebinder.TypesEquivalent(local.Type, targetType))
             && locals.Any(local => GenericCallRebinder.TypesEquivalent(
                 local.Type,
@@ -2631,7 +2631,7 @@ public static class LocalVariables
         ApplicationAnalysisContext appContext)
     {
         if (instruction.OpCode is not (
-                OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.DivideUnsigned
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned))
             return null;
 

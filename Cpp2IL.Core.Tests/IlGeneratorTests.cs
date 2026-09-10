@@ -256,6 +256,21 @@ public class IlGeneratorTests
     }
 
     [Test]
+    [Category("基本功能")]
+    public void 有符号与无符号整数除法映射到不同Cil操作码()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                IlGenerator.GetBinaryNumericCilOpCode(OpCode.Divide),
+                Is.EqualTo(CilOpCodes.Div));
+            Assert.That(
+                IlGenerator.GetBinaryNumericCilOpCode(OpCode.DivideUnsigned),
+                Is.EqualTo(CilOpCodes.Div_Un));
+        });
+    }
+
+    [Test]
     [Category("异常输入")]
     public void 非二元数值操作码拒绝进入Cil映射()
     {
