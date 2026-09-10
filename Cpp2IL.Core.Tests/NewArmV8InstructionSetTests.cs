@@ -1941,7 +1941,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction(machineCode, 0x5000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered);
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(native, out var recovered);
 
         Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic} {native.Op3ShiftType}");
         Assert.Multiple(() =>
@@ -1961,7 +1961,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction([0xF8, 0x54, 0xF5, 0x0A], 0x6000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered);
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(native, out var recovered);
 
         Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic} {native.Op3ShiftType}");
         Assert.Multiple(() =>
@@ -1992,7 +1992,7 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction(machineCode, 0x7000);
 
-        var recognized = NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered);
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(native, out var recovered);
 
         Assert.Multiple(() =>
         {
@@ -2007,8 +2007,113 @@ public class NewArmV8InstructionSetTests
     {
         var native = DecodeSingleInstruction([0x00, 0x01, 0x20, 0x6A], 0x8000);
 
-        Assert.That(NewArmV8InstructionSet.TryCreateBitClearInstructions(native, out var recovered), Is.False);
+        Assert.That(NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(native, out var recovered), Is.False);
         Assert.That(recovered, Is.Empty);
+    }
+
+    [TestCase(new byte[] { 0x28, 0x00, 0x23, 0x2A }, 32, OpCode.Xor,
+        TestName = "基本_冻结输入32位ORN恢复取反与位或")]
+    [TestCase(new byte[] { 0x89, 0x0C, 0x68, 0x2A }, 32, OpCode.ShiftRightUnsigned,
+        TestName = "边界_冻结输入ORN逻辑右移3位")]
+    [TestCase(new byte[] { 0x28, 0xFD, 0xEA, 0xAA }, 64, OpCode.ShiftRightUnsigned,
+        TestName = "边界_64位ORN循环右移63位")]
+    [Category("基本功能")]
+    public void OrnRestoresWidthAndShiftedInvertedOr(
+        byte[] machineCode,
+        int expectedWidth,
+        OpCode expectedFirstOperation)
+    {
+        var native = DecodeSingleInstruction(machineCode, 0x9000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(
+            native,
+            out var recovered);
+
+        Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic} {native.Op3ShiftType}");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered[0].OpCode, Is.EqualTo(expectedFirstOperation));
+            Assert.That(recovered[^2].OpCode, Is.EqualTo(OpCode.Xor));
+            Assert.That(recovered[^2].Operands[2],
+                Is.EqualTo(new Immediate(expectedWidth == 32 ? 0xFFFFFFFFL : -1L)));
+            Assert.That(recovered[^1].OpCode, Is.EqualTo(OpCode.Or));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == expectedWidth), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void OrnZeroLeftAliasPreservesIntegerComplement()
+    {
+        // ORN W0, WZR, W8 被其他反汇编器显示为 MVN；Disarm 保留 ORN 三操作数语义。
+        var native = DecodeSingleInstruction([0xE0, 0x03, 0x28, 0x2A], 0xA000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True, $"解码形态：{native.Mnemonic}");
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[]
+            {
+                OpCode.Xor,
+                OpCode.Or,
+            }));
+            Assert.That(recovered[1].Operands[1], Is.EqualTo(new Immediate(0)));
+            Assert.That(recovered.All(item => item.IntegerWidthBits == 32), Is.True);
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void OrnZeroRightProducesNativeWidthAllOnes()
+    {
+        var native = DecodeSingleInstruction([0x28, 0x01, 0x3F, 0x2A], 0xB000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { OpCode.Move }));
+            Assert.That(recovered[0].Operands[1], Is.EqualTo(new Immediate(0xFFFFFFFFL)));
+            Assert.That(recovered[0].IntegerWidthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void OrnZeroDestinationProducesNoDataFlowDefinition()
+    {
+        var native = DecodeSingleInstruction([0x3F, 0x01, 0x2A, 0x2A], 0xC000);
+
+        var recognized = NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(
+            native,
+            out var recovered);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recognized, Is.True);
+            Assert.That(recovered.Select(item => item.OpCode), Is.EqualTo(new[] { OpCode.Nop }));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void OrrMustNotEnterInvertedLogicalRecovery()
+    {
+        var native = DecodeSingleInstruction([0x28, 0x01, 0x0A, 0x2A], 0xD000);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryCreateInvertedLogicalInstructions(native, out var recovered),
+                Is.False);
+            Assert.That(recovered, Is.Empty);
+        });
     }
 
     [Test]

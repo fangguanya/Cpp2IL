@@ -746,8 +746,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         recovered = [];
         if (instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op1Reg, out var sourceWidthBits)
             || sourceWidthBits != widthBits
             || !TryDecodeUnsignedBitfieldImmediates(
                 instruction,
@@ -808,8 +808,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if (instruction.Mnemonic is not (Arm64Mnemonic.LSL or Arm64Mnemonic.LSR or Arm64Mnemonic.ASR)
             || instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var sourceWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op1Reg, out var sourceWidthBits)
             || sourceWidthBits != widthBits)
             return false;
         var shiftOpCode = instruction.Mnemonic switch
@@ -848,7 +848,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         if (instruction.Op2Kind != Arm64OperandKind.Register
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op2Reg, out var shiftWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op2Reg, out var shiftWidthBits)
             || shiftWidthBits != widthBits)
             return false;
 
@@ -902,22 +902,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
-    /// 恢复 ARM64 BIC 的位清除和可选移位源：Rn AND NOT(Shift(Rm))。
+    /// 恢复 ARM64 BIC/ORN 的取反右源逻辑与可选移位：Rn AND/OR NOT(Shift(Rm))。
     /// 所有中间结果携带原生 W/X 位宽；ROR 展开为同宽逻辑右移、左移和按位或，
     /// 避免依赖宿主整数符号或内部统一寄存器名称推断轮转宽度。
     /// </summary>
-    internal static bool TryCreateBitClearInstructions(
+    internal static bool TryCreateInvertedLogicalInstructions(
         Arm64Instruction instruction,
         out Instruction[] recovered)
     {
         recovered = [];
-        if (instruction.Mnemonic != Arm64Mnemonic.BIC
+        var isBitClear = instruction.Mnemonic == Arm64Mnemonic.BIC;
+        var isOrNot = instruction.Mnemonic == Arm64Mnemonic.ORN;
+        if (!isBitClear && !isOrNot
             || instruction.Op0Kind != Arm64OperandKind.Register
             || instruction.Op1Kind != Arm64OperandKind.Register
             || instruction.Op2Kind != Arm64OperandKind.Register
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op0Reg, out var widthBits)
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op1Reg, out var leftWidthBits)
-            || !TryGetUnsignedBitfieldRegisterWidthBits(instruction.Op2Reg, out var rightWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op0Reg, out var widthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op1Reg, out var leftWidthBits)
+            || !TryGetGeneralPurposeValueWidthBits(instruction.Op2Reg, out var rightWidthBits)
             || leftWidthBits != widthBits
             || rightWidthBits != widthBits)
             return false;
@@ -928,11 +930,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return true;
         }
 
+        var operationName = isBitClear ? "BIC" : "ORN";
         var destination = new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op0Reg));
         IOperand left = Arm64RegisterHelper.IsZeroRegister(instruction.Op1Reg)
             ? Imm(0)
             : new Register(null, Arm64RegisterHelper.CanonicalName(instruction.Op1Reg));
-        if (left is Immediate)
+        if (left is Immediate && isBitClear)
         {
             recovered =
             [
@@ -951,7 +954,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             recovered =
             [
-                new Instruction(0, OpCode.Move, destination, left)
+                new Instruction(
+                    0,
+                    OpCode.Move,
+                    destination,
+                    isBitClear ? left : Imm(widthBits == 32 ? 0xFFFFFFFFL : -1L))
                 {
                     IntegerWidthBits = widthBits,
                 },
@@ -960,7 +967,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         // Disarm 将逻辑移位寄存器格式的类型附在第 4 个显示操作数上；
-        // FinalOpShiftType 专用于另一类最终修饰符，不能用来读取 BIC 编码。
+        // FinalOpShiftType 专用于另一类最终修饰符，不能用来读取 BIC/ORN 编码。
         var shiftType = instruction.Op3ShiftType;
         if (instruction.Op3Kind != Arm64OperandKind.Immediate
             || instruction.Op3Imm < 0
@@ -974,9 +981,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             if (shiftType == Arm64ShiftType.ROR)
             {
-                var low = new Register(null, $"BIC_ROR_LOW_{instruction.Address:X}");
-                var high = new Register(null, $"BIC_ROR_HIGH_{instruction.Address:X}");
-                var rotated = new Register(null, $"BIC_ROR_{instruction.Address:X}");
+                var low = new Register(null, $"{operationName}_ROR_LOW_{instruction.Address:X}");
+                var high = new Register(null, $"{operationName}_ROR_HIGH_{instruction.Address:X}");
+                var rotated = new Register(null, $"{operationName}_ROR_{instruction.Address:X}");
                 instructions.Add(new Instruction(0, OpCode.ShiftRightUnsigned, low, right, Imm(shift))
                 {
                     IntegerWidthBits = widthBits,
@@ -1002,7 +1009,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 };
                 if (shiftOpCode == OpCode.Invalid)
                     return false;
-                var temporary = new Register(null, $"BIC_SHIFTED_{instruction.Address:X}");
+                var temporary = new Register(null, $"{operationName}_SHIFTED_{instruction.Address:X}");
                 instructions.Add(new Instruction(0, shiftOpCode, temporary, right, Imm(shift))
                 {
                     IntegerWidthBits = widthBits,
@@ -1020,12 +1027,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         // 32 位掩码必须保留为 0xFFFFFFFF，再由 IntegerWidthBits 统一收窄；64 位的 -1
         // 与全一位模式完全相同。这样类型传播和 CIL 生成始终沿数值二元运算路径处理。
         var complementMask = widthBits == 32 ? 0xFFFFFFFFL : -1L;
-        var inverted = new Register(null, $"BIC_INVERTED_{instruction.Address:X}");
+        var inverted = new Register(null, $"{operationName}_INVERTED_{instruction.Address:X}");
         instructions.Add(new Instruction(instructions.Count, OpCode.Xor, inverted, shifted, Imm(complementMask))
         {
             IntegerWidthBits = widthBits,
         });
-        instructions.Add(new Instruction(instructions.Count, OpCode.And, destination, left, inverted)
+        instructions.Add(new Instruction(
+            instructions.Count,
+            isBitClear ? OpCode.And : OpCode.Or,
+            destination,
+            left,
+            inverted)
         {
             IntegerWidthBits = widthBits,
         });
@@ -1093,25 +1105,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             default:
                 return false;
         }
-    }
-
-    /// <summary>识别 UBFM 可使用的同宽 W/X 通用寄存器，31号槽位按零寄存器处理。</summary>
-    private static bool TryGetUnsignedBitfieldRegisterWidthBits(Arm64Register register, out int bits)
-    {
-        if (register is >= Arm64Register.W0 and <= Arm64Register.W31)
-        {
-            bits = 32;
-            return true;
-        }
-
-        if (register is >= Arm64Register.X0 and <= Arm64Register.X31)
-        {
-            bits = 64;
-            return true;
-        }
-
-        bits = 0;
-        return false;
     }
 
     /// <summary>
@@ -5079,10 +5072,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
 
             case Arm64Mnemonic.BIC:
+            case Arm64Mnemonic.ORN:
                 {
-                    if (!TryCreateBitClearInstructions(instruction, out var recovered))
+                    if (!TryCreateInvertedLogicalInstructions(instruction, out var recovered))
                     {
-                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction BIC operand widths or shift are not exactly modeled."));
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction inverted logical operand widths or shift are not exactly modeled."));
                         break;
                     }
 
