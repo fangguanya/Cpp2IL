@@ -25,7 +25,8 @@ internal enum Arm64FlagState
 
 internal enum Arm64RecoveredVectorOperation
 {
-    DuplicateInt16,
+    DuplicateGeneralRegister,
+    DuplicateVectorLane,
     WidenUnsignedInt16ToInt32,
     ShiftLeftInt32,
     CompareLessThanZeroInt32,
@@ -1557,15 +1558,50 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var firstSourceRegister = (int)((machineCode >> 5) & 0x1Fu);
         var secondSourceRegister = (int)((machineCode >> 16) & 0x1Fu);
 
-        // DUP Vd.4H, Wn：将一个32位通用寄存器的低16位复制到四个半字通道。
-        if ((machineCode & 0xFFFFFC00u) == 0x0E020C00u)
+        // Advanced SIMD copy 的 imm5 以最低置位位编码 B/H/S/D 元素宽度，
+        // 更高位编码向量来源的通道索引；Q 位决定 64/128 位目标 arrangement。
+        var duplicateKind = machineCode & 0xBFE0FC00u;
+        var duplicatesGeneralRegister = duplicateKind == 0x0E000C00u;
+        var duplicatesVectorLane = duplicateKind == 0x0E000400u;
+        if (duplicatesGeneralRegister || duplicatesVectorLane)
         {
+            var immediate = (int)((machineCode >> 16) & 0x1Fu);
+            var elementSizeCode = -1;
+            for (var bit = 0; bit < 4; bit++)
+            {
+                if ((immediate & (1 << bit)) == 0)
+                    continue;
+                elementSizeCode = bit;
+                break;
+            }
+            if (elementSizeCode < 0)
+            {
+                instruction = default;
+                return false;
+            }
+
+            var elementWidthBits = 8 << elementSizeCode;
+            var vectorWidthBits = (machineCode & 0x40000000u) == 0 ? 64 : 128;
+            var laneCount = vectorWidthBits / elementWidthBits;
+            var sourceLane = immediate >> (elementSizeCode + 1);
+            var sourceLaneCapacity = 128 / elementWidthBits;
+            if (laneCount < 2
+                || duplicatesGeneralRegister && sourceLane != 0
+                || duplicatesVectorLane && sourceLane >= sourceLaneCapacity)
+            {
+                instruction = default;
+                return false;
+            }
+
             instruction = new Arm64RecoveredVectorInstruction(
-                Arm64RecoveredVectorOperation.DuplicateInt16,
+                duplicatesGeneralRegister
+                    ? Arm64RecoveredVectorOperation.DuplicateGeneralRegister
+                    : Arm64RecoveredVectorOperation.DuplicateVectorLane,
                 destinationRegister,
                 firstSourceRegister,
-                laneCount: 4,
-                elementWidthBits: 16);
+                laneCount: laneCount,
+                elementWidthBits: elementWidthBits,
+                immediate: sourceLane);
             return true;
         }
 
@@ -1650,8 +1686,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         formatted = instruction.Operation switch
         {
-            Arm64RecoveredVectorOperation.DuplicateInt16 =>
-                $"0x{address:X8} DUP V{instruction.DestinationRegister}.4H, W{instruction.FirstSourceRegister}",
+            Arm64RecoveredVectorOperation.DuplicateGeneralRegister =>
+                $"0x{address:X8} DUP V{instruction.DestinationRegister}.{instruction.LaneCount}{VectorElementSuffix(instruction.ElementWidthBits)}, {(instruction.ElementWidthBits == 64 ? "X" : "W")}{instruction.FirstSourceRegister}",
+            Arm64RecoveredVectorOperation.DuplicateVectorLane =>
+                $"0x{address:X8} DUP V{instruction.DestinationRegister}.{instruction.LaneCount}{VectorElementSuffix(instruction.ElementWidthBits)}, V{instruction.FirstSourceRegister}.{VectorElementSuffix(instruction.ElementWidthBits)}[{instruction.Immediate}]",
             Arm64RecoveredVectorOperation.WidenUnsignedInt16ToInt32 =>
                 $"0x{address:X8} USHLL V{instruction.DestinationRegister}.4S, V{instruction.FirstSourceRegister}.4H, #0",
             Arm64RecoveredVectorOperation.ShiftLeftInt32 =>
@@ -1665,6 +1703,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             _ => throw new ArgumentOutOfRangeException(nameof(instruction.Operation))
         };
         return true;
+
+        static string VectorElementSuffix(int elementWidthBits) => elementWidthBits switch
+        {
+            8 => "B",
+            16 => "H",
+            32 => "S",
+            64 => "D",
+            _ => throw new ArgumentOutOfRangeException(nameof(elementWidthBits)),
+        };
     }
 
     internal static ulong ResolveInstructionAddress(
@@ -3971,12 +4018,34 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var firstVectorSource = new Register(null, $"V{decoded.FirstSourceRegister}");
             switch (decoded.Operation)
             {
-                case Arm64RecoveredVectorOperation.DuplicateInt16:
+                case Arm64RecoveredVectorOperation.DuplicateGeneralRegister:
                     Add(
                         address,
                         OpCode.VectorDuplicate,
                         destination,
-                        new Register(null, $"W{decoded.FirstSourceRegister}"),
+                        new Register(
+                            null,
+                            $"{(decoded.ElementWidthBits == 64 ? "X" : "W")}{decoded.FirstSourceRegister}"),
+                        Imm(decoded.LaneCount),
+                        Imm(decoded.ElementWidthBits));
+                    return true;
+
+                case Arm64RecoveredVectorOperation.DuplicateVectorLane:
+                    var elementSuffix = decoded.ElementWidthBits switch
+                    {
+                        8 => "B",
+                        16 => "H",
+                        32 => "S",
+                        64 => "D",
+                        _ => throw new ArgumentOutOfRangeException(nameof(decoded.ElementWidthBits)),
+                    };
+                    Add(
+                        address,
+                        OpCode.VectorDuplicate,
+                        destination,
+                        new Register(
+                            null,
+                            $"V{decoded.FirstSourceRegister}.{elementSuffix}[{decoded.Immediate}]"),
                         Imm(decoded.LaneCount),
                         Imm(decoded.ElementWidthBits));
                     return true;
@@ -5245,6 +5314,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 AddInteger(address, OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
 
+            case Arm64Mnemonic.DUP:
             case Arm64Mnemonic.UMOV:
             case Arm64Mnemonic.INVALID:
             case Arm64Mnemonic.UNIMPLEMENTED:

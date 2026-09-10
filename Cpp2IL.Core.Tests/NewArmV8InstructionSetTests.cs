@@ -2536,7 +2536,7 @@ public class NewArmV8InstructionSetTests
 
     [TestCase(
         0x0E020D00u,
-        (int)Arm64RecoveredVectorOperation.DuplicateInt16,
+        (int)Arm64RecoveredVectorOperation.DuplicateGeneralRegister,
         0,
         8,
         -1,
@@ -2596,6 +2596,51 @@ public class NewArmV8InstructionSetTests
             Assert.That(instruction.FirstSourceRegister, Is.EqualTo(expectedFirstSource));
             Assert.That(instruction.SecondSourceRegister, Is.EqualTo(expectedSecondSource));
         }
+    }
+
+    [TestCase(0x0E040D00u, (int)Arm64RecoveredVectorOperation.DuplicateGeneralRegister, 2, 32, 0,
+        TestName = "基本_DUP通用寄存器复制到2S")]
+    [TestCase(0x4E040D20u, (int)Arm64RecoveredVectorOperation.DuplicateGeneralRegister, 4, 32, 0,
+        TestName = "基本_DUP通用寄存器复制到4S")]
+    [TestCase(0x4E080D40u, (int)Arm64RecoveredVectorOperation.DuplicateGeneralRegister, 2, 64, 0,
+        TestName = "边界_DUP通用寄存器复制到2D")]
+    [TestCase(0x0E040422u, (int)Arm64RecoveredVectorOperation.DuplicateVectorLane, 2, 32, 0,
+        TestName = "基本_DUP向量首通道复制到2S")]
+    [TestCase(0x0E0C0401u, (int)Arm64RecoveredVectorOperation.DuplicateVectorLane, 2, 32, 1,
+        TestName = "边界_DUP向量第二通道复制到2S")]
+    [TestCase(0x4E080400u, (int)Arm64RecoveredVectorOperation.DuplicateVectorLane, 2, 64, 0,
+        TestName = "边界_DUP双精度通道复制到2D")]
+    [Category("基本功能")]
+    public void VectorDuplicateDecodesArrangementAndSourceKind(
+        uint machineCode,
+        int expectedOperation,
+        int expectedLaneCount,
+        int expectedElementWidthBits,
+        int expectedSourceLane)
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(
+            machineCode,
+            out var instruction);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That((int)instruction.Operation, Is.EqualTo(expectedOperation));
+            Assert.That(instruction.LaneCount, Is.EqualTo(expectedLaneCount));
+            Assert.That(instruction.ElementWidthBits, Is.EqualTo(expectedElementWidthBits));
+            Assert.That(instruction.Immediate, Is.EqualTo(expectedSourceLane));
+        });
+    }
+
+    [TestCase(0x0E000C00u, TestName = "异常_DUP缺失元素宽度位")]
+    [TestCase(0x0E0C0C00u, TestName = "异常_DUP通用寄存器编码携带通道索引")]
+    [TestCase(0x0E080400u, TestName = "异常_DUP六十四位目标只有单个D通道")]
+    [Category("异常输入")]
+    public void VectorDuplicateRejectsReservedArrangement(uint machineCode)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(machineCode, out _),
+            Is.False);
     }
 
     [Test]
