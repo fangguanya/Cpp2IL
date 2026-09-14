@@ -750,25 +750,41 @@ public static class GenericCallRebinder
            && (ReferenceEquals(left, right)
                || (left.Definition != null && ReferenceEquals(left.Definition, right.Definition)));
 
-    internal static bool TypesEquivalent(TypeAnalysisContext? left, TypeAnalysisContext? right)
+    /// <summary>
+    /// 共用类型树比较；原生布局证明必须要求定义身份，绝不以显示名称作为身份凭据。
+    /// </summary>
+    internal static bool TypesEquivalent(TypeAnalysisContext? left, TypeAnalysisContext? right,
+        bool requireDefinitionIdentity = false)
     {
         if (ReferenceEquals(left, right))
-            return true;
+            return !requireDefinitionIdentity || left != null;
         if (left == null || right == null)
+            return false;
+        if (requireDefinitionIdentity && !ReferenceEquals(left.AppContext, right.AppContext))
             return false;
 
         if (left is GenericInstanceTypeAnalysisContext leftGeneric
             && right is GenericInstanceTypeAnalysisContext rightGeneric)
             return SameTypeDefinition(leftGeneric.GenericType, rightGeneric.GenericType)
-                   && TypeListsEquivalent(leftGeneric.GenericArguments, rightGeneric.GenericArguments);
+                   && TypeListsEquivalent(leftGeneric.GenericArguments, rightGeneric.GenericArguments, requireDefinitionIdentity);
 
         if (left is SzArrayTypeAnalysisContext leftArray && right is SzArrayTypeAnalysisContext rightArray)
-            return TypesEquivalent(leftArray.ElementType, rightArray.ElementType);
+            return TypesEquivalent(leftArray.ElementType, rightArray.ElementType, requireDefinitionIdentity);
 
         if (left is ByRefTypeAnalysisContext leftByRef && right is ByRefTypeAnalysisContext rightByRef)
-            return TypesEquivalent(leftByRef.ElementType, rightByRef.ElementType);
+            return TypesEquivalent(leftByRef.ElementType, rightByRef.ElementType, requireDefinitionIdentity);
 
-        return SameTypeDefinition(left, right) || left.FullName == right.FullName;
+        if (requireDefinitionIdentity)
+        {
+            if (left is GenericParameterTypeAnalysisContext leftParameter && right is GenericParameterTypeAnalysisContext rightParameter)
+                return ReferenceEquals(leftParameter.Owner, rightParameter.Owner)
+                       && leftParameter.Index == rightParameter.Index && leftParameter.Type == rightParameter.Type;
+            // 构造类型与裸定义、不同包装种类的相同名字不构成精确类型身份。
+            if (left is WrappedTypeAnalysisContext or GenericInstanceTypeAnalysisContext
+                || right is WrappedTypeAnalysisContext or GenericInstanceTypeAnalysisContext)
+                return false;
+        }
+        return SameTypeDefinition(left, right) || !requireDefinitionIdentity && left.FullName == right.FullName;
     }
 
     /// <summary>
@@ -918,7 +934,7 @@ public static class GenericCallRebinder
 
     private static bool TypeListsEquivalent(
         IReadOnlyList<TypeAnalysisContext> left,
-        IReadOnlyList<TypeAnalysisContext> right)
+        IReadOnlyList<TypeAnalysisContext> right, bool requireDefinitionIdentity = false)
         => left.Count == right.Count
-           && left.Select((type, index) => TypesEquivalent(type, right[index])).All(equal => equal);
+           && left.Select((type, index) => TypesEquivalent(type, right[index], requireDefinitionIdentity)).All(equal => equal);
 }

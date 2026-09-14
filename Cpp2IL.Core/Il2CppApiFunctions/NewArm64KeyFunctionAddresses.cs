@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Disarm;
 using Cpp2IL.Core.Logging;
+using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Il2CppApiFunctions;
@@ -19,6 +20,22 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
     }
 
     private List<Arm64Instruction>? _cachedDisassembledBytes;
+    private TailThunkIndex? _tailThunkIndex;
+
+    public override void Find(ApplicationAnalysisContext applicationAnalysisContext)
+    {
+        try
+        {
+            base.Find(applicationAnalysisContext);
+        }
+        finally
+        {
+            // 整段代码索引只服务本次关键函数发现。地址表完成后立即释放大型反汇编图，
+            // 避免它与托管程序集桩和方法图叠加到同一内存峰值。
+            _tailThunkIndex = null;
+            _cachedDisassembledBytes = null;
+        }
+    }
 
     private List<Arm64Instruction> DisassembleTextSection()
     {
@@ -38,13 +55,12 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         // BL只是普通子调用，纳入会把包含目标调用的大函数误判成运行时helper。
         // 部分Unity ARM64运行时把实际可调用入口放在尾跳前一条无副作用的自移动指令上。
         // 只有调用者计数能唯一证明此前入口时才回溯，避免把相邻函数末尾误并入thunk。
-        foreach (var address in FindDirectTailThunkEntryAddresses(
-                     DisassembleTextSection(),
-                     addr,
-                     maxBytesBack,
-                     addressesToIgnore))
+        foreach (var address in GetTailThunkIndex().FindEntryAddresses(addr, maxBytesBack, addressesToIgnore))
             yield return address;
     }
+
+    private TailThunkIndex GetTailThunkIndex() =>
+        _tailThunkIndex ??= new TailThunkIndex(DisassembleTextSection());
 
     internal static IReadOnlyList<ulong> FindDirectTailThunkEntryAddresses(
         IReadOnlyList<Arm64Instruction> instructions,
@@ -52,30 +68,87 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         uint maxBytesBack = 0,
         IEnumerable<ulong>? addressesToIgnore = null)
     {
-        var ignored = new HashSet<ulong>(addressesToIgnore ?? Enumerable.Empty<ulong>());
-        var ordered = instructions.OrderBy(instruction => instruction.Address).ToArray();
-        var indexByAddress = ordered
-            .Select((instruction, index) => (instruction.Address, index))
-            .GroupBy(pair => pair.Address)
-            .ToDictionary(group => group.Key, group => group.First().index);
-        var callerCounts = ordered
-            .Where(instruction => instruction.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BL
-                && instruction.BranchTarget != 0)
-            .GroupBy(instruction => instruction.BranchTarget)
-            .ToDictionary(group => group.Key, group => group.Count());
-        var maximumInstructionsBack = checked((int)(maxBytesBack / sizeof(uint)));
-        var entries = new List<ulong>();
+        return new TailThunkIndex(instructions)
+            .FindEntryAddresses(target, maxBytesBack, addressesToIgnore);
+    }
 
-        foreach (var branchAddress in FindDirectTailThunkAddresses(ordered, target, ignored))
+    /// <summary>
+    /// 对同一代码段只建立一次尾跳、调用者和必要地址索引。生产扫描会为多个关键函数查询该索引，
+    /// 不再为每个目标重复排序整段指令或为所有非分支指令建立地址字典。
+    /// </summary>
+    private sealed class TailThunkIndex
+    {
+        private readonly IReadOnlyList<Arm64Instruction> ordered;
+        private readonly Dictionary<ulong, int> branchIndices = [];
+        private readonly Dictionary<ulong, int> callerCounts = [];
+        private readonly Dictionary<ulong, List<ulong>> directTailBranches = [];
+
+        internal TailThunkIndex(IReadOnlyList<Arm64Instruction> instructions)
         {
-            if (maximumInstructionsBack == 0 || !indexByAddress.TryGetValue(branchAddress, out var branchIndex))
+            ordered = IsAddressOrdered(instructions)
+                ? instructions
+                : instructions.OrderBy(instruction => instruction.Address).ToArray();
+
+            for (var index = 0; index < ordered.Count; index++)
             {
-                entries.Add(branchAddress);
-                continue;
+                var instruction = ordered[index];
+                if (instruction.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BL
+                    && instruction.BranchTarget != 0)
+                {
+                    callerCounts.TryGetValue(instruction.BranchTarget, out var count);
+                    callerCounts[instruction.BranchTarget] = count + 1;
+                }
+
+                if (instruction.Mnemonic != Arm64Mnemonic.B || instruction.BranchTarget == 0)
+                    continue;
+
+                if (!branchIndices.ContainsKey(instruction.Address))
+                    branchIndices.Add(instruction.Address, index);
+                if (!directTailBranches.TryGetValue(instruction.BranchTarget, out var branches))
+                    directTailBranches.Add(instruction.BranchTarget, branches = []);
+                branches.Add(instruction.Address);
+            }
+        }
+
+        internal IReadOnlyList<ulong> FindEntryAddresses(
+            ulong target,
+            uint maxBytesBack,
+            IEnumerable<ulong>? addressesToIgnore)
+        {
+            if (!directTailBranches.TryGetValue(target, out var targetBranches))
+                return [];
+
+            var ignored = new HashSet<ulong>(addressesToIgnore ?? Enumerable.Empty<ulong>());
+            var maximumInstructionsBack = checked((int)(maxBytesBack / sizeof(uint)));
+            var entries = new List<ulong>(targetBranches.Count);
+            var distinctEntries = new HashSet<ulong>();
+
+            foreach (var branchAddress in targetBranches)
+            {
+                if (ignored.Contains(branchAddress))
+                    continue;
+
+                var entry = branchAddress;
+                if (maximumInstructionsBack > 0 && branchIndices.TryGetValue(branchAddress, out var branchIndex))
+                    entry = FindStrongestEntry(branchAddress, branchIndex, maximumInstructionsBack, ignored);
+                if (distinctEntries.Add(entry))
+                    entries.Add(entry);
             }
 
-            var candidates = new List<ulong> { branchAddress };
+            return entries;
+        }
+
+        private ulong FindStrongestEntry(
+            ulong branchAddress,
+            int branchIndex,
+            int maximumInstructionsBack,
+            ISet<ulong> ignored)
+        {
+            var strongestAddress = branchAddress;
+            callerCounts.TryGetValue(branchAddress, out var strongestCallerCount);
+            var strongestCountOccurrences = 1;
             var currentAddress = branchAddress;
+
             for (var offset = 1; offset <= maximumInstructionsBack && branchIndex - offset >= 0; offset++)
             {
                 var previous = ordered[branchIndex - offset];
@@ -84,28 +157,34 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
                     || ignored.Contains(previous.Address))
                     break;
 
-                candidates.Add(previous.Address);
+                callerCounts.TryGetValue(previous.Address, out var callerCount);
+                if (callerCount > strongestCallerCount)
+                {
+                    strongestAddress = previous.Address;
+                    strongestCallerCount = callerCount;
+                    strongestCountOccurrences = 1;
+                }
+                else if (callerCount == strongestCallerCount)
+                {
+                    strongestCountOccurrences++;
+                }
+
                 currentAddress = previous.Address;
             }
 
-            var rankedCandidates = candidates
-                .Select(candidate => (
-                    Address: candidate,
-                    CallerCount: callerCounts.TryGetValue(candidate, out var count) ? count : 0))
-                .ToArray();
-            var strongestCallerCount = rankedCandidates.Max(candidate => candidate.CallerCount);
-            var strongest = rankedCandidates
-                .Where(candidate => candidate.CallerCount == strongestCallerCount)
-                .Select(candidate => candidate.Address)
-                .ToArray();
-
             // 零调用者或并列强度都不能证明入口边界，保持精确尾跳地址。
-            entries.Add(strongestCallerCount > 0 && strongest.Length == 1
-                ? strongest[0]
-                : branchAddress);
+            return strongestCallerCount > 0 && strongestCountOccurrences == 1
+                ? strongestAddress
+                : branchAddress;
         }
 
-        return entries.Distinct().ToArray();
+        private static bool IsAddressOrdered(IReadOnlyList<Arm64Instruction> instructions)
+        {
+            for (var index = 1; index < instructions.Count; index++)
+                if (instructions[index - 1].Address > instructions[index].Address)
+                    return false;
+            return true;
+        }
     }
 
     private static bool IsNoOpSelfMove(Arm64Instruction instruction) =>

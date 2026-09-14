@@ -958,6 +958,60 @@ public class NewArmV8InstructionSetTests
 
     [Test]
     [Category("基本功能")]
+    public void ReplicatedVectorMoveImmediateUsesSixteenByteByteShape()
+    {
+        var decoded = NewArmV8InstructionSet.TryGetReplicatedVectorMoveImmediateShape(
+            Arm64Register.V1,
+            Arm64ArrangementSpecifier.SixteenB,
+            out var vectorWidthBits,
+            out var laneCount,
+            out var elementWidthBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidthBits, Is.EqualTo(128));
+            Assert.That(laneCount, Is.EqualTo(16));
+            Assert.That(elementWidthBits, Is.EqualTo(8));
+        });
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void ReplicatedVectorMoveImmediateUsesDoubleRegisterWholeWidth()
+    {
+        var decoded = NewArmV8InstructionSet.TryGetReplicatedVectorMoveImmediateShape(
+            Arm64Register.D6,
+            Arm64ArrangementSpecifier.None,
+            out var vectorWidthBits,
+            out var laneCount,
+            out var elementWidthBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(vectorWidthBits, Is.EqualTo(64));
+            Assert.That(laneCount, Is.EqualTo(1));
+            Assert.That(elementWidthBits, Is.EqualTo(64));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void ReplicatedVectorMoveImmediateRejectsNonVectorDestination()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryGetReplicatedVectorMoveImmediateShape(
+                Arm64Register.W0,
+                Arm64ArrangementSpecifier.None,
+                out _,
+                out _,
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void WordCmnImmediateDecodesSignedSwitchThreshold()
     {
         var decoded = NewArmV8InstructionSet.TryDecodeCmnSignedThreshold(
@@ -1407,6 +1461,61 @@ public class NewArmV8InstructionSetTests
             Assert.That(recovered[1].Operands[0], Is.EqualTo(new Register(null, expectedDestination)));
             Assert.That(recovered[1].Operands[1], Is.EqualTo(new Register(null, expectedAccumulator)));
             Assert.That(recovered[1].Operands[2], Is.EqualTo(recovered[0].Operands[0]));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void FSQRT标量浮点宽度由S寄存器精确恢复()
+    {
+        var decoded = DecodeSingleInstruction(
+            [0x00, 0xC0, 0x21, 0x1E],
+            0x1000);
+
+        var accepted = NewArmV8InstructionSet.TryGetMatchingScalarFloatingWidth(
+            [
+                (decoded.Op0Kind, decoded.Op0Reg),
+                (decoded.Op1Kind, decoded.Op1Reg),
+            ],
+            out var widthBits);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded.Mnemonic, Is.EqualTo(Arm64Mnemonic.FSQRT));
+            Assert.That(accepted, Is.True);
+            Assert.That(widthBits, Is.EqualTo(32));
+        });
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void FSQRT标量浮点宽度拒绝混合S与D寄存器()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryGetMatchingScalarFloatingWidth(
+                [
+                    (Arm64OperandKind.Register, Arm64Register.S0),
+                    (Arm64OperandKind.Register, Arm64Register.D0),
+                ],
+                out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void UCVTF保留W源与S目标的精确宽度()
+    {
+        var decoded = DecodeSingleInstruction(
+            [0x20, 0x01, 0x23, 0x1E],
+            0x1000);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded.Mnemonic, Is.EqualTo(Arm64Mnemonic.UCVTF));
+            Assert.That(NewArmV8InstructionSet.TryGetFloatingPointPrecisionBits(decoded.Op0Reg, out var destinationBits), Is.True);
+            Assert.That(destinationBits, Is.EqualTo(32));
+            Assert.That(NewArmV8InstructionSet.TryGetGeneralPurposeValueWidthBits(decoded.Op1Reg, out var sourceBits), Is.True);
+            Assert.That(sourceBits, Is.EqualTo(32));
         });
     }
 
@@ -2564,11 +2673,18 @@ public class NewArmV8InstructionSetTests
         TestName = "恢复UIStats四通道负值比较")]
     [TestCase(
         0x6E631C80u,
-        (int)Arm64RecoveredVectorOperation.BitwiseSelect128,
+        (int)Arm64RecoveredVectorOperation.BitwiseSelect,
         0,
         4,
         3,
         TestName = "恢复UIStats一百二十八位选择")]
+    [TestCase(
+        0x2E611C80u,
+        (int)Arm64RecoveredVectorOperation.BitwiseSelect,
+        0,
+        4,
+        1,
+        TestName = "恢复UIStats六十四位选择")]
     [TestCase(
         0x4F829000u,
         (int)Arm64RecoveredVectorOperation.MultiplyFloat32ByElement,
@@ -2576,6 +2692,34 @@ public class NewArmV8InstructionSetTests
         0,
         2,
         TestName = "恢复UIStats四通道单元素浮点乘法")]
+    [TestCase(
+        0x6EE44463u,
+        (int)Arm64RecoveredVectorOperation.ShiftLeftUnsignedVariable,
+        3,
+        3,
+        4,
+        TestName = "恢复ColorUtilities双精度无符号变量移位")]
+    [TestCase(
+        0x0EA0E822u,
+        (int)Arm64RecoveredVectorOperation.CompareFloatingLessThanZero,
+        2,
+        1,
+        -1,
+        TestName = "恢复EmojiColor单精度负值比较")]
+    [TestCase(
+        0x0EA1B821u,
+        (int)Arm64RecoveredVectorOperation.ConvertFloatingToSignedInteger,
+        1,
+        1,
+        -1,
+        TestName = "恢复EmojiColor单精度向零转换")]
+    [TestCase(
+        0x2EA21C21u,
+        (int)Arm64RecoveredVectorOperation.BitwiseInsert,
+        1,
+        1,
+        2,
+        TestName = "恢复EmojiColor字节位插入")]
     [Category("基本功能")]
     public void RecoveredUiStatsVectorInstructionsDecodeExactRegisters(
         uint machineCode,
@@ -2598,6 +2742,319 @@ public class NewArmV8InstructionSetTests
         }
     }
 
+    [TestCase(0x0EA1B821u, 64, 2, 32)]
+    [TestCase(0x4EA1B821u, 128, 4, 32)]
+    [TestCase(0x4EE1B821u, 128, 2, 64)]
+    [Category("基本功能")]
+    public void FCVTZS向量编码按Q与sz恢复精确布局(
+        uint machineCode,
+        int expectedVectorWidth,
+        int expectedLaneCount,
+        int expectedElementWidth)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(machineCode, out var decoded),
+            Is.True);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded.Operation, Is.EqualTo(Arm64RecoveredVectorOperation.ConvertFloatingToSignedInteger));
+            Assert.That(decoded.LaneCount, Is.EqualTo(expectedLaneCount));
+            Assert.That(decoded.ElementWidthBits, Is.EqualTo(expectedElementWidth));
+            Assert.That(decoded.LaneCount * decoded.ElementWidthBits, Is.EqualTo(expectedVectorWidth));
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(machineCode, 0, out var text),
+                Is.True);
+            Assert.That(text, Does.Contain("FCVTZS"));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void FCVTZS拒绝六十四位单通道双精度保留编码()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(0x0EE1B821u, out _),
+            Is.False);
+    }
+
+    [TestCase(0x0E2128C6u, 0, 8, 16, 8, 8, TestName = "XTN八个半字截取为八字节")]
+    [TestCase(0x0E6128C6u, 0, 4, 32, 4, 16, TestName = "XTN四个字截取为四半字")]
+    [TestCase(0x0EA128C6u, 0, 2, 64, 2, 32, TestName = "XTN两个双字截取为两个字")]
+    [TestCase(0x4E2128C6u, 1, 8, 16, 16, 8, TestName = "XTN2八个半字写入高八字节")]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void XTN编码按Q与size恢复半区和元素布局(
+        uint machineCode,
+        int expectedUpper,
+        int expectedSourceLaneCount,
+        int expectedSourceWidth,
+        int expectedDestinationLaneCount,
+        int expectedDestinationWidth)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(machineCode, out var decoded),
+            Is.True);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded.Operation, Is.EqualTo(Arm64RecoveredVectorOperation.ExtractNarrow));
+            Assert.That(decoded.Immediate, Is.EqualTo(expectedUpper));
+            Assert.That(decoded.LaneCount, Is.EqualTo(expectedSourceLaneCount));
+            Assert.That(decoded.ElementWidthBits, Is.EqualTo(expectedSourceWidth));
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(machineCode, 0, out var text),
+                Is.True);
+            Assert.That(text, Does.Contain(expectedUpper == 0 ? "XTN " : "XTN2 "));
+            Assert.That(text, Does.Contain($".{expectedDestinationLaneCount}{VectorNarrowSuffix(expectedDestinationWidth)}"));
+            Assert.That(text, Does.Contain($".{expectedSourceLaneCount}{VectorNarrowSuffix(expectedSourceWidth)}"));
+        }
+
+        static string VectorNarrowSuffix(int elementWidthBits) => elementWidthBits switch
+        {
+            8 => "B",
+            16 => "H",
+            32 => "S",
+            64 => "D",
+            _ => throw new ArgumentOutOfRangeException(nameof(elementWidthBits)),
+        };
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void XTN拒绝保留size编码()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(0x0EE128C6u, out _),
+            Is.False);
+    }
+
+    [TestCase(0x2E213441u, 8, 8, 1, 2, 1, false, TestName = "CMHI八字节无符号比较")]
+    [TestCase(0x6E613441u, 8, 16, 1, 2, 1, false, TestName = "CMHI八半字无符号比较")]
+    [TestCase(0x6EA13441u, 4, 32, 1, 2, 1, false, TestName = "CMHI四单字无符号比较")]
+    [TestCase(0x6EE53426u, 2, 64, 6, 1, 5, false, TestName = "CMHI双字无符号比较")]
+    [TestCase(0x2E213C41u, 8, 8, 1, 2, 1, true, TestName = "CMHS八字节无符号大于等于比较")]
+    [TestCase(0x6E613C41u, 8, 16, 1, 2, 1, true, TestName = "CMHS八半字无符号大于等于比较")]
+    [TestCase(0x6EA13C41u, 4, 32, 1, 2, 1, true, TestName = "CMHS四单字无符号大于等于比较")]
+    [TestCase(0x6EE53C26u, 2, 64, 6, 1, 5, true, TestName = "CMHS双字无符号大于等于比较")]
+    [Category("基本功能")]
+    public void CMHI与CMHS编码按Q与size恢复三寄存器布局(
+        uint machineCode,
+        int expectedLaneCount,
+        int expectedElementWidth,
+        int expectedDestination,
+        int expectedFirstSource,
+        int expectedSecondSource,
+        bool expectedHigherOrSame)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(machineCode, out var decoded),
+            Is.True);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                decoded.Operation,
+                Is.EqualTo(expectedHigherOrSame
+                    ? Arm64RecoveredVectorOperation.CompareUnsignedHigherOrSame
+                    : Arm64RecoveredVectorOperation.CompareUnsignedHigher));
+            Assert.That(decoded.Immediate, Is.EqualTo(0));
+            Assert.That(decoded.LaneCount, Is.EqualTo(expectedLaneCount));
+            Assert.That(decoded.ElementWidthBits, Is.EqualTo(expectedElementWidth));
+            Assert.That(decoded.DestinationRegister, Is.EqualTo(expectedDestination));
+            Assert.That(decoded.FirstSourceRegister, Is.EqualTo(expectedFirstSource));
+            Assert.That(decoded.SecondSourceRegister, Is.EqualTo(expectedSecondSource));
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(machineCode, 0, out var text),
+                Is.True);
+            Assert.That(text, Does.Contain(expectedHigherOrSame ? "CMHS" : "CMHI"));
+            Assert.That(text, Does.Contain($"V{expectedDestination}."));
+            Assert.That(text, Does.Contain($"V{expectedFirstSource}."));
+            Assert.That(text, Does.Contain($"V{expectedSecondSource}."));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void CMHI拒绝非Q双字保留编码()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(0x2EE21341u, out _),
+            Is.False);
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void CMHS拒绝非Q双字保留编码()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(0x2EE21C41u, out _),
+            Is.False);
+    }
+
+    [TestCase(0x2EA1E443u, 2, 32, 3, 2, 1, TestName = "FCMGT双单字浮点比较")]
+    [TestCase(0x6EA3E674u, 4, 32, 20, 19, 3, TestName = "FCMGT四单字浮点比较")]
+    [TestCase(0x6EE5E426u, 2, 64, 6, 1, 5, TestName = "FCMGT双双字浮点比较")]
+    [Category("基本功能")]
+    public void FCMGT编码按Q与sz恢复三寄存器布局(
+        uint machineCode,
+        int expectedLaneCount,
+        int expectedElementWidth,
+        int expectedDestination,
+        int expectedFirstSource,
+        int expectedSecondSource)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(machineCode, out var decoded),
+            Is.True);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded.Operation, Is.EqualTo(Arm64RecoveredVectorOperation.CompareFloatingGreaterThan));
+            Assert.That(decoded.Immediate, Is.EqualTo(0));
+            Assert.That(decoded.LaneCount, Is.EqualTo(expectedLaneCount));
+            Assert.That(decoded.ElementWidthBits, Is.EqualTo(expectedElementWidth));
+            Assert.That(decoded.DestinationRegister, Is.EqualTo(expectedDestination));
+            Assert.That(decoded.FirstSourceRegister, Is.EqualTo(expectedFirstSource));
+            Assert.That(decoded.SecondSourceRegister, Is.EqualTo(expectedSecondSource));
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(machineCode, 0, out var text),
+                Is.True);
+            Assert.That(text, Does.Contain("FCMGT"));
+            Assert.That(text, Does.Contain($"V{expectedDestination}."));
+            Assert.That(text, Does.Contain($"V{expectedFirstSource}."));
+            Assert.That(text, Does.Contain($"V{expectedSecondSource}."));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void FCMGT拒绝非Q双字保留编码()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(0x2EE1E443u, out _),
+            Is.False);
+    }
+
+    [TestCase(0x0EA1E443u, 2, 32, 3, 2, 1, TestName = "FCMEQ双单字浮点相等比较")]
+    [TestCase(0x4EA3E674u, 4, 32, 20, 19, 3, TestName = "FCMEQ四单字浮点相等比较")]
+    [TestCase(0x4EE5E426u, 2, 64, 6, 1, 5, TestName = "FCMEQ双双字浮点相等比较")]
+    [Category("基本功能")]
+    public void FCMEQ编码按Q与sz恢复三寄存器布局(
+        uint machineCode,
+        int expectedLaneCount,
+        int expectedElementWidth,
+        int expectedDestination,
+        int expectedFirstSource,
+        int expectedSecondSource)
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(machineCode, out var decoded),
+            Is.True);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded.Operation, Is.EqualTo(Arm64RecoveredVectorOperation.CompareFloatingEqual));
+            Assert.That(decoded.Immediate, Is.EqualTo(0));
+            Assert.That(decoded.LaneCount, Is.EqualTo(expectedLaneCount));
+            Assert.That(decoded.ElementWidthBits, Is.EqualTo(expectedElementWidth));
+            Assert.That(decoded.DestinationRegister, Is.EqualTo(expectedDestination));
+            Assert.That(decoded.FirstSourceRegister, Is.EqualTo(expectedFirstSource));
+            Assert.That(decoded.SecondSourceRegister, Is.EqualTo(expectedSecondSource));
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(machineCode, 0, out var text),
+                Is.True);
+            Assert.That(text, Does.Contain("FCMEQ"));
+            Assert.That(text, Does.Contain($"V{expectedDestination}."));
+            Assert.That(text, Does.Contain($"V{expectedFirstSource}."));
+            Assert.That(text, Does.Contain($"V{expectedSecondSource}."));
+        }
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void FCMEQ拒绝非Q双字保留编码()
+    {
+        Assert.That(
+            NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(0x0EE1E443u, out _),
+            Is.False);
+    }
+
+    [TestCase(0x0F839000u, 2, 0, 0, 3)]
+    [TestCase(0x4F829000u, 4, 0, 0, 2)]
+    [TestCase(0x0F819081u, 2, 1, 4, 1)]
+    [TestCase(0x4F809042u, 4, 2, 2, 0)]
+    public void VectorByElement首通道乘法按Q位恢复布局(
+        uint code, int lanes, int destination, int left, int right)
+    {
+        Assert.That(NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(code, out var decoded), Is.True);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decoded.Operation, Is.EqualTo(Arm64RecoveredVectorOperation.MultiplyFloat32ByElement));
+            Assert.That(decoded.LaneCount, Is.EqualTo(lanes));
+            Assert.That(decoded.ElementWidthBits, Is.EqualTo(32));
+            Assert.That(decoded.Immediate, Is.Zero);
+            Assert.That(decoded.DestinationRegister, Is.EqualTo(destination));
+            Assert.That(decoded.FirstSourceRegister, Is.EqualTo(left));
+            Assert.That(decoded.SecondSourceRegister, Is.EqualTo(right));
+            Assert.That(NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(code, 0, out var text), Is.True);
+            Assert.That(text, Does.Contain($"V{destination}.{lanes}S, V{left}.{lanes}S"));
+        }
+    }
+
+    [TestCase(0x0FC29000u)]
+    [TestCase(0x0FA29000u)]
+    [TestCase(0x0F829800u)]
+    public void VectorByElement未实现宽度或非首通道保持严格边界(uint code)
+    {
+        // 中文注释：本轮仅证实单精度首通道，其他编码不得错误解释为首通道乘法。
+        var accepted = NewArmV8InstructionSet.TryDecodeRecoveredVectorInstruction(code, out var decoded);
+        Assert.That(accepted && decoded.Operation == Arm64RecoveredVectorOperation.MultiplyFloat32ByElement, Is.False);
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void USHL格式化保留Q位宽与三个向量寄存器()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(
+                    0x6EE44463u, 0x0542C0FC, out var text),
+                Is.True);
+            Assert.That(
+                text,
+                Is.EqualTo("0x0542C0FC USHL V3.2D, V3.2D, V4.2D"));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void FCMLT格式化保留浮点通道布局与零比较()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(
+                    0x0EA0E822u, 0x0542A0B0, out var text),
+                Is.True);
+            Assert.That(
+                text,
+                Is.EqualTo("0x0542A0B0 FCMLT V2.2S, V1.2S, #0.0"));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void BIT格式化保留目标旧值与值掩码来源()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(
+                    0x2EA21C21u, 0x02BC435C, out var text),
+                Is.True);
+            Assert.That(
+                text,
+                Is.EqualTo("0x02BC435C BIT V1.8B, V1.8B, V2.8B"));
+        });
+    }
     [TestCase(0x0E040D00u, (int)Arm64RecoveredVectorOperation.DuplicateGeneralRegister, 2, 32, 0,
         TestName = "基本_DUP通用寄存器复制到2S")]
     [TestCase(0x4E040D20u, (int)Arm64RecoveredVectorOperation.DuplicateGeneralRegister, 4, 32, 0,
@@ -2643,6 +3100,55 @@ public class NewArmV8InstructionSetTests
             Is.False);
     }
 
+    [TestCase(0x0E28D400u, "AddFloating", 64, 32, 2, 0, 0, 8)]
+    [TestCase(0x4E60D420u, "AddFloating", 128, 64, 2, 0, 1, 0)]
+    [TestCase(0x4EA2D420u, "SubtractFloating", 128, 32, 4, 0, 1, 2)]
+    [TestCase(0x6E22DC20u, "MultiplyFloating", 128, 32, 4, 0, 1, 2)]
+    [TestCase(0x6E62FC20u, "DivideFloating", 128, 64, 2, 0, 1, 2)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 浮点向量四则运算统一解码原生通道布局(
+        uint machineCode,
+        string expectedOperation,
+        int expectedVectorWidth,
+        int expectedElementWidth,
+        int expectedLaneCount,
+        int expectedDestination,
+        int expectedLeft,
+        int expectedRight)
+    {
+        var decoded = NewArmV8InstructionSet.TryDecodeVectorFloatingBinary(
+            machineCode,
+            out var operation,
+            out var vectorWidth,
+            out var elementWidth,
+            out var laneCount,
+            out var destination,
+            out var left,
+            out var right);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(decoded, Is.True);
+            Assert.That(operation.ToString(), Is.EqualTo(expectedOperation));
+            Assert.That(vectorWidth, Is.EqualTo(expectedVectorWidth));
+            Assert.That(elementWidth, Is.EqualTo(expectedElementWidth));
+            Assert.That(laneCount, Is.EqualTo(expectedLaneCount));
+            Assert.That(destination, Is.EqualTo(expectedDestination));
+            Assert.That(left, Is.EqualTo(expectedLeft));
+            Assert.That(right, Is.EqualTo(expectedRight));
+        });
+    }
+
+    [TestCase(0x0E60D400u, TestName = "单D通道FADD保留给标量解码")]
+    [TestCase(0x4E22C400u, TestName = "不同操作族不会冒充浮点向量四则运算")]
+    [Category("异常输入")]
+    public void 浮点向量四则运算拒绝保留或不同编码(uint machineCode)
+    {
+        Assert.That(NewArmV8InstructionSet.TryDecodeVectorFloatingBinary(
+            machineCode, out _, out _, out _, out _, out _, out _, out _), Is.False);
+    }
+
     [Test]
     [Category("边界值")]
     public void RecoveredBitwiseSelectFormatterKeepsMaskAndBothInputs()
@@ -2658,6 +3164,24 @@ public class NewArmV8InstructionSetTests
             Assert.That(
                 text,
                 Is.EqualTo("0x02E684F4 BSL V0.16B, V4.16B, V1.16B"));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void RecoveredBitwiseSelectFormatterKeepsDWidth()
+    {
+        var formatted = NewArmV8InstructionSet.TryFormatRecoveredVectorInstruction(
+            0x2E611C80u,
+            0x02E684F4u,
+            out var text);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(formatted, Is.True);
+            Assert.That(
+                text,
+                Is.EqualTo("0x02E684F4 BSL V0.8B, V4.8B, V1.8B"));
         }
     }
 

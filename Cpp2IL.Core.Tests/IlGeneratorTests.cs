@@ -16,7 +16,7 @@ using ReflectionTypeAttributes = System.Reflection.TypeAttributes;
 
 namespace Cpp2IL.Core.Tests;
 
-public class IlGeneratorTests
+public partial class IlGeneratorTests
 {
     private delegate ref byte 字节引用偏移委托(ref byte value);
 
@@ -2539,6 +2539,1504 @@ public class IlGeneratorTests
     }
 
     private delegate void 引用零写委托(ref long value);
+
+    [TestCase(2, 32, 0, 0x3344)]
+    [TestCase(4, 32, 5, 0x1122)]
+    [TestCase(2, 64, 7, 0xFEDC)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void DUP通用寄存器广播生成PE并执行全部六十四与一百二十八位块(
+        int laneCount,
+        int elementWidthBits,
+        int extractedUInt16Lane,
+        int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var inputType = elementWidthBits == 64
+            ? app.SystemTypes.SystemInt64Type
+            : app.SystemTypes.SystemInt32Type;
+        var input = new LocalVariable("value", new Register(null, elementWidthBits == 64 ? "X0" : "W0"), inputType);
+        // 故意保留未定型槽，证明 CIL 载体只依赖原生布局而不依赖业务类型推断。
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var result = new LocalVariable("result", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        long inputValue = elementWidthBits == 64
+            ? unchecked((long)0xFEDCBA9876543210UL)
+            : unchecked((int)0x11223344);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "DuplicateAndExtract",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [inputType]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                new Immediate(laneCount), new Immediate(elementWidthBits), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorExtractUnsignedInt16, result, vector, new Immediate(extractedUInt16Lane)),
+            new Instruction(2, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [input];
+        context.Locals = [vector, result];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("VectorDuplicateRuntime.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        // 局部量的 Int32 身份必须来自真实核心库作用域，不能在夹具程序集内伪造同名基元。
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        if (elementWidthBits == 64)
+            绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt64Type, "Int64",
+                TypeAttributes.Public | TypeAttributes.Sealed);
+        var host = new TypeDefinition("Fixture", "VectorDuplicateHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var parameterSignature = elementWidthBits == 64
+            ? module.CorLibTypeFactory.Int64
+            : module.CorLibTypeFactory.Int32;
+        var definition = new MethodDefinition("DuplicateAndExtract",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32, [parameterSignature]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var words = definition.CilMethodBody!.LocalVariables
+            .Count(local => local.VariableType.FullName == "System.UInt64");
+        Assert.That(words, Is.EqualTo(laneCount * elementWidthBits / 64));
+        using var stream = new System.IO.MemoryStream();
+        var assembly = new AssemblyDefinition("VectorDuplicateRuntime", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorDuplicateHost", true)!.GetMethod("DuplicateAndExtract")!;
+        object runtimeArgument = elementWidthBits == 64
+            ? (object)inputValue
+            : unchecked((int)inputValue);
+        var actual = (int)runtimeMethod.Invoke(null, [runtimeArgument])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(false, 2, 32, 3, 0x89AB)]
+    [TestCase(true, 2, 64, 7, 0xFEDC)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void DUP浮点标量首通道按原始位模式广播并执行(
+        bool doubleSource,
+        int laneCount,
+        int elementWidthBits,
+        int extractedUInt16Lane,
+        int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var sourceType = doubleSource ? app.SystemTypes.SystemDoubleType : app.SystemTypes.SystemSingleType;
+        var source = new LocalVariable("value", new Register(null, "V1"), sourceType);
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var result = new LocalVariable("result", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,
+            "DuplicateScalarLane", app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [sourceType]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, source,
+                new Immediate(laneCount), new Immediate(elementWidthBits), new Immediate(0)),
+            new Instruction(1, OpCode.VectorExtractUnsignedInt16, result, vector, new Immediate(extractedUInt16Lane)),
+            new Instruction(2, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [source];
+        context.Locals = [vector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, sourceType, doubleSource ? "Double" : "Single",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var assemblyName = doubleSource ? "VectorDoubleLane" : "VectorSingleLane";
+        var module = new ModuleDefinition(assemblyName + ".dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", assemblyName + "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var parameterType = doubleSource ? module.CorLibTypeFactory.Double : module.CorLibTypeFactory.Single;
+        var definition = new MethodDefinition("DuplicateScalarLane", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32, [parameterType]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var bitCall = definition.CilMethodBody!.Instructions
+            .Single(item => item.OpCode == CilOpCodes.Call
+                            && item.Operand is IMethodDescriptor descriptor
+                            && descriptor.Name == (doubleSource ? "DoubleToInt64Bits" : "SingleToInt32Bits"));
+        Assert.That(bitCall, Is.Not.Null);
+        var assembly = new AssemblyDefinition(assemblyName, new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture." + assemblyName + "Host", true)!.GetMethod("DuplicateScalarLane")!;
+        // 条件表达式会先把Single提升为Double；两支分别装箱，保持真实方法签名。
+        object argument = doubleSource
+            ? (object)BitConverter.Int64BitsToDouble(unchecked((long)0xFEDCBA9876543210UL))
+            : BitConverter.Int32BitsToSingle(unchecked((int)0x89ABCDEF));
+        var actual = (int)runtimeMethod.Invoke(null, [argument])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(OpCode.Add, 32, 3, 0x3FC00000L, 0x40100000L, 0x4070, 1)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x3FC00000L, 0x40000000L, 0x4040, 0, 0)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 7, 0x3FC00000L, 0x40000000L, 0x4040, 1, 0, false, 4)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x3FC00000L, 0x40000000L, 0x4040, 2, 0)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x3FC00000L, 0x40000000L, 0x4040, 0, 0, true)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 7, 0x3FC00000L, 0x400000003F800000L, 0x4040, 0, 3, false, 4, true)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x3FC00000L, 0x400000003F800000L, 0x3FC0, 0, 0, false, 2, true)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x80000000L, 0x40000000L, 0x8000, 0, 0)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x7F800000L, 0x40000000L, 0x7F80, 0, 0)]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x3FC00000L, 0x40000000L, 0, 0, 2, false, 2, false, "VECTOR_LANE_SOURCE_RANGE")]
+    [TestCase(OpCode.VectorMultiplyByElement, 32, 3, 0x3FC00000L, 0x40000000L, 0, 0, 1, true, 2, false, "VECTOR_LANE_SOURCE_STATE")]
+    [TestCase(OpCode.Multiply, 32, 3, 0x3FC00000L, 0x40000000L, 0x4040, 2)]
+    [TestCase(OpCode.Divide, 64, 7, 0x401E000000000000L, 0x4004000000000000L, 0x4008, 1)]
+    [TestCase(OpCode.Subtract, 64, 7, 0x401E000000000000L, 0x4004000000000000L, 0x4014, 2)]
+    [TestCase(OpCode.Add, 32, 1, 0x3FC00000L, 0x40100000L, 0x4070)]
+    [TestCase(OpCode.Divide, 64, 3, 0x401E000000000000L, 0x4004000000000000L, 0x4008)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void DUP载体执行逐通道浮点四则运算并保持位模式(
+        OpCode operation,
+        int elementWidthBits,
+        int extractedUInt16Lane,
+        long leftBits,
+        long rightBits,
+        int expected, int alias = 0, int sourceLane = -1, bool scalarSource = false,
+        int laneCount = 2, bool packedRight = false, string? expectedFailure = null)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var inputType = elementWidthBits == 32
+            ? app.SystemTypes.SystemInt32Type
+            : app.SystemTypes.SystemInt64Type;
+        var leftInput = new LocalVariable("left", new Register(null, elementWidthBits == 32 ? "W0" : "X0"), inputType);
+        var rightInputType = scalarSource ? app.SystemTypes.SystemSingleType
+            : packedRight ? app.SystemTypes.SystemInt64Type : inputType;
+        var rightInput = new LocalVariable("right", new Register(null, scalarSource ? "V1" : packedRight ? "X1" : elementWidthBits == 32 ? "W1" : "X1"), rightInputType);
+        var leftVector = new LocalVariable("leftVector", new Register(null, "V0"));
+        var rightVector = new LocalVariable("rightVector", new Register(null, "V1"));
+        var resultVector = alias == 1 ? leftVector : alias == 2 ? rightVector : new LocalVariable("resultVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,
+            "VectorBinary", app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [inputType, rightInputType]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, leftVector, leftInput,
+                new Immediate(laneCount), new Immediate(elementWidthBits), new Immediate(-1)),
+            scalarSource ? new Instruction(1, OpCode.Nop) :
+                new Instruction(1, OpCode.VectorDuplicate, rightVector, rightInput,
+                    new Immediate(packedRight ? 2 : laneCount), new Immediate(packedRight ? 64 : elementWidthBits), new Immediate(-1)),
+            sourceLane >= 0
+                ? new Instruction(2, operation, resultVector, leftVector, scalarSource ? rightInput : rightVector,
+                    new Immediate(sourceLane), new Immediate(laneCount), new Immediate(elementWidthBits))
+                : new Instruction(2, operation, resultVector, leftVector, rightVector,
+                    new Immediate(laneCount), new Immediate(elementWidthBits)),
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, resultVector,
+                new Immediate(extractedUInt16Lane)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [leftInput, rightInput];
+        context.Locals = new[] { leftVector, rightVector, resultVector, result }.Distinct().ToList();
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        if (elementWidthBits == 64 || packedRight)
+            绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt64Type, "Int64",
+                TypeAttributes.Public | TypeAttributes.Sealed);
+        if (scalarSource)
+            绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemSingleType, "Single",
+                TypeAttributes.Public | TypeAttributes.Sealed);
+        var assemblyName = $"Vector{operation}{elementWidthBits}Alias{alias}Lane{sourceLane}Scalar{scalarSource}Count{laneCount}Packed{packedRight}";
+        var module = new ModuleDefinition(assemblyName + ".dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", assemblyName + "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var parameterType = elementWidthBits == 32 ? module.CorLibTypeFactory.Int32 : module.CorLibTypeFactory.Int64;
+        var definition = new MethodDefinition("VectorBinary", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32, [parameterType,
+                scalarSource ? module.CorLibTypeFactory.Single : packedRight ? module.CorLibTypeFactory.Int64 : parameterType]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "left", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "right", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        if (expectedFailure != null)
+        {
+            var error = Assert.Throws<UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+            Assert.That(error!.Message, Does.Contain(expectedFailure));
+            return;
+        }
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition(assemblyName, new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture." + assemblyName + "Host", true)!.GetMethod("VectorBinary")!;
+        object leftArgument = elementWidthBits == 32 ? (object)unchecked((int)leftBits) : leftBits;
+        object rightArgument = scalarSource ? (object)BitConverter.Int32BitsToSingle(unchecked((int)rightBits))
+            : packedRight || elementWidthBits == 64 ? (object)rightBits : unchecked((int)rightBits);
+        var actual = (int)runtimeMethod.Invoke(null, [leftArgument, rightArgument])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(0x00010002, 0x00030004, 6)]
+    [TestCase(-1, 1, 0)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 整数向量ADD按元素位宽执行并保留溢出截断(int leftValue, int rightValue, int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var leftInput = new LocalVariable("left", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var rightInput = new LocalVariable("right", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var leftVector = new LocalVariable("leftVector", new Register(null, "V0"));
+        var rightVector = new LocalVariable("rightVector", new Register(null, "V1"));
+        var resultVector = new LocalVariable("resultVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var vectorAdd = new Instruction(
+            2,
+            OpCode.Add,
+            resultVector,
+            leftVector,
+            rightVector,
+            new Immediate(2),
+            new Immediate(32))
+        {
+            IntegerWidthBits = 32,
+        };
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorIntegerAdd",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, leftVector, leftInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorDuplicate, rightVector, rightInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            vectorAdd,
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, resultVector, new Immediate(0)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [leftInput, rightInput];
+        context.Locals = [leftVector, rightVector, resultVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorIntegerAdd.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorIntegerAddHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorIntegerAdd",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32, module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "left", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "right", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorIntegerAdd", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorIntegerAddHost", true)!.GetMethod("VectorIntegerAdd")!;
+        var actual = (int)runtimeMethod.Invoke(null, [leftValue, rightValue])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(3, 1, 6)]
+    [TestCase(6, -1, 3)]
+    [TestCase(7, 32, 0)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void USHL按有符号移位通道执行无符号逐通道移位(int value, int shift, int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var valueInput = new LocalVariable("value", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var shiftInput = new LocalVariable("shift", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var valueVector = new LocalVariable("valueVector", new Register(null, "V0"));
+        var shiftVector = new LocalVariable("shiftVector", new Register(null, "V1"));
+        var resultVector = new LocalVariable("resultVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorUnsignedShift",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, valueVector, valueInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorDuplicate, shiftVector, shiftInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(2, OpCode.VectorShiftLeftUnsignedVariable, resultVector,
+                valueVector, shiftVector, new Immediate(2), new Immediate(32)),
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, resultVector,
+                new Immediate(0)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [valueInput, shiftInput];
+        context.Locals = [valueVector, shiftVector, resultVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorUnsignedShift.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorUnsignedShiftHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorUnsignedShift",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32, module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "shift", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorUnsignedShift", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorUnsignedShiftHost", true)!.GetMethod("VectorUnsignedShift")!;
+        var actual = (int)runtimeMethod.Invoke(null, [value, shift])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(-1082130432, 65535)]
+    [TestCase(1065353216, 0)]
+    [TestCase(int.MinValue, 0)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void FCMLT按浮点位模式逐通道生成比较掩码(int valueBits, int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var input = new LocalVariable("value", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var resultVector = new LocalVariable("resultVector", new Register(null, "V1"));
+        var result = new LocalVariable("result", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorFloatingLessThanZero",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorCompareFloatingLessThanZero, resultVector, vector,
+                new Immediate(2), new Immediate(32)),
+            new Instruction(2, OpCode.VectorExtractUnsignedInt16, result, resultVector,
+                new Immediate(0)),
+            new Instruction(3, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [input];
+        context.Locals = [vector, resultVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorFloatingLessThanZero.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorFloatingLessThanZeroHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorFloatingLessThanZero",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorFloatingLessThanZero", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorFloatingLessThanZeroHost", true)!
+            .GetMethod("VectorFloatingLessThanZero")!;
+        var actual = (int)runtimeMethod.Invoke(null, [valueBits])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(0x3F800000, 0x3F000000, 65535, false, TestName = "FCMGT正数大于比较值生成全掩码")]
+    [TestCase(0x3F000000, 0x3F800000, 0, false, TestName = "FCMGT正数小于比较值生成零掩码")]
+    [TestCase(0x3F800000, 0x3F800000, 0, false, TestName = "FCMGT相等值生成零掩码")]
+    [TestCase(int.MinValue, 0, 0, false, TestName = "FCMGT负零不大于正零")]
+    [TestCase(unchecked((int)0x7FC00000), 0x3F800000, 0, false, TestName = "FCMGT非数字比较生成零掩码")]
+    [TestCase(0x3F800000, 0x3F000000, 0, true, TestName = "FCMEQ不相等值生成零掩码")]
+    [TestCase(0x3F800000, 0x3F800000, 65535, true, TestName = "FCMEQ相等值生成全掩码")]
+    [TestCase(int.MinValue, 0, 65535, true, TestName = "FCMEQ负零等于正零")]
+    [TestCase(unchecked((int)0x7FC00000), unchecked((int)0x7FC00000), 0, true, TestName = "FCMEQ非数字比较生成零掩码")]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void FCMGT与FCMEQ按浮点位模式逐通道生成比较掩码(
+        int leftBits,
+        int rightBits,
+        int expected,
+        bool equal)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var leftInput = new LocalVariable("left", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var rightInput = new LocalVariable("right", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var leftVector = new LocalVariable("leftVector", new Register(null, "V0"));
+        var rightVector = new LocalVariable("rightVector", new Register(null, "V1"));
+        var resultVector = new LocalVariable("resultVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            equal ? "VectorFloatingEqual" : "VectorFloatingGreaterThan",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, leftVector, leftInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorDuplicate, rightVector, rightInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(2, equal
+                ? OpCode.VectorCompareFloatingEqual
+                : OpCode.VectorCompareFloatingGreaterThan, resultVector,
+                leftVector, rightVector, new Immediate(2), new Immediate(32)),
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, resultVector,
+                new Immediate(0)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [leftInput, rightInput];
+        context.Locals = [leftVector, rightVector, resultVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var comparisonName = equal ? "VectorFloatingEqual" : "VectorFloatingGreaterThan";
+        var module = new ModuleDefinition(comparisonName + ".dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", comparisonName + "Host",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition(comparisonName,
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32, module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "left", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "right", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition(comparisonName, new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture." + comparisonName + "Host", true)!
+            .GetMethod(comparisonName)!;
+        var actual = (int)runtimeMethod.Invoke(null, [leftBits, rightBits])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(0x40700000, 3)]
+    [TestCase(unchecked((int)0xC0300000), 65534)]
+    [TestCase(0x3F000000, 0)]
+    [TestCase(0x46FFFF80, 32767)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void FCVTZS按浮点位模式逐通道向零转换(int valueBits, int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var input = new LocalVariable("value", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var resultVector = new LocalVariable("resultVector", new Register(null, "V1"));
+        var result = new LocalVariable("result", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorFloatingToSignedInteger",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorConvertFloatToSignedInteger, resultVector, vector,
+                new Immediate(2), new Immediate(32)),
+            new Instruction(2, OpCode.VectorExtractUnsignedInt16, result, resultVector,
+                new Immediate(0)),
+            new Instruction(3, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [input];
+        context.Locals = [vector, resultVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorFloatingToSignedInteger.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorFloatingToSignedIntegerHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorFloatingToSignedInteger",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorFloatingToSignedInteger", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorFloatingToSignedIntegerHost", true)!
+            .GetMethod("VectorFloatingToSignedInteger")!;
+        var actual = (int)runtimeMethod.Invoke(null, [valueBits])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(0x0000AAAA, 0x00005555, 0x00000F0F, 0x00005A5A)]
+    [TestCase(0x0000AAAA, 0x00005555, 0x00000000, 0x00005555)]
+    [TestCase(0x0000AAAA, 0x00005555, -1, 0x0000AAAA)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void BIT按目标旧值和掩码逐位选择(int destinationValue, int value, int mask, int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var destinationInput = new LocalVariable("destination", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var valueInput = new LocalVariable("value", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var maskInput = new LocalVariable("mask", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var destinationVector = new LocalVariable("destinationVector", new Register(null, "V0"));
+        var valueVector = new LocalVariable("valueVector", new Register(null, "V1"));
+        var maskVector = new LocalVariable("maskVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W3"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorBitwiseInsert",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, destinationVector, destinationInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorDuplicate, valueVector, valueInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(2, OpCode.VectorDuplicate, maskVector, maskInput,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(3, OpCode.VectorBitwiseInsert, destinationVector,
+                valueVector, maskVector, new Immediate(64)),
+            new Instruction(4, OpCode.VectorExtractUnsignedInt16, result, destinationVector,
+                new Immediate(0)),
+            new Instruction(5, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [destinationInput, valueInput, maskInput];
+        context.Locals = [destinationVector, valueVector, maskVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorBitwiseInsert.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorBitwiseInsertHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorBitwiseInsert",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32, module.CorLibTypeFactory.Int32,
+                    module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "destination", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "value", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(3, "mask", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorBitwiseInsert", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorBitwiseInsertHost", true)!
+            .GetMethod("VectorBitwiseInsert")!;
+        var actual = (int)runtimeMethod.Invoke(null, [destinationValue, value, mask])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(0, 0x00001234, unchecked((int)0xFFFFABCD), 0x0000ABCD)]
+    [TestCase(-1, 0x00001234, unchecked((int)0xFFFFABCD), 0x00001234)]
+    [TestCase(0x0000AAAA, 0x00005555, unchecked((int)0x0000F0F0), 0x00005050)]
+    [TestCase(unchecked((int)0x0000F0F0), unchecked((int)0x0000AAAA), 0x00005555, unchecked((int)0x0000A5A5))]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void BSL按目标掩码在两侧向量之间逐位选择(
+        int mask,
+        int selectedWhenSet,
+        int selectedWhenClear,
+        int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var maskInput = new LocalVariable("mask", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var selectedWhenSetInput = new LocalVariable("selectedWhenSet", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var selectedWhenClearInput = new LocalVariable("selectedWhenClear", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var maskVector = new LocalVariable("maskVector", new Register(null, "V0"));
+        var selectedWhenSetVector = new LocalVariable("selectedWhenSetVector", new Register(null, "V1"));
+        var selectedWhenClearVector = new LocalVariable("selectedWhenClearVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W3"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorBitwiseSelect",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, maskVector, maskInput,
+                new Immediate(4), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorDuplicate, selectedWhenSetVector, selectedWhenSetInput,
+                new Immediate(4), new Immediate(32), new Immediate(-1)),
+            new Instruction(2, OpCode.VectorDuplicate, selectedWhenClearVector, selectedWhenClearInput,
+                new Immediate(4), new Immediate(32), new Immediate(-1)),
+            new Instruction(3, OpCode.VectorBitwiseSelect, maskVector, maskVector,
+                selectedWhenSetVector, selectedWhenClearVector, new Immediate(128)),
+            new Instruction(4, OpCode.VectorExtractUnsignedInt16, result, maskVector,
+                new Immediate(0)),
+            new Instruction(5, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [maskInput, selectedWhenSetInput, selectedWhenClearInput];
+        context.Locals = [maskVector, selectedWhenSetVector, selectedWhenClearVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorBitwiseSelect.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorBitwiseSelectHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorBitwiseSelect",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32, module.CorLibTypeFactory.Int32,
+                    module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "mask", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "selectedWhenSet", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(3, "selectedWhenClear", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorBitwiseSelect", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorBitwiseSelectHost", true)!
+            .GetMethod("VectorBitwiseSelect")!;
+        var actual = (int)runtimeMethod.Invoke(null, [mask, selectedWhenSet, selectedWhenClear])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(32)]
+    [TestCase(192)]
+    [Category("异常输入")]
+    public void BSL拒绝未支持的向量布局(int vectorWidth)
+    {
+        var destination = new LocalVariable("destination", new Register(null, "V0"));
+        var mask = new LocalVariable("mask", new Register(null, "V0"));
+        var selectedWhenSet = new LocalVariable("selectedWhenSet", new Register(null, "V1"));
+        var selectedWhenClear = new LocalVariable("selectedWhenClear", new Register(null, "V2"));
+        var instruction = new Instruction(0, OpCode.VectorBitwiseSelect,
+            destination, mask, selectedWhenSet, selectedWhenClear, new Immediate(vectorWidth));
+
+        var accepted = VectorCilRecoveryHelper.TryDescribeBitwiseSelect(instruction, out _, out var failure);
+        Assert.That(accepted, Is.False);
+        Assert.That(failure, Does.Contain("向量位宽"));
+    }
+
+    [TestCase(16, 0x00001234L, false, 0x3434, TestName = "XTN半字到字节并清理高半区")]
+    [TestCase(16, 0x00001234L, true, 0x3434, TestName = "XTN2半字到字节并保留低半区")]
+    [TestCase(32, 0xABCD1234L, false, 0x1234, TestName = "XTN字到半字并清理高半区")]
+    [TestCase(32, 0xABCD1234L, true, 0x1234, TestName = "XTN2字到半字并保留低半区")]
+    [TestCase(64, unchecked((long)0xFEDCBA9876543210UL), false, 0x3210, TestName = "XTN双字到字并清理高半区")]
+    [TestCase(64, unchecked((long)0xFEDCBA9876543210UL), true, 0x3210, TestName = "XTN2双字到字并保留低半区")]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void XTN按元素低半宽截取并执行半区写入(
+        int sourceElementWidth,
+        long sourceBits,
+        bool upper,
+        int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var sourceInput = new LocalVariable("source", new Register(null, "X0"), app.SystemTypes.SystemInt64Type);
+        var destinationInput = new LocalVariable("destination", new Register(null, "X1"), app.SystemTypes.SystemInt64Type);
+        var sourceVector = new LocalVariable("sourceVector", new Register(null, "V0"));
+        var destinationVector = new LocalVariable("destinationVector", new Register(null, "V1"));
+        var resultVector = upper
+            ? destinationVector
+            : new LocalVariable("resultVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var sourceLaneCount = 128 / sourceElementWidth;
+        var destinationElementWidth = sourceElementWidth / 2;
+        var destinationLaneCount = sourceLaneCount * 2;
+        var instructions = new List<Instruction>();
+        var index = 0;
+        if (upper)
+        {
+            instructions.Add(new Instruction(index++, OpCode.VectorDuplicate, destinationVector, destinationInput,
+                new Immediate(destinationLaneCount), new Immediate(destinationElementWidth), new Immediate(-1)));
+        }
+
+        instructions.Add(new Instruction(index++, OpCode.VectorDuplicate, sourceVector, sourceInput,
+            new Immediate(sourceLaneCount), new Immediate(sourceElementWidth), new Immediate(-1)));
+        if (upper)
+        {
+            instructions.Add(new Instruction(index++, OpCode.VectorNarrowExtractUpper,
+                resultVector, resultVector, sourceVector,
+                new Immediate(sourceLaneCount), new Immediate(sourceElementWidth)));
+        }
+        else
+        {
+            instructions.Add(new Instruction(index++, OpCode.VectorNarrowExtract,
+                resultVector, sourceVector,
+                new Immediate(sourceLaneCount), new Immediate(sourceElementWidth)));
+        }
+
+        instructions.Add(new Instruction(index++, OpCode.VectorExtractUnsignedInt16, result,
+            resultVector, new Immediate(upper ? 4 : 0)));
+        instructions.Add(new Instruction(index, OpCode.Return, result));
+
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "VectorNarrowExtract",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt64Type, app.SystemTypes.SystemInt64Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        context.ParameterLocals = [sourceInput, destinationInput];
+        context.Locals = new[] { sourceVector, destinationVector, resultVector, result }.Distinct().ToList();
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt64Type, "Int64",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorNarrowExtract.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorNarrowExtractHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("VectorNarrowExtract",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int64, module.CorLibTypeFactory.Int64]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "source", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "destination", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorNarrowExtract", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorNarrowExtractHost", true)!
+            .GetMethod("VectorNarrowExtract")!;
+        var actual = (int)runtimeMethod.Invoke(null, [sourceBits, unchecked((long)0xA5A5A5A5A5A5A5A5UL)])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(0xFFFFFFFFFFFFFFFFUL, 1UL, 0xFFFF, false, TestName = "CMHI无符号最大值大于一")]
+    [TestCase(0x8000000000000000UL, 0x7FFFFFFFFFFFFFFFUL, 0xFFFF, false, TestName = "CMHI无符号高位值大于低位值")]
+    [TestCase(1UL, 1UL, 0, false, TestName = "CMHI相等值生成零掩码")]
+    [TestCase(0UL, 1UL, 0, false, TestName = "CMHI较小值生成零掩码")]
+    [TestCase(0xFFFFFFFFFFFFFFFFUL, 1UL, 0xFFFF, true, TestName = "CMHS无符号最大值大于一")]
+    [TestCase(0x8000000000000000UL, 0x7FFFFFFFFFFFFFFFUL, 0xFFFF, true, TestName = "CMHS无符号高位值大于低位值")]
+    [TestCase(1UL, 1UL, 0xFFFF, true, TestName = "CMHS相等值生成全掩码")]
+    [TestCase(0UL, 1UL, 0, true, TestName = "CMHS较小值生成零掩码")]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void CMHI按无符号逐通道比较并生成全元素掩码(
+        ulong leftBits,
+        ulong rightBits,
+        int expected,
+        bool higherOrSame)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var leftInput = new LocalVariable("left", new Register(null, "X0"), app.SystemTypes.SystemUInt64Type);
+        var rightInput = new LocalVariable("right", new Register(null, "X1"), app.SystemTypes.SystemUInt64Type);
+        var leftVector = new LocalVariable("leftVector", new Register(null, "V0"));
+        var rightVector = new LocalVariable("rightVector", new Register(null, "V1"));
+        var resultVector = new LocalVariable("resultVector", new Register(null, "V2"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            higherOrSame ? "VectorCompareUnsignedHigherOrSame" : "VectorCompareUnsignedHigher",
+            app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemUInt64Type, app.SystemTypes.SystemUInt64Type]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, leftVector, leftInput,
+                new Immediate(2), new Immediate(64), new Immediate(-1)),
+            new Instruction(1, OpCode.VectorDuplicate, rightVector, rightInput,
+                new Immediate(2), new Immediate(64), new Immediate(-1)),
+            new Instruction(2, higherOrSame
+                ? OpCode.VectorCompareUnsignedHigherOrSame
+                : OpCode.VectorCompareUnsignedHigher, resultVector,
+                leftVector, rightVector, new Immediate(2), new Immediate(64)),
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, resultVector,
+                new Immediate(0)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [leftInput, rightInput];
+        context.Locals = [leftVector, rightVector, resultVector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemUInt64Type, "UInt64",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var comparisonName = higherOrSame ? "VectorCompareUnsignedHigherOrSame" : "VectorCompareUnsignedHigher";
+        var module = new ModuleDefinition(comparisonName + ".dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", comparisonName + "Host",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition(comparisonName,
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.UInt64, module.CorLibTypeFactory.UInt64]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "left", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "right", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition(comparisonName, new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture." + comparisonName + "Host", true)!
+            .GetMethod(comparisonName)!;
+        var actual = (int)runtimeMethod.Invoke(null, [leftBits, rightBits])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void DUP六十四位载体按等宽布局写入静态与实例字段并执行(bool isStatic)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(
+            app.Assemblies[0],
+            "Fixture",
+            isStatic ? "VectorStaticFieldHost" : "VectorInstanceFieldHost",
+            app.SystemTypes.SystemObjectType,
+            ReflectionTypeAttributes.Public);
+        var attributes = System.Reflection.FieldAttributes.Public
+                         | (isStatic ? System.Reflection.FieldAttributes.Static : 0);
+        var field = owner.InjectFieldContext("Bits", app.SystemTypes.SystemInt64Type, attributes);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var input = new LocalVariable("value", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var fieldReference = new FieldReference(field, receiver, 0);
+        var context = owner.InjectMethodContext(
+            "WriteBits",
+            app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            owner,
+            app.SystemTypes.SystemInt32Type);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.Move, fieldReference, vector) { MemoryAccessWidthBits = 64 },
+            new Instruction(2, OpCode.Return),
+        ]);
+        context.ParameterLocals = [receiver, input];
+        context.Locals = [vector];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt64Type, "Int64",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var assemblyName = isStatic ? "VectorStaticField" : "VectorInstanceField";
+        var module = new ModuleDefinition(assemblyName + ".dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", owner.Name, TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        owner.PutExtraData("AsmResolverType", host);
+        var fieldAttributes = FieldAttributes.Public | (isStatic ? FieldAttributes.Static : 0);
+        var fieldDefinition = new FieldDefinition("Bits", fieldAttributes, module.CorLibTypeFactory.Int64);
+        host.Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var hostSignature = new TypeDefOrRefSignature(host, false);
+        var definition = new MethodDefinition("WriteBits", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [hostSignature, module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "receiver", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var expectedAddressOpCode = isStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda;
+        Assert.That(definition.CilMethodBody!.Instructions.Count(item => item.OpCode == expectedAddressOpCode), Is.EqualTo(1));
+        Assert.That(definition.CilMethodBody.Instructions.Count(item => item.OpCode == CilOpCodes.Stind_I8), Is.EqualTo(1));
+        var assembly = new AssemblyDefinition(assemblyName, new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeType = System.Reflection.Assembly.Load(stream.ToArray()).GetType("Fixture." + owner.Name, true)!;
+        var instance = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(runtimeType);
+        const int inputValue = unchecked((int)0x89ABCDEF);
+        runtimeType.GetMethod("WriteBits")!.Invoke(null, [instance, inputValue]);
+        var actual = (long)runtimeType.GetField("Bits")!.GetValue(isStatic ? null : instance)!;
+        Assert.That(unchecked((ulong)actual), Is.EqualTo(0x89ABCDEF89ABCDEFUL));
+    }
+
+    [TestCase(4, 32, 128, "System.Int64")]
+    [TestCase(2, 32, 32, "System.Int64")]
+    [TestCase(2, 32, 64, "System.String")]
+    [Category("异常输入")]
+    public void DUP字段桥接拒绝宽度或非托管布局证据不一致(
+        int laneCount,
+        int elementWidthBits,
+        int memoryWidthBits,
+        string fieldTypeName)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var fieldType = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName(fieldTypeName)!;
+        var owner = new InjectedTypeAnalysisContext(app.Assemblies[0], "Fixture", "RejectedVectorFieldHost",
+            app.SystemTypes.SystemObjectType, ReflectionTypeAttributes.Public);
+        var field = owner.InjectFieldContext("Value", fieldType,
+            System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var input = new LocalVariable("value", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var context = owner.InjectMethodContext("RejectedWrite", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, owner, app.SystemTypes.SystemInt32Type);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                new Immediate(laneCount), new Immediate(elementWidthBits), new Immediate(-1)),
+            new Instruction(1, OpCode.Move, new FieldReference(field, receiver, 0), vector)
+                { MemoryAccessWidthBits = memoryWidthBits },
+            new Instruction(2, OpCode.Return),
+        ]);
+        context.ParameterLocals = [receiver, input];
+        context.Locals = [vector];
+        context.AnalysisWarnings = [];
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("RejectedVectorField.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", owner.Name, TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        owner.PutExtraData("AsmResolverType", host);
+        // 异常夹具只验证布局门；字段签名仍使用真实核心库引用，避免伪造同名类型抢先失败。
+        var fieldSignature = fieldTypeName == "System.Int64"
+            ? module.CorLibTypeFactory.Int64
+            : module.CorLibTypeFactory.String;
+        var fieldDefinition = new FieldDefinition("Value", FieldAttributes.Public | FieldAttributes.Static,
+            fieldSignature);
+        host.Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var definition = new MethodDefinition("RejectedWrite", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void,
+                [new TypeDefOrRefSignature(host, false), module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "receiver", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        var error = Assert.Throws<UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("VECTOR_FIELD_STORE"));
+    }
+
+    [TestCase(false, false, 0x3FC0, false)]
+    [TestCase(true, false, 0x3FC0, false)]
+    [TestCase(false, true, 0x401E, false)]
+    [TestCase(true, true, 0x401E, false)]
+    [TestCase(false, false, 0x3FC0, true)]
+    [TestCase(true, false, 0x3FC0, true)]
+    [TestCase(false, true, 0x401E, true)]
+    [TestCase(true, true, 0x401E, true)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void DUP连续字段跨度按元数据布局写入读取并执行(bool isStatic, bool wide, int expected, bool nativeLiteral)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.Assemblies[0], "Fixture",
+            $"VectorSpan{(isStatic ? "Static" : "Instance")}{(wide ? "Double" : "Single")}",
+            app.SystemTypes.SystemObjectType, ReflectionTypeAttributes.Public);
+        var analysisAttributes = System.Reflection.FieldAttributes.Public
+                                 | (isStatic ? System.Reflection.FieldAttributes.Static : 0);
+        var fieldType = wide ? app.SystemTypes.SystemDoubleType : app.SystemTypes.SystemSingleType;
+        var first = owner.InjectFieldContext("First", fieldType, analysisAttributes);
+        var second = owner.InjectFieldContext("Second", fieldType, analysisAttributes);
+        var startOffset = isStatic ? 0 : 16;
+        var fieldBytes = wide ? 8 : 4;
+        first.Offset = startOffset;
+        second.Offset = startOffset + fieldBytes;
+
+        var inputType = wide ? app.SystemTypes.SystemInt64Type : app.SystemTypes.SystemInt32Type;
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var input = new LocalVariable("value", new Register(null, wide ? "X1" : "W1"), inputType);
+        var vector = new LocalVariable("vector", new Register(null, nativeLiteral ? "RAW_BITS" : "V0"));
+        var loaded = new LocalVariable("loaded", new Register(null, "V1"));
+        var result = new LocalVariable("result", new Register(null, "W2"), app.SystemTypes.SystemInt32Type);
+        var reference = new FieldReference(first, receiver, startOffset);
+        var laneCount = 2;
+        var elementWidth = wide ? 64 : 32;
+        var context = owner.InjectMethodContext("RoundTrip", app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, owner, inputType);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            nativeLiteral
+                ? new Instruction(0, OpCode.Move, vector, new NativeBitPatternLiteral(
+                    wide ? 0x401E000000000000UL : 0x3FC000013FC00000UL,
+                    wide ? 0x401E000000000001UL : 0, laneCount * elementWidth))
+                    { MemoryAccessWidthBits = laneCount * elementWidth }
+                : new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                    new Immediate(laneCount), new Immediate(elementWidth), new Immediate(-1)),
+            new Instruction(1, OpCode.Move, reference, vector) { MemoryAccessWidthBits = laneCount * elementWidth },
+            new Instruction(2, OpCode.Move, loaded, reference) { MemoryAccessWidthBits = laneCount * elementWidth },
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, loaded,
+                new Immediate(wide ? 7 : 3)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [receiver, input];
+        context.Locals = [vector, loaded, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        if (wide)
+            绑定AsmResolver系统类型(coreModule, inputType, "Int64",
+                TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, fieldType, wide ? "Double" : "Single",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var assemblyName = owner.Name;
+        var module = new ModuleDefinition(assemblyName + ".dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", owner.Name, TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        owner.PutExtraData("AsmResolverType", host);
+        var managedAttributes = FieldAttributes.Public | (isStatic ? FieldAttributes.Static : 0);
+        var managedFieldType = wide ? module.CorLibTypeFactory.Double : module.CorLibTypeFactory.Single;
+        var firstDefinition = new FieldDefinition("First", managedAttributes, managedFieldType);
+        var secondDefinition = new FieldDefinition("Second", managedAttributes, managedFieldType);
+        host.Fields.Add(firstDefinition);
+        host.Fields.Add(secondDefinition);
+        first.PutExtraData("AsmResolverField", firstDefinition);
+        second.PutExtraData("AsmResolverField", secondDefinition);
+        var inputSignature = wide ? module.CorLibTypeFactory.Int64 : module.CorLibTypeFactory.Int32;
+        var definition = new MethodDefinition("RoundTrip", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [new TypeDefOrRefSignature(host, false), inputSignature]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "receiver", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        Assert.That(definition.CilMethodBody!.Instructions.Count(item => item.OpCode == CilOpCodes.Stfld
+                                                                          || item.OpCode == CilOpCodes.Stsfld),
+            Is.EqualTo(2));
+        Assert.That(definition.CilMethodBody.Instructions.Count(item => item.OpCode == CilOpCodes.Ldfld
+                                                                 || item.OpCode == CilOpCodes.Ldsfld),
+            Is.EqualTo(2));
+        var assembly = new AssemblyDefinition(assemblyName, new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeType = System.Reflection.Assembly.Load(stream.ToArray()).GetType("Fixture." + owner.Name, true)!;
+        var instance = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(runtimeType);
+        // 条件表达式会把Int32分支先提升为Int64；分别装箱以保持实际签名。
+        object argument = wide
+            ? (object)unchecked((long)0x401E000000000000UL)
+            : unchecked((int)0x3FC00000);
+        var actual = (int)runtimeType.GetMethod("RoundTrip")!.Invoke(null, [instance, argument])!;
+        Assert.That(actual, Is.EqualTo(expected));
+        foreach (var name in new[] { "First", "Second" })
+        {
+            var value = runtimeType.GetField(name)!.GetValue(isStatic ? null : instance)!;
+            var bits = wide
+                ? unchecked((ulong)BitConverter.DoubleToInt64Bits((double)value))
+                : unchecked((uint)BitConverter.SingleToInt32Bits((float)value));
+            // 第二通道故意不同，实际 PE 执行必须保留读取的全部位，而不是重复首通道。
+            var expectedBits = (wide ? 0x401E000000000000UL : 0x3FC00000UL)
+                               + (nativeLiteral && name == "Second" ? 1UL : 0UL);
+            Assert.That(bits, Is.EqualTo(expectedBits));
+        }
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void DUP连续字段中间字段跨六十四位边界仍保持全部位模式()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.Assemblies[0], "Fixture", "VectorCrossWordSpan",
+            app.SystemTypes.SystemObjectType, ReflectionTypeAttributes.Public);
+        var attributes = System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static;
+        var first = owner.InjectFieldContext("First", app.SystemTypes.SystemInt32Type, attributes);
+        var middle = owner.InjectFieldContext("Middle", app.SystemTypes.SystemInt64Type, attributes);
+        var last = owner.InjectFieldContext("Last", app.SystemTypes.SystemInt32Type, attributes);
+        first.Offset = 0;
+        middle.Offset = 4;
+        last.Offset = 12;
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var input = new LocalVariable("value", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var vector = new LocalVariable("vector", new Register(null, "V0"));
+        var loaded = new LocalVariable("loaded", new Register(null, "V1"));
+        var result = new LocalVariable("result", new Register(null, "W1"), app.SystemTypes.SystemInt32Type);
+        var reference = new FieldReference(first, receiver, 0);
+        var context = owner.InjectMethodContext("RoundTrip", app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, app.SystemTypes.SystemInt32Type);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, vector, input,
+                new Immediate(4), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.Move, reference, vector) { MemoryAccessWidthBits = 128 },
+            new Instruction(2, OpCode.Move, loaded, reference) { MemoryAccessWidthBits = 128 },
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, loaded, new Immediate(7)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [input];
+        context.Locals = [vector, loaded, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt64Type, "Int64",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorCrossWordSpan.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", owner.Name, TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        owner.PutExtraData("AsmResolverType", host);
+        foreach (var pair in new[]
+                 {
+                     (Context: first, Definition: new FieldDefinition("First", FieldAttributes.Public | FieldAttributes.Static,
+                         module.CorLibTypeFactory.Int32)),
+                     (Context: middle, Definition: new FieldDefinition("Middle", FieldAttributes.Public | FieldAttributes.Static,
+                         module.CorLibTypeFactory.Int64)),
+                     (Context: last, Definition: new FieldDefinition("Last", FieldAttributes.Public | FieldAttributes.Static,
+                         module.CorLibTypeFactory.Int32)),
+                 })
+        {
+            host.Fields.Add(pair.Definition);
+            pair.Context.PutExtraData("AsmResolverField", pair.Definition);
+        }
+        var definition = new MethodDefinition("RoundTrip", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32, [module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "value", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var assembly = new AssemblyDefinition("VectorCrossWordSpan", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var runtimeType = System.Reflection.Assembly.Load(stream.ToArray()).GetType("Fixture." + owner.Name, true)!;
+        var actual = (int)runtimeType.GetMethod("RoundTrip")!.Invoke(null, [unchecked((int)0x11223344)])!;
+        Assert.That(actual, Is.EqualTo(0x1122));
+        Assert.That(unchecked((ulong)(long)runtimeType.GetField("Middle")!.GetValue(null)!),
+            Is.EqualTo(0x1122334411223344UL));
+    }
+
+    [TestCase("gap", "间隙")]
+    [TestCase("overlap", "重叠")]
+    [TestCase("managed", "托管引用字段重叠")]
+    [TestCase("partial", "一部分")]
+    [Category("异常输入")]
+    public void DUP连续字段跨度拒绝间隙重叠托管引用和部分字段(string kind, string expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.Assemblies[0], "Fixture", "RejectedVectorSpan",
+            app.SystemTypes.SystemObjectType, ReflectionTypeAttributes.Public);
+        var attributes = System.Reflection.FieldAttributes.Public;
+        var firstType = kind == "partial" ? app.SystemTypes.SystemInt64Type : app.SystemTypes.SystemSingleType;
+        var first = owner.InjectFieldContext("First", firstType, attributes);
+        var secondType = kind == "managed" ? app.SystemTypes.SystemStringType : app.SystemTypes.SystemSingleType;
+        var second = owner.InjectFieldContext("Second", secondType, attributes);
+        first.Offset = 16;
+        second.Offset = kind switch
+        {
+            "gap" => 24,
+            "overlap" => 18,
+            _ => 20,
+        };
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var width = kind == "partial" ? 4 : 8;
+        var accepted = ManagedFieldSpanRecoveryHelper.TryDescribe(
+            new FieldReference(first, receiver, 16), app.Binary.PointerSizeBytes, width,
+            out _, out var failure);
+        Assert.That(accepted, Is.False);
+        Assert.That(failure, Does.Contain(expected));
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void DUP共享SIMD槽的标量除法与后继向量定义保持双视图并执行()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var left = new LocalVariable("left", new Register(null, "V1"), app.SystemTypes.SystemSingleType);
+        var right = new LocalVariable("right", new Register(null, "V2"), app.SystemTypes.SystemSingleType);
+        var scalar = new LocalVariable("scalar", new Register(null, "V0", 7), app.SystemTypes.SystemSingleType);
+        var vector = new LocalVariable("vector", new Register(null, "V3"));
+        var result = new LocalVariable("result", new Register(null, "W0"), app.SystemTypes.SystemInt32Type);
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "ScalarThenVector",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemSingleType, app.SystemTypes.SystemSingleType]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Divide, scalar, left, right),
+            new Instruction(1, OpCode.VectorDuplicate, vector, scalar,
+                new Immediate(4), new Immediate(32), new Immediate(0)),
+            // 同一SSA身份在后继控制流重新作为向量目标，复现原始图中的标量/向量双重身份。
+            new Instruction(2, OpCode.VectorDuplicate, scalar, scalar,
+                new Immediate(4), new Immediate(32), new Immediate(0)),
+            new Instruction(3, OpCode.VectorExtractUnsignedInt16, result, vector, new Immediate(5)),
+            new Instruction(4, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [left, right];
+        context.Locals = [scalar, vector, result];
+        context.AnalysisWarnings = [];
+
+        var coreModule = new ModuleDefinition("mscorlib.dll");
+        var coreAssembly = new AssemblyDefinition("mscorlib", new Version(4, 0, 0, 0));
+        coreAssembly.Modules.Add(coreModule);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemSingleType, "Single",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        绑定AsmResolver系统类型(coreModule, app.SystemTypes.SystemInt32Type, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed);
+        var module = new ModuleDefinition("VectorScalarIdentity.dll", new AssemblyReference(coreAssembly));
+        var host = new TypeDefinition("Fixture", "VectorScalarIdentityHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("ScalarThenVector", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Single, module.CorLibTypeFactory.Single]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "left", (ParameterAttributes)0));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(2, "right", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        Assert.That(definition.CilMethodBody!.Instructions.Count(item => item.OpCode == CilOpCodes.Div), Is.EqualTo(1));
+        var assembly = new AssemblyDefinition("VectorScalarIdentity", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var actual = (int)System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.VectorScalarIdentityHost", true)!
+            .GetMethod("ScalarThenVector")!.Invoke(null, [6f, 2f])!;
+        Assert.That(actual, Is.EqualTo(0x4040));
+    }
+
+    [TestCase(2, 1, 3)]
+    [TestCase(0, -1, -1)]
+    [TestCase(0, int.MinValue, int.MinValue)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void V寄存器标量整型加法按FloatLiteral原始位模式生成并执行(
+        int seed,
+        int rawBits,
+        int expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var integerType = app.SystemTypes.SystemInt32Type;
+        var marker = new LocalVariable("marker", new Register(null, "V1"), integerType);
+        var result = new LocalVariable("result", new Register(null, "V0"), integerType);
+        var context = new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType,
+            "ScalarIntegerWithVectorView",
+            integerType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [integerType]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, marker, marker,
+                new Immediate(2), new Immediate(32), new Immediate(-1)),
+            new Instruction(1, OpCode.Add, result, marker,
+                new FloatLiteral(BitConverter.Int32BitsToSingle(rawBits))),
+            new Instruction(2, OpCode.Return, result),
+        ]);
+        context.ParameterLocals = [marker];
+        context.Locals = [marker, result];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition(
+            "ScalarIntegerVectorView.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemObjectType,
+            "Object", TypeAttributes.Class | TypeAttributes.Public);
+        绑定AsmResolver系统类型(module, integerType, "Int32",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        var host = new TypeDefinition("Fixture", "ScalarIntegerVectorViewHost",
+            TypeAttributes.Class | TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition(
+            "ScalarIntegerWithVectorView",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Int32]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "marker", (ParameterAttributes)0));
+        host.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+        CilStackValidator.Validate(definition.CilMethodBody!, context.FullName);
+        var rawConstant = definition.CilMethodBody!.Instructions.Single(instruction =>
+            instruction.OpCode == CilOpCodes.Ldc_I4
+            && instruction.Operand is int value
+            && value == rawBits);
+        Assert.That(rawConstant, Is.Not.Null);
+
+        using var stream = new System.IO.MemoryStream();
+        var assembly = new AssemblyDefinition("ScalarIntegerVectorView", new Version(1, 0, 0, 0));
+        assembly.Modules.Add(module);
+        module.Write(stream);
+        var runtimeMethod = System.Reflection.Assembly.Load(stream.ToArray())
+            .GetType("Fixture.ScalarIntegerVectorViewHost", true)!
+            .GetMethod("ScalarIntegerWithVectorView")!;
+        var actual = (int)runtimeMethod.Invoke(null, [seed])!;
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void V寄存器整型旁路拒绝混合标量来源()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var integerType = app.SystemTypes.SystemInt32Type;
+        var otherType = app.SystemTypes.SystemInt64Type;
+        var marker = new LocalVariable("marker", new Register(null, "V1"), integerType);
+        var other = new LocalVariable("other", new Register(null, "V2"), otherType);
+        var result = new LocalVariable("result", new Register(null, "V0"), integerType);
+        var instruction = new Instruction(2, OpCode.Add, result, marker, other);
+
+        Assert.That(IlGenerator.IsProvenScalarIntegerBinary(instruction), Is.False);
+    }
+
+    [TestCase(-1, 2, 32, false)]
+    [TestCase(4, 4, 32, false)]
+    [TestCase(0, 3, 32, false)]
+    [TestCase(0, 2, 64, false)]
+    [TestCase(0, 2, 32, true)]
+    [Category("异常输入")]
+    public void VectorByElement拒绝错误布局和缺失来源身份(int lane, int count, int width, bool immediateSource)
+    {
+        var destination = new LocalVariable("target", new Register(null, "V0"));
+        var left = new LocalVariable("left", new Register(null, "V1"));
+        IOperand right = immediateSource ? new Immediate(1) : new LocalVariable("right", new Register(null, "V2"));
+        var instruction = new Instruction(0, OpCode.VectorMultiplyByElement, destination, left, right,
+            new Immediate(lane), new Immediate(count), new Immediate(width));
+        Assert.That(VectorCilRecoveryHelper.TryDescribeFloatingBinary(instruction, out _, out var failure), Is.False);
+        Assert.That(failure, Is.Not.Empty);
+    }
+
+    [TestCase(3, 32, -1, "目标总位宽")]
+    [TestCase(2, 24, -1, "通道布局无效")]
+    [TestCase(2, 64, 2, "来源通道超出")]
+    [Category("异常输入")]
+    public void DUP位载体拒绝不完整或越界布局(int laneCount, int elementWidthBits, int sourceLane, string expectedFailure)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var destination = new LocalVariable("vector", new Register(null, "V0"));
+        IOperand source = sourceLane < 0
+            ? new Immediate(1)
+            : new LocalVariable("source", new Register(null, "V1"), app.SystemTypes.SystemInt64Type);
+        var instruction = new Instruction(0, OpCode.VectorDuplicate, destination, source,
+            new Immediate(laneCount), new Immediate(elementWidthBits), new Immediate(sourceLane));
+        var accepted = VectorCilRecoveryHelper.TryDescribe(instruction, out _, out var failure);
+        Assert.That(accepted, Is.False);
+        Assert.That(failure, Does.Contain(expectedFailure));
+    }
+
+    [Test]
+    [Category("异常输入")]
+    public void DUP向量通道缺少SSA位模式时保持显式未解决()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable("source", new Register(null, "V1"));
+        var destination = new LocalVariable("destination", new Register(null, "V0"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "MissingLaneSource",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.VectorDuplicate, destination, source,
+                new Immediate(4), new Immediate(32), new Immediate(1)),
+            new Instruction(1, OpCode.Return),
+        ]);
+        context.ParameterLocals = [];
+        context.Locals = [source, destination];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("MissingVectorLane.dll",
+            new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        绑定AsmResolver系统类型(module, app.SystemTypes.SystemObjectType, "Object", TypeAttributes.Public);
+        var host = new TypeDefinition("Fixture", "MissingVectorLaneHost",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(host);
+        var definition = new MethodDefinition("MissingLaneSource", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        host.Methods.Add(definition);
+        var error = Assert.Throws<UnresolvedCilSemanticException>(() => IlGenerator.GenerateIl(context, definition));
+        Assert.That(error!.Message, Does.Contain("VECTOR_LANE_SOURCE_STATE"));
+    }
 
     [TestCase("managed_reference")]
     [TestCase("native_pointer")]

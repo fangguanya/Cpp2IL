@@ -5,7 +5,7 @@ using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
-//Resolves field offsets on generic instances, which are all 0 in the metadata.
+// 从原始布局证据恢复泛型实例字段位置；泛型声明偏移本身不代表具体实例。
 public static class GenericInstanceFieldLayout
 {
     internal readonly record struct ConcreteFieldLayout(
@@ -18,6 +18,9 @@ public static class GenericInstanceFieldLayout
     private sealed class LayoutTraversal
     {
         internal readonly HashSet<GenericInstanceTypeAnalysisContext> Active = [];
+        internal readonly HashSet<TypeAnalysisContext> OriginalActive = [];
+        internal readonly HashSet<TypeAnalysisContext> ReferenceActive = [];
+        internal readonly Dictionary<TypeAnalysisContext, (long Size, long Alignment)?> OriginalCompleted = [];
         internal readonly Dictionary<GenericInstanceTypeAnalysisContext, IReadOnlyList<ConcreteFieldLayout>?> Completed = [];
     }
 
@@ -62,7 +65,7 @@ public static class GenericInstanceFieldLayout
         if (traversal.Active.Count >= 64 || !traversal.Active.Add(key)) return null;
         try
         {
-            if (GetDeclaredFieldStart(type, pointerSize) is not { } offset)
+            if (GetDeclaredFieldStart(type, pointerSize, traversal) is not { } offset)
                 return null;
 
             // 显式布局及指定类尺寸需额外原始尺寸证据，不能套用顺序字段算法。
@@ -98,7 +101,7 @@ public static class GenericInstanceFieldLayout
     /// 使用继承链中已经落定的字段偏移计算当前类型首个声明字段的位置。
     /// 非泛型基类的字段偏移来自元数据；泛型基类则递归按其实例参数计算，避免把基类实例字段覆盖掉。
     /// </summary>
-    private static long? GetDeclaredFieldStart(GenericInstanceTypeAnalysisContext type, int pointerSize)
+    private static long? GetDeclaredFieldStart(GenericInstanceTypeAnalysisContext type, int pointerSize, LayoutTraversal traversal)
     {
         if (type.IsValueType)
             return 0;
@@ -107,48 +110,38 @@ public static class GenericInstanceFieldLayout
             return 2L * pointerSize;
 
         var baseType = GenericInstantiation.Instantiate(openBaseType, type.GenericArguments, []);
-        return GetReferenceTypeEnd(baseType, pointerSize);
+        return GetReferenceTypeEnd(baseType, pointerSize, traversal);
     }
 
-    private static long? GetReferenceTypeEnd(TypeAnalysisContext type, int pointerSize)
+    private static long? GetReferenceTypeEnd(TypeAnalysisContext type, int pointerSize, LayoutTraversal traversal)
     {
         if (type is GenericInstanceTypeAnalysisContext genericInstance)
-            return GetGenericInstanceEnd(genericInstance, pointerSize);
-
-        var inheritedEnd = type.BaseType is { } baseType
-            ? GetReferenceTypeEnd(baseType, pointerSize)
-            : 2L * pointerSize;
-        if (inheritedEnd is null)
-            return null;
-
-        var end = inheritedEnd.Value;
-        foreach (var field in type.Fields.Where(field => !field.IsStatic))
         {
-            if (field.Offset < 0 || GetSizeAndAlignment(field.FieldType, pointerSize) is not var (size, _))
-                return null;
-
-            end = System.Math.Max(end, field.Offset + size);
+            // 基类末尾复用唯一具体布局，保持打包规则一致，不再次计算全部字段。
+            var layout = GetConcreteFieldLayout(genericInstance, pointerSize, traversal);
+            if (layout is null) return null;
+            return layout.Count == 0
+                ? GetDeclaredFieldStart(genericInstance, pointerSize, traversal)
+                : layout.Max(field => checked(field.Offset + field.Size));
         }
 
-        return end;
-    }
-
-    private static long? GetGenericInstanceEnd(GenericInstanceTypeAnalysisContext type, int pointerSize)
-    {
-        if (GetDeclaredFieldStart(type, pointerSize) is not { } offset)
-            return null;
-
-        foreach (var field in type.GenericType.Fields.Where(field => !field.IsStatic))
+        if (traversal.ReferenceActive.Count >= 64 || !traversal.ReferenceActive.Add(type)) return null;
+        try
         {
-            var concreteFieldType = GenericInstantiation.Instantiate(field.FieldType, type.GenericArguments, []);
-            if (GetSizeAndAlignment(concreteFieldType, pointerSize) is not var (size, alignment))
-                return null;
-
-            offset = (offset + alignment - 1) & ~(alignment - 1);
-            offset += size;
+            var inheritedEnd = type.BaseType is { } baseType
+                ? GetReferenceTypeEnd(baseType, pointerSize, traversal)
+                : 2L * pointerSize;
+            if (inheritedEnd is null) return null;
+            var end = inheritedEnd.Value;
+            foreach (var field in type.Fields.Where(field => !field.IsStatic))
+            {
+                if (field.Offset < 0 || GetSizeAndAlignment(field.FieldType, pointerSize, traversal) is not var (size, _))
+                    return null;
+                end = System.Math.Max(end, checked(field.Offset + size));
+            }
+            return end;
         }
-
-        return offset;
+        finally { traversal.ReferenceActive.Remove(type); }
     }
 
     /// <summary>
@@ -186,14 +179,52 @@ public static class GenericInstanceFieldLayout
             return (checked(end + alignment - 1) & ~(alignment - 1), alignment);
         }
 
-        return fieldType.FullName switch
-        {
-            "System.Boolean" or "System.Byte" or "System.SByte" => (1, 1),
-            "System.Int16" or "System.UInt16" or "System.Char" => (2, 2),
-            "System.Int32" or "System.UInt32" or "System.Single" => (4, 4),
-            "System.Int64" or "System.UInt64" or "System.Double" => (8, 8),
-            "System.IntPtr" or "System.UIntPtr" => (pointerSize, pointerSize),
-            _ => null // an arbitrary struct needs its own layout computed, bail rather than guess
-        };
+        // 与字段跨度共享核心声明身份和尺寸表；同名非核心值类型不能取得基元 ABI 布局。
+        if (ManagedFieldSpanRecoveryHelper.TryGetScalarLayout(fieldType, pointerSize, false, out var size, out _))
+            return (size, size);
+        return GetOriginalValueLayout(fieldType, pointerSize, traversal);
     }
+
+    private static (long Size, long Alignment)? GetOriginalValueLayout(
+        TypeAnalysisContext type, int pointerSize, LayoutTraversal traversal)
+    {
+        if (traversal.OriginalCompleted.TryGetValue(type, out var cached)) return cached;
+        if (traversal.OriginalActive.Count + traversal.Active.Count >= 64
+            || !traversal.OriginalActive.Add(type)) return null;
+        try
+        {
+            var definition = type.Definition;
+            // 原始尺寸属于实际输入架构；指定尺寸、显式或自动布局均需另行证明。
+            if (pointerSize != type.AppContext.Binary.PointerSizeBytes || definition is null
+                || type.GenericParameters.Count != 0 || !definition.ClassSizeIsDefault
+                || (type.Attributes & System.Reflection.TypeAttributes.LayoutMask)
+                    != System.Reflection.TypeAttributes.SequentialLayout) return null;
+            var originalSize = TypeSizes.UnboxedSize(type, pointerSize);
+            if (originalSize <= 0) return null;
+            var packing = definition.PackingSize;
+            if (packing < 0 || (packing != 0 && (packing & (packing - 1)) != 0)) return null;
+            long end = 0, maximumAlignment = 1;
+            var count = 0;
+            foreach (var field in type.Fields.Where(field => !field.IsStatic))
+            {
+                // 字段偏移已经去除装箱头；不再次减头，也不接受注入字段伪造原始证明。
+                if (field.BackingData is null || field.Offset != field.DefaultOffset
+                    || GetSizeAndAlignment(field.FieldType, pointerSize, traversal) is not var (size, alignment)) return null;
+                if (packing != 0) alignment = System.Math.Min(alignment, packing);
+                var offset = checked(end + alignment - 1) & ~(alignment - 1);
+                if (offset != field.Offset || size <= 0) return null;
+                end = checked(offset + size);
+                if (end > originalSize) return null;
+                maximumAlignment = System.Math.Max(maximumAlignment, alignment);
+                count++;
+            }
+            var paddedEnd = checked(end + maximumAlignment - 1) & ~(maximumAlignment - 1);
+            if (count == 0 || paddedEnd != originalSize) return null;
+            var result = (originalSize, maximumAlignment);
+            traversal.OriginalCompleted[type] = result;
+            return result;
+        }
+        finally { traversal.OriginalActive.Remove(type); }
+    }
+
 }

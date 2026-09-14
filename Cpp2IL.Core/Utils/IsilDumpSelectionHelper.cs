@@ -4,6 +4,9 @@ using System.Linq;
 
 namespace Cpp2IL.Core.Utils;
 
+/// <summary>诊断选择的原始身份；地址仅作来源校验，不替代程序集与token。</summary>
+public readonly record struct OriginalRecoveryMethodIdentity(string Assembly, uint Token, ulong NativeAddress);
+
 public static class IsilDumpSelectionHelper
 {
     /// <summary>
@@ -82,23 +85,40 @@ public static class IsilDumpSelectionHelper
             throw new ArgumentNullException(nameof(candidates));
         if (identitySelector == null)
             throw new ArgumentNullException(nameof(identitySelector));
-        var candidateList = candidates.ToList();
         var normalizedFilters = NormalizeFilters(filters, label);
-        if (normalizedFilters.Count == 0)
-            return candidateList;
+        return SelectExactIdentity(candidates, normalizedFilters, identitySelector, label);
+    }
 
-        var candidatesByIdentity = candidateList
-            .GroupBy(identitySelector, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.Ordinal);
-        foreach (var filter in normalizedFilters)
+    /// <summary>名称与结构化身份复用同一唯一匹配算法；保持原始顺序，拒绝歧义及重复请求。</summary>
+    public static IReadOnlyList<T> SelectExactIdentity<T, TIdentity>(
+        IEnumerable<T> candidates,
+        IReadOnlyList<TIdentity> filters,
+        Func<T, TIdentity> identitySelector,
+        string label) where TIdentity : notnull
+    {
+        if (candidates == null) throw new ArgumentNullException(nameof(candidates));
+        if (filters == null) throw new ArgumentNullException(nameof(filters));
+        if (identitySelector == null) throw new ArgumentNullException(nameof(identitySelector));
+        if (string.IsNullOrWhiteSpace(label)) throw new ArgumentException("筛选标签不得为空。", nameof(label));
+        var accepted = new HashSet<TIdentity>();
+        foreach (var filter in filters)
+            if (filter is null || !accepted.Add(filter))
+                throw new ArgumentException($"{label}身份筛选重复：{filter}", nameof(filters));
+        if (filters.Count == 0)
+            return candidates.ToArray();
+        // 每个候选身份只计算一次，索引与结果都消费这份投影。
+        var projected = candidates.Select(candidate => (Value: candidate, Identity: identitySelector(candidate))).ToArray();
+
+        var candidatesByIdentity = projected.GroupBy(item => item.Identity)
+            .ToDictionary(group => group.Key, group => group.Count());
+        foreach (var filter in filters)
         {
             if (!candidatesByIdentity.TryGetValue(filter, out var matches))
                 throw new InvalidOperationException($"{label} filter '{filter}' did not match any candidate.");
-            if (matches.Count != 1)
-                throw new InvalidOperationException($"{label} filter '{filter}' matched {matches.Count} candidates.");
+            if (matches != 1)
+                throw new InvalidOperationException($"{label} filter '{filter}' matched {matches} candidates.");
         }
 
-        var accepted = new HashSet<string>(normalizedFilters, StringComparer.Ordinal);
-        return candidateList.Where(candidate => accepted.Contains(identitySelector(candidate))).ToList();
+        return projected.Where(item => accepted.Contains(item.Identity)).Select(item => item.Value).ToArray();
     }
 }

@@ -9,6 +9,36 @@ namespace Cpp2IL.Core.Tests;
 
 public class PropertyBackingFieldRecoveryTests
 {
+    [TestCase(false, 0, 1)]
+    [TestCase(true, 0, 1)]
+    [TestCase(false, 32, 1)]
+    [TestCase(true, 32, 1)]
+    [TestCase(false, 16, 0)]
+    [TestCase(true, 16, 0)]
+    [TestCase(false, 64, 0)]
+    [TestCase(true, 64, 0)]
+    [TestCase(false, 128, 0)]
+    [TestCase(true, 128, 0)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 属性访问器只转换完整单字段而非部分或相邻跨度(bool write, int width, int expected)
+    {
+        var fixture = CreateFixture("<Value>k__BackingField", write);
+        var field = fixture.Access.Operands.OfType<FieldReference>().Single().Field;
+        field.Offset = 16;
+        var next = ((InjectedTypeAnalysisContext)field.DeclaringType).InjectFieldContext("Adjacent", field.FieldType, FieldAttributes.Private);
+        next.Offset = 20;
+        fixture.Access.MemoryAccessWidthBits = width;
+        Assert.That(PropertyBackingFieldRecovery.Run(fixture.Caller), Is.EqualTo(expected));
+        Assert.That(fixture.Access.MemoryAccessWidthBits, Is.EqualTo(width));
+        if (expected == 0)
+        {
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(fixture.Caller.ControlFlowGraph!.Instructions, Has.Count.EqualTo(2), "嵌入getter路径也不得吞掉宽读取。");
+        }
+    }
+
     [SetUp]
     public void Setup()
     {
@@ -234,6 +264,74 @@ public class PropertyBackingFieldRecoveryTests
 
     [Test]
     [Category("基本功能")]
+    [Category("边界值")]
+    public void 属性元数据缺失时按精确公开Getter方法恢复()
+    {
+        var fixture = CreateFixture("<Value>k__BackingField", write: false);
+        ((InjectedTypeAnalysisContext)fixture.Receiver.Type!).Properties.Clear();
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Access.Operands[0], Is.SameAs(fixture.Getter));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 带前缀字段按原始小驼峰属性恢复公开Getter()
+    {
+        var fixture = CreateFixture("m_value", write: false, propertyName: "value");
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Access.Operands[0], Is.SameAs(fixture.Getter));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    [Category("边界值")]
+    public void 带大写成员前缀字段按小驼峰属性恢复公开Getter()
+    {
+        var fixture = CreateFixture("m_Value", write: false, propertyName: "value");
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Access.Operands[0], Is.SameAs(fixture.Getter));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
+    public void Vector后缀字段按去后缀属性恢复公开Getter()
+    {
+        var fixture = CreateFixture("forwardVector", write: false, propertyName: "forward");
+
+        var recovered = PropertyBackingFieldRecovery.Run(fixture.Caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(fixture.Access.Operands[0], Is.SameAs(fixture.Getter));
+        });
+    }
+
+    [Test]
+    [Category("基本功能")]
     public void 字段到字段赋值同时恢复Getter与Setter()
     {
         var writeFixture = CreateFixture("<TargetValue>k__BackingField", write: true, propertyName: "TargetValue");
@@ -313,6 +411,49 @@ public class PropertyBackingFieldRecoveryTests
             Assert.That(recovered, Is.Zero);
             Assert.That(fixture.Access.OpCode, Is.EqualTo(OpCode.Move));
         });
+    }
+
+    [TestCase("同一声明", false, true)]
+    [TestCase("同一声明", true, true)]
+    [TestCase("嵌套到外层", false, true)]
+    [TestCase("嵌套到外层", true, true)]
+    [TestCase("深层到外层", false, true)]
+    [TestCase("深层到外层", true, true)]
+    [TestCase("外层到嵌套", false, false)]
+    [TestCase("外层到嵌套", true, false)]
+    [TestCase("兄弟互访", false, false)]
+    [TestCase("兄弟互访", true, false)]
+    [TestCase("不同声明", false, false)]
+    [TestCase("不同声明", true, false)]
+    [TestCase("声明循环", false, false)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 私有访问按照调用者嵌套方向和原始声明身份判定(string relation, bool generic, bool expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        InjectedTypeAnalysisContext Type(string name) => new(app.Assemblies[0], "AccessFixture", name,
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var root = Type("Root");
+        var child = Type("Child"); child.DeclaringType = root;
+        var sibling = Type("Sibling"); sibling.DeclaringType = root;
+        var deep = Type("Deep"); deep.DeclaringType = child;
+        var other = Type("Root");
+        TypeAnalysisContext caller = relation switch
+        {
+            "嵌套到外层" => child, "深层到外层" => deep, "兄弟互访" => sibling,
+            "不同声明" or "声明循环" => other, _ => root
+        };
+        TypeAnalysisContext owner = relation is "外层到嵌套" or "兄弟互访" ? child : root;
+        if (relation == "声明循环") other.DeclaringType = other;
+        var field = ((InjectedTypeAnalysisContext)owner).InjectFieldContext("value", app.SystemTypes.SystemInt32Type, FieldAttributes.Private);
+        FieldAnalysisContext accessed = field;
+        if (generic)
+        {
+            caller = caller.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]);
+            accessed = new ConcreteGenericFieldAnalysisContext(field, owner.MakeGenericInstanceType([app.SystemTypes.SystemStringType]));
+        }
+        Assert.That(PropertyBackingFieldRecovery.CanDirectlyAccessPrivateField(caller, accessed), Is.EqualTo(expected));
     }
 
     private static Fixture CreateFixture(

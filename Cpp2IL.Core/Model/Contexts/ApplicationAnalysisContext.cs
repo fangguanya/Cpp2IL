@@ -98,7 +98,7 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// <summary>
     /// Key Function Addresses for the binary file. Populated on-demand
     /// </summary>
-    private BaseKeyFunctionAddresses? _keyFunctionAddresses;
+    private readonly KeyFunctionAddressInitializer _keyFunctionAddressInitializer = new();
 
     private readonly ulong[] _allKnownFunctionStarts;
 
@@ -352,13 +352,11 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
 
     public BaseKeyFunctionAddresses GetOrCreateKeyFunctionAddresses()
     {
-        lock (InstructionSet)
-        {
-            if (_keyFunctionAddresses == null)
-                (_keyFunctionAddresses = InstructionSet.CreateKeyFunctionAddressesInstance()).Find(this);
-
-            return _keyFunctionAddresses;
-        }
+        // 候选只有在完整扫描成功后才发布。扫描期间的内存、解析或重入异常都不得把
+        // 半初始化地址表留给后续方法，否则同一输入会随首个分析方法的资源时序改变结果。
+        return _keyFunctionAddressInitializer.GetOrInitialize(
+            InstructionSet.CreateKeyFunctionAddressesInstance,
+            candidate => candidate.Find(this));
     }
 
     public MultiAssemblyInjectedType InjectTypeIntoAllAssemblies(string ns, string name, TypeAnalysisContext? baseType, TypeAttributes typeAttributes = TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.Sealed)

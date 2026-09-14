@@ -92,12 +92,32 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
+        // 关键函数扫描依赖原始二进制且是所有方法共享的只读前置事实。先在托管桩和方法图
+        // 尚未占用峰值内存时完成一次，并让失败直接阻断本阶段，禁止方法级捕获后继续使用半成品。
+        context.GetOrCreateKeyFunctionAddresses();
         var runtimeOptions = Cpp2IlApi.RuntimeOptions;
         var assemblyFilters = runtimeOptions?.IsilDumpAssemblyFilters ?? [];
         var typeFilters = runtimeOptions?.IsilDumpTypeFilters ?? [];
         var methodFilters = runtimeOptions?.IsilDumpMethodFilters ?? [];
-        hasSelection = assemblyFilters.Count != 0 || typeFilters.Count != 0 || methodFilters.Count != 0;
-        if (hasSelection)
+        var exactMethods = runtimeOptions?.ExactRecoveryMethods ?? [];
+        var hasNameSelection = assemblyFilters.Count != 0 || typeFilters.Count != 0 || methodFilters.Count != 0;
+        if (exactMethods.Count > 0 && hasNameSelection)
+            throw new InvalidOperationException("原始身份选择与名称选择不得混用。");
+        hasSelection = hasNameSelection || exactMethods.Count > 0;
+        selectedRecoveryMethods = null;
+        if (exactMethods.Count > 0)
+        {
+            if (exactMethods.Any(identity => string.IsNullOrWhiteSpace(identity.Assembly)
+                    || (identity.Token & 0xFF000000) != 0x06000000 || (identity.Token & 0xFFFFFF) == 0))
+                throw new InvalidOperationException("原始方法身份必须包含程序集和有效MethodDef token。");
+            selectedRecoveryMethods = new HashSet<MethodAnalysisContext>(IsilDumpSelectionHelper.SelectExactIdentity(
+                context.Assemblies.SelectMany(assembly => assembly.Types).SelectMany(type => type.Methods)
+                    .Where(method => method.Definition != null && method is not InjectedMethodAnalysisContext),
+                exactMethods,
+                method => new OriginalRecoveryMethodIdentity(method.DeclaringType!.DeclaringAssembly.Name,
+                    method.Definition!.token, method.UnderlyingPointer), "IL恢复原始身份"));
+        }
+        else if (hasNameSelection)
         {
             var assemblies = IsilDumpSelectionHelper.SelectExact(
                 context.Assemblies,

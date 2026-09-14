@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -53,10 +54,60 @@ public static class DeadCodeEliminator
                 workList.Push(root);
         }
 
+        // 栈帧地址一经取址外泄（例如大值类型按值实参的栈临时区被装入实参寄存器），
+        // 持有该地址的被调方就能观察与取址槽位连续成段的相邻栈槽；在调用签名尚未解析的
+        // 阶段无法证明这些写入位于被调方视野之外，因此与取址槽位连续相交的栈槽写入
+        // 按可观察存储保留，不作死码删除。与取址槽位不相连的无关栈槽写入（如序言
+        // 保存与调用溢出槽）不享受该保留，避免干扰下游分派折叠的形态证明。
+        var stackWriteIntervals = new List<(Instruction Instruction, int Start, int End)>();
+        var escapedSlotOffsets = new List<int>();
+        foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
+        {
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable addressedSlot }
+                    && AggregateStackCopyRecovery.TryGetStackOffset(addressedSlot, out var escapedOffset))
+                    escapedSlotOffsets.Add(escapedOffset);
+            if (instruction.OpCode == OpCode.Move
+                && instruction.MemoryAccessWidthBits > 0
+                && instruction.MemoryAccessWidthBits % 8 == 0
+                && instruction.Operands is [LocalVariable writtenSlot, _]
+                && AggregateStackCopyRecovery.TryGetStackOffset(writtenSlot, out var writtenOffset))
+                stackWriteIntervals.Add((instruction, writtenOffset,
+                    checked(writtenOffset + instruction.MemoryAccessWidthBits / 8)));
+        }
+
+        // 以取址槽位为种子做接触式区间扩张：栈聚合临时的逐槽写入是与基址连续的一段，
+        // 不与该段相交的写入不可能是被调方通过该地址观察到的字节。
+        var escapedWrites = new HashSet<Instruction>();
+        foreach (var seed in escapedSlotOffsets)
+        {
+            var runStart = seed;
+            var runEnd = seed;
+            var expanded = true;
+            while (expanded)
+            {
+                expanded = false;
+                foreach (var (stackWrite, start, end) in stackWriteIntervals)
+                {
+                    if (escapedWrites.Contains(stackWrite) && runStart <= start && end <= runEnd)
+                        continue;
+                    if (start > runEnd || end < runStart)
+                        continue;
+                    if (escapedWrites.Add(stackWrite))
+                    {
+                        runStart = Math.Min(runStart, start);
+                        runEnd = Math.Max(runEnd, end);
+                        expanded = true;
+                    }
+                }
+            }
+        }
+
         foreach (var instruction in cfg.Blocks.SelectMany(block => block.Instructions))
         {
             // 可删除运算写入普通局部时才是候选；存储等非局部目标始终是根。
-            if (IsRemovable(instruction.OpCode) && instruction.Destination is LocalVariable)
+            if (IsRemovable(instruction.OpCode) && instruction.Destination is LocalVariable
+                && !escapedWrites.Contains(instruction))
                 continue;
 
             if (live.Add(instruction))
@@ -116,7 +167,7 @@ public static class DeadCodeEliminator
     /// 递归枚举一个操作数读取的局部量。HFA在托管签名中是单个实参，但其每个分量都是
     /// 独立的数据流源；统一递归后，普通局部量、内存基址和索引都只在一个位置计算。
     /// </summary>
-    private static IEnumerable<LocalVariable> EnumerateUsedLocals(IOperand operand)
+    internal static IEnumerable<LocalVariable> EnumerateUsedLocals(IOperand operand)
     {
         switch (operand)
         {

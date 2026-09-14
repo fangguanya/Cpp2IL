@@ -52,7 +52,11 @@ public static class ReadOnlyScalarLiteralRecovery
                     continue;
 
                 var address = checked((ulong)memory.Addend);
-                var byteCount = widthBits / 8;
+                // 原生宽读取必须消费全部字节，禁止只按首字段的 Single 类型截断。
+                var nativeWidth = instruction.MemoryAccessWidthBits;
+                var byteCount = (nativeWidth == 0 ? widthBits : nativeWidth) / 8;
+                if (byteCount is not (4 or 8 or 16))
+                    continue;
                 if ((address & (ulong)(byteCount - 1)) != 0
                     || !elf.IsReadOnlyFileBackedVirtualRange(address, byteCount)
                     || !binary.TryMapVirtualAddressToRaw(address, out var rawOffset)
@@ -61,12 +65,13 @@ public static class ReadOnlyScalarLiteralRecovery
                     continue;
 
                 var raw = binary.GetRawBinaryContent().Slice(checked((int)rawOffset), byteCount);
-                if (!TryDecodeScalarLiteral(raw, binary.IsBigEndian, widthBits, out var literal))
+                if (!TryDecodeMemoryLiteral(raw, binary.IsBigEndian, nativeWidth, widthBits, out var literal))
                     continue;
 
                 instruction.SetOperand(operandIndex, literal);
                 if (instruction.OpCode is
                         OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                    && literal is not NativeBitPatternLiteral
                     && instruction.Destination is LocalVariable moveDestination)
                     moveDestination.Type = floatingType;
             }
@@ -232,6 +237,25 @@ public static class ReadOnlyScalarLiteralRecovery
         }
 
         values = new string(chars);
+        return true;
+    }
+
+    internal static bool TryDecodeMemoryLiteral(
+        ReadOnlySpan<byte> raw, bool isBigEndian, int nativeWidthBits, int scalarWidthBits,
+        out IOperand literal)
+    {
+        literal = null!;
+        var width = nativeWidthBits == 0 ? scalarWidthBits : nativeWidthBits;
+        if (scalarWidthBits is not (32 or 64) || width is not (32 or 64 or 128)
+            || raw.Length != width / 8 || width < scalarWidthBits)
+            return false;
+        if (width == scalarWidthBits)
+            return TryDecodeScalarLiteral(raw, isBigEndian, scalarWidthBits, out literal);
+        // 大端 SIMD 通道与内存顺序尚无此合同证明，保持原始内存操作。
+        if (isBigEndian)
+            return false;
+        literal = new NativeBitPatternLiteral(BinaryPrimitives.ReadUInt64LittleEndian(raw),
+            width == 128 ? BinaryPrimitives.ReadUInt64LittleEndian(raw.Slice(8)) : 0, width);
         return true;
     }
 

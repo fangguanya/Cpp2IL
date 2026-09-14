@@ -116,6 +116,18 @@ public class Arm64StartupFixtureIntegrationTests
         }
 
         Logger.VerboseLog += CaptureVerboseLog;
+        var evidenceRoot = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
+        using var trace = Environment.GetEnvironmentVariable("CPP2IL_NATIVE_STAGE_TRACE") == "1"
+            ? new AnalysisStageTraceEvidence(method, Path.Combine(evidenceRoot!, "native-stage-traces"))
+            : null;
+        // 槽地址只定位原始测试输入；实际字符串值必须来自重定位后的编码元数据项。
+        var slot = 0x59EEF90UL;
+        var entryAddress = context.Binary.ReadPointerAtVirtualAddress(slot);
+        var encodedUsage = context.Binary.ReadPointerAtVirtualAddress(entryAddress);
+        var usage = context.LibCpp2IlContext.CheckForPost27GlobalTableEntryAt(slot, 0);
+        Assert.That(usage?.Type, Is.EqualTo(MetadataUsageType.StringLiteral));
+        Assert.That(usage!.AsLiteral(), Is.EqualTo(string.Empty));
+        TestContext.Out.WriteLine($"原始初始化槽：slot=0x{slot:X}; entry=0x{entryAddress:X}; encoded=0x{encodedUsage:X}; literalLength={usage.AsLiteral().Length}");
         try
         {
             method.Analyze();
@@ -123,6 +135,9 @@ public class Arm64StartupFixtureIntegrationTests
         finally
         {
             Logger.VerboseLog -= CaptureVerboseLog;
+            if (trace != null)
+                File.WriteAllText(Path.Combine(evidenceRoot!, "native-string-stage-receipt.json"),
+                    JsonSerializer.Serialize(trace.Complete()));
         }
         var finalInstructions = method.ControlFlowGraph!.Instructions;
         var renderedInstructions = finalInstructions
@@ -220,10 +235,10 @@ public class Arm64StartupFixtureIntegrationTests
         }
     }
 
-    [TestCase("AWSSDK.Core", 0x0600000Bu, 0x386E004UL)]
-    [TestCase("UnityEngine.CoreModule", 0x06000BB4u, 0x536B5C4UL)]
+    [TestCase("AWSSDK.Core", 0x0600000Bu, 0x386E004UL, 0)]
+    [TestCase("UnityEngine.CoreModule", 0x06000BB4u, 0x536B5C4UL, 2)]
     [Category("fixture集成")]
-    public void 原始机器码的结构体引用字段进入最终恢复图(string assemblyName, uint token, ulong address)
+    public void 原始机器码的结构体引用字段进入最终恢复图(string assemblyName, uint token, ulong address, int expectedZeroBlocks)
     {
         var context = LoadFixture();
         // 身份和地址仅固定原始回归样本，不进入生产算法的任何分派。
@@ -258,6 +273,31 @@ public class Arm64StartupFixtureIntegrationTests
         var remaining = final.SelectMany(instruction => instruction.Operands).OfType<MemoryOperand>()
             .Where(memory => memory.Base is LocalVariable { Type: ByRefTypeAnalysisContext { ElementType.IsValueType: true } }
                 && memory.Index == null && memory.Scale == 0 && memory.Addend > 0).ToArray();
+        // 原始八字节零写覆盖四字节整数及四字节尾填充，单个字段赋值会丢失后半区间。
+        // 保留精确内存操作是图合同的一部分；只接受生产帮助器已证明的无引用零块。
+        var zeroBlocks = final.Select(instruction =>
+        {
+            var accepted = ByRefZeroBlockRecovery.TryDescribe(instruction, pointerSize, out var block);
+            return new { instruction, accepted, block };
+        }).Where(row => row.accepted).ToArray();
+        Assert.That(zeroBlocks, Has.Length.EqualTo(expectedZeroBlocks));
+        foreach (var row in zeroBlocks)
+        {
+            var owner = ((ByRefTypeAnalysisContext)row.block.Receiver.Type!).ElementType;
+            var layout = byRefLayouts.Single();
+            Assert.That(row.block.Offset, Is.EqualTo(8));
+            Assert.That(row.block.ByteCount, Is.EqualTo(8));
+            Assert.That(layout.unboxedSize, Is.EqualTo(16));
+            Assert.That(layout.nativeSize, Is.EqualTo(16));
+            Assert.That(layout.boxedSize, Is.EqualTo(32));
+            Assert.That(layout.fields.Select(field => (field.Offset, field.size)),
+                Is.EqualTo(new[] { (0, (long?)8), (8, (long?)4) }));
+            Assert.That(owner.Fields.Single(field => !field.IsStatic && field.Offset == 8).FieldType,
+                Is.SameAs(context.SystemTypes.SystemInt32Type));
+            Assert.That(rawMemoryAccesses.Any(raw => raw.Index == row.instruction.Index
+                && raw.MemoryAccessWidthBits == row.block.ByteCount * 8), Is.True);
+        }
+        var coveredMemory = zeroBlocks.Select(row => row.instruction.Operands[0]).ToHashSet();
         var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
         Assert.That(root, Is.Not.Null.And.Not.Empty, "原始回归需要独立证据目录。");
         Directory.CreateDirectory(root!);
@@ -269,6 +309,8 @@ public class Arm64StartupFixtureIntegrationTests
                 fields = fields.Select(field => field.ToString()).ToArray(),
                 remaining = remaining.Select(memory => memory.ToString()).ToArray(),
                 pointerSize, rawMemoryAccesses, byRefLayouts,
+                exactZeroBlocks = zeroBlocks.Select(row => new
+                    { row.instruction.Index, row.block.Offset, row.block.ByteCount }).ToArray(),
                 finalMemoryAccesses = final.Where(instruction => instruction.Operands.Any(operand =>
                     operand is MemoryOperand or FieldReference)).Select(instruction => new
                     { instruction.Index, instruction.MemoryAccessWidthBits, text = instruction.ToString() }).ToArray(),
@@ -281,7 +323,8 @@ public class Arm64StartupFixtureIntegrationTests
         Assert.That(byRefLayouts.All(layout => layout.unboxedSize > 0), Is.True,
             "当前原始非泛型回归的值类型边界必须有二进制尺寸证据。");
         Assert.That(fields, Is.Not.Empty, "真实机器码中应保留已知结构字段的托管引用身份。");
-        Assert.That(remaining, Is.Empty, "非零偏移的结构体引用内存访问仍有未恢复字段。");
+        Assert.That(remaining.Where(memory => !coveredMemory.Contains(memory)), Is.Empty,
+            "每条非零偏移访问必须是精确字段或已逐字节证明范围的零块；其他残留继续报错。");
     }
 
     internal static ApplicationAnalysisContext LoadFixture()

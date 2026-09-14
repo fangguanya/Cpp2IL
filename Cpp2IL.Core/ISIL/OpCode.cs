@@ -113,11 +113,17 @@ public enum OpCode
     /// <summary>按 op 3 指定的目标位宽转换浮点精度，并把 op 2 写入 op 1</summary>
     ConvertFloatingPointPrecision,
 
+    /// <summary>按 op 3 指定的浮点位宽计算 op 2 的平方根，并把结果写入 op 1</summary>
+    SquareRoot,
+
     /// <summary>把 op 2 向零舍入为 op 3 指定位宽的有符号整数，并写入 op 1</summary>
     ConvertFloatToSignedInteger,
 
     /// <summary>把 op 2 的有符号整数按 op 3 目标浮点位宽和 op 4 源整数位宽转换，并写入 op 1</summary>
     ConvertSignedIntegerToFloat,
+
+    /// <summary>把 op 2 的无符号整数按 op 3 目标浮点位宽和 op 4 源整数位宽转换，并写入 op 1</summary>
+    ConvertUnsignedIntegerToFloat,
 
     /// <summary>把 op 2 的有符号整数从 op 4 源位宽转换到 op 3 目标位宽，并写入 op 1</summary>
     ConvertSignedIntegerWidth,
@@ -128,7 +134,7 @@ public enum OpCode
     /// <summary>把 op 2 的浮点位模式按 op 3 指定位宽原样解释为整数值，并写入 op 1</summary>
     ReinterpretFloatBitsAsInteger,
 
-    /// <summary>把 op 2 的低位元素复制为 op 3 个 op 4 位向量通道，并写入 op 1</summary>
+    /// <summary>把 op 2 的元素复制为 op 3 个 op 4 位向量通道并写入 op 1；op 5 为来源通道，-1 表示普通寄存器</summary>
     VectorDuplicate,
 
     /// <summary>把 op 2 的无符号16位向量通道拓宽为32位，并写入 op 1；op 3 为通道数</summary>
@@ -136,6 +142,36 @@ public enum OpCode
 
     /// <summary>把 op 2 的向量通道左移 op 3 位并写入 op 1；op 4/5 为通道数和元素位宽</summary>
     VectorShiftLeft,
+
+    /// <summary>按 op 3 向量的有符号通道量对 op 2 做无符号逐通道移位；op 4/5 为通道数和元素位宽</summary>
+    VectorShiftLeftUnsignedVariable,
+
+    /// <summary>逐通道判断 op 2 的浮点值是否小于零并把元素全掩码写入 op 1；op 3/4 为通道数和元素位宽</summary>
+    VectorCompareFloatingLessThanZero,
+
+    /// <summary>逐通道判断 op 2 的浮点值是否大于 op 3 并把元素全掩码写入 op 1；op 4/5 为通道数和元素位宽</summary>
+    VectorCompareFloatingGreaterThan,
+
+    /// <summary>逐通道判断 op 2 的浮点值是否等于 op 3 并把元素全掩码写入 op 1；op 4/5 为通道数和元素位宽</summary>
+    VectorCompareFloatingEqual,
+
+    /// <summary>把 op 2 的浮点向量按通道向零转换为有符号整数并写入 op 1；op 3/4 为通道数和元素位宽</summary>
+    VectorConvertFloatToSignedInteger,
+
+    /// <summary>把 op 2 的每个双宽整数通道截取低半宽并写入 op 1 的低半区；op 3/4 为来源通道数和来源元素位宽</summary>
+    VectorNarrowExtract,
+
+    /// <summary>把 op 3 的每个双宽整数通道截取低半宽并写入 op 1 的高半区，同时保留 op 2 的低半区；op 4/5 为来源通道数和来源元素位宽</summary>
+    VectorNarrowExtractUpper,
+
+    /// <summary>逐通道比较 op 2 是否无符号大于 op 3，并把全元素掩码写入 op 1；op 4/5 为通道数和元素位宽</summary>
+    VectorCompareUnsignedHigher,
+
+    /// <summary>逐通道比较 op 2 是否无符号大于等于 op 3，并把全元素掩码写入 op 1；op 4/5 为通道数和元素位宽</summary>
+    VectorCompareUnsignedHigherOrSame,
+
+    /// <summary>按 op 4 位宽执行 ARM BIT：保留目标与 op 3 掩码交集，其余位取自 op 2</summary>
+    VectorBitwiseInsert,
 
     /// <summary>逐通道判断 op 2 是否小于零并把掩码写入 op 1；op 3/4 为通道数和元素位宽</summary>
     VectorCompareLessThanZero,

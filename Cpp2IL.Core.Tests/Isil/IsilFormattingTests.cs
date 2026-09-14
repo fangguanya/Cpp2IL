@@ -72,4 +72,44 @@ public class IsilFormattingTests
 			Assert.That(instruction.IsFallThrough, Is.True);
 		}
 	}
+
+    [TestCase(OpCode.VectorCompareUnsignedHigher)]
+    [TestCase(OpCode.VectorCompareUnsignedHigherOrSame)]
+    [Category("基本功能")]
+    public void UnsignedVectorComparison_ExposesBothVectorSourcesToLivenessAnalysis(OpCode opCode)
+	{
+		var destination = new Register(null, "v0");
+		var left = new Register(null, "v1");
+		var right = new Register(null, "v2");
+		var instruction = new Instruction(
+			9,
+            opCode,
+			destination,
+			left,
+			right,
+			new Immediate(8),
+			new Immediate(8));
+
+		Assert.That(instruction.Sources, Is.EqualTo(new IOperand[] { left, right }));
+	}
+
+    [TestCase(OpCode.VectorCompareFloatingGreaterThan)]
+    [TestCase(OpCode.VectorCompareFloatingEqual)]
+    [Category("基本功能")]
+    public void FloatingVectorComparison_ExposesBothVectorSourcesToLivenessAnalysis(OpCode opCode)
+	{
+		var destination = new Register(null, "v0");
+		var left = new Register(null, "v1");
+		var right = new Register(null, "v2");
+		var instruction = new Instruction(
+			10,
+			opCode,
+			destination,
+			left,
+			right,
+			new Immediate(2),
+			new Immediate(32));
+
+		Assert.That(instruction.Sources, Is.EqualTo(new IOperand[] { left, right }));
+	}
 }

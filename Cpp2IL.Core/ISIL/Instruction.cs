@@ -125,14 +125,26 @@ public class Instruction : IOperand
             case OpCode.AbsoluteDifference:
             case OpCode.MaximumNumber:
             case OpCode.ConvertFloatingPointPrecision:
+            case OpCode.SquareRoot:
             case OpCode.ConvertFloatToSignedInteger:
             case OpCode.ConvertSignedIntegerToFloat:
+            case OpCode.ConvertUnsignedIntegerToFloat:
             case OpCode.ConvertSignedIntegerWidth:
             case OpCode.ReinterpretIntegerBitsAsFloat:
             case OpCode.ReinterpretFloatBitsAsInteger:
             case OpCode.VectorDuplicate:
             case OpCode.VectorWidenUnsignedInt16ToInt32:
             case OpCode.VectorShiftLeft:
+            case OpCode.VectorShiftLeftUnsignedVariable:
+            case OpCode.VectorCompareFloatingLessThanZero:
+            case OpCode.VectorCompareFloatingGreaterThan:
+            case OpCode.VectorCompareFloatingEqual:
+            case OpCode.VectorConvertFloatToSignedInteger:
+            case OpCode.VectorNarrowExtract:
+            case OpCode.VectorNarrowExtractUpper:
+            case OpCode.VectorCompareUnsignedHigher:
+            case OpCode.VectorCompareUnsignedHigherOrSame:
+            case OpCode.VectorBitwiseInsert:
             case OpCode.VectorCompareLessThanZero:
             case OpCode.VectorBitwiseSelect:
             case OpCode.VectorMultiplyByElement:
@@ -195,23 +207,45 @@ public class Instruction : IOperand
 
             OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.ConvertFloatingPointPrecision or OpCode.ConvertFloatToSignedInteger
-                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertSignedIntegerWidth
+                or OpCode.ConvertFloatingPointPrecision or OpCode.SquareRoot or OpCode.ConvertFloatToSignedInteger
+                or OpCode.ConvertSignedIntegerToFloat or OpCode.ConvertUnsignedIntegerToFloat
+                or OpCode.ConvertSignedIntegerWidth
                 or OpCode.ReinterpretIntegerBitsAsFloat or OpCode.ReinterpretFloatBitsAsInteger
                 or OpCode.VectorDuplicate or OpCode.VectorWidenUnsignedInt16ToInt32
-                or OpCode.VectorShiftLeft or OpCode.VectorCompareLessThanZero
+                or OpCode.VectorShiftLeft
+                or OpCode.VectorCompareFloatingLessThanZero
+                or OpCode.VectorConvertFloatToSignedInteger
+                or OpCode.VectorNarrowExtract
+                or OpCode.VectorCompareLessThanZero
                 or OpCode.RoundFloatTowardPositiveInfinity or OpCode.RoundFloatTowardNegativeInfinity
                 or OpCode.AbsoluteNumber
                 or OpCode.Newobj or OpCode.Box or OpCode.Unbox or OpCode.CastClass or OpCode.IsInst
                 => [_operands[1]],
 
+            OpCode.VectorNarrowExtractUpper
+                => [_operands[1], _operands[2]],
+
+            OpCode.VectorCompareUnsignedHigher
+                or OpCode.VectorCompareUnsignedHigherOrSame
+                => [_operands[1], _operands[2]],
+
+            OpCode.VectorCompareFloatingGreaterThan
+                or OpCode.VectorCompareFloatingEqual
+                => [_operands[1], _operands[2]],
+
             OpCode.VectorBitwiseSelect
                 => [_operands[1], _operands[2], _operands[3]],
+
+            OpCode.VectorBitwiseInsert
+                => [_operands[1], _operands[2]],
 
             OpCode.ConditionalSelect
                 => [_operands[1], _operands[2], _operands[3]],
 
             OpCode.VectorMultiplyByElement
+                => [_operands[1], _operands[2]],
+
+            OpCode.VectorShiftLeftUnsignedVariable
                 => [_operands[1], _operands[2]],
 
             OpCode.VectorAllLanesPredicate

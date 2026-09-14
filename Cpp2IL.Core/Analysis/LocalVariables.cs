@@ -157,6 +157,7 @@ public static class LocalVariables
                 continue;
 
             local.Name = method.Parameters[i].ParameterName;
+            local.SourceParameter = method.Parameters[i];
             paramLocals.Add(local);
         }
 
@@ -3607,7 +3608,7 @@ public static class LocalVariables
            || type is GenericInstanceTypeAnalysisContext genericInstance
            && genericInstance.GenericArguments.Any(ContainsUninstantiatedGenericParameter);
 
-    private static void PropagateFromParameters(MethodAnalysisContext method)
+    internal static void PropagateFromParameters(MethodAnalysisContext method)
     {
         // 'this'
         if (!method.IsStatic)
@@ -3620,18 +3621,21 @@ public static class LocalVariables
         if (method.Parameters.Count == 0)
             return;
 
-        // Normal params
-        var paramIndex = 0;
+        // 只消费入口已证明的原始形参身份；未使用形参及 HFA 分量不会挤占后续形参的位置。
         foreach (var local in method.ParameterLocals)
         {
             if (local.IsThis || local.IsMethodInfo)
                 continue;
 
-            if (paramIndex >= method.Parameters.Count)
-                break;
+            if (local.SourceParameter is not { } parameter)
+                continue;
+            if (!ReferenceEquals(parameter.DeclaringMethod, method)
+                || parameter.ParameterIndex < 0
+                || parameter.ParameterIndex >= method.Parameters.Count
+                || !ReferenceEquals(method.Parameters[parameter.ParameterIndex], parameter))
+                throw new InvalidOperationException("形参来源身份与当前方法声明不一致。");
 
-            local.Type = method.Parameters[paramIndex].ParameterType;
-            paramIndex++;
+            local.Type = parameter.ParameterType;
         }
     }
 

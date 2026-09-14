@@ -13,7 +13,9 @@ namespace Cpp2IL.Core;
 
 public static class Cpp2IlPluginManager
 {
-    private static List<Cpp2IlPlugin> _loadedPlugins = [];
+    private static readonly List<Cpp2IlPlugin> _loadedPlugins = [];
+    private static readonly HashSet<Type> _attemptedPluginTypes = [];
+    private static readonly object InitializationGate = new();
     
     internal static List<LibCpp2IlMain.MetadataFixupFunc>? MetadataFixupFuncs;
 
@@ -37,50 +39,42 @@ public static class Cpp2IlPluginManager
 
     internal static void InitAll()
     {
-        var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-        Logger.VerboseNewline("Collecting and instantiating plugins...", "Plugins");
+        var registrations = AppDomain.CurrentDomain.GetAssemblies()
+            .SelectMany(assembly => assembly.GetCustomAttributes<RegisterCpp2IlPluginAttribute>()).ToArray();
+        InitializeCandidates(registrations);
+    }
 
-        foreach (var assembly in assemblies)
+    /// <summary>
+    /// 以运行时类型身份保证每个插件只尝试初始化一次。失败插件可能已经注册部分全局状态，
+    /// 因此不自动重试，也不把失败实例放入事件列表；重复入口和同线程重入均复用既有状态。
+    /// </summary>
+    internal static void InitializeCandidates(IEnumerable<RegisterCpp2IlPluginAttribute> registrations)
+    {
+        lock (InitializationGate)
         {
-            var attrs = assembly.GetCustomAttributes<RegisterCpp2IlPluginAttribute>().ToList();
-
-            if (attrs.Count == 0)
-                continue;
-
-            foreach (var registerCpp2IlPluginAttribute in attrs)
+            foreach (var registration in registrations.ToArray())
             {
-                Cpp2IlPlugin plugin;
+                // 保留注册属性原有的构造函数裁剪注解，不经过丢失类型保留信息的 Type 集合。
+                var pluginType = registration.PluginType;
+                if (!_attemptedPluginTypes.Add(pluginType)) continue;
                 try
                 {
-                    Logger.VerboseNewline($"\tLoading plugin {registerCpp2IlPluginAttribute.PluginType.FullName} from assembly: {assembly.GetName().Name}.dll", "Plugins");
-                    plugin = (Cpp2IlPlugin)Activator.CreateInstance(registerCpp2IlPluginAttribute.PluginType)!;
+                    var plugin = (Cpp2IlPlugin)Activator.CreateInstance(pluginType)!;
+                    plugin.OnLoad();
+                    Logger.InfoNewline($"Using Plugin: {plugin.Name}", "Plugins");
+                    _loadedPlugins.Add(plugin);
                 }
-                catch (Exception e)
+                catch (Exception error)
                 {
-                    Logger.ErrorNewline($"Plugin {registerCpp2IlPluginAttribute.PluginType.FullName} from assembly {assembly.GetName().Name} threw an exception during construction: {e}. It will not be loaded.", "Plugins");
-                    continue;
+                    Logger.ErrorNewline($"插件 {pluginType.FullName} 初始化失败，不加入事件列表且不重复执行：{error}", "Plugins");
                 }
-
-                _loadedPlugins.Add(plugin);
             }
         }
+    }
 
-        Logger.VerboseNewline("Invoking OnLoad on " + _loadedPlugins.Count + " plugins.", "Plugins");
-        foreach (var plugin in _loadedPlugins)
-        {
-            try
-            {
-                plugin.OnLoad();
-                Logger.InfoNewline($"Using Plugin: {plugin.Name}", "Plugins");
-            }
-            catch (Exception e)
-            {
-                Logger.ErrorNewline($"Plugin {plugin.GetType().FullName} threw an exception during OnLoad: {e}. It will not receive any further events.", "Plugins");
-                _loadedPlugins.Remove(plugin);
-            }
-        }
-
-        Logger.VerboseNewline("OnLoad complete", "Plugins");
+    private static Cpp2IlPlugin[] LoadedPluginSnapshot()
+    {
+        lock (InitializationGate) return _loadedPlugins.ToArray();
     }
 
     /// <summary>
@@ -91,7 +85,7 @@ public static class Cpp2IlPluginManager
     /// <returns>True if the path was handled, and the game can be loaded based on the arguments, otherwise false.</returns>
     public static bool TryProcessGamePath(string gamePath, ref Cpp2IlRuntimeArgs args)
     {
-        foreach (var cpp2IlPlugin in _loadedPlugins)
+        foreach (var cpp2IlPlugin in LoadedPluginSnapshot())
         {
             if (cpp2IlPlugin.HandleGamePath(gamePath, ref args))
                 return true;
@@ -102,7 +96,7 @@ public static class Cpp2IlPluginManager
 
     public static void CallOnFinish()
     {
-        foreach (var cpp2IlPlugin in _loadedPlugins)
+        foreach (var cpp2IlPlugin in LoadedPluginSnapshot())
         {
             cpp2IlPlugin.CallOnFinish();
         }

@@ -43,8 +43,11 @@ public class ByRefRegressionEvidenceTests
         var forbiddenCilFragments = SplitExpectedFragments("CPP2IL_REGRESSION_FORBIDDEN_CIL_FRAGMENTS");
         var forbiddenRawIsilFragments = SplitExpectedFragments("CPP2IL_REGRESSION_FORBIDDEN_RAW_ISIL_FRAGMENTS");
         var samples = document.RootElement.GetProperty("methods").EnumerateArray()
-            .Where(row => row.GetProperty("operation").GetString() == operation).ToArray();
+            .Where(row => operation == "*" || row.GetProperty("operation").GetString() == operation).ToArray();
         Assert.That(samples, Is.Not.Empty);
+        Assert.That(samples.Select(row => (row.GetProperty("assembly").GetString(),
+            row.GetProperty("originalToken").GetUInt32())).Distinct().Count(), Is.EqualTo(samples.Length),
+            "取证投影存在重复的原始身份。");
         var root = Environment.GetEnvironmentVariable("CPP2IL_LEDGER_EVIDENCE_ROOT");
         Assert.That(root, Is.Not.Null.And.Not.Empty);
         var output = Path.Combine(root!, "byref-regression-graphs");
@@ -54,6 +57,31 @@ public class ByRefRegressionEvidenceTests
         var methods = app.Assemblies.SelectMany(assembly => assembly.Types.SelectMany(type => type.Methods))
             .Where(method => method.Definition != null)
             .ToLookup(method => (method.DeclaringType!.DeclaringAssembly.Name, method.Definition!.token));
+        if (Environment.GetEnvironmentVariable("CPP2IL_ANALYSIS_STAGE_TRACE") == "1")
+        {
+            var receipts = new System.Collections.Generic.List<object>();
+            foreach (var sample in samples)
+            {
+                var assembly = sample.GetProperty("assembly").GetString()!;
+                var token = sample.GetProperty("originalToken").GetUInt32();
+                var method = methods[(assembly, token)].Single();
+                Assert.That(method.UnderlyingPointer, Is.EqualTo(sample.GetProperty("nativeAddress").GetUInt64()));
+                using var trace = new AnalysisStageTraceEvidence(method, output);
+                try { method.Analyze(); }
+                catch (Exception error) { trace.CaptureAnalysisFailure(error); }
+                receipts.Add(trace.Complete());
+                // 每个方法写完立即释放图和取证根，避免480个阶段图同时占用受控内存。
+                method.ReleaseAnalysisData();
+            }
+            File.WriteAllText(Path.Combine(output, "stage-trace-summary.json"), JsonSerializer.Serialize(new
+            {
+                schema = "FullRecovery.AnalysisStageTrace/v1", count = receipts.Count, methods = receipts,
+                inputSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(input!))).ToLowerInvariant(),
+                exactMethodBoundariesProved = false, transformationAncestryProved = false,
+                firstFactLossCausesVerified = false, fullRecoveryProved = false, formalPublishEligible = false
+            }, new JsonSerializerOptions { WriteIndented = true }));
+            return;
+        }
         if (Environment.GetEnvironmentVariable("CPP2IL_BYREF_REGRESSION_EMIT") == "1")
         {
             var selected = samples.Select(row => methods[(row.GetProperty("assembly").GetString()!,
@@ -111,12 +139,19 @@ public class ByRefRegressionEvidenceTests
                 return;
             }
             var options = Cpp2IlApi.RuntimeOptions!;
-            options.IsilDumpAssemblyFilters = selected.Select(method => method.DeclaringType!.DeclaringAssembly.Name).Distinct().ToArray();
-            options.IsilDumpTypeFilters = selected.Select(method => method.DeclaringType!.Definition!.FullName ?? throw new InvalidDataException("原始类型名称缺失。")).Distinct().ToArray();
-            options.IsilDumpMethodFilters = selected.Select(method => method.Definition!.HumanReadableSignature ?? throw new InvalidDataException("原始方法签名缺失。")).Distinct().ToArray();
+            options.IsilDumpAssemblyFilters = [];
+            options.IsilDumpTypeFilters = [];
+            options.IsilDumpMethodFilters = [];
+            // 原始token与地址消除跨类型同名方法歧义；不改生产语义或扩大诊断分母。
+            options.ExactRecoveryMethods = samples.Select(row => new OriginalRecoveryMethodIdentity(
+                row.GetProperty("assembly").GetString()!, row.GetProperty("originalToken").GetUInt32(),
+                row.GetProperty("nativeAddress").GetUInt64())).ToArray();
             var directory = Path.Combine(root!, "byref-original-emission");
             // 使用同一生产分析与发射流程，仅以回归输入界定测试范围；不发布局部程序集。
-            new RegressionEmitter().BuildWithReceipt(app, directory);
+            var emitter = new RegressionEmitter(
+                Environment.GetEnvironmentVariable("CPP2IL_EMITTER_STAGE_TRACE") == "1" ? selected : null,
+                Path.Combine(root!, "emitter-stage-traces"));
+            emitter.BuildWithReceipt(app, directory);
             foreach (var method in selected)
             {
                 var managed = method.GetExtraData<MethodDefinition>("AsmResolverMethod")
@@ -164,6 +199,8 @@ public class ByRefRegressionEvidenceTests
                 fullRecoveryProved = false
             }, new JsonSerializerOptions { WriteIndented = true }));
             using var ledger = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "dll-il-recovery-method-ledger.json")));
+            Assert.That(ledger.RootElement.GetProperty("formalPublishEligible").GetBoolean(), Is.False,
+                "精确身份诊断发射不得获得正式发布资格。");
             var rows = ledger.RootElement.GetProperty("methods").EnumerateArray()
                 .Where(row => row.GetProperty("original").GetBoolean() && row.GetProperty("selected").GetBoolean()).ToArray();
             Assert.That(rows.Length, Is.EqualTo(samples.Length));
@@ -197,6 +234,9 @@ public class ByRefRegressionEvidenceTests
             var instructions = method.ControlFlowGraph!.Instructions.Select(instruction => new
             {
                 instruction.Index, opcode = instruction.OpCode.ToString(), instruction.MemoryAccessWidthBits,
+                instruction.IntegerWidthBits,
+                definition = instruction.Destination?.ToString(),
+                sources = instruction.Sources.Select(source => source.ToString()).ToArray(),
                 text = instruction.ToString(),
                 operands = instruction.Operands.Select(operand => new
                 {
@@ -226,6 +266,26 @@ public class ByRefRegressionEvidenceTests
             JsonSerializer.Serialize(stream, new
             {
                 schema = "OriginalByRefRegressionGraph/v1", assembly, token, address = method.UnderlyingPointer,
+                // 这是生产分析完成后的图，不把终态图伪称为原始SSA或逐阶段来源映射。
+                analysisStage = "POST_ANALYSIS", originalSsaMappingProved = false,
+                blocks = method.ControlFlowGraph.Blocks.Select(block => new
+                {
+                    block.ID, predecessors = block.Predecessors.Select(predecessor => predecessor.ID).ToArray(),
+                    successors = block.Successors.Select(successor => successor.ID).ToArray(),
+                    instructions = block.Instructions.Select(instruction => instruction.Index).ToArray()
+                }).ToArray(),
+                argumentOperands = Arm64CallingConventionResolver.ArgumentOperands(method)
+                    .Select(operand => operand.ToString()).ToArray(),
+                // 每个不同的字段声明只投影一次；泛型实例沿用生产布局帮助器。
+                fields = method.ControlFlowGraph.Instructions.SelectMany(instruction => instruction.Operands)
+                    .OfType<FieldReference>().DistinctBy(field => field.Field).Select(field => new
+                    {
+                        field.Field.Name, field.Offset, field.Field.IsStatic,
+                        owner = field.Field.DeclaringType.FullName,
+                        declaredType = field.Field.FieldType.FullName,
+                        // 被引用对象的非装箱大小不是引用字段跨度，避免把两者混作布局证明。
+                        unboxedTypeSize = TypeSizes.UnboxedSize(field.Field.FieldType, app.Binary.PointerSizeBytes)
+                    }).ToArray(),
                 method = method.FullName, parameters = method.ParameterLocals.Select(local => new
                 {
                     text = local.ToString(),
@@ -245,12 +305,38 @@ public class ByRefRegressionEvidenceTests
         }));
     }
 
-    private sealed class RegressionEmitter : AsmResolverDllOutputFormatIlRecovery
+    private sealed class RegressionEmitter(
+        MethodAnalysisContext[]? tracedMethods = null, string? traceDirectory = null) : AsmResolverDllOutputFormatIlRecovery
     {
+        private readonly System.Collections.Generic.HashSet<MethodAnalysisContext>? traced = tracedMethods == null ? null : new(tracedMethods);
+        private readonly System.Collections.Concurrent.ConcurrentBag<object> traceReceipts = [];
+
+        protected override void FillMethodBody(MethodDefinition definition, MethodAnalysisContext method)
+        {
+            if (traced?.Contains(method) != true)
+            {
+                base.FillMethodBody(definition, method);
+                return;
+            }
+            // 接入真正发射器的同一个虚方法，包含声明绑定后的分析，不另跑直接 Analyze 来冒充该路径。
+            using var evidence = new AnalysisStageTraceEvidence(method, traceDirectory!);
+            base.FillMethodBody(definition, method);
+            traceReceipts.Add(evidence.Complete(definition.CilMethodBody != null));
+        }
+
         internal void BuildWithReceipt(ApplicationAnalysisContext app, string directory)
         {
             BuildAssembliesForOutput(app, directory);
             WriteOutputReceipts(directory);
+            if (traced == null) return;
+            Assert.That(traceReceipts.Count, Is.EqualTo(traced.Count), "实际发射追踪遗漏了选定原始方法。");
+            using var output = new FileStream(Path.Combine(traceDirectory!, "stage-trace-summary.json"), FileMode.CreateNew);
+            JsonSerializer.Serialize(output, new
+            {
+                schema = "FullRecovery.EmitterAnalysisStageTrace/v1", count = traceReceipts.Count,
+                methods = traceReceipts.ToArray(), actualEmitterPath = true,
+                transformationAncestryProved = false, fullRecoveryProved = false
+            }, new JsonSerializerOptions { WriteIndented = true });
         }
     }
 

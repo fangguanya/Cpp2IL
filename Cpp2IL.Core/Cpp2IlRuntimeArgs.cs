@@ -2,6 +2,7 @@
 using AssetRipper.Primitives;
 using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core;
 
@@ -32,4 +33,7 @@ public class Cpp2IlRuntimeArgs
     public IReadOnlyList<string> IsilDumpAssemblyFilters = [];
     public IReadOnlyList<string> IsilDumpTypeFilters = [];
     public IReadOnlyList<string> IsilDumpMethodFilters = [];
+
+    // 结构化身份只界定诊断发射范围；与名称筛选互斥，非空时没有正式发布资格。
+    public IReadOnlyList<OriginalRecoveryMethodIdentity> ExactRecoveryMethods = [];
 }

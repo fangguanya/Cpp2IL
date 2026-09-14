@@ -7,6 +7,82 @@ namespace Cpp2IL.Core.Tests;
 
 public class GenericInstanceFieldLayoutTests
 {
+    [Test]
+    [Category("基本功能")]
+    public void 原始顺序值类型按字段证据证明对齐而非按总尺寸猜测()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var guid = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Guid")!;
+        var pointerSize = app.Binary.PointerSizeBytes;
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(guid, pointerSize), Is.EqualTo((16L, 4L)));
+        var nullable = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Nullable`1")!
+            .MakeGenericInstanceType([guid]);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(nullable, pointerSize), Is.EqualTo((20L, 4L)));
+        var layout = GenericInstanceFieldLayout.GetConcreteFieldLayout(nullable)!;
+        // 本输入原始声明为值字段在先、存在标志在后；不套用其他运行时的字段顺序。
+        Assert.That(layout.Select(field => field.Field.FieldType), Is.EqualTo(new[] { guid, app.SystemTypes.SystemBooleanType }));
+        Assert.That(layout.Select(field => field.Offset), Is.EqualTo(new long[] { 0, 16 }));
+    }
+
+    [TestCase(-1)]
+    [TestCase(1)]
+    [TestCase(16)]
+    [Category("异常输入")]
+    public void 原始值布局拒绝修改的偏移证据(int offset)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var guid = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Guid")!;
+        guid.Fields.First(field => !field.IsStatic).Offset = offset;
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(guid, app.Binary.PointerSizeBytes), Is.Null);
+    }
+
+    [TestCase(TypeAttributes.ExplicitLayout)]
+    [TestCase(TypeAttributes.AutoLayout)]
+    [Category("异常输入")]
+    public void 原始值布局拒绝未证明的布局规则(TypeAttributes layout)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var guid = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Guid")!;
+        guid.Attributes = (guid.Attributes & ~TypeAttributes.LayoutMask) | layout;
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(guid, app.Binary.PointerSizeBytes), Is.Null);
+    }
+
+    [Test]
+    [Category("边界值")]
+    public void 原始实例尺寸不跨输入架构复用()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var guid = app.GetAssemblyByName("mscorlib")!.GetTypeByFullName("System.Guid")!;
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(guid, app.Binary.PointerSizeBytes == 8 ? 4 : 8), Is.Null);
+    }
+
+    [TestCase("Single", false)]
+    [TestCase("Single", true)]
+    [TestCase("Double", false)]
+    [TestCase("Double", true)]
+    [TestCase("Int32", false)]
+    [TestCase("Int32", true)]
+    [TestCase("Int64", false)]
+    [TestCase("Int64", true)]
+    [TestCase("IntPtr", false)]
+    [TestCase("IntPtr", true)]
+    [TestCase("UIntPtr", false)]
+    [TestCase("UIntPtr", true)]
+    [Category("异常输入")]
+    public void 泛型布局拒绝同名非核心基元身份(string name, bool foreignAssembly)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var core = app.GetAssemblyByName("mscorlib")!;
+        var assembly = foreignAssembly ? app.Assemblies.First(item => !ReferenceEquals(item, core)) : core;
+        var fake = new InjectedTypeAnalysisContext(assembly, "System", name, core.GetTypeByFullName("System.ValueType"),
+            TypeAttributes.Public | TypeAttributes.SequentialLayout);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(fake, 8), Is.Null);
+        var outer = CreateValue("IdentityBoundCarrier");
+        outer.InjectFieldContext("value", fake, FieldAttributes.Public);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(outer.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]), 8), Is.Null);
+        Assert.That(GenericInstanceFieldLayout.GetSizeAndAlignment(core.GetTypeByFullName("System." + name)!, 8), Is.Not.Null);
+    }
+
     [TestCase(false, 56L)]
     [TestCase(true, 64L)]
     [Category("边界值")]

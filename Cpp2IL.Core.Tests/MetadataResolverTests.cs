@@ -1644,6 +1644,67 @@ public class MetadataResolverTests
         });
     }
 
+    [TestCase("", 0)]
+    [TestCase("边界字符串", 0)]
+    [TestCase("", 1)]
+    [TestCase("", 2)]
+    [TestCase("", 3)]
+    [TestCase("", 4)]
+    [TestCase("", 5)]
+    [TestCase("", 6)]
+    [TestCase("", 7)]
+    [Category("基本功能")]
+    [Category("边界值")]
+    [Category("异常输入")]
+    public void 已初始化字符串槽与字段地址合流必须保留入边和读取顺序(string literal, int invalidCase)
+    {
+        var fixture = CreatePhiBackedInstanceFieldFixture(mismatchSecondFieldType: invalidCase == 2);
+        var graph = fixture.Method.ControlFlowGraph!;
+        var first = new Block { ID = 10, Instructions = [fixture.AddressDefinitions[0]] };
+        var second = new Block { ID = 11, Instructions = [fixture.AddressDefinitions[1]] };
+        var merge = new Block { ID = 12, Instructions = [fixture.Phi, fixture.Load] };
+        graph.Blocks = [graph.EntryBlock, first, second, merge, graph.ExitBlock];
+        graph.EntryBlock.Successors = [first, second];
+        first.Predecessors = second.Predecessors = [graph.EntryBlock];
+        first.Successors = second.Successors = [merge];
+        merge.Predecessors = [first, second];
+        merge.Successors = [graph.ExitBlock];
+        graph.ExitBlock.Predecessors = [merge];
+        const long slot = 0x1200;
+        fixture.AddressDefinitions[0].OpCode = OpCode.Move;
+        fixture.AddressDefinitions[0].SetOperands(fixture.AddressLocals[0],
+            new MemoryOperand(null, null, slot));
+        fixture.Load.MemoryAccessWidthBits = fixture.Method.AppContext.Binary.PointerSizeBytes * 8;
+        if (invalidCase == 3)
+            second.Instructions.Add(new Instruction(90, OpCode.CallVoid, new StringLiteral("观察点")));
+        if (invalidCase == 4)
+            merge.Instructions.Insert(1, new Instruction(91, OpCode.CallVoid, new StringLiteral("观察点")));
+        if (invalidCase == 5) merge.Predecessors.Reverse();
+        if (invalidCase == 6) fixture.Load.MemoryAccessWidthBits = 8;
+        if (invalidCase == 7)
+            first.Instructions.Add(new Instruction(92, OpCode.Return, fixture.AddressLocals[0]));
+        var instructions = graph.Instructions;
+        var before = instructions.Select(instruction => instruction.ToString()).ToArray();
+        var changed = MetadataResolver.ResolvePhiBackedManagedFieldLoads(instructions,
+            address => invalidCase != 1 && address == slot ? new StringLiteral(literal) : null,
+            fixture.Method.AppContext.SystemTypes.SystemStringType, graph);
+        Assert.That(changed, Is.EqualTo(invalidCase == 0 ? 1 : 0));
+        if (invalidCase != 0)
+        {
+            Assert.That(instructions.Select(instruction => instruction.ToString()), Is.EqualTo(before),
+                "任一来源、位宽、入边或观察顺序缺证时，整组图必须保持不变。");
+            return;
+        }
+        Assert.That(fixture.AddressDefinitions[0].Operands[1], Is.TypeOf<StringLiteral>());
+        Assert.That(((StringLiteral)fixture.AddressDefinitions[0].Operands[1]).Value, Is.EqualTo(literal));
+        Assert.That(fixture.AddressDefinitions[1].Operands[1], Is.TypeOf<FieldReference>());
+        Assert.That(fixture.Load.Operands[1], Is.SameAs(fixture.PhiValue));
+        Assert.That(fixture.Load.MemoryAccessWidthBits, Is.Zero);
+        Assert.That(MetadataResolver.ResolvePhiBackedManagedFieldLoads(graph.Instructions,
+            _ => throw new InvalidOperationException("已消费的目录不得再次解析。"),
+            fixture.Method.AppContext.SystemTypes.SystemStringType, graph), Is.Zero);
+    }
+
     [Test]
     [Category("基本功能")]
     public void 不同接收者字段地址Phi恢复为同类型字段值Phi()

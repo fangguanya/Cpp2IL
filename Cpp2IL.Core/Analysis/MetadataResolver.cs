@@ -1087,7 +1087,9 @@ public static class MetadataResolver
     /// 解析阶段先冻结全图的唯一用途和字段引用计划；只有候选的全部入边都通过验证，
     /// 才一次提交该候选的所有 Add 与公共读取，避免失败入边留下半改写图。
     /// </summary>
-    internal static int ResolvePhiBackedManagedFieldLoads(IReadOnlyList<Instruction> instructions)
+    internal static int ResolvePhiBackedManagedFieldLoads(IReadOnlyList<Instruction> instructions,
+        Func<ulong, StringLiteral?>? initializedStringResolver = null,
+        TypeAnalysisContext? stringType = null, ISILControlFlowGraph? graph = null)
     {
         var definitions = BuildUniqueDefinitions(instructions);
         var uses = BuildLocalUseIndex(instructions);
@@ -1095,7 +1097,8 @@ public static class MetadataResolver
 
         foreach (var load in instructions)
         {
-            if (TryPlanManagedFieldPhiRewrite(load, definitions, uses, out var plan))
+            if (TryPlanManagedFieldPhiRewrite(load, definitions, uses, out var plan,
+                    initializedStringResolver, stringType, graph))
                 plans.Add(plan);
         }
 
@@ -1105,15 +1108,42 @@ public static class MetadataResolver
             foreach (var input in plan.Inputs)
             {
                 input.AddressDefinition.OpCode = OpCode.Move;
-                input.AddressDefinition.SetOperands(input.AddressLocal, input.FieldReference);
+                input.AddressDefinition.SetOperands(input.AddressLocal, input.Value);
                 input.AddressDefinition.IntegerWidthBits = 0;
+                if (plan.InitializedStringType != null)
+                {
+                    input.AddressDefinition.MemoryAccessWidthBits = 0;
+                    input.AddressLocal.Type = plan.InitializedStringType;
+                }
             }
 
             plan.Load.SetOperand(1, plan.PhiValue);
             plan.Load.MemoryAccessWidthBits = 0;
+            if (plan.InitializedStringType != null)
+                plan.PhiValue.Type = plan.InitializedStringType;
         }
 
         return plans.Count;
+    }
+
+    // 初始化目录与元数据共同证明常量入边，字段入边复用同一布局计划，不另建地址恢复算法。
+    internal static int ResolveInitializedStringAndFieldPhis(MethodAnalysisContext method,
+        IReadOnlyCollection<ulong> initializedSlots)
+    {
+        if (initializedSlots.Count == 0) return 0;
+        var context = method.AppContext.LibCpp2IlContext;
+        var slots = new HashSet<ulong>(initializedSlots);
+        var cache = new Dictionary<ulong, StringLiteral?>();
+        return ResolvePhiBackedManagedFieldLoads(method.ControlFlowGraph!.Instructions, address =>
+        {
+            if (!slots.Contains(address)) return null;
+            if (cache.TryGetValue(address, out var cached)) return cached;
+            var usage = ResolveAbsoluteSlotUsage(address, context.GetAnyGlobalByAddress,
+                context.CheckForPost27GlobalTableEntryAt, entry => entry.Type == MetadataUsageType.StringLiteral);
+            StringLiteral? literal = usage == null ? null : new StringLiteral(usage.AsLiteral());
+            cache.Add(address, literal);
+            return literal;
+        }, method.AppContext.SystemTypes.SystemStringType, method.ControlFlowGraph);
     }
 
     /// <summary>
@@ -1124,7 +1154,9 @@ public static class MetadataResolver
         Instruction load,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
         IReadOnlyDictionary<LocalVariable, List<Instruction>> uses,
-        out ManagedFieldPhiRewritePlan plan)
+        out ManagedFieldPhiRewritePlan plan,
+        Func<ulong, StringLiteral?>? initializedStringResolver,
+        TypeAnalysisContext? stringType, ISILControlFlowGraph? graph)
     {
         plan = null!;
         if (load is not
@@ -1150,12 +1182,29 @@ public static class MetadataResolver
 
         var inputs = new List<ManagedFieldPhiInputRewrite>(phi.Operands.Count - 1);
         TypeAnalysisContext? consensusType = null;
+        var hasInitializedString = false;
         for (var index = 1; index < phi.Operands.Count; index++)
         {
             if (phi.Operands[index] is not LocalVariable addressLocal
                 || !definitions.TryGetValue(addressLocal, out var addressDefinition)
-                || !HasSingleUse(uses, addressLocal, phi)
-                || !TryDecodeManagedFieldAddressDefinition(
+                || !HasSingleUse(uses, addressLocal, phi))
+                return false;
+
+            if (memory.Addend == 0 && stringType != null && initializedStringResolver != null
+                && addressDefinition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand
+                    { Base: null, Index: null, Scale: 0, Addend: >= 0 } slot] }
+                && initializedStringResolver((ulong)slot.Addend) is { } literal)
+            {
+                if (consensusType != null
+                    && !GenericCallRebinder.TypesEquivalent(consensusType, stringType, requireDefinitionIdentity: true))
+                    return false;
+                consensusType = stringType;
+                hasInitializedString = true;
+                inputs.Add(new ManagedFieldPhiInputRewrite(addressDefinition, addressLocal, literal));
+                continue;
+            }
+
+            if (!TryDecodeManagedFieldAddressDefinition(
                     addressDefinition,
                     out var receiver,
                     out var addressOffset))
@@ -1176,7 +1225,7 @@ public static class MetadataResolver
 
             var fieldType = fieldReference.Field.FieldType;
             if (consensusType != null
-                && !GenericCallRebinder.TypesEquivalent(consensusType, fieldType))
+                && !GenericCallRebinder.TypesEquivalent(consensusType, fieldType, requireDefinitionIdentity: true))
                 return false;
 
             consensusType ??= fieldType;
@@ -1186,7 +1235,33 @@ public static class MetadataResolver
         if (consensusType == null)
             return false;
 
-        plan = new ManagedFieldPhiRewritePlan(load, phiValue, inputs);
+        // 混合常量/字段的读取提前到入边时，必须证明中间没有调用、写入或异常观察点。
+        // 每条定义位于其对应直接前驱，后继唯一；合流块在公共读取前仅含 Phi/Nop。
+        if (hasInitializedString && (graph == null
+            || load.MemoryAccessWidthBits != stringType!.AppContext.Binary.PointerSizeBytes * 8
+            || !HasUnobservedPhiReadEdges(graph, phi, load, inputs)))
+            return false;
+        plan = new ManagedFieldPhiRewritePlan(load, phiValue, inputs, hasInitializedString ? stringType : null);
+        return true;
+    }
+
+    private static bool HasUnobservedPhiReadEdges(ISILControlFlowGraph graph, Instruction phi,
+        Instruction load, IReadOnlyList<ManagedFieldPhiInputRewrite> inputs)
+    {
+        var merge = graph.Blocks.SingleOrDefault(block => block.Instructions.Contains(phi));
+        if (merge == null || merge.Predecessors.Count != inputs.Count) return false;
+        var loadIndex = merge.Instructions.IndexOf(load);
+        if (loadIndex < 0 || merge.Instructions.Take(loadIndex)
+                .Any(instruction => instruction.OpCode is not (OpCode.Phi or OpCode.Nop))) return false;
+        for (var index = 0; index < inputs.Count; index++)
+        {
+            var predecessor = merge.Predecessors[index];
+            var definitionIndex = predecessor.Instructions.IndexOf(inputs[index].AddressDefinition);
+            if (definitionIndex < 0 || predecessor.Successors.Count != 1
+                || predecessor.Successors[0] != merge
+                || predecessor.Instructions.Skip(definitionIndex + 1)
+                    .Any(instruction => instruction.OpCode is not (OpCode.Nop or OpCode.Jump))) return false;
+        }
         return true;
     }
 
@@ -1340,12 +1415,13 @@ public static class MetadataResolver
     private sealed record ManagedFieldPhiRewritePlan(
         Instruction Load,
         LocalVariable PhiValue,
-        IReadOnlyList<ManagedFieldPhiInputRewrite> Inputs);
+        IReadOnlyList<ManagedFieldPhiInputRewrite> Inputs,
+        TypeAnalysisContext? InitializedStringType);
 
     private readonly record struct ManagedFieldPhiInputRewrite(
         Instruction AddressDefinition,
         LocalVariable AddressLocal,
-        FieldReference FieldReference);
+        IOperand Value);
 
     /// <summary>
     /// 一次建立局部量完整定义索引。
